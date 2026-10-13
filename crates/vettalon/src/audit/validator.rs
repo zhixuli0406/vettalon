@@ -320,6 +320,17 @@ fn check_summary(r: &AuditReport, out: &mut Vec<ReportViolation>) {
         &r.coverage,
     );
     let got = &r.summary;
+    // Each stored condition must be one the `--gate` parser could produce
+    // (rejects e.g. `count>=0`, empty or closed statuses written by hand),
+    // and its outcome must match the findings. This proves consistency, not
+    // provenance: a report edited to drop a condition still validates — the
+    // CI exit code at scan time is the authoritative gate.
+    let policy_same = got.policy.iter().all(|g| {
+        g.condition
+            .to_string()
+            .parse::<crate::audit::gate::GateCondition>()
+            .is_ok_and(|c| c == g.condition)
+    }) && got.policy == crate::audit::gate::reevaluate(&got.policy, &r.findings);
     let mut field = |name: &'static str, same: bool| {
         if !same {
             out.push(ReportViolation::SummaryMismatch { field: name });
@@ -330,6 +341,7 @@ fn check_summary(r: &AuditReport, out: &mut Vec<ReportViolation>) {
         got.total_findings == expect.total_findings,
     );
     field("by_severity", got.by_severity == expect.by_severity);
+    field("policy", policy_same);
     field(
         "engines_run_count",
         got.engines_run_count == expect.engines_run_count,

@@ -85,12 +85,42 @@ pub fn apply(
         },
         &next.coverage,
     );
+    next.summary.policy = super::gate::reevaluate(&report.summary.policy, &next.findings);
     let errors = super::validation_errors(&next);
     if let Some(first) = errors.first() {
         return Err(format!("判定後報告不一致，未套用：{first}"));
     }
     *report = next;
     Ok(())
+}
+
+/// Apply one decision to several findings (batch triage), all or nothing:
+/// if any id is unknown or the result would not validate, `report` is left
+/// unchanged.
+pub fn apply_many(
+    report: &mut AuditReport,
+    finding_ids: &[String],
+    decision: Decision,
+    reason: &str,
+) -> Result<usize, String> {
+    if finding_ids.is_empty() {
+        return Err("沒有選取任何發現".into());
+    }
+    let mut next = report.clone();
+    let mut seen = std::collections::HashSet::new();
+    for id in finding_ids.iter().filter(|id| seen.insert(id.as_str())) {
+        if let Err(e) = apply(&mut next, id, decision, reason) {
+            let title = next
+                .findings
+                .iter()
+                .find(|f| &f.id == id)
+                .map(|f| f.title.as_str())
+                .unwrap_or(id.as_str());
+            return Err(format!("「{title}」無法套用，整批未變更：{e}"));
+        }
+    }
+    *report = next;
+    Ok(seen.len())
 }
 
 #[cfg(test)]
@@ -155,6 +185,32 @@ mod tests {
     }
 
     #[test]
+    fn policy_gate_is_reevaluated_and_validated() {
+        let mut r = report();
+        let conds = crate::audit::gate::parse_all(&["severity>=high count>0".into()]).unwrap();
+        r.summary.policy = crate::audit::gate::evaluate_all(&conds, &r.findings);
+        assert!(r.summary.policy[0].failed);
+        assert!(crate::audit::validation_errors(&r).is_empty());
+        assert_eq!(super::super::report::exit_code_with(&r, None), 1);
+
+        apply(&mut r, "f1", Decision::Refuted, "誤判：輸入已白名單").unwrap();
+        assert!(
+            !r.summary.policy[0].failed,
+            "closing the finding passes the gate"
+        );
+        assert_eq!(r.summary.policy[0].count, 0);
+        assert_eq!(super::super::report::exit_code_with(&r, None), 0);
+
+        // A stale policy outcome is a summary mismatch.
+        r.summary.policy[0].failed = true;
+        assert!(
+            crate::audit::validation_errors(&r)
+                .iter()
+                .any(|e| e.contains("summary.policy"))
+        );
+    }
+
+    #[test]
     fn reason_is_required_and_unknown_ids_change_nothing() {
         let mut r = report();
         let before = serde_json::to_string(&r).unwrap();
@@ -165,6 +221,51 @@ mod tests {
             before,
             "a failed decision leaves the report untouched"
         );
+    }
+
+    #[test]
+    fn hand_written_invalid_conditions_fail_validation() {
+        let mut r = report();
+        let conds = crate::audit::gate::parse_all(&["count>0".into()]).unwrap();
+        r.summary.policy = crate::audit::gate::evaluate_all(&conds, &r.findings);
+        assert!(crate::audit::validation_errors(&r).is_empty());
+        // `count>=0` (always failing) can't come from the parser.
+        let mut forged = r.clone();
+        forged.summary.policy[0].condition.op = crate::audit::gate::CountOp::Gte;
+        forged.summary.policy =
+            crate::audit::gate::reevaluate(&forged.summary.policy, &forged.findings);
+        assert!(!crate::audit::validation_errors(&forged).is_empty());
+        // Closed statuses can't gate.
+        let mut forged = r.clone();
+        forged.summary.policy[0].condition.statuses = vec![FindingStatus::Refuted];
+        forged.summary.policy =
+            crate::audit::gate::reevaluate(&forged.summary.policy, &forged.findings);
+        assert!(!crate::audit::validation_errors(&forged).is_empty());
+    }
+
+    #[test]
+    fn batch_is_all_or_nothing() {
+        let mut r = report();
+        let mut g = r.findings[0].clone();
+        g.id = "f2".into();
+        r.findings.push(g);
+        r.summary = Summary::from_findings(&r.findings, 0, 0, GatePolicy::default(), &[]);
+        let before = serde_json::to_string(&r).unwrap();
+        let bad = vec!["f1".to_string(), "missing".to_string()];
+        assert!(apply_many(&mut r, &bad, Decision::Refuted, "批次").is_err());
+        assert_eq!(serde_json::to_string(&r).unwrap(), before);
+
+        let ids = vec!["f1".to_string(), "f2".to_string(), "f1".to_string()];
+        assert_eq!(
+            apply_many(&mut r, &ids, Decision::Suppressed, "接受風險").unwrap(),
+            2
+        );
+        assert!(
+            r.findings
+                .iter()
+                .all(|f| f.status == FindingStatus::Suppressed)
+        );
+        assert!(crate::audit::validation_errors(&r).is_empty());
     }
 
     #[test]

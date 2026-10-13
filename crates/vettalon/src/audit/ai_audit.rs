@@ -599,33 +599,52 @@ pub async fn run_ai_audit_capped<C: LlmCaller>(
     candidate_cap: usize,
 ) -> AiAuditOutcome {
     let counter = std::sync::atomic::AtomicU32::new(0);
+    let none = std::collections::HashSet::new();
     run_ai_audit_progress(
         repo_root,
         modules,
         caller,
         candidate_cap,
-        &crate::audit::NoProgress,
-        "",
-        &counter,
-        modules.len() as u32,
+        AuditProgress {
+            sink: &crate::audit::NoProgress,
+            label: "",
+            audited: &counter,
+            total: modules.len() as u32,
+            cross_check: &none,
+        },
     )
     .await
 }
 
-/// [`run_ai_audit_capped`] that reports per-module progress. `label` is the
-/// finder id, `audited` a counter shared across finders, `total` the run's
-/// module count — together they drive a sub-progress bar.
-#[allow(clippy::too_many_arguments)]
+/// Progress reporting for one finder's share of modules.
+pub struct AuditProgress<'a> {
+    pub sink: &'a dyn crate::audit::Progress,
+    /// The finder id.
+    pub label: &'a str,
+    /// Module counter shared across finders.
+    pub audited: &'a std::sync::atomic::AtomicU32,
+    /// The run's module count.
+    pub total: u32,
+    /// Modules this finder audits as the second, cross-check finder.
+    pub cross_check: &'a std::collections::HashSet<String>,
+}
+
+/// [`run_ai_audit_capped`] that reports per-module progress (model, round
+/// and a module counter shared across finders).
 pub async fn run_ai_audit_progress<C: LlmCaller>(
     repo_root: &Path,
     modules: &[ModuleTarget],
     caller: &C,
     candidate_cap: usize,
-    progress: &dyn crate::audit::Progress,
-    label: &str,
-    audited: &std::sync::atomic::AtomicU32,
-    total: u32,
+    progress: AuditProgress<'_>,
 ) -> AiAuditOutcome {
+    let AuditProgress {
+        sink,
+        label,
+        audited,
+        total,
+        cross_check,
+    } = progress;
     if modules.is_empty() {
         return AiAuditOutcome::Unavailable {
             reason: "no candidate modules found (empty repo, or no readable files under it)"
@@ -644,11 +663,20 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
 
     for (idx, module) in modules.iter().enumerate() {
         let done = audited.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        progress.step(
+        let round = if cross_check.contains(&module.module_path) {
+            crate::audit::Round::CrossCheck
+        } else {
+            crate::audit::Round::Primary
+        };
+        sink.model_step(
             crate::audit::Phase::AiAudit,
-            &format!("{label} 審查模組 {}", module.module_path),
-            done.min(total),
-            total.max(1),
+            crate::audit::ModelStep {
+                model: label,
+                round,
+                message: &format!("{label} 審查模組 {}", module.module_path),
+                current: done.min(total),
+                total: total.max(1),
+            },
         );
         if findings.len() >= candidate_cap {
             candidate_cap_hit = true;

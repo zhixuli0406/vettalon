@@ -26,8 +26,18 @@ use crate::audit::validator::validate_report;
 /// above `fail_on`. Pure function over the already-computed summary —
 /// infra-level failures (bad repo path, can't write `--report`, a report
 /// that fails validation) are decided by the caller and use `2` directly.
+#[cfg(test)]
 pub fn exit_code(report: &AuditReport, fail_on: Severity) -> i32 {
-    if report.summary.gate_counts().count_at_or_above(fail_on) > 0 {
+    exit_code_with(report, Some(fail_on))
+}
+
+/// [`exit_code`] with `--fail-on` optional (`none`, or only `--gate`
+/// conditions set): `1` when the severity threshold is met or any policy
+/// gate condition in `summary.policy` failed.
+pub fn exit_code_with(report: &AuditReport, fail_on: Option<Severity>) -> i32 {
+    let by_severity =
+        fail_on.is_some_and(|s| report.summary.gate_counts().count_at_or_above(s) > 0);
+    if by_severity || crate::audit::gate::any_failed(&report.summary.policy) {
         1
     } else {
         0
@@ -36,7 +46,13 @@ pub fn exit_code(report: &AuditReport, fail_on: Severity) -> i32 {
 
 /// zh-TW human-readable summary. Pure function (returns a `String`) so it's
 /// testable without capturing stdout.
+#[cfg(test)]
 pub fn render_summary(report: &AuditReport, fail_on: Severity) -> String {
+    render_summary_with(report, Some(fail_on))
+}
+
+/// [`render_summary`] with `--fail-on` optional and the policy gate shown.
+pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> String {
     let mut out = String::new();
     out.push_str("程式碼安全審計（vettalon）\n");
     out.push_str(&format!("  掃描目標：{}\n", report.repo));
@@ -187,18 +203,40 @@ pub fn render_summary(report: &AuditReport, fail_on: Severity) -> String {
     }
 
     out.push('\n');
-    let code = exit_code(report, fail_on);
-    if code == 0 {
-        out.push_str(&format!(
+    if !report.summary.policy.is_empty() {
+        out.push_str("政策門檻（--gate）：\n");
+        for r in &report.summary.policy {
+            out.push_str(&format!(
+                "  [{}] {} — 實際 {} 筆\n",
+                if r.failed { "未通過" } else { "通過" },
+                r.expr,
+                r.count
+            ));
+        }
+        out.push('\n');
+    }
+    let policy_failed = crate::audit::gate::any_failed(&report.summary.policy);
+    let severity_hits = fail_on.map(|s| (s, report.summary.gate_counts().count_at_or_above(s)));
+    match severity_hits {
+        Some((s, n)) if n > 0 => out.push_str(&format!(
+            "結論：發現 {n} 項 {} 以上等級的問題，未通過。\n",
+            s.as_str()
+        )),
+        _ if policy_failed => out.push_str("結論：政策門檻有條件未通過，未通過。\n"),
+        Some((s, _)) => out.push_str(&format!(
             "結論：未達 --fail-on 門檻（{}），視為通過。\n",
-            fail_on.as_str()
-        ));
-    } else {
-        out.push_str(&format!(
-            "結論：發現 {} 項 {} 以上等級的問題，未通過。\n",
-            report.summary.gate_counts().count_at_or_above(fail_on),
-            fail_on.as_str()
-        ));
+            s.as_str()
+        )),
+        None if report.summary.policy.is_empty() => {
+            out.push_str("結論：未設定 --fail-on 或 --gate 門檻，僅供參考。\n")
+        }
+        None => out.push_str("結論：政策門檻全部通過。\n"),
+    }
+    let failed = policy_failed || severity_hits.is_some_and(|(_, n)| n > 0);
+    if !failed && report.run_status == RunStatus::Incomplete {
+        out.push_str(
+            "注意：本次掃描不完整，通過只代表「已審查的部分」沒有達到門檻，不代表沒有問題。\n",
+        );
     }
     out
 }
@@ -731,6 +769,16 @@ mod tests {
         );
         f.status = FindingStatus::NeedsHuman;
         f
+    }
+
+    #[test]
+    fn incomplete_pass_is_qualified() {
+        let mut report = base_report(vec![]);
+        assert!(!render_summary(&report, Severity::High).contains("本次掃描不完整"));
+        report.run_status = RunStatus::Incomplete;
+        report.incomplete_reason =
+            Some(vettalon_contract::coverage::IncompleteReason::EngineUnavailable);
+        assert!(render_summary(&report, Severity::High).contains("本次掃描不完整"));
     }
 
     #[test]

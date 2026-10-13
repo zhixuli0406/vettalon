@@ -69,6 +69,11 @@ vettalon validate report.json
 # 全部模組都審（--max-modules 0；大型 repo 較慢、較花費）
 vettalon scan . --profile deep --max-modules 0 --report report.json
 
+# 政策門檻（可重複）：跨家族覆核成立或人工確認的「高」以上發現超過 0 筆就讓 CI 失敗
+# 有 --gate 而沒指定 --fail-on 時，只由門檻條件決定結束碼
+vettalon scan . --profile deep \
+  --gate 'severity>=high status=confirmed,needs_human cross_family count>0'
+
 # 漏洞提交草稿：先列出可提交的項目，再為其中一項產生指定管道的草稿
 # （只產生草稿，不會替你送出；只有經覆核「需人工研判」或人工確認的項目才能產生）
 vettalon disclose report.json
@@ -79,7 +84,20 @@ vettalon disclose report.json --finding <id> --channel twcert --out draft.txt
 
 `vettalon disclose` 從 repo 本身（git remote、SECURITY.md、套件設定，不連網）判斷通報管道，產生 GitHub 私密漏洞回報、專案安全信箱、TWCERT/CC（建議 90 天公開）、HITCON ZeroDay（60 天）格式的草稿與建議公開日期。草稿裡「已人工重現／尚未重現」一欄必須自己填。只有經覆核留下的 `needs_human` 或人工確認的發現可以產生草稿，沒覆核過或已證偽的會被拒絕。vettalon 不會替你送出任何東西。
 
-結束碼：`0` 沒有達到 `--fail-on` 門檻的發現；`1` 有；`2` 掃描本身沒能完成（路徑錯誤、報告寫不出來等等）。
+### 政策門檻（`--gate`）
+
+`--fail-on` 只看嚴重度。`--gate` 是條件式門檻，可以疊好幾條，任一條成立就算不通過，結果寫進報告的 `summary.policy`：
+
+| 寫法 | 意思 | 預設 |
+|---|---|---|
+| `severity>=LEVEL` | 只算這個等級以上（critical／high／medium／low／info） | `info` |
+| `status=a,b` | 只算這些狀態（candidate／confirmed／needs_human；誤判與排除不能當門檻） | `candidate,confirmed` |
+| `cross_family` | 只算有跨家族覆核模型判定成立、或已人工確認的發現 | 不限 |
+| `count>N`／`count>=N` | 數量達到就不通過（必填） | — |
+
+沒給 `--fail-on` 又有 `--gate` 時，`--fail-on` 視為 `none`；兩者都給時任一不通過即失敗。報告後續的人工判定會重算門檻結果。`summary.policy` 只證明「結果與報告內的條件一致」，不證明條件沒被改過；以掃描當下的結束碼為準。
+
+結束碼：`0` 沒有達到 `--fail-on` 門檻、`--gate` 條件全部通過；`1` 未通過；`2` 掃描本身沒能完成（路徑錯誤、門檻條件寫錯、報告寫不出來等等）。
 
 ### 模型設定
 
@@ -195,7 +213,7 @@ cargo clippy --all-targets
 
 這個 repo 是 Vettalon 的開源核心：上面列的掃描、多模型分工與跨家族覆核、PoC 沙箱、SARIF、提交草稿全部免費，沒有功能鎖或次數限制。
 
-另有付費的 Vettalon Pro，提供桌面 App、本機 dashboard，以及對齊台灣資安檢測報告慣例的企業報告產生器（PDF／HTML）。Pro 讀的是同一份 `scan --report` JSON，核心不依賴 Pro。
+另有付費的 Vettalon Pro，提供桌面 App、本機 dashboard，以及對齊台灣資安檢測報告慣例的企業報告產生器（PDF／Word／HTML）。Pro 讀的是同一份 `scan --report` JSON，核心不依賴 Pro。
 
 ## License
 

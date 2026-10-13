@@ -19,8 +19,8 @@
 //!    - d: with `--poc`, a sandboxed PoC for `NeedsHuman` findings ≥ High.
 //! 4. Assemble the report, run the validator (violation ⇒ exit 2), print a
 //!    zh-TW summary, write `--report` / `--sarif` / `--save`.
-//! 5. Exit `0` nothing meets `--fail-on`; `1` something does; `2` the scan
-//!    itself could not complete.
+//! 5. Exit `0` nothing meets `--fail-on` and every `--gate` condition
+//!    passes; `1` otherwise; `2` the scan itself could not complete.
 //!
 //! A model refusal is never retried with another model: that module (or
 //! finding) is recorded as not reviewed, the rest of the model's share goes
@@ -33,6 +33,7 @@ mod assign;
 mod coverage;
 pub mod cvss;
 pub mod cwe;
+pub mod gate;
 mod injection;
 mod intake;
 mod llm_util;
@@ -70,8 +71,11 @@ pub struct ScanOptions {
     pub profile: String,
     pub report: Option<PathBuf>,
     pub sarif: Option<PathBuf>,
-    /// `"critical"|"high"|"medium"|"low"|"info"`.
+    /// `"critical"|"high"|"medium"|"low"|"info"`, or `"none"` (only the
+    /// policy gate, if any, decides the exit code).
     pub fail_on: String,
+    /// Policy gate conditions (`--gate`), evaluated into `summary.policy`.
+    pub gates: Vec<gate::GateCondition>,
     /// How many ranked modules the AI audit covers (the main cost guard).
     /// `0` means every ranked module (full coverage).
     pub max_modules: usize,
@@ -158,6 +162,28 @@ pub struct ProgressEvent {
     pub message: String,
     pub current: Option<u32>,
     pub total: Option<u32>,
+    /// The model doing this step (AI steps only). Finders and verifiers run
+    /// in parallel, so a UI keeps the latest event per model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Which pass this step belongs to (AI steps only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<Round>,
+}
+
+/// The pass a model step belongs to, for a progress stepper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Round {
+    /// A module's first finder.
+    Primary,
+    /// A second, different-family finder on a high-risk / flagged / top-N
+    /// module.
+    CrossCheck,
+    /// Adversarial review by a verifier.
+    Verify,
+    /// Sandboxed PoC generation.
+    Poc,
 }
 
 /// A sink for scan progress. A GUI streams these to its frontend (SSE, or a
@@ -173,6 +199,8 @@ pub trait Progress: Send + Sync {
             message: detail.to_string(),
             current: None,
             total: None,
+            model: None,
+            round: None,
         });
     }
 
@@ -183,8 +211,31 @@ pub trait Progress: Send + Sync {
             message: message.to_string(),
             current: Some(current),
             total: Some(total),
+            model: None,
+            round: None,
         });
     }
+
+    /// A sub-step done by `model` in `round`.
+    fn model_step(&self, phase: Phase, step: ModelStep<'_>) {
+        self.emit(ProgressEvent {
+            phase: phase.as_str().to_string(),
+            message: step.message.to_string(),
+            current: Some(step.current),
+            total: Some(step.total),
+            model: Some(step.model.to_string()),
+            round: Some(step.round),
+        });
+    }
+}
+
+/// One model's sub-step, for [`Progress::model_step`].
+pub struct ModelStep<'a> {
+    pub model: &'a str,
+    pub round: Round,
+    pub message: &'a str,
+    pub current: u32,
+    pub total: u32,
 }
 
 /// Discards progress (the CLI's default).
@@ -281,7 +332,7 @@ pub async fn run_scan_with_progress(
         }
         if opts.poc {
             progress.phase(Phase::Poc, "sandboxed PoC generation");
-            poc_step(&repo_root, &mut findings, opts, &refusals).await;
+            poc_step(&repo_root, &mut findings, opts, &refusals, progress).await;
         }
     }
 
@@ -309,13 +360,14 @@ pub async fn run_scan_with_progress(
     let gate = GatePolicy {
         include_needs_human: opts.fail_on_needs_human,
     };
-    let summary = Summary::from_findings(
+    let mut summary = Summary::from_findings(
         &findings,
         engines_run.len(),
         engines_missing.len(),
         gate,
         &coverage,
     );
+    summary.policy = gate::evaluate_all(&opts.gates, &findings);
     let mut audit_report = AuditReport {
         schema_version: CURRENT_SCHEMA_VERSION,
         repo: repo_str,
@@ -361,11 +413,15 @@ pub async fn run_scan_with_progress(
 /// outputs, and return the process exit code (`0` clean, `1` a gated finding
 /// at/above `--fail-on`, `2` the scan could not complete).
 pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
-    let fail_on: Severity = match opts.fail_on.parse() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[vettalon] 無效的 --fail-on：{e}");
-            return 2;
+    let fail_on: Option<Severity> = if opts.fail_on.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        match opts.fail_on.parse() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("[vettalon] 無效的 --fail-on：{e}");
+                return 2;
+            }
         }
     };
     let audit_report = match run_scan(home_dir, &opts).await {
@@ -378,7 +434,7 @@ pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
 
     // Repo-derived strings (paths, extensions, errors) reach the terminal:
     // drop control characters so they cannot inject escape sequences.
-    let summary_text: String = report::render_summary(&audit_report, fail_on)
+    let summary_text: String = report::render_summary_with(&audit_report, fail_on)
         .chars()
         .map(|c| if c.is_control() && c != '\n' { '?' } else { c })
         .collect();
@@ -408,7 +464,7 @@ pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
         }
     }
 
-    report::exit_code(&audit_report, fail_on)
+    report::exit_code_with(&audit_report, fail_on)
 }
 
 /// Fields that are identifiers or fixed vocabulary, never free text.
@@ -579,6 +635,8 @@ async fn run_audit_step(
     // ranked[..take] is already sorted by score, so index < cross_check_top
     // is "top N".
     let mut shares: Vec<Vec<ModuleTarget>> = vec![Vec::new(); opts.finders.len()];
+    // Per finder: the modules it audits as the second (cross-check) finder.
+    let mut second_pass: Vec<HashSet<String>> = vec![HashSet::new(); opts.finders.len()];
     for (i, m) in ranked[..take].iter().enumerate() {
         let Some(primary) = assign::finder_for(i, opts.finders.len()) else {
             continue;
@@ -594,6 +652,7 @@ async fn run_audit_step(
             && second != primary
         {
             shares[second].push(m.clone());
+            second_pass[second].insert(m.module_path.clone());
         }
     }
     // Modules that ended up with more than one finder.
@@ -612,29 +671,36 @@ async fn run_audit_step(
     let cap = (ai_audit::MAX_TOTAL_AI_CANDIDATES / busy).max(ai_audit::MAX_CANDIDATES_PER_MODULE);
     let audited = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let total_modules = take as u32;
-    let runs = futures::future::join_all(opts.finders.iter().zip(shares.iter()).map(
-        |(finder, share)| {
-            let audited = audited.clone();
-            async move {
-                if share.is_empty() {
-                    return None;
+    let runs = futures::future::join_all(
+        opts.finders
+            .iter()
+            .zip(shares.iter())
+            .zip(second_pass.iter())
+            .map(|((finder, share), second)| {
+                let audited = audited.clone();
+                async move {
+                    if share.is_empty() {
+                        return None;
+                    }
+                    let caller = StepCaller::new(finder.clone(), "audit", refusals.clone());
+                    let outcome = ai_audit::run_ai_audit_progress(
+                        repo_root,
+                        share,
+                        &caller,
+                        cap,
+                        ai_audit::AuditProgress {
+                            sink: progress,
+                            label: &finder.id,
+                            audited: &audited,
+                            total: total_modules,
+                            cross_check: second,
+                        },
+                    )
+                    .await;
+                    Some((finder.id.clone(), outcome))
                 }
-                let caller = StepCaller::new(finder.clone(), "audit", refusals.clone());
-                let outcome = ai_audit::run_ai_audit_progress(
-                    repo_root,
-                    share,
-                    &caller,
-                    cap,
-                    progress,
-                    &finder.id,
-                    &audited,
-                    total_modules,
-                )
-                .await;
-                Some((finder.id.clone(), outcome))
-            }
-        },
-    ))
+            }),
+    )
     .await;
 
     let mut step = AuditStep {
@@ -804,11 +870,15 @@ async fn review_step(
             let mut out = Vec::with_capacity(batch.len());
             for (i, pick, mut f) in batch {
                 let done = reviewed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                progress.step(
+                progress.model_step(
                     Phase::Review,
-                    &format!("{} 覆核 {}", verifier.id, f.file),
-                    done.min(review_total),
-                    review_total.max(1),
+                    ModelStep {
+                        model: &verifier.id,
+                        round: Round::Verify,
+                        message: &format!("{} 覆核 {}", verifier.id, f.file),
+                        current: done.min(review_total),
+                        total: review_total.max(1),
+                    },
                 );
                 if dead {
                     adversarial::note_unverified(
@@ -863,16 +933,28 @@ async fn poc_step(
     findings: &mut [Finding],
     opts: &ScanOptions,
     refusals: &RefusalLog,
+    progress: &dyn Progress,
 ) {
     if opts.poc_models.is_empty() {
         eprintln!("[vettalon] 提示：沒有設定 poc 模型，略過 PoC。");
         return;
     }
+    let total = findings.len() as u32;
     for (nth, f) in findings.iter_mut().enumerate() {
         let pick = finder_of(f, opts)
             .and_then(|finder| assign::verifier_for(finder, &opts.poc_models, nth))
             .map(|p| p.index)
             .unwrap_or(0);
+        progress.model_step(
+            Phase::Poc,
+            ModelStep {
+                model: &opts.poc_models[pick].id,
+                round: Round::Poc,
+                message: &format!("{} 檢查 PoC 條件 {}", opts.poc_models[pick].id, f.file),
+                current: nth as u32 + 1,
+                total: total.max(1),
+            },
+        );
         let caller = StepCaller::new(opts.poc_models[pick].clone(), "poc", refusals.clone());
         poc::maybe_run_poc(repo_root, f, &caller, opts.poc).await;
     }
@@ -1033,6 +1115,7 @@ mod tests {
             report: None,
             sarif: None,
             fail_on: "high".to_string(),
+            gates: Vec::new(),
             max_modules: 5,
             poc: false,
             save: false,
@@ -1609,6 +1692,39 @@ mod tests {
         assert_eq!(s2.prompts.lock().unwrap().len(), 1);
         let v = read_report(&report_path);
         assert_eq!(v["ensemble"]["cross_checked"], 1);
+    }
+
+    /// Progress names the model and round of each AI step.
+    #[tokio::test]
+    async fn progress_reports_model_and_round() {
+        use std::sync::Mutex;
+        struct Rec(Mutex<Vec<(Option<String>, Option<Round>)>>);
+        impl Progress for Rec {
+            fn emit(&self, e: ProgressEvent) {
+                if e.phase == "ai_audit" && e.model.is_some() {
+                    self.0.lock().unwrap().push((e.model, e.round));
+                }
+            }
+        }
+        let dir = repo_with_module();
+        let home = tempfile::tempdir().unwrap();
+        let (f1, _s1) = model("claude", "anthropic", vec![Ok("[]".into())]);
+        let (f2, _s2) = model("codex", "openai", vec![Ok("[]".into())]);
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.roster = info(&[&f1, &f2]);
+        o.finders = vec![f1, f2];
+        let rec = Rec(Mutex::new(Vec::new()));
+        run_scan_with_progress(home.path(), &o, &rec).await.unwrap();
+        let mut seen = rec.0.lock().unwrap().clone();
+        seen.sort_by_key(|(m, _)| m.clone());
+        assert_eq!(
+            seen,
+            vec![
+                (Some("claude".into()), Some(Round::Primary)),
+                (Some("codex".into()), Some(Round::CrossCheck)),
+            ]
+        );
     }
 
     /// --cross-check-top widens double-auditing to the top N ranked modules

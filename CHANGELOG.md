@@ -5,6 +5,13 @@
 ## [Unreleased]
 
 ### Added
+- **政策門檻 `--gate`**（SonarQube 式條件列，可重複）：`severity>=LEVEL`、`status=…`、`cross_family`（只算跨家族覆核成立或人工確認）、`count>N`／`count>=N`；任一條件不通過即結束碼 1。結果寫入 `summary.policy`（無條件時不輸出），人工判定後自動重算，validator 會檢查是否與 findings 一致。`--fail-on` 改為選填並接受 `none`；有 `--gate` 而未給 `--fail-on` 時視為 `none`。dashboard／桌面 App 新增條件編輯器（可複製成 CI 參數）與結果頁的門檻卡片。
+- **批次人工判定**：`audit::triage::apply_many`（全有或全無）；dashboard 可勾選、跨檢視累選，一次套用同一判定與理由；判定理由提供常用選項（含「暫不處理（複查期限）」）。
+- **進度事件帶模型與輪次**：`ProgressEvent` 新增選填 `model`、`round`（`primary`／`cross_check`／`verify`／`poc`），PoC 步驟也回報進度；dashboard 進度面板逐模型顯示目前在做什麼。
+- dashboard 發現清單：「覆核不確定」檢視（覆核模型全部無判定、或 AI 候選未覆核）、依模型篩選、依規則／CWE 或檔案分組、依嚴重度／覆核共識／檔案排序；結果頁新增「誤報過濾漏斗」卡（候選→跨家族駁回→其他駁回→人工排除→未裁決→仍成立）。
+- 掃描不完整時，CLI 結論與 dashboard 政策門檻卡會註明「通過只代表已審查的部分」，空結果頁也不再寫「不是漏抓」。
+- 模型名冊標示每個模型的資料去向（本機／雲端 CLI 帳號／雲端 API 金鑰），並說明 vettalon 不經手、不轉售 token。
+- **企業報告 Word（.docx）匯出**（Vettalon Pro）：章節與 PDF 相同，可再編輯套用公司範本；不需 Python 或 Office。
 - **zh-TW CWE 知識庫**（`crates/vettalon/src/cwe_kb.json`，58 筆）：由 MITRE CWE v4.20 官方 XML 建立、與 OWASP Top 10 2021 對應雙來源核對；提交草稿依 CWE 查表帶入中文說明，函式庫 API `vettalon::kb` 供其他前端重用。OWASP 類別中文採 OWASP 官方繁中譯名（A08–A10 官方未譯，保留英文）。
 - **漏洞提交助手**：`vettalon disclose <report.json> [--finding <id>] [--channel ghsa|email|twcert|hitcon]`。只從 repo 本身判斷管道（git remote、SECURITY.md、套件設定，無網路），產生 GitHub 私密漏洞回報、專案安全信箱、TWCERT/CC（90 天）、HITCON ZeroDay（60 天）格式草稿與建議公開日期；草稿強制要求填寫「已人工重現／尚未重現」。**只產生草稿、永不送出**；只有「需人工研判」或人工確認的項目可產生，誤判與未覆核項目拒絕；輸出附送出前檢查清單。
 - **人工判定（triage）函式庫 API**（`audit::triage::apply`）：確認為漏洞／判定誤判／排除，理由必填，依 `OperatorReview` 合約寫入並以 validator 同一規則重算摘要；判定後報告仍須通過 validator 否則不套用。理由進入報告的誤判清單、排除清單（「人工判定：…」）。
@@ -28,6 +35,10 @@
 - `fixtures/demo-app`：附標準答案的漏洞測試專案。
 - 召回基準：對 9 個真實已知 CVE（跨 5 語言 6 類別）的掃描結果與可重現 harness（benchmarks/recall/）。脆弱碼在範圍內時 9/9 識別正確類別，整庫 5/9（分頁修復後）。
 - 誤報率實驗（OWASP Benchmark 160-case，FP 各 80，附 95% CI，benchmarks/owasp-fp/）：vettalon 91% 召回 [83–96%]、0 誤報（上界 ≤ 3.8%）；跨家族覆核把 7B 本機模型的誤報率 57%→0%、保住 51/60 真發現。基準抓出並修好 verifier 過度嚴格（看不到部署脈絡就 refute）的 bug，召回 66%→94%、precision 不變。
+
+### Changed
+- `vettalon scan --fail-on` 不再有固定預設值：未指定時，沒有 `--gate` 為 `high`（與先前相同），有 `--gate` 為 `none`。
+- `ai_audit::run_ai_audit_progress` 改收 `AuditProgress` 結構（函式庫 API）。
 
 ### Fixed
 - Windows 上沒有 `HOME` 時，CLI 改讀 `%USERPROFILE%\.vettalon`（原本落到目前目錄）。

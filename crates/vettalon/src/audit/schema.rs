@@ -813,6 +813,10 @@ pub struct Summary {
     /// Findings whose status was carried from a prior report (zero LLM).
     #[serde(default)]
     pub carried_from_prior: usize,
+    /// Policy gate conditions (`--gate`) and their outcome on these
+    /// findings; empty when no condition was set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy: Vec<super::gate::GateResult>,
 }
 
 impl Summary {
@@ -867,6 +871,7 @@ impl Summary {
             coverage: CoverageSummary::from_coverage(coverage),
             precheck_refuted,
             carried_from_prior,
+            policy: Vec::new(),
         }
     }
 

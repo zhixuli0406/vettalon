@@ -46,9 +46,16 @@ struct ScanArgs {
     /// Write a SARIF 2.1.0 file here.
     #[arg(long)]
     sarif: Option<PathBuf>,
-    /// Exit 1 when a gated finding is at or above this severity.
-    #[arg(long, default_value = "high")]
-    fail_on: String,
+    /// Exit 1 when a gated finding is at or above this severity (`none` to
+    /// disable). Default `high`, or `none` when a --gate is given.
+    #[arg(long)]
+    fail_on: Option<String>,
+    /// Policy gate condition (repeatable); exit 1 when any fails. Example:
+    /// "severity>=critical status=confirmed,needs_human cross_family count>0".
+    /// Tokens: severity>=LEVEL, status=candidate|confirmed|needs_human,...,
+    /// cross_family, count>N | count>=N.
+    #[arg(long = "gate", value_name = "CONDITION")]
+    gates: Vec<String>,
     /// Also count needs_human findings toward --fail-on.
     #[arg(long)]
     fail_on_needs_human: bool,
@@ -240,12 +247,21 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         report,
         sarif,
         fail_on,
+        gates,
         fail_on_needs_human,
         poc,
         poc_image,
         save,
         no_prior,
     } = args;
+    let gates = match audit::gate::parse_all(&gates) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[vettalon] {e}");
+            return 2;
+        }
+    };
+    let fail_on = fail_on.unwrap_or_else(|| if gates.is_empty() { "high" } else { "none" }.into());
     // Same parser the pipeline uses (case-insensitive), so `--profile Deep`
     // loads the roster too; a bad value is reported by the pipeline (exit 2).
     let deep = profile.parse::<ProfileMode>() == Ok(ProfileMode::Deep);
@@ -306,6 +322,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         report,
         sarif,
         fail_on,
+        gates,
         max_modules,
         poc,
         save,
