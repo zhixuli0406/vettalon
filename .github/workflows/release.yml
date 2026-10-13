@@ -145,10 +145,11 @@ jobs:
           merge-multiple: true
           path: artifacts
       - name: Publish to npm
-        if: ${{ secrets.NPM_TOKEN != '' }}
         env:
+          # secrets can't be used in `if:`, so gate at runtime instead.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           ARTIFACTS_DIR: ./artifacts
         run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "no NPM_TOKEN, skipping npm publish"; exit 0; fi
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           ./npm/scripts/publish.sh "${TAG#v}"
