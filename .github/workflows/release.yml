@@ -32,10 +32,10 @@ jobs:
             os: macos-latest
             artifact: vettalon-darwin-x64
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             artifact: vettalon-linux-x64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             artifact: vettalon-linux-arm64
     steps:
       - name: Validate tag
@@ -43,7 +43,7 @@ jobs:
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: '[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag $TAG"; exit 1; }'
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -73,7 +73,7 @@ jobs:
             --output-certificate ${{ matrix.artifact }}.tar.gz.pem \
             ${{ matrix.artifact }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -81,11 +81,11 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       # minisign is optional: sign only if the keypair secret is configured
@@ -103,7 +103,7 @@ jobs:
           done
           rm -f /tmp/mk.key
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
@@ -117,16 +117,16 @@ jobs:
   npm-publish:
     needs: release
     if: github.repository == 'zhixuli0406/vettalon'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
           path: artifacts
