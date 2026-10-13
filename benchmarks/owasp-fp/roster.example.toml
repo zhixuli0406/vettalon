@@ -1,0 +1,26 @@
+# Config A: claude finds, codex (different family) verifies.
+[[model]]
+id = "claude"
+backend = "cli"
+preset = "claude"
+roles = ["finder", "verifier"]
+[[model]]
+id = "codex"
+backend = "cli"
+preset = "codex"
+allow_agent_tools = true   # OWASP cases are synthetic; production uses the container
+roles = ["verifier"]
+
+# Config B (uncomment): a weaker local finder, claude cross-family verifier —
+# shows cross-family catching the weaker model's false positives.
+# [[model]]
+# id = "qwen-local"
+# backend = "ollama"
+# family = "qwen"
+# model = "qwen2.5-coder:7b"
+# roles = ["finder"]
+# [[model]]
+# id = "claude"
+# backend = "cli"
+# preset = "claude"
+# roles = ["verifier"]

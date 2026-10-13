@@ -1,0 +1,1158 @@
+[
+  {
+    "id": "CWE-79",
+    "name_en": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+    "name_zh": "跨站腳本（XSS）",
+    "summary_zh": "應用程式把使用者可控的輸入未經適當編碼就輸出到網頁中，攻擊者可讓惡意 JavaScript 在其他使用者的瀏覽器執行。",
+    "consequences_zh": [
+      "竊取受害者的 Session Cookie 或權杖並冒用其身分",
+      "以受害者身分執行操作或竄改頁面內容",
+      "繞過同源政策讀取頁面上的敏感資料"
+    ],
+    "mitigations_zh": [
+      "依輸出情境（HTML 內容、屬性、JavaScript、URL）進行對應的輸出編碼",
+      "優先使用預設自動跳脫的範本引擎或前端框架，避免 innerHTML、dangerouslySetInnerHTML 等直接插入 HTML 的寫法",
+      "若必須接受 HTML，使用經審核的消毒函式庫（如 DOMPurify）以白名單過濾",
+      "設定 Content-Security-Policy 並為 Cookie 加上 HttpOnly，降低攻擊成功後的影響"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "xss",
+      "cross_site_scripting"
+    ]
+  },
+  {
+    "id": "CWE-89",
+    "name_en": "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')",
+    "name_zh": "SQL 注入",
+    "summary_zh": "應用程式以外部輸入拼組 SQL 指令卻未正確處理特殊字元，攻擊者可改寫查詢語意，直接讀取或竄改資料庫。",
+    "consequences_zh": [
+      "可讀取或竄改資料庫內容",
+      "繞過登入驗證或取得較高權限",
+      "在部分資料庫設定下可進一步執行系統指令"
+    ],
+    "mitigations_zh": [
+      "使用參數化查詢（prepared statement），不要以字串串接 SQL",
+      "使用 ORM 或查詢建構器時，避免把使用者輸入放進 raw SQL 片段",
+      "資料表名、欄位名、排序方向等無法參數化的部分，以固定白名單對照",
+      "應用程式連線資料庫的帳號只授予必要的最小權限"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "sql_injection",
+      "sqli"
+    ]
+  },
+  {
+    "id": "CWE-78",
+    "name_en": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+    "name_zh": "作業系統指令注入",
+    "summary_zh": "應用程式以外部輸入組出作業系統指令卻未正確處理特殊字元，攻擊者可在伺服器上執行任意指令。",
+    "consequences_zh": [
+      "以應用程式的權限在主機上執行任意指令",
+      "讀取、竄改或刪除伺服器上的檔案",
+      "植入後門或使服務中斷"
+    ],
+    "mitigations_zh": [
+      "優先改用程式語言內建的函式庫 API，不要呼叫外部 shell 指令",
+      "必須執行外部程式時，以參數陣列方式呼叫（如 execve、subprocess 的 list 形式），不要經過 shell 解析",
+      "對輸入參數採白名單驗證，只允許預期的值或字元",
+      "以低權限帳號或沙箱（容器、jail）執行相關程序"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "command_injection",
+      "os_command_injection",
+      "shell_injection"
+    ]
+  },
+  {
+    "id": "CWE-77",
+    "name_en": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+    "name_zh": "指令注入",
+    "summary_zh": "應用程式以外部輸入組出要交給下游元件解析的指令，卻未正確處理特殊字元，攻擊者可改變指令的原本用意。",
+    "consequences_zh": [
+      "執行未經授權的指令或操作"
+    ],
+    "mitigations_zh": [
+      "盡量以函式庫呼叫取代組字串交給外部直譯器執行",
+      "把要執行的指令寫死在程式中，外部輸入只作為經驗證的參數",
+      "以白名單驗證所有會進入指令的輸入值"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": []
+  },
+  {
+    "id": "CWE-94",
+    "name_en": "Improper Control of Generation of Code ('Code Injection')",
+    "name_zh": "程式碼注入",
+    "summary_zh": "應用程式以外部輸入動態產生程式碼後執行，攻擊者可插入自己的程式碼並以應用程式身分執行。",
+    "consequences_zh": [
+      "執行任意程式碼",
+      "繞過保護機制或取得較高權限"
+    ],
+    "mitigations_zh": [
+      "重構程式，避免在執行期動態產生並執行程式碼",
+      "若無法避免，對輸入採嚴格白名單驗證，只允許預期的格式",
+      "在沙箱或受限環境中執行動態程式碼"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "code_injection"
+    ]
+  },
+  {
+    "id": "CWE-95",
+    "name_en": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+    "name_zh": "Eval 注入",
+    "summary_zh": "應用程式把外部輸入交給 eval 等動態求值函式執行，卻未過濾其中的程式語法，攻擊者可執行任意程式碼。",
+    "consequences_zh": [
+      "執行任意程式碼",
+      "讀取應用程式資料或伺服器上的檔案"
+    ],
+    "mitigations_zh": [
+      "移除 eval、Function()、exec 等動態求值呼叫，改用明確的資料解析邏輯",
+      "需要解析資料結構時，使用安全的解析器（如 JSON.parse、Python 的 ast.literal_eval）",
+      "對無法移除的動態求值輸入採嚴格白名單驗證"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "eval_injection",
+      "unsafe_eval"
+    ]
+  },
+  {
+    "id": "CWE-1336",
+    "name_en": "Improper Neutralization of Special Elements Used in a Template Engine",
+    "name_zh": "範本注入（SSTI）",
+    "summary_zh": "應用程式把外部輸入當作範本內容交給範本引擎處理，攻擊者可注入範本語法，常可進一步在伺服器上執行程式碼。",
+    "consequences_zh": [
+      "在伺服器端執行任意程式碼或指令",
+      "讀取伺服器上的設定與機敏資料"
+    ],
+    "mitigations_zh": [
+      "不要以使用者輸入組成範本本身，使用者資料只能作為範本變數傳入",
+      "選用支援沙箱或受限模式的範本引擎，並啟用該模式",
+      "限制範本中可呼叫的函式與可存取的物件"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "template_injection",
+      "ssti",
+      "server_side_template_injection"
+    ]
+  },
+  {
+    "id": "CWE-90",
+    "name_en": "Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')",
+    "name_zh": "LDAP 注入",
+    "summary_zh": "應用程式以外部輸入拼組 LDAP 查詢卻未跳脫特殊字元，攻擊者可改變查詢條件。",
+    "consequences_zh": [
+      "讀取目錄服務中未授權的帳號或屬性資料",
+      "繞過以 LDAP 實作的登入驗證",
+      "竄改目錄資料"
+    ],
+    "mitigations_zh": [
+      "以 LDAP 函式庫提供的跳脫函式處理所有進入過濾條件與 DN 的輸入",
+      "對輸入採白名單驗證，只允許預期的字元集",
+      "應用程式綁定 LDAP 的帳號只授予必要的唯讀權限"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "ldap_injection"
+    ]
+  },
+  {
+    "id": "CWE-643",
+    "name_en": "Improper Neutralization of Data within XPath Expressions ('XPath Injection')",
+    "name_zh": "XPath 注入",
+    "summary_zh": "應用程式以外部輸入動態組出 XPath 運算式查詢 XML 資料，攻擊者可控制查詢結構。",
+    "consequences_zh": [
+      "讀取 XML 資料中未授權的內容",
+      "繞過以 XPath 實作的驗證邏輯"
+    ],
+    "mitigations_zh": [
+      "使用參數化的 XPath 查詢（如 XQuery 變數綁定），把資料與查詢結構分開",
+      "對輸入進行驗證並跳脫引號等 XPath 特殊字元"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "xpath_injection"
+    ]
+  },
+  {
+    "id": "CWE-917",
+    "name_en": "Improper Neutralization of Special Elements used in an Expression Language Statement ('Expression Language Injection')",
+    "name_zh": "運算式語言（EL）注入",
+    "summary_zh": "應用程式以外部輸入組出 EL、OGNL、SpEL 等運算式語言陳述式，攻擊者可注入運算式，在伺服器上執行程式碼。",
+    "consequences_zh": [
+      "執行任意程式碼",
+      "讀取應用程式資料"
+    ],
+    "mitigations_zh": [
+      "避免把使用者可控的資料放進運算式直譯器",
+      "必須使用時，以白名單驗證輸入並跳脫運算式語法字元",
+      "不需要時關閉框架的 EL 解析功能（如 JSP 的 isELIgnored）"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "expression_language_injection",
+      "el_injection"
+    ]
+  },
+  {
+    "id": "CWE-22",
+    "name_en": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+    "name_zh": "路徑穿越",
+    "summary_zh": "應用程式以外部輸入組出檔案路徑，卻未處理「../」等特殊序列，攻擊者可存取限定目錄以外的檔案。",
+    "consequences_zh": [
+      "讀取伺服器上的任意檔案（如設定檔、金鑰）",
+      "覆寫或刪除重要檔案",
+      "在可寫入特定位置時進一步執行程式碼"
+    ],
+    "mitigations_zh": [
+      "將路徑正規化（canonicalize）後，檢查結果仍位於允許的根目錄之內",
+      "不要直接使用使用者提供的檔名，改以 ID 對照伺服器端的實際檔名",
+      "以白名單限制可接受的檔名字元，拒絕包含「..」、路徑分隔符號或絕對路徑的輸入"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "path_traversal",
+      "directory_traversal"
+    ]
+  },
+  {
+    "id": "CWE-73",
+    "name_en": "External Control of File Name or Path",
+    "name_zh": "外部控制檔名或路徑",
+    "summary_zh": "應用程式允許使用者輸入控制或影響檔案系統操作所使用的路徑或檔名。",
+    "consequences_zh": [
+      "讀取、修改或刪除非預期的檔案",
+      "造成服務中斷或資源耗盡"
+    ],
+    "mitigations_zh": [
+      "檔案集合有限時，以固定 ID 對照實際檔名，拒絕其他輸入",
+      "對路徑與檔名採白名單驗證",
+      "在沙箱或受限目錄中執行檔案操作"
+    ],
+    "owasp_top10_2021": "A04:2021-Insecure Design",
+    "kind_aliases": []
+  },
+  {
+    "id": "CWE-434",
+    "name_en": "Unrestricted Upload of File with Dangerous Type",
+    "name_zh": "未限制上傳危險類型檔案",
+    "summary_zh": "應用程式允許上傳會被系統自動處理或執行的危險檔案類型（如 .php、.jsp），攻擊者可藉此在伺服器上執行程式碼。",
+    "consequences_zh": [
+      "上傳 Web Shell 並在伺服器上執行任意程式碼"
+    ],
+    "mitigations_zh": [
+      "以白名單限制允許的副檔名，並在伺服器端驗證檔案內容格式",
+      "為上傳檔案重新產生隨機檔名，不使用使用者提供的檔名",
+      "將上傳檔案存放在網站根目錄以外或物件儲存，並設定為不可執行",
+      "下載回應時設定正確的 Content-Type 與 Content-Disposition"
+    ],
+    "owasp_top10_2021": "A04:2021-Insecure Design",
+    "kind_aliases": [
+      "file_upload",
+      "unrestricted_file_upload"
+    ]
+  },
+  {
+    "id": "CWE-352",
+    "name_en": "Cross-Site Request Forgery (CSRF)",
+    "name_zh": "跨站請求偽造（CSRF）",
+    "summary_zh": "應用程式無法確認請求是否出自使用者本人的意願，攻擊者可誘使已登入的使用者在不知情下送出請求。",
+    "consequences_zh": [
+      "以受害者身分執行轉帳、改密碼、改設定等操作",
+      "竄改受害者的帳號資料"
+    ],
+    "mitigations_zh": [
+      "所有會改變狀態的請求都驗證不可預測的 CSRF token（框架內建機制優先）",
+      "為 Session Cookie 設定 SameSite=Lax 或 Strict",
+      "改變狀態的操作不要使用 GET 方法",
+      "高風險操作要求重新輸入密碼或二次確認"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "csrf",
+      "xsrf"
+    ]
+  },
+  {
+    "id": "CWE-918",
+    "name_en": "Server-Side Request Forgery (SSRF)",
+    "name_zh": "伺服器端請求偽造（SSRF）",
+    "summary_zh": "伺服器依外部提供的 URL 發出請求，卻未確保目的地符合預期，攻擊者可讓伺服器替他存取內網服務或雲端中繼資料端點。",
+    "consequences_zh": [
+      "存取內部網路服務或雲端中繼資料（如 169.254.169.254）取得機敏資訊與憑據",
+      "以伺服器身分繞過防火牆或存取控制",
+      "對內部系統發動進一步攻擊"
+    ],
+    "mitigations_zh": [
+      "以白名單限制允許的協定、主機與連接埠，不要依賴黑名單或正規表示式過濾",
+      "解析 DNS 後驗證目的 IP，拒絕內網、迴路與鏈路本地位址，並防範 DNS rebinding",
+      "關閉自動跟隨 HTTP 重新導向，且不要把原始回應直接回傳給使用者",
+      "在網路層以預設拒絕的規則限制發出請求的服務可連線的範圍"
+    ],
+    "owasp_top10_2021": "A10:2021-Server-Side Request Forgery (SSRF)",
+    "kind_aliases": [
+      "ssrf"
+    ]
+  },
+  {
+    "id": "CWE-611",
+    "name_en": "Improper Restriction of XML External Entity Reference",
+    "name_zh": "XML 外部實體（XXE）",
+    "summary_zh": "XML 解析器處理文件時會解析指向外部資源的實體，攻擊者可藉此讀取伺服器檔案或讓伺服器對外發出請求。",
+    "consequences_zh": [
+      "讀取伺服器上的本機檔案",
+      "以伺服器發出請求存取內網（SSRF）",
+      "透過實體展開耗盡 CPU 或記憶體造成服務中斷"
+    ],
+    "mitigations_zh": [
+      "設定 XML 解析器停用 DTD 與外部實體解析",
+      "使用預設安全設定的解析函式庫並保持更新",
+      "資料格式允許時改用 JSON 等較單純的格式"
+    ],
+    "owasp_top10_2021": "A05:2021-Security Misconfiguration",
+    "kind_aliases": [
+      "xxe",
+      "xml_external_entity"
+    ]
+  },
+  {
+    "id": "CWE-502",
+    "name_en": "Deserialization of Untrusted Data",
+    "name_zh": "不受信任資料的反序列化",
+    "summary_zh": "應用程式對不受信任的資料進行反序列化，卻未確保結果有效，攻擊者可構造惡意物件觸發非預期行為，常見後果是遠端程式碼執行。",
+    "consequences_zh": [
+      "遠端執行任意程式碼",
+      "竄改應用程式資料或邏輯狀態",
+      "消耗大量資源造成服務中斷"
+    ],
+    "mitigations_zh": [
+      "不要對不受信任的來源使用原生物件序列化（如 Java Serializable、Python pickle、PHP unserialize）",
+      "改用 JSON 等純資料格式，並以 schema 驗證後再建立物件",
+      "必須反序列化時，以簽章驗證資料完整性並限制允許的類別白名單"
+    ],
+    "owasp_top10_2021": "A08:2021-Software and Data Integrity Failures",
+    "kind_aliases": [
+      "deserialization",
+      "insecure_deserialization",
+      "unsafe_deserialization"
+    ]
+  },
+  {
+    "id": "CWE-287",
+    "name_en": "Improper Authentication",
+    "name_zh": "身分驗證不當",
+    "summary_zh": "使用者宣稱具有某個身分時，系統未證明或未充分證明該宣稱屬實，攻擊者可冒用他人身分。",
+    "consequences_zh": [
+      "冒用其他使用者或管理員身分",
+      "存取需要登入才能使用的資料與功能"
+    ],
+    "mitigations_zh": [
+      "使用成熟的身分驗證框架或服務，不要自行實作驗證邏輯",
+      "每個需要身分的請求都在伺服器端驗證 Session 或權杖（包含簽章、有效期限與發行者）",
+      "高權限或敏感操作啟用多因素驗證"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "auth_bypass",
+      "authentication_bypass",
+      "broken_authentication"
+    ]
+  },
+  {
+    "id": "CWE-306",
+    "name_en": "Missing Authentication for Critical Function",
+    "name_zh": "關鍵功能缺少身分驗證",
+    "summary_zh": "需要確認使用者身分或會消耗大量資源的功能，完全沒有進行身分驗證。",
+    "consequences_zh": [
+      "未經登入即可使用管理或敏感功能"
+    ],
+    "mitigations_zh": [
+      "盤點所有端點並區分匿名、一般使用者與管理員區域，敏感區域一律要求驗證",
+      "在路由或中介層統一套用驗證，避免個別端點遺漏",
+      "所有驗證檢查都在伺服器端執行，不只依賴前端"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "missing_authentication",
+      "unauthenticated_access"
+    ]
+  },
+  {
+    "id": "CWE-307",
+    "name_en": "Improper Restriction of Excessive Authentication Attempts",
+    "name_zh": "未限制過多的驗證嘗試",
+    "summary_zh": "系統沒有機制防止短時間內大量失敗的登入嘗試，攻擊者可暴力破解或撞庫。",
+    "consequences_zh": [
+      "透過暴力破解或撞庫取得帳號控制權"
+    ],
+    "mitigations_zh": [
+      "對登入、OTP 驗證等端點依帳號與來源 IP 設定嘗試次數上限",
+      "連續失敗後逐步延長等待時間或暫時鎖定",
+      "異常嘗試時要求 CAPTCHA 或多因素驗證"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "brute_force",
+      "login_rate_limit"
+    ]
+  },
+  {
+    "id": "CWE-384",
+    "name_en": "Session Fixation",
+    "name_zh": "Session 固定",
+    "summary_zh": "使用者登入或建立新 Session 時，系統沒有讓既有的 Session ID 失效，攻擊者可預先植入已知的 Session ID 並在受害者登入後接管。",
+    "consequences_zh": [
+      "接管受害者已驗證的 Session"
+    ],
+    "mitigations_zh": [
+      "登入成功或權限變更時一律重新產生 Session ID，並使舊的失效",
+      "不接受由 URL 參數傳入的 Session ID"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "session_fixation"
+    ]
+  },
+  {
+    "id": "CWE-613",
+    "name_en": "Insufficient Session Expiration",
+    "name_zh": "Session 逾期不足",
+    "summary_zh": "系統允許攻擊者重複使用舊的 Session 或權杖進行授權，Session 有效時間過長或登出後仍可使用。",
+    "consequences_zh": [
+      "以竊得的舊 Session 或權杖持續存取帳號"
+    ],
+    "mitigations_zh": [
+      "為 Session 與權杖設定閒置逾時與絕對有效期限",
+      "登出、改密碼時在伺服器端撤銷 Session 與 refresh token",
+      "存取權杖使用較短的有效期限"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "session_expiration",
+      "insufficient_session_expiration"
+    ]
+  },
+  {
+    "id": "CWE-640",
+    "name_en": "Weak Password Recovery Mechanism for Forgotten Password",
+    "name_zh": "脆弱的忘記密碼機制",
+    "summary_zh": "系統提供不需原密碼即可重設密碼的機制，但機制本身不夠安全，攻擊者可藉此接管帳號。",
+    "consequences_zh": [
+      "透過重設流程接管他人帳號"
+    ],
+    "mitigations_zh": [
+      "重設連結使用高強度隨機、一次性且短效期的 token",
+      "不使用容易猜測或可公開查得的安全提問",
+      "限制重設請求與驗證失敗次數",
+      "重設成功後撤銷既有 Session 並通知帳號擁有者"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "weak_password_recovery",
+      "password_reset"
+    ]
+  },
+  {
+    "id": "CWE-521",
+    "name_en": "Weak Password Requirements",
+    "name_zh": "密碼強度要求不足",
+    "summary_zh": "系統未要求使用者設定足夠強度的密碼，帳號容易被猜中或暴力破解。",
+    "consequences_zh": [
+      "帳號被猜測或暴力破解後遭接管"
+    ],
+    "mitigations_zh": [
+      "要求足夠的最低密碼長度（例如至少 8 碼，建議更長）",
+      "註冊與改密碼時比對常見密碼與已外洩密碼清單",
+      "提供多因素驗證，避免密碼成為單一失效點"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "weak_password_policy",
+      "weak_password"
+    ]
+  },
+  {
+    "id": "CWE-862",
+    "name_en": "Missing Authorization",
+    "name_zh": "缺少授權檢查",
+    "summary_zh": "使用者存取資源或執行操作時，系統完全沒有檢查其是否具備權限。",
+    "consequences_zh": [
+      "讀取或修改其他使用者的資料",
+      "執行僅限管理員的功能"
+    ],
+    "mitigations_zh": [
+      "每個存取資源或執行操作的端點都在伺服器端進行授權檢查",
+      "採預設拒絕，在路由或中介層統一套用授權機制",
+      "依角色明確定義權限，並針對越權情境撰寫測試"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "missing_authorization",
+      "missing_authz"
+    ]
+  },
+  {
+    "id": "CWE-863",
+    "name_en": "Incorrect Authorization",
+    "name_zh": "授權檢查錯誤",
+    "summary_zh": "系統有進行授權檢查，但檢查邏輯不正確，攻擊者可繞過限制存取不該存取的資源。",
+    "consequences_zh": [
+      "讀取或修改未授權的資料",
+      "提升權限執行受限功能"
+    ],
+    "mitigations_zh": [
+      "使用集中且經測試的授權機制，不要在各處重複撰寫判斷邏輯",
+      "授權判斷依據伺服器端的身分與資源擁有關係，不信任用戶端傳來的角色或旗標",
+      "針對各角色與邊界條件撰寫授權測試"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "incorrect_authorization",
+      "broken_authorization"
+    ]
+  },
+  {
+    "id": "CWE-639",
+    "name_en": "Authorization Bypass Through User-Controlled Key",
+    "name_zh": "透過使用者可控鍵值繞過授權（IDOR）",
+    "summary_zh": "系統以使用者可修改的識別值（如網址中的訂單編號）查詢資料，卻未檢查該筆資料是否屬於目前使用者，攻擊者改數字即可看到別人的資料。",
+    "consequences_zh": [
+      "讀取或修改其他使用者的資料",
+      "冒用其他使用者的身分執行操作"
+    ],
+    "mitigations_zh": [
+      "每次存取資料都驗證目前使用者是否擁有或有權存取該筆紀錄",
+      "查詢時以 Session 中的使用者身分作為條件，不只依賴用戶端傳入的 ID",
+      "可搭配不可預測的識別值（如 UUID），但不能取代授權檢查"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "idor",
+      "insecure_direct_object_reference",
+      "bola"
+    ]
+  },
+  {
+    "id": "CWE-284",
+    "name_en": "Improper Access Control",
+    "name_zh": "存取控制不當",
+    "summary_zh": "系統未限制或錯誤限制未授權者對資源的存取。",
+    "consequences_zh": [
+      "未授權存取資料或功能，實際影響依情境而定"
+    ],
+    "mitigations_zh": [
+      "明確劃分信任邊界，所有存取控制在伺服器端執行",
+      "採預設拒絕並依最小權限原則配置權限",
+      "定期檢視權限設定並以測試驗證存取控制"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "access_control",
+      "broken_access_control"
+    ]
+  },
+  {
+    "id": "CWE-269",
+    "name_en": "Improper Privilege Management",
+    "name_zh": "權限管理不當",
+    "summary_zh": "系統未正確指派、修改、追蹤或檢查使用者權限，使其可做到超出預期範圍的事。",
+    "consequences_zh": [
+      "取得超出預期的權限（權限提升）"
+    ],
+    "mitigations_zh": [
+      "遵循最小權限原則指派權限",
+      "權限變更只能由已授權的管理流程執行，並留下稽核紀錄",
+      "高風險操作採權限分離，要求多重條件才能執行"
+    ],
+    "owasp_top10_2021": "A04:2021-Insecure Design",
+    "kind_aliases": [
+      "privilege_escalation",
+      "improper_privilege_management"
+    ]
+  },
+  {
+    "id": "CWE-915",
+    "name_en": "Improperly Controlled Modification of Dynamically-Determined Object Attributes",
+    "name_zh": "未適當控制動態物件屬性修改（大量指派）",
+    "summary_zh": "應用程式依外部輸入一次設定物件的多個屬性，卻未限制哪些屬性可被修改，攻擊者可多送 isAdmin 等欄位竄改不該改的值。",
+    "consequences_zh": [
+      "竄改權限、角色、價格等敏感欄位",
+      "改變應用程式邏輯"
+    ],
+    "mitigations_zh": [
+      "以白名單（DTO 或框架的允許欄位設定）明確指定可由使用者設定的欄位",
+      "不要把請求內容直接綁定到資料庫模型物件",
+      "權限、擁有者等敏感欄位一律由伺服器端設定"
+    ],
+    "owasp_top10_2021": "A08:2021-Software and Data Integrity Failures",
+    "kind_aliases": [
+      "mass_assignment"
+    ]
+  },
+  {
+    "id": "CWE-798",
+    "name_en": "Use of Hard-coded Credentials",
+    "name_zh": "使用寫死的帳密或金鑰",
+    "summary_zh": "程式碼中直接寫入密碼、API 金鑰或加密金鑰等認證資訊，取得程式碼或執行檔的人都能拿來使用。",
+    "consequences_zh": [
+      "攻擊者以外洩的金鑰或密碼存取系統與第三方服務",
+      "繞過身分驗證取得管理權限",
+      "金鑰難以輪替，外洩後影響範圍大"
+    ],
+    "mitigations_zh": [
+      "將密碼與金鑰移出程式碼，改由環境變數或密鑰管理服務（如 GCP Secret Manager、Vault）提供",
+      "已提交到版本控制的金鑰視為外洩，立即撤銷並輪替",
+      "在 CI 與 pre-commit 加入秘密掃描（如 gitleaks）",
+      "不要內建預設帳密，首次使用時強制設定"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "hardcoded_secret",
+      "secret_exposure",
+      "hardcoded_credentials",
+      "hardcoded_api_key"
+    ]
+  },
+  {
+    "id": "CWE-259",
+    "name_en": "Use of Hard-coded Password",
+    "name_zh": "使用寫死的密碼",
+    "summary_zh": "程式碼中寫死了用於登入驗證或連線外部元件的密碼。",
+    "consequences_zh": [
+      "攻擊者以寫死的密碼登入系統或外部服務",
+      "密碼無法在不改版的情況下更換"
+    ],
+    "mitigations_zh": [
+      "將密碼移至受保護的設定檔、環境變數或密鑰管理服務",
+      "不要內建預設密碼，首次登入時強制使用者設定",
+      "已外洩的密碼立即更換並檢查存取紀錄"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "hardcoded_password"
+    ]
+  },
+  {
+    "id": "CWE-312",
+    "name_en": "Cleartext Storage of Sensitive Information",
+    "name_zh": "以明文儲存敏感資訊",
+    "summary_zh": "系統把敏感資訊以明文存放在其他人可能存取到的地方（資料庫、檔案、雲端儲存、瀏覽器儲存空間）。",
+    "consequences_zh": [
+      "儲存位置被存取時，敏感資料直接外洩"
+    ],
+    "mitigations_zh": [
+      "敏感資料以經審核的演算法加密後儲存，金鑰與資料分開管理",
+      "密碼不要加密儲存，改用 Argon2、bcrypt 等密碼雜湊",
+      "啟用雲端儲存服務的加密功能並限制存取權限",
+      "評估是否真的需要保存該資料，不需要就不存"
+    ],
+    "owasp_top10_2021": "A04:2021-Insecure Design",
+    "kind_aliases": [
+      "cleartext_storage",
+      "plaintext_storage"
+    ]
+  },
+  {
+    "id": "CWE-319",
+    "name_en": "Cleartext Transmission of Sensitive Information",
+    "name_zh": "以明文傳輸敏感資訊",
+    "summary_zh": "系統透過可被竊聽的通道以明文傳送敏感資料，例如使用 HTTP 而非 HTTPS。",
+    "consequences_zh": [
+      "傳輸中的帳密、權杖或個資遭竊聽",
+      "資料在傳輸過程中被竄改"
+    ],
+    "mitigations_zh": [
+      "所有傳輸敏感資料的連線一律使用 TLS（HTTPS），從登入到登出全程加密",
+      "啟用 HSTS 並將 HTTP 導向 HTTPS",
+      "內部服務之間的連線也使用 TLS 或 mTLS"
+    ],
+    "owasp_top10_2021": "A02:2021-Cryptographic Failures",
+    "kind_aliases": [
+      "cleartext_transmission",
+      "plaintext_transmission",
+      "insecure_transport"
+    ]
+  },
+  {
+    "id": "CWE-200",
+    "name_en": "Exposure of Sensitive Information to an Unauthorized Actor",
+    "name_zh": "敏感資訊洩漏給未授權者",
+    "summary_zh": "系統把敏感資訊暴露給未獲明確授權存取的人。",
+    "consequences_zh": [
+      "個資、內部資料或系統資訊外洩，可能被用於進一步攻擊"
+    ],
+    "mitigations_zh": [
+      "API 回應只回傳必要欄位，不要直接序列化整個資料庫物件",
+      "依信任邊界劃分資料，敏感資料不得流出可信區域",
+      "定期檢查回應內容、錯誤訊息與公開檔案是否包含敏感資訊"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "information_disclosure",
+      "info_leak",
+      "sensitive_data_exposure"
+    ]
+  },
+  {
+    "id": "CWE-209",
+    "name_en": "Generation of Error Message Containing Sensitive Information",
+    "name_zh": "錯誤訊息包含敏感資訊",
+    "summary_zh": "系統產生的錯誤訊息包含環境、使用者或資料相關的敏感資訊，例如堆疊追蹤、SQL 語句或內部路徑。",
+    "consequences_zh": [
+      "洩漏系統架構與版本資訊，協助攻擊者規劃攻擊"
+    ],
+    "mitigations_zh": [
+      "對使用者只顯示通用的錯誤訊息，詳細內容記錄在伺服器端日誌",
+      "在正式環境關閉除錯模式與詳細錯誤頁",
+      "統一攔截例外，避免未處理的例外直接回傳給用戶端"
+    ],
+    "owasp_top10_2021": "A04:2021-Insecure Design",
+    "kind_aliases": [
+      "verbose_error",
+      "error_message_leak",
+      "stack_trace_exposure"
+    ]
+  },
+  {
+    "id": "CWE-532",
+    "name_en": "Insertion of Sensitive Information into Log File",
+    "name_zh": "日誌檔寫入敏感資訊",
+    "summary_zh": "系統把密碼、權杖、個資等敏感資訊寫進日誌檔。",
+    "consequences_zh": [
+      "能讀取日誌的人（含第三方日誌平台）可取得敏感資料"
+    ],
+    "mitigations_zh": [
+      "不要把密碼、權杖、金鑰與完整個資寫入日誌，必要時遮罩處理",
+      "在日誌框架層統一過濾敏感欄位",
+      "限制日誌檔與日誌平台的存取權限",
+      "上線前移除除錯用的詳細日誌設定"
+    ],
+    "owasp_top10_2021": "A09:2021-Security Logging and Monitoring Failures",
+    "kind_aliases": [
+      "sensitive_data_in_logs",
+      "log_leak"
+    ]
+  },
+  {
+    "id": "CWE-327",
+    "name_en": "Use of a Broken or Risky Cryptographic Algorithm",
+    "name_zh": "使用已破解或有風險的加密演算法",
+    "summary_zh": "系統使用已被破解或安全性不足的加密演算法或協定（如 DES、RC4、ECB 模式），攻擊者可解密或竄改資料。",
+    "consequences_zh": [
+      "加密資料被解密而外洩",
+      "資料或簽章被竄改而未被發現"
+    ],
+    "mitigations_zh": [
+      "改用目前公認安全的演算法（如 AES-GCM、ChaCha20-Poly1305），不要自行設計加密演算法",
+      "使用成熟的加密函式庫（如 libsodium、平台內建加密 API），避免直接操作底層原語",
+      "設計上保留更換演算法的彈性，並妥善保護金鑰"
+    ],
+    "owasp_top10_2021": "A02:2021-Cryptographic Failures",
+    "kind_aliases": [
+      "weak_crypto",
+      "broken_crypto",
+      "insecure_cipher"
+    ]
+  },
+  {
+    "id": "CWE-328",
+    "name_en": "Use of Weak Hash",
+    "name_zh": "使用弱雜湊",
+    "summary_zh": "系統使用不符安全需求的雜湊演算法（如 MD5、SHA-1），攻擊者可找到碰撞或推回原始輸入。",
+    "consequences_zh": [
+      "偽造具相同雜湊值的資料，繞過完整性檢查",
+      "密碼雜湊被快速破解"
+    ],
+    "mitigations_zh": [
+      "完整性與簽章用途改用 SHA-256 以上的雜湊演算法",
+      "儲存密碼使用 Argon2id、bcrypt、scrypt 等可調整成本的密碼雜湊函式，並加上 salt"
+    ],
+    "owasp_top10_2021": "A02:2021-Cryptographic Failures",
+    "kind_aliases": [
+      "weak_hash",
+      "insecure_hash"
+    ]
+  },
+  {
+    "id": "CWE-330",
+    "name_en": "Use of Insufficiently Random Values",
+    "name_zh": "使用隨機性不足的值",
+    "summary_zh": "在需要不可預測值的安全情境中，系統產生的數值隨機性不足，攻擊者可預測產生的值。",
+    "consequences_zh": [
+      "預測權杖、Session ID 或重設碼並冒用身分"
+    ],
+    "mitigations_zh": [
+      "安全用途一律使用作業系統或語言提供的密碼學安全亂數來源",
+      "權杖要有足夠長度（例如至少 128 位元）",
+      "不要以時間戳、遞增序號或使用者資訊產生安全相關的值"
+    ],
+    "owasp_top10_2021": "A02:2021-Cryptographic Failures",
+    "kind_aliases": [
+      "insufficient_randomness",
+      "weak_random"
+    ]
+  },
+  {
+    "id": "CWE-338",
+    "name_en": "Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)",
+    "name_zh": "使用密碼學強度不足的虛擬亂數產生器",
+    "summary_zh": "系統在安全情境中使用非密碼學安全的 PRNG（如 Math.random、java.util.Random），輸出可被預測。",
+    "consequences_zh": [
+      "推算出權杖、金鑰或驗證碼"
+    ],
+    "mitigations_zh": [
+      "改用密碼學安全的亂數產生器（如 crypto.getRandomValues、SecureRandom、Python secrets 模組）",
+      "以程式碼掃描規則禁止在安全相關程式碼使用一般用途亂數函式"
+    ],
+    "owasp_top10_2021": "A02:2021-Cryptographic Failures",
+    "kind_aliases": [
+      "weak_prng",
+      "insecure_random"
+    ]
+  },
+  {
+    "id": "CWE-295",
+    "name_en": "Improper Certificate Validation",
+    "name_zh": "憑證驗證不當",
+    "summary_zh": "系統未驗證或未正確驗證 TLS 憑證（例如關閉驗證、未比對主機名稱），攻擊者可進行中間人攻擊。",
+    "consequences_zh": [
+      "攔截並解密加密連線中的資料",
+      "冒充合法伺服器竄改傳輸內容"
+    ],
+    "mitigations_zh": [
+      "保持 TLS 憑證驗證開啟，不要設定 verify=False、InsecureSkipVerify 等略過驗證的選項",
+      "驗證憑證鏈、有效期限與主機名稱",
+      "使用憑證綁定（pinning）時完整驗證憑證屬性"
+    ],
+    "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
+    "kind_aliases": [
+      "improper_certificate_validation",
+      "tls_verification_disabled",
+      "insecure_tls"
+    ]
+  },
+  {
+    "id": "CWE-601",
+    "name_en": "URL Redirection to Untrusted Site ('Open Redirect')",
+    "name_zh": "開放重新導向",
+    "summary_zh": "網站接受使用者可控的網址並直接重新導向，攻擊者可利用可信網域的連結把受害者導到釣魚網站。",
+    "consequences_zh": [
+      "使用者被導向釣魚或惡意網站",
+      "在 OAuth 等流程中可能被用來竊取授權碼或權杖"
+    ],
+    "mitigations_zh": [
+      "以白名單限制允許導向的網址或網域",
+      "只接受站內相對路徑，或以 ID 對照伺服器端預先定義的目的地",
+      "導向外部網站前顯示提示頁讓使用者確認"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "open_redirect"
+    ]
+  },
+  {
+    "id": "CWE-1321",
+    "name_en": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+    "name_zh": "原型污染",
+    "summary_zh": "應用程式依外部輸入設定物件屬性，卻未阻擋對物件原型（如 __proto__、constructor.prototype）的修改，影響全域所有物件。",
+    "consequences_zh": [
+      "改變應用程式邏輯，可能繞過權限檢查",
+      "造成服務當機",
+      "在特定條件下可進一步執行程式碼"
+    ],
+    "mitigations_zh": [
+      "合併或設定物件屬性時，拒絕 __proto__、constructor、prototype 等鍵名",
+      "以 schema 驗證不受信任的物件輸入",
+      "需要當作字典使用時，改用 Map 或 Object.create(null)",
+      "可考慮以 Object.freeze(Object.prototype) 凍結原型"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "prototype_pollution"
+    ]
+  },
+  {
+    "id": "CWE-400",
+    "name_en": "Uncontrolled Resource Consumption",
+    "name_zh": "未受控的資源消耗",
+    "summary_zh": "系統未妥善控制有限資源（CPU、記憶體、磁碟、連線）的配置與維護，攻擊者可耗盡資源使服務中斷。",
+    "consequences_zh": [
+      "服務變慢、當機或無法回應（阻斷服務）"
+    ],
+    "mitigations_zh": [
+      "在架構中設計流量節流，限制未授權使用者可消耗的資源量",
+      "為請求大小、處理時間與並行數設定上限",
+      "資源配置失敗時讓系統進入安全狀態"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "dos",
+      "denial_of_service",
+      "resource_exhaustion"
+    ]
+  },
+  {
+    "id": "CWE-770",
+    "name_en": "Allocation of Resources Without Limits or Throttling",
+    "name_zh": "資源配置未設限或節流",
+    "summary_zh": "系統代替使用者配置資源時，未限制可配置的數量或大小。",
+    "consequences_zh": [
+      "耗盡記憶體、CPU 或連線導致服務中斷"
+    ],
+    "mitigations_zh": [
+      "為每位使用者或來源設定資源上限與請求頻率限制（rate limit）",
+      "限制上傳大小、分頁筆數、批次數量等可由使用者控制的參數",
+      "對輸入的數量與大小參數進行範圍驗證"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "missing_rate_limit",
+      "rate_limiting",
+      "unbounded_allocation"
+    ]
+  },
+  {
+    "id": "CWE-362",
+    "name_en": "Concurrent Execution using Shared Resource with Improper Synchronization ('Race Condition')",
+    "name_zh": "競爭條件",
+    "summary_zh": "多個並行執行的程式碼需要獨佔存取共用資源，但存在時間窗口讓資源被其他執行緒或請求改動。",
+    "consequences_zh": [
+      "繞過檢查（例如重複使用優惠券、超額提款）",
+      "資料不一致或服務不穩定"
+    ],
+    "mitigations_zh": [
+      "以鎖、交易或原子操作保護共用資源的臨界區段",
+      "在資料庫層使用唯一約束、條件更新或樂觀鎖，避免先查再寫",
+      "盡量減少共用的可變狀態，並使用執行緒安全的函式"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "race_condition",
+      "concurrency_issue"
+    ]
+  },
+  {
+    "id": "CWE-367",
+    "name_en": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+    "name_zh": "檢查時間與使用時間不一致（TOCTOU）",
+    "summary_zh": "系統先檢查資源狀態再使用，但資源在檢查與使用之間可能被改變，使檢查結果失效。",
+    "consequences_zh": [
+      "繞過檢查存取或修改非預期的檔案或資料",
+      "改變程式執行邏輯"
+    ],
+    "mitigations_zh": [
+      "以單一原子操作完成檢查與使用（例如以 O_CREAT|O_EXCL 開檔後再對檔案描述元檢查）",
+      "對已開啟的檔案描述元進行檢查，不要對路徑名稱重複檢查",
+      "必要時以鎖限制多個程序同時存取同一資源"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "toctou"
+    ]
+  },
+  {
+    "id": "CWE-20",
+    "name_en": "Improper Input Validation",
+    "name_zh": "輸入驗證不當",
+    "summary_zh": "系統收到輸入時，未驗證或未正確驗證其是否符合安全處理所需的格式與條件。",
+    "consequences_zh": [
+      "依後續使用情境不同，可能導致注入、當機或記憶體破壞等問題"
+    ],
+    "mitigations_zh": [
+      "在系統邊界以 schema 驗證所有外部輸入的型別、長度、格式與範圍",
+      "採白名單策略，拒絕不符合規格的輸入",
+      "先將輸入解碼並正規化後再驗證",
+      "用戶端驗證只作為體驗輔助，伺服器端必須重複驗證"
+    ],
+    "owasp_top10_2021": "A03:2021-Injection",
+    "kind_aliases": [
+      "input_validation",
+      "improper_input_validation"
+    ]
+  },
+  {
+    "id": "CWE-276",
+    "name_en": "Incorrect Default Permissions",
+    "name_zh": "預設權限設定不當",
+    "summary_zh": "安裝時檔案被設定為任何人都可修改的權限。",
+    "consequences_zh": [
+      "其他使用者可讀取或竄改程式與資料檔"
+    ],
+    "mitigations_zh": [
+      "安裝與部署時明確設定最嚴格的檔案權限，只開放給必要的帳號",
+      "檢查安裝腳本與容器映像中的檔案權限設定"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "insecure_default_permissions"
+    ]
+  },
+  {
+    "id": "CWE-732",
+    "name_en": "Incorrect Permission Assignment for Critical Resource",
+    "name_zh": "關鍵資源權限設定不當",
+    "summary_zh": "系統對安全關鍵資源（設定檔、金鑰、日誌）設定的權限，讓非預期的使用者可以讀取或修改。",
+    "consequences_zh": [
+      "未授權者讀取金鑰、設定或機敏資料",
+      "竄改設定或程式以取得更高權限"
+    ],
+    "mitigations_zh": [
+      "金鑰、設定檔等關鍵資源只授權給必要的帳號（例如私鑰設定為 600）",
+      "程式啟動時設定最嚴格的 umask，並檢查關鍵檔案權限",
+      "檢查雲端儲存桶與資料庫等資源未開放公開存取"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "insecure_permissions",
+      "file_permissions"
+    ]
+  },
+  {
+    "id": "CWE-59",
+    "name_en": "Improper Link Resolution Before File Access ('Link Following')",
+    "name_zh": "存取檔案前未正確處理連結（連結跟隨）",
+    "summary_zh": "系統依檔名存取檔案，卻未防止該檔名是指向非預期資源的符號連結或捷徑。",
+    "consequences_zh": [
+      "讀取或覆寫非預期的檔案",
+      "在高權限程序中可被用來提升權限"
+    ],
+    "mitigations_zh": [
+      "開檔時使用不跟隨符號連結的選項（如 O_NOFOLLOW），或檢查實際路徑是否位於允許目錄內",
+      "避免在他人可寫入的目錄（如 /tmp）以固定檔名建立檔案",
+      "以最小權限執行檔案操作"
+    ],
+    "owasp_top10_2021": "A01:2021-Broken Access Control",
+    "kind_aliases": [
+      "symlink_attack",
+      "link_following"
+    ]
+  },
+  {
+    "id": "CWE-190",
+    "name_en": "Integer Overflow or Wraparound",
+    "name_zh": "整數溢位或繞回",
+    "summary_zh": "計算結果超出整數型別可表示的範圍而溢位或繞回，程式卻假設結果仍正確，可能導致後續配置大小或邊界檢查錯誤。",
+    "consequences_zh": [
+      "造成緩衝區配置過小並引發記憶體破壞",
+      "繞過數量或金額等邏輯檢查",
+      "程式當機"
+    ],
+    "mitigations_zh": [
+      "對數值輸入驗證上下限",
+      "使用具溢位檢查的運算（如 Rust 的 checked_add、C 的 __builtin_add_overflow）",
+      "選用適當大小的型別，並注意有號與無號整數轉換"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "integer_overflow"
+    ]
+  },
+  {
+    "id": "CWE-787",
+    "name_en": "Out-of-bounds Write",
+    "name_zh": "越界寫入",
+    "summary_zh": "程式寫入資料時超出緩衝區的結尾或開頭，破壞相鄰的記憶體。",
+    "consequences_zh": [
+      "執行任意程式碼",
+      "程式當機或資料毀損"
+    ],
+    "mitigations_zh": [
+      "優先使用記憶體安全的語言或安全的容器型別",
+      "寫入前檢查目的緩衝區大小，改用有長度限制的函式",
+      "啟用編譯器與系統保護（如 stack protector、FORTIFY_SOURCE、ASLR）",
+      "以 fuzzing 與 AddressSanitizer 測試邊界處理"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "buffer_overflow",
+      "out_of_bounds_write",
+      "memory_corruption"
+    ]
+  },
+  {
+    "id": "CWE-125",
+    "name_en": "Out-of-bounds Read",
+    "name_zh": "越界讀取",
+    "summary_zh": "程式讀取資料時超出緩衝區的結尾或開頭。",
+    "consequences_zh": [
+      "讀取記憶體中的敏感資料（如金鑰）",
+      "程式當機"
+    ],
+    "mitigations_zh": [
+      "讀取前驗證索引與長度位於緩衝區範圍內",
+      "使用提供邊界檢查的語言或資料結構"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "out_of_bounds_read",
+      "buffer_over_read"
+    ]
+  },
+  {
+    "id": "CWE-416",
+    "name_en": "Use After Free",
+    "name_zh": "釋放後使用（Use After Free）",
+    "summary_zh": "程式在記憶體釋放後仍繼續使用指向該記憶體的指標，該區塊可能已被重新配置給其他資料。",
+    "consequences_zh": [
+      "執行任意程式碼",
+      "資料毀損或程式當機"
+    ],
+    "mitigations_zh": [
+      "優先使用具自動記憶體管理或所有權檢查的語言",
+      "釋放後立即將指標設為 NULL，並釐清物件的擁有權",
+      "以 AddressSanitizer 與 fuzzing 偵測此類問題"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "use_after_free"
+    ]
+  },
+  {
+    "id": "CWE-476",
+    "name_en": "NULL Pointer Dereference",
+    "name_zh": "空指標解參考",
+    "summary_zh": "程式解參考一個預期有效但實際為 NULL 的指標。",
+    "consequences_zh": [
+      "程式當機造成服務中斷",
+      "在特定環境下可能被進一步利用"
+    ],
+    "mitigations_zh": [
+      "使用可能為 NULL 的指標前先檢查",
+      "檢查所有函式回傳值，處理失敗或空值的情況",
+      "使用 Option 等可表達空值的型別，讓編譯器協助檢查"
+    ],
+    "owasp_top10_2021": null,
+    "kind_aliases": [
+      "null_pointer_dereference",
+      "null_dereference"
+    ]
+  },
+  {
+    "id": "CWE-1104",
+    "name_en": "Use of Unmaintained Third Party Components",
+    "name_zh": "使用未維護的第三方元件",
+    "summary_zh": "系統依賴原開發者或可信維護者已不再支援維護的第三方元件，出現漏洞時無法取得修補。",
+    "consequences_zh": [
+      "已知或新發現的漏洞無法修補",
+      "維護成本與安全風險持續累積"
+    ],
+    "mitigations_zh": [
+      "持續盤點前後端元件與其相依套件的版本與維護狀態",
+      "以軟體組成分析（SCA）工具監控 CVE 與套件維護狀態",
+      "移除未使用的相依套件，並將未維護的元件替換為仍有維護的替代方案",
+      "暫時無法替換時，以虛擬修補或額外防護降低風險"
+    ],
+    "owasp_top10_2021": "A06:2021-Vulnerable and Outdated Components",
+    "kind_aliases": [
+      "unmaintained_dependency",
+      "outdated_component",
+      "vulnerable_dependency"
+    ]
+  }
+]

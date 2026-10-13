@@ -1,0 +1,1442 @@
+[
+ {
+  "id": "BenchmarkTest00001",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00002",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00006",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00007",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00008",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00011",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00013",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00014",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00015",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00017",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00018",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00024",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00025",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00026",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00027",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00028",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00030",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00032",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00033",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00034",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00036",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00037",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00038",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00039",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00040",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00041",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00043",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00045",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00047",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00048",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00049",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00051",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00052",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00060",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00061",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00062",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00063",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00064",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00065",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00077",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00090",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00091",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00092",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00093",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00100",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00101",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00102",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00103",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00104",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00105",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00106",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00107",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00108",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00109",
+  "cat": "sqli",
+  "real": true,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00110",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00113",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00114",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00131",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00132",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00133",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00134",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00135",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00136",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00137",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00144",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00145",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00146",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00147",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00148",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00149",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00150",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00151",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00152",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00153",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00154",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00155",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00156",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00157",
+  "cat": "xss",
+  "real": true,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00158",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00159",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00171",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00172",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00173",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00174",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00175",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00176",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00177",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00190",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00191",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00197",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00200",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00201",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00202",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00205",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00206",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00215",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00216",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00217",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00218",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00219",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00220",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00221",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00222",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00261",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00262",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00263",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00264",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00265",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00275",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00277",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00278",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00281",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00282",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00283",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00285",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00286",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00288",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00289",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00293",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00294",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00295",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00302",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00303",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00304",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00305",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00306",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00307",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00308",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00309",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00310",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00311",
+  "cat": "cmdi",
+  "real": true,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00329",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00330",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00331",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00332",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00333",
+  "cat": "sqli",
+  "real": false,
+  "cwe": "89",
+  "expect_class": "sql-injection",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00359",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00360",
+  "cat": "pathtraver",
+  "real": true,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": true
+ },
+ {
+  "id": "BenchmarkTest00361",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00364",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00365",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00366",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00377",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00379",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00381",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00386",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00389",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00391",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00393",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00394",
+  "cat": "xss",
+  "real": false,
+  "cwe": "79",
+  "expect_class": "xss",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00396",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00406",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00408",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00410",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00411",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00412",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00454",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00458",
+  "cat": "pathtraver",
+  "real": false,
+  "cwe": "22",
+  "expect_class": "path-traversal",
+  "finder_pos": true,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00481",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ },
+ {
+  "id": "BenchmarkTest00494",
+  "cat": "cmdi",
+  "real": false,
+  "cwe": "78",
+  "expect_class": "command-injection",
+  "finder_pos": false,
+  "crossfamily_pos": false
+ }
+]

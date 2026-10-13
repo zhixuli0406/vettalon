@@ -1,0 +1,4 @@
+/target
+*.sarif
+/vettalon-report*.json
+.DS_Store

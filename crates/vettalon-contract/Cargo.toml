@@ -1,0 +1,15 @@
+[package]
+name = "vettalon-contract"
+description = "LLM output contract primitives: strict JSON, safe repo paths, stable fingerprints, coverage states"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+percent-encoding = "2.3"
+unicode-normalization = "0.1.25"

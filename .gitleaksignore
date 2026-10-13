@@ -1,0 +1,4 @@
+# Fake AWS-shaped keys inside a raw JSON test fixture (JSON cannot carry an
+# inline gitleaks:allow comment). Other fake test values are marked inline.
+crates/vettalon/src/audit/scanners/gitleaks.rs:aws-access-token:139
+crates/vettalon/src/audit/scanners/gitleaks.rs:aws-access-token:140

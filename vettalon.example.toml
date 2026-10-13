@@ -1,0 +1,71 @@
+# vettalon model roster. Copy to ~/.vettalon/config.toml (or pass
+# --config). A config inside the repository being scanned is refused.
+# Without any config file, vettalon uses only the claude CLI (the one CLI
+# whose tools can be fully disabled).
+#
+# roles: finder (audits modules), verifier (tries to refute other models'
+# findings), poc (writes PoC scripts for the Docker sandbox).
+# family: verifiers are picked from a family different from the finder's.
+# API keys are never written here: name the environment variable instead.
+
+# ── Subscription CLIs ──────────────────────────────────────────────
+[[model]]
+id = "claude"
+backend = "cli"
+preset = "claude"          # family defaults to anthropic
+# model = "opus"
+
+# codex and grok keep tools that can READ files on this machine even with
+# their "no tools" flags (checked 2026-10-12); grok can also run commands.
+# They run in the agents container by default — build it once with
+# `vettalon agents build`. Add `allow_agent_tools = true` to a model to run
+# it on the host instead (faster, but a prompt injection in the audited code
+# could then read local files). Custom `program` CLIs can only run on host.
+[[model]]
+id = "codex"
+backend = "cli"
+preset = "codex"           # family defaults to openai; container by default
+
+[[model]]
+id = "grok"
+backend = "cli"
+preset = "grok"            # family defaults to xai; container by default
+timeout_secs = 1200
+
+# ── OpenAI-compatible APIs ─────────────────────────────────────────
+# [[model]]
+# id = "deepseek"
+# backend = "openai"
+# family = "deepseek"
+# base_url = "https://api.deepseek.com/v1"
+# model = "deepseek-chat"
+# api_key_env = "DEEPSEEK_API_KEY"
+# roles = ["finder", "verifier"]
+
+# [[model]]
+# id = "qwen-openrouter"
+# backend = "openai"
+# family = "qwen"
+# base_url = "https://openrouter.ai/api/v1"
+# model = "qwen/qwen3-coder"
+# api_key_env = "OPENROUTER_API_KEY"
+
+# ── Local Ollama (free; weaker, best kept as an extra finder) ──────
+# [[model]]
+# id = "qwen-local"
+# backend = "ollama"         # base_url defaults to http://localhost:11434/v1
+# family = "qwen"
+# model = "qwen2.5-coder:7b"
+# roles = ["finder"]
+
+# ── Any other CLI ──────────────────────────────────────────────────
+# [[model]]
+# id = "my-cli"
+# backend = "cli"
+# family = "google"
+# program = "/opt/homebrew/bin/some-cli"   # absolute path
+# allow_agent_tools = true                 # required: custom CLIs run on host
+# env_passthrough = ["SOME_CLI_TOKEN"]     # env is scrubbed otherwise
+# args = ["--print", "{prompt}"]   # {prompt}, {output_file}, {model}
+# prompt_via = "arg"               # or "stdin"
+# output = "json:response"         # stdout | file | json:<field>
