@@ -40,7 +40,9 @@ impl std::str::FromStr for Channel {
             "email" | "vendor" | "vendor_email" => Ok(Channel::VendorEmail),
             "twcert" => Ok(Channel::Twcert),
             "hitcon" | "zeroday" | "hitcon_zeroday" => Ok(Channel::HitconZeroday),
-            other => Err(format!("unknown channel {other:?} (ghsa | email | twcert | hitcon)")),
+            other => Err(format!(
+                "unknown channel {other:?} (ghsa | email | twcert | hitcon)"
+            )),
         }
     }
 }
@@ -147,7 +149,11 @@ pub fn github_slug(url: &str) -> Option<String> {
     let rest = rest.trim_end_matches('/').trim_end_matches(".git");
     let mut parts = rest.split('/');
     let (owner, repo) = (parts.next()?, parts.next()?);
-    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
     (ok(owner) && ok(repo) && parts.next().is_none()).then(|| format!("{owner}/{repo}"))
 }
 
@@ -168,20 +174,24 @@ fn head_commit(git_dir: &Path) -> Option<String> {
     let head = read_small(&git_dir.join("HEAD"))?;
     let head = head.trim();
     let sha = match head.strip_prefix("ref: ") {
-        Some(r) if !r.contains("..") => read_small(&git_dir.join(r)).map(|s| s.trim().to_string()).or_else(|| {
-            // Packed refs: `<sha> <ref>` lines.
-            read_small(&git_dir.join("packed-refs"))?
-                .lines()
-                .find_map(|l| l.strip_suffix(r).map(|s| s.trim().to_string()))
-        })?,
+        Some(r) if !r.contains("..") => read_small(&git_dir.join(r))
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                // Packed refs: `<sha> <ref>` lines.
+                read_small(&git_dir.join("packed-refs"))?
+                    .lines()
+                    .find_map(|l| l.strip_suffix(r).map(|s| s.trim().to_string()))
+            })?,
         Some(_) => return None,
         None => head.to_string(),
     };
-    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha[..12.min(sha.len())].to_string())
+    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| sha[..12.min(sha.len())].to_string())
 }
 
 fn emails_in(text: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").expect("static regex");
+    let re =
+        regex::Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").expect("static regex");
     let mut out: Vec<String> = Vec::new();
     for m in re.find_iter(text) {
         let e = m.as_str().trim_end_matches('.').to_ascii_lowercase();
@@ -213,7 +223,12 @@ pub fn detect_project(repo: &Path) -> ProjectMeta {
         m.github = origin_url(&cfg).as_deref().and_then(github_slug);
     }
     m.commit = head_commit(&git);
-    for rel in ["SECURITY.md", ".github/SECURITY.md", "docs/SECURITY.md", "security.md"] {
+    for rel in [
+        "SECURITY.md",
+        ".github/SECURITY.md",
+        "docs/SECURITY.md",
+        "security.md",
+    ] {
         if let Some(t) = read_small(&repo.join(rel)) {
             m.security_policy = Some(rel.to_string());
             m.security_emails = emails_in(&t);
@@ -227,15 +242,23 @@ pub fn detect_project(repo: &Path) -> ProjectMeta {
     } else if let Some(t) = read_small(&repo.join("package.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
             m.name = v.get("name").and_then(|x| x.as_str()).map(str::to_string);
-            m.version = v.get("version").and_then(|x| x.as_str()).map(str::to_string);
+            m.version = v
+                .get("version")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
         }
         m.ecosystem = Some("npm".into());
     } else if let Some(t) = read_small(&repo.join("pyproject.toml")) {
-        m.name = toml_field(&t, "project", "name").or_else(|| toml_field(&t, "tool.poetry", "name"));
-        m.version = toml_field(&t, "project", "version").or_else(|| toml_field(&t, "tool.poetry", "version"));
+        m.name =
+            toml_field(&t, "project", "name").or_else(|| toml_field(&t, "tool.poetry", "name"));
+        m.version = toml_field(&t, "project", "version")
+            .or_else(|| toml_field(&t, "tool.poetry", "version"));
         m.ecosystem = Some("pip".into());
     } else if let Some(t) = read_small(&repo.join("go.mod")) {
-        m.name = t.lines().find_map(|l| l.trim().strip_prefix("module ")).map(|s| s.trim().to_string());
+        m.name = t
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("module "))
+            .map(|s| s.trim().to_string());
         m.ecosystem = Some("Go".into());
     }
     if m.name.is_none() {
@@ -318,7 +341,13 @@ fn analysis(f: &Finding) -> String {
     f.evidence
         .iter()
         .find(|e| matches!(e.kind, EvidenceKind::AiAnalysis | EvidenceKind::StaticHit))
-        .map(|e| e.detail.strip_prefix("reasoning: ").unwrap_or(&e.detail).trim().to_string())
+        .map(|e| {
+            e.detail
+                .strip_prefix("reasoning: ")
+                .unwrap_or(&e.detail)
+                .trim()
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| f.title.clone())
 }
@@ -326,13 +355,24 @@ fn analysis(f: &Finding) -> String {
 fn steps(f: &Finding) -> Vec<String> {
     f.trace
         .iter()
-        .map(|s| format!("`{}:{}` ({}) — {}", s.file, s.line, s.scope, s.description.trim()))
+        .map(|s| {
+            format!(
+                "`{}:{}` ({}) — {}",
+                s.file,
+                s.line,
+                s.scope,
+                s.description.trim()
+            )
+        })
         .collect()
 }
 
 fn cwe_line(f: &Finding) -> Option<(String, Option<&'static kb::CweEntry>)> {
     let kind = f.rule_id.strip_prefix("ai-audit/").unwrap_or("");
-    let id = f.cwe.clone().or_else(|| kb::for_kind(kind).map(|e| e.id.clone()))?;
+    let id = f
+        .cwe
+        .clone()
+        .or_else(|| kb::for_kind(kind).map(|e| e.id.clone()))?;
     let entry = kb::lookup(&id);
     Some((id, entry))
 }
@@ -346,7 +386,10 @@ fn poc(f: &Finding) -> Option<String> {
 }
 
 fn affected(meta: &ProjectMeta) -> String {
-    let mut s = meta.name.clone().unwrap_or_else(|| "【產品／專案名稱】".into());
+    let mut s = meta
+        .name
+        .clone()
+        .unwrap_or_else(|| "【產品／專案名稱】".into());
     if let Some(v) = &meta.version {
         s.push_str(&format!(" {v}"));
     }
@@ -360,14 +403,23 @@ fn numbered(items: &[String]) -> String {
     if items.is_empty() {
         return "1. 【請補上可照做的重現步驟】".into();
     }
-    items.iter().enumerate().map(|(i, s)| format!("{}. {s}", i + 1)).collect::<Vec<_>>().join("\n")
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {s}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn bullets(items: &[String], empty: &str) -> String {
     if items.is_empty() {
         return format!("- {empty}");
     }
-    items.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n")
+    items
+        .iter()
+        .map(|s| format!("- {s}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Draft the report for `channel`. `today` is injected for testability.
@@ -388,11 +440,19 @@ pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
             None => id.clone(),
         })
         .unwrap_or_else(|| "【請填寫弱點類型】".into());
-    let fixes: Vec<String> = cwe.as_ref().and_then(|(_, e)| e.map(|e| e.mitigations_zh.clone())).unwrap_or_default();
+    let fixes: Vec<String> = cwe
+        .as_ref()
+        .and_then(|(_, e)| e.map(|e| e.mitigations_zh.clone()))
+        .unwrap_or_default();
     let cvss = f
         .cvss
         .as_ref()
-        .map(|c| format!("CVSS {} {:.1}（{}）", c.cvss_version, c.base_score, c.cvss_vector))
+        .map(|c| {
+            format!(
+                "CVSS {} {:.1}（{}）",
+                c.cvss_version, c.base_score, c.cvss_vector
+            )
+        })
         .unwrap_or_else(|| "CVSS：【建議自行以 FIRST 計算器評估】".into());
     let impact = f
         .threat_model
@@ -404,7 +464,8 @@ pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
     let affected = affected(meta);
     let loc = location(f);
     let verified = "【已人工重現／尚未重現——請擇一，未重現請勿以「已確認漏洞」通報】";
-    let poc_block = poc(f).map(|p| format!("\n\n沙箱 PoC 執行紀錄（送出前請確認未含敏感資料）：\n```\n{p}\n```"));
+    let poc_block = poc(f)
+        .map(|p| format!("\n\n沙箱 PoC 執行紀錄（送出前請確認未含敏感資料）：\n```\n{p}\n```"));
 
     match channel {
         Channel::GithubAdvisory => {
@@ -414,7 +475,11 @@ pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
                 title = f.title,
                 eco = meta.ecosystem.as_deref().unwrap_or("(choose)"),
                 pkg = meta.name.as_deref().unwrap_or("(package name)"),
-                ver = meta.version.as_deref().map(|v| format!("<= {v}")).unwrap_or_else(|| "(affected range)".into()),
+                ver = meta
+                    .version
+                    .as_deref()
+                    .map(|v| format!("<= {v}"))
+                    .unwrap_or_else(|| "(affected range)".into()),
                 sev = severity_en(f.severity),
                 summary = analysis,
                 steps_md = numbered(&steps),
@@ -424,11 +489,23 @@ pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
                 fix = bullets(&fixes, "(describe the fix)"),
                 date = disclose_by,
             );
-            body.push_str(&format!("\n\n(Generated by vettalon from automated multi-model review; {cvss}.)"));
-            Draft { channel, subject, body, submit: None, disclose_by }
+            body.push_str(&format!(
+                "\n\n(Generated by vettalon from automated multi-model review; {cvss}.)"
+            ));
+            Draft {
+                channel,
+                subject,
+                body,
+                submit: None,
+                disclose_by,
+            }
         }
         Channel::VendorEmail => {
-            let subject = format!("[Security] {} in {}", f.title, meta.name.as_deref().unwrap_or("your project"));
+            let subject = format!(
+                "[Security] {} in {}",
+                f.title,
+                meta.name.as_deref().unwrap_or("your project")
+            );
             let body = format!(
                 "Hello maintainers,\n\nI'd like to privately report a security issue in {affected}.\n\nSummary: {title}\nSeverity (assessed): {sev}; {cvss}\nWeakness: {cwe_text}\nLocation: {loc}\nVerification status: [manually reproduced / not yet reproduced — pick one]\n\nDetails:\n{analysis}\n\nSteps to reproduce:\n{steps}\n\nImpact:\n{impact}\n\nSuggested fix:\n{fix}{poc}\n\nI propose coordinated disclosure: I will keep this private until a fix is released or {date} ({days} days), whichever comes first. Please let me know if you need more time.\n\nThanks,\n[your name or handle]",
                 title = f.title,
@@ -439,7 +516,13 @@ pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
                 date = disclose_by,
                 days = channel.window_days(),
             );
-            Draft { channel, subject, body, submit: None, disclose_by }
+            Draft {
+                channel,
+                subject,
+                body,
+                submit: None,
+                disclose_by,
+            }
         }
         Channel::Twcert => {
             let subject = format!("[漏洞通報] {affected}：{}", f.title);
@@ -452,7 +535,13 @@ pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
                 poc = poc_block.clone().unwrap_or_default(),
                 date = disclose_by,
             );
-            Draft { channel, subject, body, submit: Some("mailto:cve@cert.org.tw".into()), disclose_by }
+            Draft {
+                channel,
+                subject,
+                body,
+                submit: Some("mailto:cve@cert.org.tw".into()),
+                disclose_by,
+            }
         }
         Channel::HitconZeroday => {
             let subject = f.title.clone();
@@ -465,14 +554,24 @@ pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
                 poc = poc_block.unwrap_or_default(),
                 date = disclose_by,
             );
-            Draft { channel, subject, body, submit: Some("https://zeroday.hitcon.org/".into()), disclose_by }
+            Draft {
+                channel,
+                subject,
+                body,
+                submit: Some("https://zeroday.hitcon.org/".into()),
+                disclose_by,
+            }
         }
     }
 }
 
 /// Build the package for one finding of `report`: project detection,
 /// channel ranking and the draft for `channel` (default: the top option).
-pub fn prepare(report: &AuditReport, finding_id: &str, channel: Option<Channel>) -> Result<DisclosurePackage, String> {
+pub fn prepare(
+    report: &AuditReport,
+    finding_id: &str,
+    channel: Option<Channel>,
+) -> Result<DisclosurePackage, String> {
     let f = report
         .findings
         .iter()
@@ -484,7 +583,10 @@ pub fn prepare(report: &AuditReport, finding_id: &str, channel: Option<Channel>)
     let chosen = channel.unwrap_or(channels[0].channel);
     let mut d = draft(f, &project, chosen, chrono::Local::now().date_naive());
     if d.submit.is_none() {
-        d.submit = channels.iter().find(|c| c.channel == chosen).and_then(|c| c.submit.clone());
+        d.submit = channels
+            .iter()
+            .find(|c| c.channel == chosen)
+            .and_then(|c| c.submit.clone());
     }
     Ok(DisclosurePackage {
         finding_id: f.id.clone(),
@@ -546,9 +648,21 @@ mod tests {
         )
         .unwrap();
         std::fs::write(d.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        std::fs::write(d.path().join(".git/refs/heads/main"), "0123456789abcdef0123456789abcdef01234567\n").unwrap();
-        std::fs::write(d.path().join("SECURITY.md"), "Report to security@acme.example please.").unwrap();
-        std::fs::write(d.path().join("Cargo.toml"), "[package]\nname = \"shop\"\nversion = \"1.2.3\"\n").unwrap();
+        std::fs::write(
+            d.path().join(".git/refs/heads/main"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("SECURITY.md"),
+            "Report to security@acme.example please.",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("Cargo.toml"),
+            "[package]\nname = \"shop\"\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
         d
     }
 
@@ -573,13 +687,19 @@ mod tests {
         assert_eq!(m.security_emails, vec!["security@acme.example".to_string()]);
         let ch = recommend(&m);
         assert_eq!(ch[0].channel, Channel::GithubAdvisory);
-        assert_eq!(ch[0].submit.as_deref(), Some("https://github.com/acme/shop/security/advisories/new"));
+        assert_eq!(
+            ch[0].submit.as_deref(),
+            Some("https://github.com/acme/shop/security/advisories/new")
+        );
         assert_eq!(ch[1].channel, Channel::VendorEmail);
     }
 
     #[test]
     fn github_slug_shapes() {
-        assert_eq!(github_slug("https://github.com/a/b.git").as_deref(), Some("a/b"));
+        assert_eq!(
+            github_slug("https://github.com/a/b.git").as_deref(),
+            Some("a/b")
+        );
         assert_eq!(github_slug("git@github.com:a/b").as_deref(), Some("a/b"));
         assert!(github_slug("https://gitlab.com/a/b").is_none());
         assert!(github_slug("https://github.com/a/b/c").is_none());
@@ -591,7 +711,15 @@ mod tests {
         let m = detect_project(repo().path());
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
         let tw = draft(&f, &m, Channel::Twcert, today);
-        for needle in ["受影響產品與版本", "shop 1.2.3", "CWE-89", "重現方法", "揭露意願", "2027-01-11", "已人工重現／尚未重現"] {
+        for needle in [
+            "受影響產品與版本",
+            "shop 1.2.3",
+            "CWE-89",
+            "重現方法",
+            "揭露意願",
+            "2027-01-11",
+            "已人工重現／尚未重現",
+        ] {
             assert!(tw.body.contains(needle), "TWCERT draft missing {needle:?}");
         }
         assert_eq!(tw.submit.as_deref(), Some("mailto:cve@cert.org.tw"));
@@ -618,7 +746,12 @@ mod tests {
         r.findings = vec![ok, bad];
         let pkg = prepare(&r, "ok", None).unwrap();
         assert_eq!(pkg.draft.channel, Channel::GithubAdvisory);
-        assert!(pkg.draft.submit.unwrap().contains("security/advisories/new"));
+        assert!(
+            pkg.draft
+                .submit
+                .unwrap()
+                .contains("security/advisories/new")
+        );
         assert_eq!(pkg.checklist.len(), CHECKLIST.len());
         assert!(prepare(&r, &bad_id, None).is_err());
         assert!(prepare(&r, "nope", None).is_err());

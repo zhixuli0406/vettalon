@@ -91,7 +91,7 @@ mod tests {
         ModuleTarget {
             module_path: p.to_string(),
             score: 1,
-                high_risk: false,
+            high_risk: false,
             files: vec![format!("{p}/x.rs")],
         }
     }

@@ -32,7 +32,6 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-
 use super::schema::{
     AuditReport, CARRIED_FROM_PRIOR_PREFIX, CURRENT_SCHEMA_VERSION, EvidenceItem, EvidenceKind,
     Finding, FindingStatus, PRIOR_CONFIRMED_PREFIX, PriorRunInfo,

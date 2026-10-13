@@ -1,0 +1,10 @@
+{
+  "name": "@vettalon/win32-x64",
+  "version": "0.1.0",
+  "description": "vettalon binary for Windows x64",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/zhixuli0406/vettalon.git", "directory": "npm/win32-x64" },
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "publishConfig": { "access": "public" }
+}

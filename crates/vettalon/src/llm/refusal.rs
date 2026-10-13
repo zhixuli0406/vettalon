@@ -69,15 +69,21 @@ mod tests {
 
     #[test]
     fn english_and_chinese_refusals_are_detected() {
-        assert!(looks_like_refusal("I'm sorry, but I can't help with exploit code."));
+        assert!(looks_like_refusal(
+            "I'm sorry, but I can't help with exploit code."
+        ));
         assert!(looks_like_refusal("I cannot assist with that request."));
-        assert!(looks_like_refusal("我不會只回傳指定的那一行 JSON。請直接說明你想完成的事。"));
+        assert!(looks_like_refusal(
+            "我不會只回傳指定的那一行 JSON。請直接說明你想完成的事。"
+        ));
         assert!(looks_like_refusal("很抱歉，這個請求我無法協助。"));
     }
 
     #[test]
     fn json_is_never_a_refusal_even_with_refusal_words_inside() {
-        assert!(!looks_like_refusal(r#"{"reason":"I cannot assist; access denied branch"}"#));
+        assert!(!looks_like_refusal(
+            r#"{"reason":"I cannot assist; access denied branch"}"#
+        ));
         assert!(!looks_like_refusal("```json\n{\"candidates\": []}\n```"));
     }
 

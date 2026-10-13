@@ -51,9 +51,9 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::llm::LlmCaller;
 use vettalon_contract::strict_json;
 use vettalon_contract::visible_text::has_visible_content;
-use crate::llm::LlmCaller;
 
 use super::ai_audit::AI_AUDIT_ENGINE;
 use super::llm_util::{
@@ -407,8 +407,7 @@ fn cap_step(s: &TraceStep) -> TraceStep {
         file: crate::util::truncate_bytes(&s.file, 4096).to_string(),
         line: s.line,
         scope: crate::util::truncate_bytes(&s.scope, TRACE_FIELD_MAX_BYTES).to_string(),
-        description: crate::util::truncate_bytes(&s.description, TRACE_FIELD_MAX_BYTES)
-            .to_string(),
+        description: crate::util::truncate_bytes(&s.description, TRACE_FIELD_MAX_BYTES).to_string(),
     }
 }
 
@@ -447,8 +446,7 @@ fn apply_corrections(
 /// Apply a parsed verifier reply to the finding. Corrections are checked
 /// against the real files under `repo_root` (the only filesystem access).
 pub fn apply_reply(repo_root: &Path, finding: &mut Finding, reply: VerifierReply) {
-    let reason =
-        crate::util::truncate_bytes(&reply.reason, EVIDENCE_DETAIL_MAX_BYTES).to_string();
+    let reason = crate::util::truncate_bytes(&reply.reason, EVIDENCE_DETAIL_MAX_BYTES).to_string();
     let has_corrections = reply.corrected_line.is_some() || reply.corrected_trace.is_some();
     match reply.verdict {
         Verdict::Refuted if has_corrections => {

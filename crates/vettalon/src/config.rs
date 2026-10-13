@@ -173,7 +173,10 @@ impl Config {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
             {
-                return Err(format!("model id {:?} must be non-empty [A-Za-z0-9._-]", m.id));
+                return Err(format!(
+                    "model id {:?} must be non-empty [A-Za-z0-9._-]",
+                    m.id
+                ));
             }
             if !ids.insert(m.id.as_str()) {
                 return Err(format!("duplicate model id {:?}", m.id));
@@ -201,7 +204,10 @@ impl Config {
                     if let Some(prog) = &m.program
                         && !Path::new(prog).is_absolute()
                     {
-                        return Err(format!("model {:?}: `program` must be an absolute path", m.id));
+                        return Err(format!(
+                            "model {:?}: `program` must be an absolute path",
+                            m.id
+                        ));
                     }
                     if let Some(p) = &m.preset
                         && CliSpec::preset(p, None, Duration::from_secs(1)).is_none()
@@ -217,7 +223,10 @@ impl Config {
                 }
                 Backend::Openai => {
                     if m.base_url.is_none() || m.model.is_none() {
-                        return Err(format!("openai model {:?} needs `base_url` and `model`", m.id));
+                        return Err(format!(
+                            "openai model {:?} needs `base_url` and `model`",
+                            m.id
+                        ));
                     }
                 }
                 Backend::Ollama => {
@@ -283,8 +292,14 @@ impl Config {
         for (m, roles) in &handles {
             let (reachable, detail) = if probe {
                 match m.caller.complete(PROBE_PROMPT).await {
-                    Ok(t) => (Some(true), crate::util::truncate_bytes(t.trim(), 120).to_string()),
-                    Err(e) => (Some(false), crate::util::truncate_bytes(&e.to_string(), 200).to_string()),
+                    Ok(t) => (
+                        Some(true),
+                        crate::util::truncate_bytes(t.trim(), 120).to_string(),
+                    ),
+                    Err(e) => (
+                        Some(false),
+                        crate::util::truncate_bytes(&e.to_string(), 200).to_string(),
+                    ),
                 }
             } else {
                 (None, String::new())
@@ -428,7 +443,9 @@ fn url_is_https_or_loopback(url: &str) -> bool {
 /// so a config cannot point `api_key_env` at e.g. `AWS_SECRET_ACCESS_KEY`.
 fn api_key_env_ok(var: &str) -> bool {
     !var.is_empty()
-        && var.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && var
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
         && (var.ends_with("_API_KEY") || var.ends_with("_KEY") || var.ends_with("_TOKEN"))
         && !var.starts_with("AWS_")
 }
@@ -439,7 +456,9 @@ fn parse_output_mode(s: &str) -> Result<OutputMode, String> {
         "file" => Ok(OutputMode::File),
         other => match other.strip_prefix("json:") {
             Some(f) if !f.is_empty() => Ok(OutputMode::JsonField(f.to_string())),
-            _ => Err(format!("output {other:?} must be stdout | file | json:<field>")),
+            _ => Err(format!(
+                "output {other:?} must be stdout | file | json:<field>"
+            )),
         },
     }
 }
@@ -456,7 +475,12 @@ impl ModelConfig {
             .as_deref()
             .and_then(preset_family)
             .map(str::to_string)
-            .ok_or_else(|| format!("model {:?} needs `family` (e.g. qwen, deepseek, google)", self.id))
+            .ok_or_else(|| {
+                format!(
+                    "model {:?} needs `family` (e.g. qwen, deepseek, google)",
+                    self.id
+                )
+            })
     }
 
     fn timeout(&self) -> Duration {
@@ -504,7 +528,8 @@ impl ModelConfig {
                         env_passthrough: Vec::new(),
                     },
                 };
-                spec.env_passthrough.extend(self.env_passthrough.iter().cloned());
+                spec.env_passthrough
+                    .extend(self.env_passthrough.iter().cloned());
                 if let Some(p) = &self.program {
                     spec.program = p.clone();
                 }
@@ -518,16 +543,21 @@ impl ModelConfig {
                     spec.output = parse_output_mode(o)?;
                 }
                 match self.isolation() {
-                    crate::llm::container::Isolation::Container(container) => Arc::new(RefusalAware {
-                        inner: crate::llm::container::ContainerCliCaller { spec, container },
-                    }),
+                    crate::llm::container::Isolation::Container(container) => {
+                        Arc::new(RefusalAware {
+                            inner: crate::llm::container::ContainerCliCaller { spec, container },
+                        })
+                    }
                     crate::llm::container::Isolation::Host => Arc::new(RefusalAware {
                         inner: CliCaller { spec },
                     }),
                 }
             }
             Backend::Openai | Backend::Ollama => {
-                let base_url = self.base_url.clone().unwrap_or_else(|| DEFAULT_OLLAMA_URL.into());
+                let base_url = self
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_OLLAMA_URL.into());
                 let spec = HttpSpec {
                     base_url,
                     model: self.model.clone().unwrap_or_default(),
@@ -583,7 +613,10 @@ roles = ["finder", "verifier"]
         let st = c.model_statuses(false).await.unwrap();
         assert_eq!(st.len(), 3);
         assert_eq!(st[0].id, "claude");
-        assert!(st.iter().all(|s| s.reachable.is_none()), "no probe ⇒ no call");
+        assert!(
+            st.iter().all(|s| s.reachable.is_none()),
+            "no probe ⇒ no call"
+        );
         assert_eq!(st[1].roles, vec!["finder"]);
     }
 
@@ -602,11 +635,23 @@ roles = ["finder", "verifier"]
     fn tool_capable_presets_default_to_container_host_on_opt_in() {
         use crate::llm::container::Isolation;
         let grok = ModelConfig {
-            id: "g".into(), backend: Backend::Cli, family: None, model: None,
-            roles: default_roles(), timeout_secs: None, allow_agent_tools: false,
-            env_passthrough: vec![], preset: Some("grok".into()), program: None,
-            args: None, prompt_via: None, output: None, base_url: None,
-            api_key_env: None, max_tokens: None, temperature: None,
+            id: "g".into(),
+            backend: Backend::Cli,
+            family: None,
+            model: None,
+            roles: default_roles(),
+            timeout_secs: None,
+            allow_agent_tools: false,
+            env_passthrough: vec![],
+            preset: Some("grok".into()),
+            program: None,
+            args: None,
+            prompt_via: None,
+            output: None,
+            base_url: None,
+            api_key_env: None,
+            max_tokens: None,
+            temperature: None,
         };
         assert!(matches!(grok.isolation(), Isolation::Container(_)));
         let mut host = grok.clone();
@@ -614,7 +659,10 @@ roles = ["finder", "verifier"]
         assert!(matches!(host.isolation(), Isolation::Host));
         let mut claude = grok.clone();
         claude.preset = Some("claude".into());
-        assert!(matches!(claude.isolation(), Isolation::Host), "claude tools are off");
+        assert!(
+            matches!(claude.isolation(), Isolation::Host),
+            "claude tools are off"
+        );
         // The container spec carries the preset's auth file.
         if let Isolation::Container(c) = grok.isolation() {
             assert_eq!(c.auth_files.len(), 1);
@@ -649,7 +697,11 @@ api_key = "sk-123"
         assert!(Config::parse(&format!("{tools}allow_agent_tools = true\n")).is_ok());
         // A custom program can only run on the host, and needs the opt-in.
         let prog = "[[model]]\nid='g'\nbackend='cli'\nfamily='x'\nprogram='/usr/bin/foo'\n";
-        assert!(Config::parse(prog).unwrap_err().contains("allow_agent_tools"));
+        assert!(
+            Config::parse(prog)
+                .unwrap_err()
+                .contains("allow_agent_tools")
+        );
         let http = "[[model]]\nid='a'\nbackend='openai'\nfamily='f'\nmodel='m'\nbase_url='http://evil.example/v1'\n";
         assert!(Config::parse(http).unwrap_err().contains("https"));
         let local = "[[model]]\nid='a'\nbackend='ollama'\nfamily='f'\nmodel='m'\nbase_url='http://localhost:11434/v1'\n";
@@ -659,7 +711,8 @@ api_key = "sk-123"
         assert!(!url_is_https_or_loopback("http://localhost.evil.com/v1"));
         let aws = "[[model]]\nid='a'\nbackend='openai'\nfamily='f'\nmodel='m'\nbase_url='https://e'\napi_key_env='AWS_SECRET_ACCESS_KEY'\n";
         assert!(Config::parse(aws).unwrap_err().contains("api_key_env"));
-        let rel = "[[model]]\nid='a'\nbackend='cli'\nfamily='f'\nprogram='sh'\nallow_agent_tools=true\n";
+        let rel =
+            "[[model]]\nid='a'\nbackend='cli'\nfamily='f'\nprogram='sh'\nallow_agent_tools=true\n";
         assert!(Config::parse(rel).unwrap_err().contains("absolute"));
         let badpreset = "[[model]]\nid='a'\nbackend='cli'\npreset='gpt'\n";
         assert!(Config::parse(badpreset).unwrap_err().contains("preset"));
@@ -674,14 +727,20 @@ api_key = "sk-123"
         let c = Config::parse(SAMPLE).unwrap();
         let text = c.to_toml().unwrap();
         // Defaults must not leak into the written file.
-        assert!(!text.contains("allow_agent_tools"), "false bool should be skipped");
+        assert!(
+            !text.contains("allow_agent_tools"),
+            "false bool should be skipped"
+        );
         assert!(!text.contains("= \"\""), "no empty-string noise");
         // Re-parsing the output yields the same roster.
         let c2 = Config::parse(&text).unwrap();
         assert_eq!(c2.models.len(), c.models.len());
         assert_eq!(c2.models[1].id, "qwen-local");
         assert_eq!(c2.models[1].family().unwrap(), "qwen");
-        assert_eq!(c2.models[2].api_key_env.as_deref(), Some("DEEPSEEK_API_KEY"));
+        assert_eq!(
+            c2.models[2].api_key_env.as_deref(),
+            Some("DEEPSEEK_API_KEY")
+        );
     }
 
     #[test]
@@ -693,9 +752,7 @@ api_key = "sk-123"
         assert_eq!(f.len(), 3);
         assert_eq!(v.len(), 2);
         // Explicit finder selection restricts to exactly that model.
-        let (f, _v, _p, _r) = c
-            .roster_for(&["qwen-local".to_string()], &[], &[])
-            .unwrap();
+        let (f, _v, _p, _r) = c.roster_for(&["qwen-local".to_string()], &[], &[]).unwrap();
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].id, "qwen-local");
         // An unknown id is an error, not a silent drop.

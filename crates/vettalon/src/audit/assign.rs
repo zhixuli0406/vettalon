@@ -24,7 +24,11 @@ pub struct VerifierPick {
 
 /// Pick a verifier for a finding found by `finder`. `nth` is a run-wide
 /// counter used to rotate among equally good candidates.
-pub fn verifier_for(finder: &ModelHandle, verifiers: &[ModelHandle], nth: usize) -> Option<VerifierPick> {
+pub fn verifier_for(
+    finder: &ModelHandle,
+    verifiers: &[ModelHandle],
+    nth: usize,
+) -> Option<VerifierPick> {
     let cross: Vec<usize> = (0..verifiers.len())
         .filter(|&i| verifiers[i].family != finder.family)
         .collect();
@@ -83,7 +87,11 @@ mod tests {
 
     #[test]
     fn verifier_prefers_other_family_and_rotates() {
-        let vs = vec![m("claude", "anthropic"), m("codex", "openai"), m("grok", "xai")];
+        let vs = vec![
+            m("claude", "anthropic"),
+            m("codex", "openai"),
+            m("grok", "xai"),
+        ];
         let f = m("claude", "anthropic");
         let a = verifier_for(&f, &vs, 0).unwrap();
         let b = verifier_for(&f, &vs, 1).unwrap();
@@ -95,10 +103,22 @@ mod tests {
     fn same_family_other_model_then_self() {
         let vs = vec![m("opus", "anthropic"), m("sonnet", "anthropic")];
         let p = verifier_for(&m("opus", "anthropic"), &vs, 0).unwrap();
-        assert_eq!(p, VerifierPick { index: 1, cross_family: false });
+        assert_eq!(
+            p,
+            VerifierPick {
+                index: 1,
+                cross_family: false
+            }
+        );
         let only = vec![m("opus", "anthropic")];
         let p = verifier_for(&m("opus", "anthropic"), &only, 0).unwrap();
-        assert_eq!(p, VerifierPick { index: 0, cross_family: false });
+        assert_eq!(
+            p,
+            VerifierPick {
+                index: 0,
+                cross_family: false
+            }
+        );
         assert!(verifier_for(&m("x", "y"), &[], 0).is_none());
     }
 }

@@ -47,12 +47,18 @@ const REASON_MAX_BYTES: usize = 500;
 
 /// Apply one operator decision to `report` in place. The report must stay
 /// validator-clean afterwards; if it would not, nothing is changed.
-pub fn apply(report: &mut AuditReport, finding_id: &str, decision: Decision, reason: &str) -> Result<(), String> {
+pub fn apply(
+    report: &mut AuditReport,
+    finding_id: &str,
+    decision: Decision,
+    reason: &str,
+) -> Result<(), String> {
     let reason = reason.trim();
     if reason.is_empty() {
         return Err("請填寫判定理由（會寫進報告的誤判清單／排除清單）".into());
     }
-    let reason = crate::util::mask_sensitive_text(crate::util::truncate_bytes(reason, REASON_MAX_BYTES));
+    let reason =
+        crate::util::mask_sensitive_text(crate::util::truncate_bytes(reason, REASON_MAX_BYTES));
     let mut next = report.clone();
     let f = next
         .findings
@@ -62,7 +68,10 @@ pub fn apply(report: &mut AuditReport, finding_id: &str, decision: Decision, rea
     f.evidence.push(EvidenceItem {
         kind: EvidenceKind::OperatorReview,
         source: "dashboard".into(),
-        detail: format!("operator_decision: {}{REASON_MARKER}{reason}", decision.as_str()),
+        detail: format!(
+            "operator_decision: {}{REASON_MARKER}{reason}",
+            decision.as_str()
+        ),
         recorded_at: chrono::Utc::now().to_rfc3339(),
     });
     f.status = decision.status();
@@ -71,7 +80,9 @@ pub fn apply(report: &mut AuditReport, finding_id: &str, decision: Decision, rea
         &next.findings,
         next.engines_run.len(),
         next.engines_missing.len(),
-        GatePolicy { include_needs_human: next.summary.gate_includes_needs_human },
+        GatePolicy {
+            include_needs_human: next.summary.gate_includes_needs_human,
+        },
         &next.coverage,
     );
     let errors = super::validation_errors(&next);
@@ -85,17 +96,32 @@ pub fn apply(report: &mut AuditReport, finding_id: &str, decision: Decision, rea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::schema::{Finding, FindingKind, ProfileMode, ScanProfile, Severity, VerifierInfo};
+    use crate::audit::schema::{
+        Finding, FindingKind, ProfileMode, ScanProfile, Severity, VerifierInfo,
+    };
 
     fn report() -> AuditReport {
-        let mut f = Finding::candidate("semgrep", FindingKind::StaticAnalysis, Severity::High, "t", "a.py", Some(1), "x", "r", vec![]);
+        let mut f = Finding::candidate(
+            "semgrep",
+            FindingKind::StaticAnalysis,
+            Severity::High,
+            "t",
+            "a.py",
+            Some(1),
+            "x",
+            "r",
+            vec![],
+        );
         f.id = "f1".into();
         let findings = vec![f];
         AuditReport {
             schema_version: 2,
             repo: "/r".into(),
             started_at: "2026-10-13T00:00:00Z".into(),
-            profile: ScanProfile { mode: ProfileMode::Quick, intake: None },
+            profile: ScanProfile {
+                mode: ProfileMode::Quick,
+                intake: None,
+            },
             engines_run: vec![],
             engines_missing: vec![],
             summary: Summary::from_findings(&findings, 0, 0, GatePolicy::default(), &[]),
@@ -120,7 +146,10 @@ mod tests {
             let expect_high = usize::from(d == Decision::Confirmed);
             assert_eq!(r.summary.by_severity.high, expect_high, "{d:?}");
             let ev = r.findings[0].evidence.last().unwrap();
-            assert!(ev.detail.starts_with(&format!("operator_decision: {}", d.as_str())));
+            assert!(
+                ev.detail
+                    .starts_with(&format!("operator_decision: {}", d.as_str()))
+            );
             assert!(ev.detail.contains("測試理由"));
         }
     }
@@ -131,13 +160,30 @@ mod tests {
         let before = serde_json::to_string(&r).unwrap();
         assert!(apply(&mut r, "f1", Decision::Suppressed, "   ").is_err());
         assert!(apply(&mut r, "nope", Decision::Suppressed, "x").is_err());
-        assert_eq!(serde_json::to_string(&r).unwrap(), before, "a failed decision leaves the report untouched");
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            before,
+            "a failed decision leaves the report untouched"
+        );
     }
 
     #[test]
     fn secrets_in_reasons_are_masked() {
         let mut r = report();
-        apply(&mut r, "f1", Decision::Refuted, "test key AKIAIOSFODNN7EXAMPLE was fake").unwrap();
-        assert!(!r.findings[0].evidence.last().unwrap().detail.contains("AKIAIOSFODNN7EXAMPLE"));
+        apply(
+            &mut r,
+            "f1",
+            Decision::Refuted,
+            "test key AKIAIOSFODNN7EXAMPLE was fake",
+        )
+        .unwrap();
+        assert!(
+            !r.findings[0]
+                .evidence
+                .last()
+                .unwrap()
+                .detail
+                .contains("AKIAIOSFODNN7EXAMPLE")
+        );
     }
 }

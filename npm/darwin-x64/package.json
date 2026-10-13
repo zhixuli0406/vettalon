@@ -1,0 +1,10 @@
+{
+  "name": "@vettalon/darwin-x64",
+  "version": "0.1.0",
+  "description": "vettalon binary for macOS x64 (Intel)",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/zhixuli0406/vettalon.git", "directory": "npm/darwin-x64" },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "publishConfig": { "access": "public" }
+}

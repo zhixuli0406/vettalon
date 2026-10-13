@@ -22,8 +22,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use vettalon_contract::strict_json::{self, Violation};
 use crate::llm::LlmCaller;
+use vettalon_contract::strict_json::{self, Violation};
 
 use super::coverage::{DEFER_CANDIDATE_CAP, DEFER_ENGINE_UNAVAILABLE};
 use super::intake::HotspotFile;
@@ -173,14 +173,20 @@ pub const MAX_PAGES_PER_MODULE: usize = 6;
 /// A single file larger than the budget becomes its own page (the existing
 /// per-file truncation then applies). `repo_root` is needed to size files;
 /// unreadable files keep their place with size 0.
-pub fn paginate_modules(repo_root: &Path, modules: Vec<ModuleTarget>, budget: usize) -> Vec<ModuleTarget> {
+pub fn paginate_modules(
+    repo_root: &Path,
+    modules: Vec<ModuleTarget>,
+    budget: usize,
+) -> Vec<ModuleTarget> {
     let mut out = Vec::new();
     for m in modules {
         let sizes: Vec<(String, usize)> = m
             .files
             .iter()
             .map(|f| {
-                let len = std::fs::metadata(repo_root.join(f)).map(|x| x.len() as usize).unwrap_or(0);
+                let len = std::fs::metadata(repo_root.join(f))
+                    .map(|x| x.len() as usize)
+                    .unwrap_or(0);
                 (f.clone(), len)
             })
             .collect();
@@ -594,8 +600,14 @@ pub async fn run_ai_audit_capped<C: LlmCaller>(
 ) -> AiAuditOutcome {
     let counter = std::sync::atomic::AtomicU32::new(0);
     run_ai_audit_progress(
-        repo_root, modules, caller, candidate_cap,
-        &crate::audit::NoProgress, "", &counter, modules.len() as u32,
+        repo_root,
+        modules,
+        caller,
+        candidate_cap,
+        &crate::audit::NoProgress,
+        "",
+        &counter,
+        modules.len() as u32,
     )
     .await
 }
@@ -681,7 +693,10 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
             Err(e) => {
                 let refused = matches!(e, crate::llm::LlmError::Refused(_));
                 let reason = if refused {
-                    format!("model refused: {}", crate::util::truncate_bytes(&e.to_string(), 300))
+                    format!(
+                        "model refused: {}",
+                        crate::util::truncate_bytes(&e.to_string(), 300)
+                    )
                 } else {
                     format!("llm call failed: {e}")
                 };
@@ -907,24 +922,51 @@ pub(crate) mod tests {
         // One small module (fits) and one big module (3 files of ~40KB each).
         std::fs::write(dir.path().join("small.rs"), "fn a() {}\n").unwrap();
         for n in ["a", "b", "c"] {
-            std::fs::write(dir.path().join("m").join(format!("{n}.rs")), "x".repeat(40 * 1024)).unwrap();
+            std::fs::write(
+                dir.path().join("m").join(format!("{n}.rs")),
+                "x".repeat(40 * 1024),
+            )
+            .unwrap();
         }
-        let small = ModuleTarget { module_path: ".".into(), score: 1, high_risk: false, files: vec!["small.rs".into()] };
+        let small = ModuleTarget {
+            module_path: ".".into(),
+            score: 1,
+            high_risk: false,
+            files: vec!["small.rs".into()],
+        };
         let big = ModuleTarget {
-            module_path: "m".into(), score: 2, high_risk: true,
+            module_path: "m".into(),
+            score: 2,
+            high_risk: true,
             files: vec!["m/a.rs".into(), "m/b.rs".into(), "m/c.rs".into()],
         };
         let out = paginate_modules(dir.path(), vec![big, small], MODULE_PROMPT_BUDGET_BYTES);
         // Small module untouched.
-        assert!(out.iter().any(|m| m.module_path == "." && m.files == vec!["small.rs".to_string()]));
+        assert!(
+            out.iter()
+                .any(|m| m.module_path == "." && m.files == vec!["small.rs".to_string()])
+        );
         // Big module split into pages; every file still present across pages.
-        let pages: Vec<&ModuleTarget> = out.iter().filter(|m| m.module_path.starts_with("m")).collect();
-        assert!(pages.len() >= 2, "oversized module should page: {:?}", pages.iter().map(|p| &p.module_path).collect::<Vec<_>>());
+        let pages: Vec<&ModuleTarget> = out
+            .iter()
+            .filter(|m| m.module_path.starts_with("m"))
+            .collect();
+        assert!(
+            pages.len() >= 2,
+            "oversized module should page: {:?}",
+            pages.iter().map(|p| &p.module_path).collect::<Vec<_>>()
+        );
         let all_files: Vec<&String> = pages.iter().flat_map(|p| p.files.iter()).collect();
         for f in ["m/a.rs", "m/b.rs", "m/c.rs"] {
-            assert!(all_files.iter().any(|x| x.as_str() == f), "{f} must be audited on some page");
+            assert!(
+                all_files.iter().any(|x| x.as_str() == f),
+                "{f} must be audited on some page"
+            );
         }
-        assert!(pages.iter().all(|p| p.high_risk && p.score == 2), "pages keep parent score/high_risk");
+        assert!(
+            pages.iter().all(|p| p.high_risk && p.score == 2),
+            "pages keep parent score/high_risk"
+        );
     }
 
     #[test]
@@ -935,9 +977,18 @@ pub(crate) mod tests {
         for f in &files {
             std::fs::write(dir.path().join(f), "y".repeat(40 * 1024)).unwrap();
         }
-        let big = ModuleTarget { module_path: "m".into(), score: 1, high_risk: false, files };
+        let big = ModuleTarget {
+            module_path: "m".into(),
+            score: 1,
+            high_risk: false,
+            files,
+        };
         let out = paginate_modules(dir.path(), vec![big], MODULE_PROMPT_BUDGET_BYTES);
-        assert!(out.len() <= MAX_PAGES_PER_MODULE, "pages capped: {}", out.len());
+        assert!(
+            out.len() <= MAX_PAGES_PER_MODULE,
+            "pages capped: {}",
+            out.len()
+        );
     }
 
     #[test]
@@ -1000,12 +1051,28 @@ pub(crate) mod tests {
     fn parse_ai_candidates_accepts_optional_cwe() {
         // Present (any case) and absent both parse; the value is normalized
         // later by `audit::cwe::normalize`.
-        let with = cand_json("a.py", 10).replacen(r#""kind":"sql_injection","#, r#""kind":"sql_injection","cwe":"cwe-89","#, 1);
+        let with = cand_json("a.py", 10).replacen(
+            r#""kind":"sql_injection","#,
+            r#""kind":"sql_injection","cwe":"cwe-89","#,
+            1,
+        );
         let parsed = parse_ai_candidates(&format!("[{with}]")).unwrap();
         assert_eq!(parsed[0].cwe.as_deref(), Some("cwe-89"));
-        let null = cand_json("a.py", 10).replacen(r#""kind":"sql_injection","#, r#""kind":"sql_injection","cwe":null,"#, 1);
-        assert!(parse_ai_candidates(&format!("[{null}]")).unwrap()[0].cwe.is_none());
-        assert!(parse_ai_candidates(&format!("[{}]", cand_json("a.py", 10))).unwrap()[0].cwe.is_none());
+        let null = cand_json("a.py", 10).replacen(
+            r#""kind":"sql_injection","#,
+            r#""kind":"sql_injection","cwe":null,"#,
+            1,
+        );
+        assert!(
+            parse_ai_candidates(&format!("[{null}]")).unwrap()[0]
+                .cwe
+                .is_none()
+        );
+        assert!(
+            parse_ai_candidates(&format!("[{}]", cand_json("a.py", 10))).unwrap()[0]
+                .cwe
+                .is_none()
+        );
     }
 
     #[test]
@@ -1155,7 +1222,7 @@ pub(crate) mod tests {
         let modules = vec![ModuleTarget {
             module_path: "a".to_string(),
             score: 1,
-                high_risk: false,
+            high_risk: false,
             files: vec!["a/main.rs".to_string()],
         }];
         let caller = StubCaller {
@@ -1185,7 +1252,7 @@ pub(crate) mod tests {
         let modules = vec![ModuleTarget {
             module_path: "a".to_string(),
             score: 1,
-                high_risk: false,
+            high_risk: false,
             files: vec!["a/main.rs".to_string()],
         }];
         let reply = format!("[{}]", cand_json("a/main.rs", 1)).replace("\"high\"", "\"critical\"");
@@ -1239,13 +1306,13 @@ pub(crate) mod tests {
             ModuleTarget {
                 module_path: "a".to_string(),
                 score: 2,
-                    high_risk: false,
+                high_risk: false,
                 files: vec!["a/main.rs".to_string()],
             },
             ModuleTarget {
                 module_path: "b".to_string(),
                 score: 1,
-                    high_risk: false,
+                high_risk: false,
                 files: vec!["b/main.rs".to_string()],
             },
         ];
@@ -1289,7 +1356,7 @@ pub(crate) mod tests {
         let modules = vec![ModuleTarget {
             module_path: "a".to_string(),
             score: 1,
-                high_risk: false,
+            high_risk: false,
             files: vec!["a/main.rs".to_string()],
         }];
         let caller = StubCaller {
@@ -1322,7 +1389,7 @@ pub(crate) mod tests {
         let modules = vec![ModuleTarget {
             module_path: "a".to_string(),
             score: 1,
-                high_risk: false,
+            high_risk: false,
             files: vec!["a/main.rs".to_string()],
         }];
         let many: Vec<String> = (0..20)
@@ -1349,7 +1416,7 @@ pub(crate) mod tests {
         let modules = vec![ModuleTarget {
             module_path: "a".to_string(),
             score: 1,
-                high_risk: false,
+            high_risk: false,
             files: vec!["a/main.rs".to_string()],
         }];
         // line 99 is out of range, and the trace points at /etc/passwd.
@@ -1404,7 +1471,7 @@ pub(crate) mod tests {
             .map(|i| ModuleTarget {
                 module_path: format!("m{i}"),
                 score: 1,
-                    high_risk: false,
+                high_risk: false,
                 files: vec![format!("m{i}/main.rs")],
             })
             .collect();
@@ -1452,7 +1519,7 @@ pub(crate) mod tests {
         let modules = vec![ModuleTarget {
             module_path: "a".to_string(),
             score: 1,
-                high_risk: false,
+            high_risk: false,
             files: vec!["a/main.rs".to_string()],
         }];
         let one = cand_json("a/main.rs", 1);

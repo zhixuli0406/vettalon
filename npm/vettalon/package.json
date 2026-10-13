@@ -1,0 +1,21 @@
+{
+  "name": "vettalon",
+  "version": "0.1.0",
+  "description": "Multi-model security audit for your own code: AI models from different vendors find bugs and a different-vendor model refutes each one. Local-first, bring your own model.",
+  "license": "Apache-2.0",
+  "author": { "name": "Louis Li", "url": "https://github.com/zhixuli0406" },
+  "repository": { "type": "git", "url": "https://github.com/zhixuli0406/vettalon.git", "directory": "npm/vettalon" },
+  "homepage": "https://github.com/zhixuli0406/vettalon#readme",
+  "bugs": { "url": "https://github.com/zhixuli0406/vettalon/issues" },
+  "keywords": ["security", "sast", "code-audit", "vulnerability-scanner", "llm", "ai-security", "cross-check", "rust", "cli", "vettalon"],
+  "bin": { "vettalon": "bin/vettalon" },
+  "files": ["bin", "scripts"],
+  "scripts": { "postinstall": "node scripts/install.js" },
+  "optionalDependencies": {
+    "@vettalon/darwin-arm64": "0.1.0",
+    "@vettalon/darwin-x64": "0.1.0",
+    "@vettalon/linux-x64": "0.1.0",
+    "@vettalon/linux-arm64": "0.1.0",
+    "@vettalon/win32-x64": "0.1.0"
+  }
+}

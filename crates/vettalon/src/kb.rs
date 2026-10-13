@@ -73,11 +73,26 @@ pub fn for_kind(kind: &str) -> Option<&'static CweEntry> {
 pub fn owasp_info(category: &str) -> Option<(&'static str, &'static str)> {
     let code = category.get(..3)?;
     Some(match code {
-        "A01" => ("A01:2021 權限控制失效", "https://owasp.org/Top10/A01_2021-Broken_Access_Control/"),
-        "A02" => ("A02:2021 加密機制失效", "https://owasp.org/Top10/A02_2021-Cryptographic_Failures/"),
-        "A03" => ("A03:2021 注入式攻擊", "https://owasp.org/Top10/A03_2021-Injection/"),
-        "A04" => ("A04:2021 不安全設計", "https://owasp.org/Top10/A04_2021-Insecure_Design/"),
-        "A05" => ("A05:2021 安全設定缺陷", "https://owasp.org/Top10/A05_2021-Security_Misconfiguration/"),
+        "A01" => (
+            "A01:2021 權限控制失效",
+            "https://owasp.org/Top10/A01_2021-Broken_Access_Control/",
+        ),
+        "A02" => (
+            "A02:2021 加密機制失效",
+            "https://owasp.org/Top10/A02_2021-Cryptographic_Failures/",
+        ),
+        "A03" => (
+            "A03:2021 注入式攻擊",
+            "https://owasp.org/Top10/A03_2021-Injection/",
+        ),
+        "A04" => (
+            "A04:2021 不安全設計",
+            "https://owasp.org/Top10/A04_2021-Insecure_Design/",
+        ),
+        "A05" => (
+            "A05:2021 安全設定缺陷",
+            "https://owasp.org/Top10/A05_2021-Security_Misconfiguration/",
+        ),
         "A06" => (
             "A06:2021 易受攻擊和已淘汰的組件",
             "https://owasp.org/Top10/A06_2021-Vulnerable_and_Outdated_Components/",
@@ -105,7 +120,10 @@ pub fn owasp_info(category: &str) -> Option<(&'static str, &'static str)> {
 /// MITRE definition page for a CWE id.
 pub fn cwe_url(cwe: &str) -> Option<String> {
     let id = crate::audit::cwe::normalize(cwe)?;
-    Some(format!("https://cwe.mitre.org/data/definitions/{}.html", id.trim_start_matches("CWE-")))
+    Some(format!(
+        "https://cwe.mitre.org/data/definitions/{}.html",
+        id.trim_start_matches("CWE-")
+    ))
 }
 
 #[cfg(test)]
@@ -114,11 +132,20 @@ mod tests {
 
     #[test]
     fn kb_parses_with_strict_schema() {
-        let entries: Vec<CweEntry> = serde_json::from_str(KB_JSON).expect("cwe_kb.json must match CweEntry");
+        let entries: Vec<CweEntry> =
+            serde_json::from_str(KB_JSON).expect("cwe_kb.json must match CweEntry");
         assert!(entries.len() >= 50, "{}", entries.len());
         for e in &entries {
-            assert!(crate::audit::cwe::normalize(&e.id).as_deref() == Some(e.id.as_str()), "{}", e.id);
-            assert!(!e.name_zh.is_empty() && !e.mitigations_zh.is_empty(), "{}", e.id);
+            assert!(
+                crate::audit::cwe::normalize(&e.id).as_deref() == Some(e.id.as_str()),
+                "{}",
+                e.id
+            );
+            assert!(
+                !e.name_zh.is_empty() && !e.mitigations_zh.is_empty(),
+                "{}",
+                e.id
+            );
             if let Some(o) = &e.owasp_top10_2021 {
                 assert!(owasp_info(o).is_some(), "{} → {o}", e.id);
             }
@@ -140,6 +167,9 @@ mod tests {
         let (title, url) = owasp_info("A03:2021-Injection").unwrap();
         assert!(title.contains("注入"));
         assert!(url.ends_with("A03_2021-Injection/"));
-        assert_eq!(cwe_url("CWE-79").unwrap(), "https://cwe.mitre.org/data/definitions/79.html");
+        assert_eq!(
+            cwe_url("CWE-79").unwrap(),
+            "https://cwe.mitre.org/data/definitions/79.html"
+        );
     }
 }

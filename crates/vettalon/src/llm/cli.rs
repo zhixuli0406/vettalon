@@ -47,17 +47,40 @@ pub const TOOL_CAPABLE_PRESETS: &[&str] = &["codex", "grok"];
 /// Environment passed to every CLI; everything else is dropped so a model
 /// that runs `env` cannot read the operator's other keys.
 pub const BASE_ENV: &[&str] = &[
-    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
-    "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
-    "https_proxy", "http_proxy", "no_proxy",
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
 ];
 
 /// Auth variables each preset may need (subscription logins use files under
 /// HOME instead, which still work).
 fn preset_env(name: &str) -> &'static [&'static str] {
     match name {
-        "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"],
+        "claude" => &[
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ],
         "codex" => &["OPENAI_API_KEY", "CODEX_HOME"],
         "grok" => &["XAI_API_KEY", "GROK_HOME"],
         _ => &[],
@@ -189,7 +212,12 @@ impl CliSpec {
     }
 
     /// [`Self::render_args`] with the prompt-file path.
-    pub fn render_args_with(&self, prompt: &str, output_file: &str, prompt_file: &str) -> Vec<String> {
+    pub fn render_args_with(
+        &self,
+        prompt: &str,
+        output_file: &str,
+        prompt_file: &str,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::with_capacity(self.args.len());
         for a in &self.args {
             if a == MODEL_PLACEHOLDER {
@@ -233,7 +261,11 @@ impl LlmCaller for CliCaller {
                 .and_then(|_| crate::util::set_owner_only(&prompt_file))
                 .map_err(|e| LlmError::Executor(format!("cannot write prompt file: {e}")))?;
         }
-        let arg_prompt = if self.spec.prompt_via == PromptVia::Arg { prompt } else { "" };
+        let arg_prompt = if self.spec.prompt_via == PromptVia::Arg {
+            prompt
+        } else {
+            ""
+        };
         let args = self.spec.render_args_with(
             arg_prompt,
             &out_file.to_string_lossy(),
@@ -242,7 +274,11 @@ impl LlmCaller for CliCaller {
 
         let mut cmd = Command::new(&bin);
         cmd.args(&args).env_clear();
-        for name in BASE_ENV.iter().copied().chain(self.spec.env_passthrough.iter().map(String::as_str)) {
+        for name in BASE_ENV
+            .iter()
+            .copied()
+            .chain(self.spec.env_passthrough.iter().map(String::as_str))
+        {
             if let Ok(v) = std::env::var(name) {
                 cmd.env(name, v);
             }
@@ -285,7 +321,8 @@ impl LlmCaller for CliCaller {
             let err = err.map(|(b, _)| b).unwrap_or_default();
             (w, status, out, err)
         };
-        let (write_res, status, out, err) = match tokio::time::timeout(self.spec.timeout, run).await {
+        let (write_res, status, out, err) = match tokio::time::timeout(self.spec.timeout, run).await
+        {
             Ok(r) => r,
             Err(_) => {
                 kill_group(pid);
@@ -338,7 +375,9 @@ fn extract_reply(mode: &OutputMode, stdout: &str, out_file: &std::path::Path) ->
                 .map_err(|e| LlmError::Executor(format!("CLI wrote no final message: {e}")))?
                 .len();
             if len > OUTPUT_CAP_BYTES as u64 {
-                return Err(LlmError::Executor(format!("CLI final message too large ({len} bytes)")));
+                return Err(LlmError::Executor(format!(
+                    "CLI final message too large ({len} bytes)"
+                )));
             }
             std::fs::read_to_string(out_file)
                 .map_err(|e| LlmError::Executor(format!("CLI wrote no final message: {e}")))
@@ -350,7 +389,9 @@ fn extract_reply(mode: &OutputMode, stdout: &str, out_file: &std::path::Path) ->
             v.get(field)
                 .and_then(|x| x.as_str())
                 .map(str::to_string)
-                .ok_or_else(|| LlmError::Executor(format!("CLI JSON envelope has no {field:?} string")))
+                .ok_or_else(|| {
+                    LlmError::Executor(format!("CLI JSON envelope has no {field:?} string"))
+                })
         }
     }
 }
@@ -364,7 +405,10 @@ mod tests {
         for name in ["claude", "codex", "grok"] {
             let spec = CliSpec::preset(name, None, Duration::from_secs(1)).unwrap();
             let args = spec.render_args("P", "/o");
-            assert!(!args.iter().any(|a| a == "--model" || a == "-m"), "{name}: {args:?}");
+            assert!(
+                !args.iter().any(|a| a == "--model" || a == "-m"),
+                "{name}: {args:?}"
+            );
             assert!(!args.iter().any(|a| a.contains('{')), "{name}: {args:?}");
         }
         assert!(CliSpec::preset("nope", None, Duration::from_secs(1)).is_none());
@@ -411,10 +455,15 @@ mod tests {
 
     #[test]
     fn codex_preset_drops_user_config_and_extensions() {
-        let a = CliSpec::preset("codex", None, Duration::from_secs(1)).unwrap().render_args("", "/o");
+        let a = CliSpec::preset("codex", None, Duration::from_secs(1))
+            .unwrap()
+            .render_args("", "/o");
         assert!(a.iter().any(|x| x == "--ignore-user-config"));
         for f in ["apps", "hooks", "plugins", "memories"] {
-            assert!(a.windows(2).any(|w| w[0] == "--disable" && w[1] == f), "{f}");
+            assert!(
+                a.windows(2).any(|w| w[0] == "--disable" && w[1] == f),
+                "{f}"
+            );
         }
     }
 
@@ -448,12 +497,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, r#"{"ok":true}"#);
-        assert!(extract_reply(
-            &OutputMode::JsonField("text".into()),
-            "not json",
-            std::path::Path::new("/x")
-        )
-        .is_err());
+        assert!(
+            extract_reply(
+                &OutputMode::JsonField("text".into()),
+                "not json",
+                std::path::Path::new("/x")
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

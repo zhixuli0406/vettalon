@@ -144,7 +144,11 @@ impl DockerSandbox {
         args.push(self.image.clone());
         // In-container hard limit too, so the PoC dies even if vettalon is
         // killed before its own timeout fires.
-        args.extend(["timeout", "-s", "KILL", IN_CONTAINER_LIMIT_SECS].iter().map(|s| s.to_string()));
+        args.extend(
+            ["timeout", "-s", "KILL", IN_CONTAINER_LIMIT_SECS]
+                .iter()
+                .map(|s| s.to_string()),
+        );
         args.extend(cmd.iter().cloned());
         args
     }
@@ -158,8 +162,14 @@ impl DockerSandbox {
         timeout: Duration,
     ) -> Result<(i64, String), String> {
         let (file, cmd) = match language {
-            "python" => ("poc.py", vec!["python3".to_string(), "/workspace/poc.py".to_string()]),
-            "bash" => ("poc.sh", vec!["bash".to_string(), "/workspace/poc.sh".to_string()]),
+            "python" => (
+                "poc.py",
+                vec!["python3".to_string(), "/workspace/poc.py".to_string()],
+            ),
+            "bash" => (
+                "poc.sh",
+                vec!["bash".to_string(), "/workspace/poc.sh".to_string()],
+            ),
             other => return Err(format!("unsupported PoC language {other:?}")),
         };
         let scratch = tempfile::Builder::new()
@@ -173,7 +183,8 @@ impl DockerSandbox {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755));
+            let _ =
+                std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755));
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
         }
 
@@ -253,7 +264,11 @@ mod tests {
             docker_bin: "docker".into(),
             image: "img".into(),
         };
-        let a = sb.run_args("n", Path::new("/tmp/x"), &["python3".into(), "/workspace/poc.py".into()]);
+        let a = sb.run_args(
+            "n",
+            Path::new("/tmp/x"),
+            &["python3".into(), "/workspace/poc.py".into()],
+        );
         for flag in [
             "--network=none",
             "--read-only",
@@ -263,7 +278,10 @@ mod tests {
         ] {
             assert!(a.iter().any(|x| x == flag), "missing {flag}: {a:?}");
         }
-        assert!(a.iter().any(|x| x == "type=bind,source=/tmp/x,target=/workspace,readonly"));
+        assert!(
+            a.iter()
+                .any(|x| x == "type=bind,source=/tmp/x,target=/workspace,readonly")
+        );
         for flag in ["--pull=never", "--memory-swap=512m", "vettalon.poc=1"] {
             assert!(a.iter().any(|x| x == flag), "missing {flag}");
         }
@@ -271,14 +289,27 @@ mod tests {
         assert_ne!(a[user + 1], "0");
         // The image comes right before the command.
         let img = a.iter().position(|x| x == "img").unwrap();
-        assert_eq!(&a[img + 1..], &["timeout", "-s", "KILL", "125", "python3", "/workspace/poc.py"]);
+        assert_eq!(
+            &a[img + 1..],
+            &[
+                "timeout",
+                "-s",
+                "KILL",
+                "125",
+                "python3",
+                "/workspace/poc.py"
+            ]
+        );
     }
 
     #[test]
     fn script_exit_127_is_the_scripts_own_result() {
         assert!(is_docker_failure(125, ""));
         assert!(!is_docker_failure(127, "bash: curl: command not found"));
-        assert!(is_docker_failure(127, "docker: Error response from daemon: OCI runtime create failed"));
+        assert!(is_docker_failure(
+            127,
+            "docker: Error response from daemon: OCI runtime create failed"
+        ));
         assert!(!is_docker_failure(1, "OCI runtime"));
     }
 
@@ -288,7 +319,10 @@ mod tests {
             docker_bin: "/nonexistent/docker".into(),
             image: "img".into(),
         };
-        let e = sb.run_script("x", "ruby", Duration::from_secs(1)).await.unwrap_err();
+        let e = sb
+            .run_script("x", "ruby", Duration::from_secs(1))
+            .await
+            .unwrap_err();
         assert!(e.contains("unsupported"));
     }
 
@@ -296,7 +330,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
     async fn docker_sandbox_runs_python_offline_as_non_root() {
-        let sb = DockerSandbox::detect(DEFAULT_POC_IMAGE).await.expect("docker + image");
+        let sb = DockerSandbox::detect(DEFAULT_POC_IMAGE)
+            .await
+            .expect("docker + image");
         let script = r#"import os, socket
 print('SANDBOX_OK', 6 * 7)
 print('UID', os.getuid())
@@ -306,7 +342,10 @@ try:
 except OSError:
     print('NET_BLOCKED')
 "#;
-        let (code, out) = sb.run_script(script, "python", Duration::from_secs(60)).await.unwrap();
+        let (code, out) = sb
+            .run_script(script, "python", Duration::from_secs(60))
+            .await
+            .unwrap();
         assert_eq!(code, 0, "{out}");
         assert!(out.contains("SANDBOX_OK 42"), "{out}");
         assert!(out.contains("NET_BLOCKED"), "{out}");

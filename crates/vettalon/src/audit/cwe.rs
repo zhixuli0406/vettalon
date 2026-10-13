@@ -22,7 +22,11 @@ pub fn normalize(raw: &str) -> Option<String> {
     // After the number only a separator (or nothing) may follow: `89abc`
     // is not CWE-89.
     let after = &rest[digits.len()..];
-    if after.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+    if after
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
         return None;
     }
     let n: u32 = digits.parse().ok()?;
@@ -33,7 +37,9 @@ pub fn normalize(raw: &str) -> Option<String> {
 pub fn from_semgrep_metadata(meta: &serde_json::Value) -> Option<String> {
     match meta.get("cwe")? {
         serde_json::Value::String(s) => normalize(s),
-        serde_json::Value::Array(items) => items.iter().filter_map(|v| v.as_str()).find_map(normalize),
+        serde_json::Value::Array(items) => {
+            items.iter().filter_map(|v| v.as_str()).find_map(normalize)
+        }
         _ => None,
     }
 }
@@ -55,14 +61,26 @@ mod tests {
         assert_eq!(normalize("CWE 22").as_deref(), Some("CWE-22"));
         assert_eq!(normalize("918").as_deref(), Some("CWE-918"));
         assert_eq!(
-            normalize("CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code").as_deref(),
+            normalize(
+                "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+            )
+            .as_deref(),
             Some("CWE-95")
         );
     }
 
     #[test]
     fn rejects_garbage() {
-        for bad in ["", "CWE-", "CWE-0", "abc", "89abc", "CWE-123456", "null", "N/A"] {
+        for bad in [
+            "",
+            "CWE-",
+            "CWE-0",
+            "abc",
+            "89abc",
+            "CWE-123456",
+            "null",
+            "N/A",
+        ] {
             assert!(normalize(bad).is_none(), "{bad:?}");
         }
     }
@@ -79,6 +97,9 @@ mod tests {
     #[test]
     fn sarif_tag_is_zero_padded() {
         assert_eq!(sarif_tag("CWE-79").as_deref(), Some("external/cwe/cwe-079"));
-        assert_eq!(sarif_tag("CWE-1321").as_deref(), Some("external/cwe/cwe-1321"));
+        assert_eq!(
+            sarif_tag("CWE-1321").as_deref(),
+            Some("external/cwe/cwe-1321")
+        );
     }
 }

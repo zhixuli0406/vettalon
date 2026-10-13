@@ -228,13 +228,13 @@ fn severity_row(c: &SeverityCounts) -> String {
     )
 }
 
-fn incomplete_reason_zh(
-    r: vettalon_contract::coverage::IncompleteReason,
-) -> &'static str {
+fn incomplete_reason_zh(r: vettalon_contract::coverage::IncompleteReason) -> &'static str {
     use vettalon_contract::coverage::IncompleteReason as R;
     match r {
         R::EngineUnavailable => "AI 引擎無法使用",
-        R::ValidationBudgetExhausted => "候選數已達全程上限（多模型時由各 finder 分攤），部分候選或模組未處理",
+        R::ValidationBudgetExhausted => {
+            "候選數已達全程上限（多模型時由各 finder 分攤），部分候選或模組未處理"
+        }
         R::BudgetCannotFundReserves => "預算不足以保留覆核額度",
         R::CriticBudgetExhausted => "覆核預算用盡",
         R::Interrupted => "執行被中斷",
@@ -303,7 +303,10 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
     let unverified = report
         .findings
         .iter()
-        .filter(|f| f.source_engine == super::schema::AI_AUDIT_ENGINE_NAME && f.status == super::schema::FindingStatus::Candidate)
+        .filter(|f| {
+            f.source_engine == super::schema::AI_AUDIT_ENGINE_NAME
+                && f.status == super::schema::FindingStatus::Candidate
+        })
         .count();
     if unverified > 0 {
         out.push_str(&format!(
@@ -322,7 +325,11 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
             report.ensemble.suspected_injection.len()
         ));
         for s in &report.ensemble.suspected_injection {
-            out.push_str(&format!("    [injection:{}] {}\n", s.module_path, s.signals.join(",")));
+            out.push_str(&format!(
+                "    [injection:{}] {}\n",
+                s.module_path,
+                s.signals.join(",")
+            ));
         }
     }
     if !report.ensemble.refusals.is_empty() {

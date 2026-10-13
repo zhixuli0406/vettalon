@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Only the public repo cuts releases; the private mirror never publishes.
+    if: github.repository == 'zhixuli0406/vettalon'
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write   # cosign keyless (Sigstore OIDC) signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: vettalon-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: vettalon-darwin-x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: vettalon-linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: vettalon-linux-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: vettalon-windows-x64
+    steps:
+      - name: Validate tag
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: '[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag $TAG"; exit 1; }'
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --locked
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            cross build --release -p vettalon --target ${{ matrix.target }}
+          else
+            cargo build --release -p vettalon --target ${{ matrix.target }}
+          fi
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir _pkg
+          cp target/${{ matrix.target }}/release/vettalon _pkg/
+          cp README.md LICENSE NOTICE _pkg/
+          tar czf ${{ matrix.artifact }}.tar.gz -C _pkg .
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          cosign sign-blob --yes \
+            --output-signature ${{ matrix.artifact }}.tar.gz.sig \
+            --output-certificate ${{ matrix.artifact }}.tar.gz.pem \
+            ${{ matrix.artifact }}.tar.gz
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory _pkg | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/vettalon.exe _pkg/
+          Copy-Item README.md,LICENSE,NOTICE _pkg/
+          Compress-Archive -Path _pkg/* -DestinationPath ${{ matrix.artifact }}.zip
+          (Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii ${{ matrix.artifact }}.zip.sha256
+          cosign sign-blob --yes --output-signature ${{ matrix.artifact }}.zip.sig --output-certificate ${{ matrix.artifact }}.zip.pem ${{ matrix.artifact }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            vettalon-*.tar.gz*
+            vettalon-*.zip*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      # minisign is optional: sign only if the keypair secret is configured
+      # (reuses the DuDuClaw signing setup). cosign signatures ship regardless.
+      - name: Sign with minisign (optional)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          [ -z "$MINISIGN_SECRET_KEY" ] && { echo "no MINISIGN_SECRET_KEY, skipping"; exit 0; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/mk.key
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          for f in vettalon-*.tar.gz vettalon-*.zip; do
+            [ -f "$f" ] && minisign -S -s /tmp/mk.key -m "$f" -t "vettalon $TAG $f" -x "$f.minisig"
+          done
+          rm -f /tmp/mk.key
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            vettalon-*.tar.gz
+            vettalon-*.zip
+            vettalon-*.sha256
+            vettalon-*.sig
+            vettalon-*.pem
+            vettalon-*.minisig
+
+  npm-publish:
+    needs: release
+    if: github.repository == 'zhixuli0406/vettalon'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+      - name: Publish to npm
+        if: ${{ secrets.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ARTIFACTS_DIR: ./artifacts
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          ./npm/scripts/publish.sh "${TAG#v}"

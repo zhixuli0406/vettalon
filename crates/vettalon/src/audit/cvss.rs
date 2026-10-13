@@ -159,7 +159,11 @@ impl BaseMetrics {
         } else {
             (impact + exploitability).min(10.0)
         };
-        if v31 { roundup_31(raw) } else { roundup_30(raw) }
+        if v31 {
+            roundup_31(raw)
+        } else {
+            roundup_30(raw)
+        }
     }
 }
 
@@ -224,12 +228,12 @@ mod tests {
     fn malformed_vectors_are_rejected_not_guessed() {
         for bad in [
             "",
-            "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",           // no prefix
+            "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", // no prefix
             "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H", // v4 not scored here
-            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H",       // missing A
-            "CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",   // unknown value
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H", // missing A
+            "CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", // unknown value
             "CVSS:3.1/AV:N/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", // duplicate
-            "CVSS:3.1/AV:NN/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",  // multi-char
+            "CVSS:3.1/AV:NN/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", // multi-char
             "CVSS:3.1/garbage",
         ] {
             assert!(CvssScore::from_vector(bad).is_none(), "{bad:?}");

@@ -1,0 +1,44 @@
+name: Bug report
+description: Something does not work the way the docs say it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. Remove API keys, tokens and any source you can't share before pasting.
+        A security problem in Vettalon itself goes to the [private report](https://github.com/zhixuli0406/vettalon/security/advisories/new), not here.
+  - type: input
+    id: version
+    attributes:
+      label: Vettalon version
+      description: Output of `vettalon --version`.
+      placeholder: vettalon 0.1.0
+    validations: { required: true }
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - npm (npm install -g vettalon)
+        - Prebuilt release binary
+        - cargo install --path
+        - Built from source
+        - Other
+    validations: { required: true }
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: ["macOS (Apple silicon)", "macOS (Intel)", "Linux x64", "Linux arm64", "Windows"]
+    validations: { required: true }
+  - type: textarea
+    id: models
+    attributes:
+      label: Model roster
+      description: Which backends were in your roster (claude / codex / grok / OpenAI-compatible / Ollama). No keys.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what happened instead. Paste the output.
+    validations: { required: true }

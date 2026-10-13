@@ -97,7 +97,12 @@ fn result(f: &Finding) -> Value {
             .evidence
             .iter()
             .rev()
-            .find(|e| matches!(e.kind, EvidenceKind::AdversarialReview | EvidenceKind::OperatorReview))
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    EvidenceKind::AdversarialReview | EvidenceKind::OperatorReview
+                )
+            })
             .map(|e| crate::util::truncate_bytes(&e.detail, 500).to_string())
             .unwrap_or_else(|| status_str(f.status));
         r["suppressions"] = json!([{ "kind": "external", "justification": why }]);
@@ -175,10 +180,22 @@ pub fn write_sarif(report: &AuditReport, path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::schema::{FindingKind, GatePolicy, ProfileMode, ScanProfile, Summary, VerifierInfo};
+    use crate::audit::schema::{
+        FindingKind, GatePolicy, ProfileMode, ScanProfile, Summary, VerifierInfo,
+    };
 
     fn finding(sev: Severity, status: FindingStatus, line: Option<u32>) -> Finding {
-        let mut f = Finding::candidate("semgrep", FindingKind::StaticAnalysis, sev, "t", "src/a.py", line, "s", "rule/x", vec![]);
+        let mut f = Finding::candidate(
+            "semgrep",
+            FindingKind::StaticAnalysis,
+            sev,
+            "t",
+            "src/a.py",
+            line,
+            "s",
+            "rule/x",
+            vec![],
+        );
         f.status = status;
         f
     }
@@ -188,7 +205,10 @@ mod tests {
             schema_version: 2,
             repo: "/r".into(),
             started_at: "2026-10-12T00:00:00Z".into(),
-            profile: ScanProfile { mode: ProfileMode::Quick, intake: None },
+            profile: ScanProfile {
+                mode: ProfileMode::Quick,
+                intake: None,
+            },
             engines_run: vec![],
             engines_missing: vec![],
             summary: Summary::from_findings(&findings, 0, 0, GatePolicy::default(), &[]),
@@ -206,14 +226,24 @@ mod tests {
     fn cwe_becomes_github_tag_and_cvss_drives_security_severity() {
         let mut a = finding(Severity::High, FindingStatus::Candidate, Some(3));
         a.cwe = Some("CWE-89".into());
-        a.cvss = crate::audit::cvss::CvssScore::from_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H");
+        a.cvss = crate::audit::cvss::CvssScore::from_vector(
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        );
         a.cve = vec!["CVE-2021-9999".into()];
         let sarif = to_sarif(&report(vec![a]));
         let rule = &sarif["runs"][0]["tool"]["driver"]["rules"][0];
-        let tags: Vec<&str> = rule["properties"]["tags"].as_array().unwrap().iter().filter_map(|t| t.as_str()).collect();
+        let tags: Vec<&str> = rule["properties"]["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
         assert!(tags.contains(&"security"));
         assert!(tags.contains(&"external/cwe/cwe-089"), "{tags:?}");
-        assert_eq!(rule["properties"]["security-severity"], "9.8", "real CVSS beats the severity default");
+        assert_eq!(
+            rule["properties"]["security-severity"], "9.8",
+            "real CVSS beats the severity default"
+        );
         let res = &sarif["runs"][0]["results"][0];
         assert_eq!(res["properties"]["vettalon.cwe"], "CWE-89");
         assert_eq!(res["properties"]["vettalon.cve"][0], "CVE-2021-9999");
@@ -229,8 +259,15 @@ mod tests {
         assert_eq!(s["version"], "2.1.0");
         let res = s["runs"][0]["results"].as_array().unwrap();
         assert_eq!(res[0]["level"], "warning");
-        assert_eq!(res[0]["locations"][0]["physicalLocation"]["region"]["startLine"], 3);
-        assert!(res[1]["locations"][0]["physicalLocation"].get("region").is_none());
+        assert_eq!(
+            res[0]["locations"][0]["physicalLocation"]["region"]["startLine"],
+            3
+        );
+        assert!(
+            res[1]["locations"][0]["physicalLocation"]
+                .get("region")
+                .is_none()
+        );
         let rules = s["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["properties"]["security-severity"], "9.5");
@@ -240,11 +277,19 @@ mod tests {
     fn unsafe_claimed_paths_get_no_location_and_uris_are_encoded() {
         let mut f = finding(Severity::High, FindingStatus::Refuted, Some(1));
         f.file = "/etc/passwd".into();
-        let mut r = report(vec![f, finding(Severity::Low, FindingStatus::Candidate, Some(2))]);
+        let mut r = report(vec![
+            f,
+            finding(Severity::Low, FindingStatus::Candidate, Some(2)),
+        ]);
         r.findings[1].file = "src/中 文.py".into();
         r.repo = "/home/a b".into();
         let s = to_sarif(&r);
-        assert!(s["runs"][0]["results"][0]["locations"].as_array().unwrap().is_empty());
+        assert!(
+            s["runs"][0]["results"][0]["locations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             s["runs"][0]["results"][1]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
             "src/%E4%B8%AD%20%E6%96%87.py"
@@ -256,7 +301,11 @@ mod tests {
 
     #[test]
     fn refuted_is_suppressed_not_dropped() {
-        let s = to_sarif(&report(vec![finding(Severity::High, FindingStatus::Refuted, Some(1))]));
+        let s = to_sarif(&report(vec![finding(
+            Severity::High,
+            FindingStatus::Refuted,
+            Some(1),
+        )]));
         let res = &s["runs"][0]["results"][0];
         assert_eq!(res["suppressions"][0]["kind"], "external");
         assert_eq!(res["properties"]["vettalon.status"], "refuted");

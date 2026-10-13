@@ -6,7 +6,6 @@
 //! "slice from the first `{` to the last `}`" helpers were removed in v2:
 //! a reply that violates the contract is discarded, never repaired.
 
-
 /// Neutralize a closing XML tag inside untrusted data so it can't break out
 /// of its delimiter block. Prompt-injection hardening: content read from a
 /// possibly-adversarial repository is DATA, and must never be able to

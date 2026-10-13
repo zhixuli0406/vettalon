@@ -1,0 +1,17 @@
+name: Feature request
+description: Suggest an improvement to the open-source core.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The use case first, not the implementation.
+    validations: { required: true }
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like it to do?
+  - type: markdown
+    attributes:
+      value: "Reminder: the desktop app, dashboard and report generator are a separate paid product and out of scope for this repo."

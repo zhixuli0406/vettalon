@@ -118,8 +118,11 @@ impl LlmCaller for StepCaller {
             self.log.push(RefusalEvent {
                 model: self.model.id.clone(),
                 step: self.step.to_string(),
-                excerpt: crate::util::truncate_bytes(&crate::util::mask_sensitive_text(excerpt), 200)
-                    .to_string(),
+                excerpt: crate::util::truncate_bytes(
+                    &crate::util::mask_sensitive_text(excerpt),
+                    200,
+                )
+                .to_string(),
             });
         }
         r
@@ -168,7 +171,11 @@ mod tests {
     #[tokio::test]
     async fn step_caller_logs_refusal_and_does_not_retry() {
         let log = RefusalLog::default();
-        let c = StepCaller::new(handle("a", Err(LlmError::Refused("no".into()))), "audit", log.clone());
+        let c = StepCaller::new(
+            handle("a", Err(LlmError::Refused("no".into()))),
+            "audit",
+            log.clone(),
+        );
         assert!(matches!(c.complete("p").await, Err(LlmError::Refused(_))));
         assert_eq!(c.call_count(), 1);
         let ev = log.snapshot();
@@ -182,8 +189,15 @@ mod tests {
         let log = RefusalLog::default();
         let ok = StepCaller::new(handle("a", Ok("{}".into())), "audit", log.clone());
         assert_eq!(ok.complete("p").await.unwrap(), "{}");
-        let err = StepCaller::new(handle("b", Err(LlmError::Executor("t".into()))), "audit", log.clone());
-        assert!(matches!(err.complete("p").await, Err(LlmError::Executor(_))));
+        let err = StepCaller::new(
+            handle("b", Err(LlmError::Executor("t".into()))),
+            "audit",
+            log.clone(),
+        );
+        assert!(matches!(
+            err.complete("p").await,
+            Err(LlmError::Executor(_))
+        ));
         assert!(log.snapshot().is_empty());
     }
 

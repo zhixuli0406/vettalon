@@ -43,8 +43,8 @@ mod prompts;
 mod report;
 pub mod sarif;
 mod scanners;
-pub mod triage;
 pub mod schema;
+pub mod triage;
 mod validator;
 
 use std::collections::HashSet;
@@ -114,7 +114,11 @@ impl std::fmt::Display for ScanError {
             }
             ScanError::NotADirectory(p) => write!(f, "掃描目標不是資料夾：{p}"),
             ScanError::ReportInvalid(vs) => {
-                write!(f, "報告未通過內部驗證（這是 vettalon 本身的錯誤）：{}", vs.join("; "))
+                write!(
+                    f,
+                    "報告未通過內部驗證（這是 vettalon 本身的錯誤）：{}",
+                    vs.join("; ")
+                )
             }
         }
     }
@@ -194,7 +198,10 @@ impl Progress for NoProgress {
 /// `cmd_scan`, and a GUI): it never prints a summary, writes a file, or
 /// exits the process — those are the caller's job. Advisory hints from the
 /// sub-steps still go to stderr.
-pub async fn run_scan(home_dir: &Path, opts: &ScanOptions) -> std::result::Result<AuditReport, ScanError> {
+pub async fn run_scan(
+    home_dir: &Path,
+    opts: &ScanOptions,
+) -> std::result::Result<AuditReport, ScanError> {
     run_scan_with_progress(home_dir, opts, &NoProgress).await
 }
 
@@ -211,10 +218,11 @@ pub async fn run_scan_with_progress(
     if opts.poc && profile_mode != ProfileMode::Deep {
         eprintln!("[vettalon] 提示：--poc 需搭配 --profile deep 才會有作用。");
     }
-    let repo_root = std::fs::canonicalize(&opts.repo_path).map_err(|e| ScanError::UnresolvablePath {
-        path: opts.repo_path.display().to_string(),
-        detail: e.to_string(),
-    })?;
+    let repo_root =
+        std::fs::canonicalize(&opts.repo_path).map_err(|e| ScanError::UnresolvablePath {
+            path: opts.repo_path.display().to_string(),
+            detail: e.to_string(),
+        })?;
     if !repo_root.is_dir() {
         return Err(ScanError::NotADirectory(repo_root.display().to_string()));
     }
@@ -281,9 +289,12 @@ pub async fn run_scan_with_progress(
     refusal_events.sort_by(|a, b| (&a.step, &a.model).cmp(&(&b.step, &b.model)));
     // Precedence: whole shares lost > budget cap > refusals > other gaps.
     let unverified = findings.iter().any(adversarial::is_eligible);
-    let units_failed = coverage
-        .iter()
-        .any(|c| matches!(c.status, schema::ModuleCoverageStatus::LlmFailed | schema::ModuleCoverageStatus::ParseFailed));
+    let units_failed = coverage.iter().any(|c| {
+        matches!(
+            c.status,
+            schema::ModuleCoverageStatus::LlmFailed | schema::ModuleCoverageStatus::ParseFailed
+        )
+    });
     if incomplete_reason.is_none() {
         incomplete_reason = if !refusal_events.is_empty() {
             Some(IncompleteReason::ModelRefused)
@@ -298,7 +309,13 @@ pub async fn run_scan_with_progress(
     let gate = GatePolicy {
         include_needs_human: opts.fail_on_needs_human,
     };
-    let summary = Summary::from_findings(&findings, engines_run.len(), engines_missing.len(), gate, &coverage);
+    let summary = Summary::from_findings(
+        &findings,
+        engines_run.len(),
+        engines_missing.len(),
+        gate,
+        &coverage,
+    );
     let mut audit_report = AuditReport {
         schema_version: CURRENT_SCHEMA_VERSION,
         repo: repo_str,
@@ -396,9 +413,26 @@ pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
 
 /// Fields that are identifiers or fixed vocabulary, never free text.
 const NON_TEXT_FIELDS: &[&str] = &[
-    "id", "source_engine", "kind", "severity", "file", "rule_id", "status", "root_fingerprint",
-    "file_hash", "severity_basis", "recorded_at", "source", "found_by", "model", "family", "verdict",
-    "cwe", "cve", "cvss_version", "cvss_vector",
+    "id",
+    "source_engine",
+    "kind",
+    "severity",
+    "file",
+    "rule_id",
+    "status",
+    "root_fingerprint",
+    "file_hash",
+    "severity_basis",
+    "recorded_at",
+    "source",
+    "found_by",
+    "model",
+    "family",
+    "verdict",
+    "cwe",
+    "cve",
+    "cvss_version",
+    "cvss_vector",
 ];
 
 /// Mask secret-shaped text in every free-text field of every finding
@@ -420,7 +454,9 @@ fn sanitize_findings(findings: &mut [Finding]) {
         }
     }
     for f in findings.iter_mut() {
-        let Ok(mut v) = serde_json::to_value(&*f) else { continue };
+        let Ok(mut v) = serde_json::to_value(&*f) else {
+            continue;
+        };
         walk(&mut v, None);
         if let Ok(clean) = serde_json::from_value(v) {
             *f = clean;
@@ -435,7 +471,12 @@ fn verifier_info(findings: &[Finding], opts: &ScanOptions, mode: ProfileMode) ->
         return VerifierInfo::default();
     }
     let ids = |ms: &[ModelHandle]| {
-        (!ms.is_empty()).then(|| ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(","))
+        (!ms.is_empty()).then(|| {
+            ms.iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
     };
     let settled: Vec<&VerifierVote> = findings
         .iter()
@@ -490,7 +531,8 @@ async fn run_audit_step(
     let ranked = ai_audit::rank_modules(&all_files, &hotspots, &intake_profile.entry_points);
     // Split oversized modules into pages so a large high-signal file in a
     // populous flat directory is audited, not dropped once the budget fills.
-    let ranked = ai_audit::paginate_modules(repo_root, ranked, ai_audit::MODULE_PROMPT_BUDGET_BYTES);
+    let ranked =
+        ai_audit::paginate_modules(repo_root, ranked, ai_audit::MODULE_PROMPT_BUDGET_BYTES);
     // `max_modules == 0` means "every ranked module" (the GUI's "完整" / full
     // coverage); any positive value caps it to the top-N by risk.
     let take = if opts.max_modules == 0 {
@@ -579,7 +621,14 @@ async fn run_audit_step(
                 }
                 let caller = StepCaller::new(finder.clone(), "audit", refusals.clone());
                 let outcome = ai_audit::run_ai_audit_progress(
-                    repo_root, share, &caller, cap, progress, &finder.id, &audited, total_modules,
+                    repo_root,
+                    share,
+                    &caller,
+                    cap,
+                    progress,
+                    &finder.id,
+                    &audited,
+                    total_modules,
                 )
                 .await;
                 Some((finder.id.clone(), outcome))
@@ -623,10 +672,13 @@ async fn run_audit_step(
             } => {
                 step.ran = true;
                 cap_hit |= candidate_cap_hit;
-                step.engine_runs.extend(engine_runs.into_iter().map(|mut r| {
-                    r.engine = r.engine.replacen("ai_audit:", &format!("ai_audit[{model}]:"), 1);
-                    r
-                }));
+                step.engine_runs
+                    .extend(engine_runs.into_iter().map(|mut r| {
+                        r.engine =
+                            r.engine
+                                .replacen("ai_audit:", &format!("ai_audit[{model}]:"), 1);
+                        r
+                    }));
                 step.findings.extend(findings.into_iter().map(|mut f| {
                     f.found_by = vec![model.clone()];
                     f
@@ -637,7 +689,10 @@ async fn run_audit_step(
     }
     step.coverage = coverage::build_module_coverage(&ranked, &reports);
     // A flagged module seen by only one family is not genuinely cross-checked.
-    let single_family = opts.finders.iter().all(|f| f.family == opts.finders[0].family);
+    let single_family = opts
+        .finders
+        .iter()
+        .all(|f| f.family == opts.finders[0].family);
     step.incomplete = if cap_hit {
         Some(IncompleteReason::ValidationBudgetExhausted)
     } else if unreachable {
@@ -662,7 +717,11 @@ fn scan_modules_for_injection(
             let files: Vec<(String, String)> = m
                 .files
                 .iter()
-                .filter_map(|f| crate::util::read_repo_file(repo_root, f).ok().map(|c| (f.clone(), c)))
+                .filter_map(|f| {
+                    crate::util::read_repo_file(repo_root, f)
+                        .ok()
+                        .map(|c| (f.clone(), c))
+                })
                 .collect();
             injection::scan_module(&m.module_path, &files)
         })
@@ -700,10 +759,13 @@ async fn review_step(
     progress: &dyn Progress,
 ) -> Vec<Finding> {
     if opts.verifiers.is_empty() {
-        eprintln!("[vettalon] 提示：沒有設定 verifier 模型，候選發現維持 candidate（未覆核），本次執行標為 incomplete。");
+        eprintln!(
+            "[vettalon] 提示：沒有設定 verifier 模型，候選發現維持 candidate（未覆核），本次執行標為 incomplete。"
+        );
         return findings;
     }
-    let mut groups: Vec<Vec<(usize, assign::VerifierPick)>> = vec![Vec::new(); opts.verifiers.len()];
+    let mut groups: Vec<Vec<(usize, assign::VerifierPick)>> =
+        vec![Vec::new(); opts.verifiers.len()];
     // One run-wide counter, so the review load rotates across every
     // eligible verifier instead of always landing on the first one.
     let mut nth = 0usize;
@@ -751,7 +813,10 @@ async fn review_step(
                 if dead {
                     adversarial::note_unverified(
                         &mut f,
-                        &format!("verifier {} unreachable earlier in this run; not attempted", verifier.id),
+                        &format!(
+                            "verifier {} unreachable earlier in this run; not attempted",
+                            verifier.id
+                        ),
                     );
                     out.push((i, f));
                     continue;
@@ -793,7 +858,12 @@ async fn review_step(
 
 /// Step 3d: PoC generation, by a PoC-role model of another family than the
 /// finder when possible. `maybe_run_poc` applies the eligibility gate.
-async fn poc_step(repo_root: &Path, findings: &mut [Finding], opts: &ScanOptions, refusals: &RefusalLog) {
+async fn poc_step(
+    repo_root: &Path,
+    findings: &mut [Finding],
+    opts: &ScanOptions,
+    refusals: &RefusalLog,
+) {
     if opts.poc_models.is_empty() {
         eprintln!("[vettalon] 提示：沒有設定 poc 模型，略過 PoC。");
         return;
@@ -813,7 +883,10 @@ async fn poc_step(repo_root: &Path, findings: &mut [Finding], opts: &ScanOptions
 /// including "not an AuditReport shape"); `2` unreadable or not JSON.
 /// Validator findings for a report, as display strings.
 pub fn validation_errors(report: &AuditReport) -> Vec<String> {
-    validator::validate_report(report).iter().map(|v| v.to_string()).collect()
+    validator::validate_report(report)
+        .iter()
+        .map(|v| v.to_string())
+        .collect()
 }
 
 /// Read a saved report to build a deliverable from: size-capped,
@@ -823,7 +896,10 @@ pub fn load_report_for_delivery(path: &Path) -> Result<AuditReport, String> {
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
     let meta = std::fs::metadata(path).map_err(|e| format!("無法讀取 {}：{e}", path.display()))?;
     if meta.len() > MAX_BYTES {
-        return Err(format!("報告檔過大（{} bytes，上限 {MAX_BYTES}）", meta.len()));
+        return Err(format!(
+            "報告檔過大（{} bytes，上限 {MAX_BYTES}）",
+            meta.len()
+        ));
     }
     let raw = std::fs::read(path).map_err(|e| format!("無法讀取 {}：{e}", path.display()))?;
     let report: AuditReport =
@@ -831,7 +907,11 @@ pub fn load_report_for_delivery(path: &Path) -> Result<AuditReport, String> {
     let errors = validation_errors(&report);
     if !errors.is_empty() {
         let head: Vec<&str> = errors.iter().take(5).map(String::as_str).collect();
-        return Err(format!("報告未通過驗證（{} 項）：{}", errors.len(), head.join("；")));
+        return Err(format!(
+            "報告未通過驗證（{} 項）：{}",
+            errors.len(),
+            head.join("；")
+        ));
     }
     Ok(report)
 }
@@ -984,7 +1064,11 @@ mod tests {
         }
     }
 
-    fn model(id: &str, family: &str, replies: Vec<crate::llm::Result<String>>) -> (ModelHandle, Arc<Script>) {
+    fn model(
+        id: &str,
+        family: &str,
+        replies: Vec<crate::llm::Result<String>>,
+    ) -> (ModelHandle, Arc<Script>) {
         let s = Arc::new(Script {
             replies: Mutex::new(replies),
             prompts: Mutex::new(Vec::new()),
@@ -1033,12 +1117,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rec = Rec(Mutex::new(Vec::new()));
         // quick profile: scanners → report → done (no AI phases).
-        run_scan_with_progress(home.path(), &opts(dir.path().to_path_buf()), &rec).await.unwrap();
+        run_scan_with_progress(home.path(), &opts(dir.path().to_path_buf()), &rec)
+            .await
+            .unwrap();
         let seen = rec.0.lock().unwrap().clone();
         assert_eq!(seen.first().map(String::as_str), Some("scanners"));
         assert_eq!(seen.last().map(String::as_str), Some("done"));
         assert!(seen.iter().any(|p| p == "report"));
-        assert!(!seen.iter().any(|p| p == "intake"), "quick profile skips intake");
+        assert!(
+            !seen.iter().any(|p| p == "intake"),
+            "quick profile skips intake"
+        );
     }
 
     #[tokio::test]
@@ -1046,27 +1135,45 @@ mod tests {
         // The library seam a GUI uses: a value, never a process exit.
         let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let report = run_scan(home.path(), &opts(dir.path().to_path_buf())).await.unwrap();
+        let report = run_scan(home.path(), &opts(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         assert_eq!(report.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(validator::validate_report(&report).is_empty());
 
         let mut bad = opts(dir.path().to_path_buf());
         bad.profile = "bogus".into();
-        assert!(matches!(run_scan(home.path(), &bad).await, Err(ScanError::BadProfile(_))));
+        assert!(matches!(
+            run_scan(home.path(), &bad).await,
+            Err(ScanError::BadProfile(_))
+        ));
 
         let mut missing = opts(PathBuf::from("/definitely/does/not/exist/xyz"));
         missing.profile = "quick".into();
-        assert!(matches!(run_scan(home.path(), &missing).await, Err(ScanError::UnresolvablePath { .. })));
+        assert!(matches!(
+            run_scan(home.path(), &missing).await,
+            Err(ScanError::UnresolvablePath { .. })
+        ));
 
         let file = dir.path().join("f.txt");
         std::fs::write(&file, "x").unwrap();
-        assert!(matches!(run_scan(home.path(), &opts(file)).await, Err(ScanError::NotADirectory(_))));
+        assert!(matches!(
+            run_scan(home.path(), &opts(file)).await,
+            Err(ScanError::NotADirectory(_))
+        ));
     }
 
     #[tokio::test]
     async fn invalid_inputs_exit_2() {
         let home = tempfile::tempdir().unwrap();
-        assert_eq!(cmd_scan(home.path(), opts(PathBuf::from("/definitely/does/not/exist/xyz"))).await, 2);
+        assert_eq!(
+            cmd_scan(
+                home.path(),
+                opts(PathBuf::from("/definitely/does/not/exist/xyz"))
+            )
+            .await,
+            2
+        );
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("f.txt");
         std::fs::write(&file, "x").unwrap();
@@ -1088,16 +1195,23 @@ mod tests {
         deep.profile = "deep".into();
         deep.report = Some(report_path.clone());
         assert_eq!(cmd_scan(home.path(), deep).await, 0);
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
         assert_eq!(v["profile"]["mode"], "deep");
-        let missing: Vec<&str> = v["engines_missing"].as_array().unwrap().iter().filter_map(|m| m["engine"].as_str()).collect();
+        let missing: Vec<&str> = v["engines_missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["engine"].as_str())
+            .collect();
         assert!(missing.contains(&"ai_audit"));
         assert_eq!(cmd_validate(&report_path).await, 0);
 
         let mut quick = opts(dir.path().to_path_buf());
         quick.report = Some(report_path.clone());
         assert_eq!(cmd_scan(home.path(), quick).await, 0);
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
         assert!(v["profile"]["intake"].is_null());
         assert_eq!(v["verifier"]["independence"], "not_run");
     }
@@ -1112,7 +1226,12 @@ mod tests {
         let mut o = opts(dir.path().to_path_buf());
         o.save = true;
         assert_eq!(cmd_scan(home.path(), o).await, 0);
-        assert_eq!(std::fs::read_dir(home.path().join("reports")).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(home.path().join("reports"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1124,7 +1243,8 @@ mod tests {
         o.profile = "deep".into();
         o.report = Some(report_path.clone());
         assert_eq!(cmd_scan(home.path(), o).await, 0);
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
         assert_eq!(v["run_status"], "incomplete");
         assert_eq!(v["incomplete_reason"], "engine_unavailable");
     }
@@ -1138,7 +1258,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let cand = format!("[{}]", ai_audit::tests::cand_json("a/main.rs", 3));
         let (finder, _) = model("claude", "anthropic", vec![Ok(cand)]);
-        let (other, other_s) = model("codex", "openai", vec![Ok(adversarial::tests::PLAUSIBLE.to_string())]);
+        let (other, other_s) = model(
+            "codex",
+            "openai",
+            vec![Ok(adversarial::tests::PLAUSIBLE.to_string())],
+        );
         let report_path = dir.path().join("r.json");
         let mut o = opts(dir.path().to_path_buf());
         o.profile = "deep".into();
@@ -1147,8 +1271,14 @@ mod tests {
         o.finders = vec![finder.clone()];
         o.verifiers = vec![finder.clone(), other.clone()];
         let code = cmd_scan(home.path(), o).await;
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
-        let ai: Vec<&serde_json::Value> = v["findings"].as_array().unwrap().iter().filter(|f| f["source_engine"] == "ai_audit").collect();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let ai: Vec<&serde_json::Value> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["source_engine"] == "ai_audit")
+            .collect();
         assert_eq!(ai.len(), 1, "{v:#}");
         assert_eq!(ai[0]["found_by"], serde_json::json!(["claude"]));
         assert_eq!(ai[0]["status"], "needs_human");
@@ -1190,7 +1320,11 @@ mod tests {
         // A plain module (not high-risk) so f2 would only see it on a reroute.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("lib")).unwrap();
-        std::fs::write(dir.path().join("lib/helper.rs"), "fn helper() { let q = read(); }\n").unwrap();
+        std::fs::write(
+            dir.path().join("lib/helper.rs"),
+            "fn helper() { let q = read(); }\n",
+        )
+        .unwrap();
         let home = tempfile::tempdir().unwrap();
         let (f1, _) = model("grok", "xai", vec![Err(LlmError::Refused("no".into()))]);
         let (f2, s2) = model("claude", "anthropic", vec![]);
@@ -1202,7 +1336,8 @@ mod tests {
         o.roster = info(&[&f1, &f2]);
         o.finders = vec![f1, f2];
         assert_eq!(cmd_scan(home.path(), o).await, 0);
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
         assert_eq!(v["ensemble"]["refusals"][0]["model"], "grok");
         assert_eq!(v["ensemble"]["refusals"][0]["step"], "audit");
         assert!(s2.prompts.lock().unwrap().is_empty(), "must not reroute");
@@ -1236,7 +1371,11 @@ mod tests {
         let (f, s) = model(
             "grok",
             "xai",
-            vec![Err(LlmError::Refused("no".into())), Ok("[]".into()), Ok("[]".into())],
+            vec![
+                Err(LlmError::Refused("no".into())),
+                Ok("[]".into()),
+                Ok("[]".into()),
+            ],
         );
         let report_path = dir.path().join("r.json");
         let mut o = opts(dir.path().to_path_buf());
@@ -1245,11 +1384,28 @@ mod tests {
         o.roster = info(&[&f]);
         o.finders = vec![f];
         assert_eq!(cmd_scan(home.path(), o).await, 0);
-        assert_eq!(s.prompts.lock().unwrap().len(), 3, "all three modules attempted");
+        assert_eq!(
+            s.prompts.lock().unwrap().len(),
+            3,
+            "all three modules attempted"
+        );
         let v = read_report(&report_path);
-        let statuses: Vec<&str> = v["coverage"].as_array().unwrap().iter().map(|c| c["status"].as_str().unwrap()).collect();
-        assert_eq!(statuses.iter().filter(|s| **s == "llm_failed").count(), 1, "{statuses:?}");
-        assert_eq!(statuses.iter().filter(|s| **s == "covered").count(), 2, "{statuses:?}");
+        let statuses: Vec<&str> = v["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            statuses.iter().filter(|s| **s == "llm_failed").count(),
+            1,
+            "{statuses:?}"
+        );
+        assert_eq!(
+            statuses.iter().filter(|s| **s == "covered").count(),
+            2,
+            "{statuses:?}"
+        );
         assert_eq!(v["run_status"], "incomplete");
         assert_eq!(v["incomplete_reason"], "model_refused");
         assert_eq!(cmd_validate(&report_path).await, 0);
@@ -1296,10 +1452,15 @@ mod tests {
         let two = format!(
             "[{},{}]",
             ai_audit::tests::cand_json("a/main.rs", 3),
-            ai_audit::tests::cand_json("a/main.rs", 4).replace("sql_injection", "command_injection")
+            ai_audit::tests::cand_json("a/main.rs", 4)
+                .replace("sql_injection", "command_injection")
         );
         let (finder, _) = model("claude", "anthropic", vec![Ok(two)]);
-        let (ver, ver_s) = model("codex", "openai", vec![Err(LlmError::Executor("codex CLI not found".into()))]);
+        let (ver, ver_s) = model(
+            "codex",
+            "openai",
+            vec![Err(LlmError::Executor("codex CLI not found".into()))],
+        );
         let report_path = dir.path().join("r.json");
         let mut o = opts(dir.path().to_path_buf());
         o.profile = "deep".into();
@@ -1308,12 +1469,21 @@ mod tests {
         o.finders = vec![finder];
         o.verifiers = vec![ver];
         cmd_scan(home.path(), o).await;
-        assert_eq!(ver_s.prompts.lock().unwrap().len(), 1, "breaker after the first failure");
+        assert_eq!(
+            ver_s.prompts.lock().unwrap().len(),
+            1,
+            "breaker after the first failure"
+        );
         let v = read_report(&report_path);
         assert_eq!(v["verifier"]["independence"], "not_run");
         assert_eq!(v["run_status"], "incomplete");
         assert_eq!(v["incomplete_reason"], "units_failed");
-        let ai: Vec<&serde_json::Value> = v["findings"].as_array().unwrap().iter().filter(|f| f["source_engine"] == "ai_audit").collect();
+        let ai: Vec<&serde_json::Value> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["source_engine"] == "ai_audit")
+            .collect();
         assert_eq!(ai.len(), 2);
         assert!(ai.iter().all(|f| f["status"] == "candidate"));
         assert_eq!(cmd_validate(&report_path).await, 0);
@@ -1346,7 +1516,11 @@ mod tests {
         let dir = repo_with_module();
         let home = tempfile::tempdir().unwrap();
         let cand = format!("[{}]", ai_audit::tests::cand_json("a/main.rs", 3));
-        let (m, _) = model("claude", "anthropic", vec![Ok(cand), Ok(adversarial::tests::REFUTED.to_string())]);
+        let (m, _) = model(
+            "claude",
+            "anthropic",
+            vec![Ok(cand), Ok(adversarial::tests::REFUTED.to_string())],
+        );
         let report_path = dir.path().join("r.json");
         let mut o = opts(dir.path().to_path_buf());
         o.profile = "deep".into();
@@ -1356,7 +1530,12 @@ mod tests {
         o.verifiers = vec![m];
         cmd_scan(home.path(), o).await;
         let v = read_report(&report_path);
-        let vote = &v["findings"].as_array().unwrap().iter().find(|f| f["source_engine"] == "ai_audit").unwrap()["verification"][0];
+        let vote = &v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["source_engine"] == "ai_audit")
+            .unwrap()["verification"][0];
         assert_eq!(vote["same_model"], true);
         assert_eq!(vote["cross_family"], false);
         assert_eq!(v["verifier"]["independence"], "same_family");
@@ -1382,7 +1561,12 @@ mod tests {
         let mut fs = vec![f];
         sanitize_findings(&mut fs);
         let j = serde_json::to_string(&fs[0]).unwrap();
-        assert!(!j.contains("sk-live123456") && !j.contains("sk-abc123456789") && !j.contains("abc.def.ghi"), "{j}");
+        assert!(
+            !j.contains("sk-live123456")
+                && !j.contains("sk-abc123456789")
+                && !j.contains("abc.def.ghi"),
+            "{j}"
+        );
         assert_eq!(fs[0].id, id);
         assert_eq!(fs[0].file, "src/config.py");
         assert_eq!(fs[0].rule_id, "ai-audit/hardcoded-secret");
@@ -1398,7 +1582,10 @@ mod tests {
         let mut o = opts(dir.path().to_path_buf());
         o.report = Some(p.clone());
         assert_eq!(cmd_scan(home.path(), o).await, 0);
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     /// A high-risk module (entry point / git security hotspot) is audited by
@@ -1432,11 +1619,19 @@ mod tests {
         // Two plain modules (no entry point, no hotspot) → not high_risk.
         for m in ["alpha", "beta"] {
             std::fs::create_dir_all(dir.path().join(m)).unwrap();
-            std::fs::write(dir.path().join(m).join("util.rs"), "fn helper() {}
-").unwrap();
+            std::fs::write(
+                dir.path().join(m).join("util.rs"),
+                "fn helper() {}
+",
+            )
+            .unwrap();
         }
         let home = tempfile::tempdir().unwrap();
-        let (f1, s1) = model("claude", "anthropic", vec![Ok("[]".into()), Ok("[]".into())]);
+        let (f1, s1) = model(
+            "claude",
+            "anthropic",
+            vec![Ok("[]".into()), Ok("[]".into())],
+        );
         let (f2, s2) = model("codex", "openai", vec![Ok("[]".into()), Ok("[]".into())]);
         let report_path = dir.path().join("r.json");
         let mut o = opts(dir.path().to_path_buf());
@@ -1469,7 +1664,11 @@ mod tests {
         // cross-family finder (codex) finds the real bug.
         let (compliant, c_s) = model("claude", "anthropic", vec![Ok("[]".into())]);
         let cand = format!("[{}]", ai_audit::tests::cand_json("api/users.py", 4));
-        let (honest, h_s) = model("codex", "openai", vec![Ok(cand), Ok(adversarial::tests::PLAUSIBLE.to_string())]);
+        let (honest, h_s) = model(
+            "codex",
+            "openai",
+            vec![Ok(cand), Ok(adversarial::tests::PLAUSIBLE.to_string())],
+        );
         let report_path = dir.path().join("r.json");
         let mut o = opts(dir.path().to_path_buf());
         o.profile = "deep".into();
@@ -1480,13 +1679,34 @@ mod tests {
         cmd_scan(home.path(), o).await;
         // Both finders saw the one module (primary + cross-family).
         assert_eq!(c_s.prompts.lock().unwrap().len(), 1);
-        assert_eq!(h_s.prompts.lock().unwrap().iter().filter(|p| p.contains("<file_content")).count(), 1);
+        assert_eq!(
+            h_s.prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.contains("<file_content"))
+                .count(),
+            1
+        );
         let v = read_report(&report_path);
-        assert_eq!(v["ensemble"]["suspected_injection"][0]["module_path"], "api");
-        assert!(v["ensemble"]["suspected_injection"][0]["signals"].as_array().unwrap()
-            .iter().any(|x| x == "suppress_findings"), "{v:#}");
-        let ai: Vec<&serde_json::Value> = v["findings"].as_array().unwrap().iter()
-            .filter(|f| f["source_engine"] == "ai_audit").collect();
+        assert_eq!(
+            v["ensemble"]["suspected_injection"][0]["module_path"],
+            "api"
+        );
+        assert!(
+            v["ensemble"]["suspected_injection"][0]["signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x == "suppress_findings"),
+            "{v:#}"
+        );
+        let ai: Vec<&serde_json::Value> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["source_engine"] == "ai_audit")
+            .collect();
         assert_eq!(ai.len(), 1, "the honest finder still surfaced the bug");
         assert_eq!(ai[0]["found_by"], serde_json::json!(["codex"]));
         assert_eq!(cmd_validate(&report_path).await, 0);
@@ -1514,7 +1734,12 @@ mod tests {
         cmd_scan(home.path(), o).await;
         let v = read_report(&report_path);
         assert_eq!(v["run_status"], "incomplete");
-        assert!(!v["ensemble"]["suspected_injection"].as_array().unwrap().is_empty());
+        assert!(
+            !v["ensemble"]["suspected_injection"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(cmd_validate(&report_path).await, 0);
     }
 
@@ -1544,10 +1769,7 @@ mod tests {
         let garbage = dir.path().join("garbage.json");
         std::fs::write(&garbage, "not json").unwrap();
         assert_eq!(cmd_validate(&garbage).await, 2);
-        assert_eq!(
-            cmd_validate(&dir.path().join("missing.json")).await,
-            2
-        );
+        assert_eq!(cmd_validate(&dir.path().join("missing.json")).await, 2);
     }
 
     #[test]
@@ -1594,5 +1816,4 @@ mod tests {
         assert_eq!(dedup_by_id(&mut fs), 2);
         assert_eq!(fs.len(), 1);
     }
-
 }

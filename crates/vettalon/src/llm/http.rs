@@ -39,7 +39,10 @@ impl OpenAiCompatCaller {
     }
 
     pub fn endpoint(&self) -> String {
-        format!("{}/chat/completions", self.spec.base_url.trim_end_matches('/'))
+        format!(
+            "{}/chat/completions",
+            self.spec.base_url.trim_end_matches('/')
+        )
     }
 
     pub fn body(&self, prompt: &str) -> serde_json::Value {
@@ -63,20 +66,19 @@ impl LlmCaller for OpenAiCompatCaller {
             })?;
             req = req.bearer_auth(key);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| {
-                // reqwest errors embed the URL; some gateways carry keys in it.
-                LlmError::Executor(format!("request failed: {}", e.without_url()))
-            })?;
+        let resp = req.send().await.map_err(|e| {
+            // reqwest errors embed the URL; some gateways carry keys in it.
+            LlmError::Executor(format!("request failed: {}", e.without_url()))
+        })?;
         let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| LlmError::Executor(format!("cannot read response: {}", e.without_url())))?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            LlmError::Executor(format!("cannot read response: {}", e.without_url()))
+        })?;
         if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(LlmError::Executor(format!("response too large ({} bytes)", bytes.len())));
+            return Err(LlmError::Executor(format!(
+                "response too large ({} bytes)",
+                bytes.len()
+            )));
         }
         let text = String::from_utf8_lossy(&bytes).to_string();
         if !status.is_success() {
@@ -98,7 +100,9 @@ pub fn parse_reply(body: &str) -> Result<String> {
     if let Some(r) = msg["refusal"].as_str()
         && !r.trim().is_empty()
     {
-        return Err(LlmError::Refused(crate::util::truncate_bytes(r, 400).to_string()));
+        return Err(LlmError::Refused(
+            crate::util::truncate_bytes(r, 400).to_string(),
+        ));
     }
     if v["choices"][0]["finish_reason"].as_str() == Some("content_filter") {
         return Err(LlmError::Refused("provider content filter".into()));
@@ -153,7 +157,9 @@ mod tests {
             Err(LlmError::Refused(_))
         ));
         assert!(matches!(
-            parse_reply(r#"{"choices":[{"finish_reason":"content_filter","message":{"content":""}}]}"#),
+            parse_reply(
+                r#"{"choices":[{"finish_reason":"content_filter","message":{"content":""}}]}"#
+            ),
             Err(LlmError::Refused(_))
         ));
         assert!(matches!(parse_reply("nope"), Err(LlmError::Executor(_))));

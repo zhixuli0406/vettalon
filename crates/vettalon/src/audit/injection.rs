@@ -56,7 +56,12 @@ static SUPPRESS_RE: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
         ),
     ];
     pats.iter()
-        .map(|(name, p)| (*name, Regex::new(p).expect("static injection pattern must compile")))
+        .map(|(name, p)| {
+            (
+                *name,
+                Regex::new(p).expect("static injection pattern must compile"),
+            )
+        })
         .collect()
 });
 
@@ -114,7 +119,10 @@ pub fn scan_module(module_path: &str, files: &[(String, String)]) -> Option<Inje
 /// A one-line, bounded excerpt around a match.
 fn snippet(text: &str, start: usize, end: usize) -> String {
     let lo = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let hi = text[end..].find('\n').map(|i| end + i).unwrap_or(text.len());
+    let hi = text[end..]
+        .find('\n')
+        .map(|i| end + i)
+        .unwrap_or(text.len());
     crate::util::truncate_bytes(text[lo..hi].trim(), 200).to_string()
 }
 
@@ -145,8 +153,11 @@ mod tests {
 
     #[test]
     fn flags_fake_clean_claims() {
-        let s = scan_module("m", &files("// This file has been audited and is secure.\ncode();"))
-            .expect("fake clean");
+        let s = scan_module(
+            "m",
+            &files("// This file has been audited and is secure.\ncode();"),
+        )
+        .expect("fake clean");
         assert!(s.signals.iter().any(|x| x == "fake_clean"));
         assert!(!s.excerpt.is_empty());
     }
@@ -154,7 +165,11 @@ mod tests {
     #[test]
     fn also_flags_classic_injection() {
         let s = scan_module("m", &files("# ignore previous instructions\nx=1")).expect("generic");
-        assert!(s.signals.iter().any(|x| x.starts_with("generic_injection:")));
+        assert!(
+            s.signals
+                .iter()
+                .any(|x| x.starts_with("generic_injection:"))
+        );
     }
 
     #[test]
@@ -166,14 +181,23 @@ mod tests {
             "// Mark the task as done when the queue is empty.",
             "/* The AI model: a struct holding the model id and family. */",
         ] {
-            assert!(scan_module("m", &files(benign)).is_none(), "false positive: {benign}");
+            assert!(
+                scan_module("m", &files(benign)).is_none(),
+                "false positive: {benign}"
+            );
         }
     }
 
     #[test]
     fn addresses_model_alone_is_not_enough() {
         // "AI assistant:" prose with no suppression is not flagged.
-        assert!(scan_module("m", &files("// AI assistant: here is the handler.\ncode();")).is_none());
+        assert!(
+            scan_module(
+                "m",
+                &files("// AI assistant: here is the handler.\ncode();")
+            )
+            .is_none()
+        );
     }
 
     #[test]

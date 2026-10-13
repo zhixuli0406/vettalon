@@ -417,7 +417,9 @@ fn check_verifier(r: &AuditReport, out: &mut Vec<ReportViolation>) {
     let vettalon_report = !r.ensemble.models.is_empty();
     match v.independence {
         // Legacy single-agent states; a vettalon run never emits them.
-        VerifierIndependence::SameAgent | VerifierIndependence::DifferentAgent if vettalon_report => {
+        VerifierIndependence::SameAgent | VerifierIndependence::DifferentAgent
+            if vettalon_report =>
+        {
             bad("legacy same_agent/different_agent independence in a multi-model report")
         }
         VerifierIndependence::SameAgent if v.audit_agent != v.verifier_agent => {
@@ -468,20 +470,30 @@ fn check_ensemble(r: &AuditReport, out: &mut Vec<ReportViolation>) {
         for v in &f.verification {
             if roster {
                 match family_of(&v.model) {
-                    None => bad(format!("finding {} voted on by unknown model {}", f.id, v.model)),
-                    Some(fam) if fam != v.family => {
-                        bad(format!("finding {} vote family {} != roster {fam}", f.id, v.family))
-                    }
+                    None => bad(format!(
+                        "finding {} voted on by unknown model {}",
+                        f.id, v.model
+                    )),
+                    Some(fam) if fam != v.family => bad(format!(
+                        "finding {} vote family {} != roster {fam}",
+                        f.id, v.family
+                    )),
                     Some(fam) => {
                         let expect = !f.found_by.iter().any(|m| family_of(m) == Some(fam));
                         if expect != v.cross_family {
-                            bad(format!("finding {} vote by {} has wrong cross_family", f.id, v.model));
+                            bad(format!(
+                                "finding {} vote by {} has wrong cross_family",
+                                f.id, v.model
+                            ));
                         }
                     }
                 }
             }
             if v.same_model && (v.cross_family || !f.found_by.contains(&v.model)) {
-                bad(format!("finding {} vote by {} marked same_model inconsistently", f.id, v.model));
+                bad(format!(
+                    "finding {} vote by {} marked same_model inconsistently",
+                    f.id, v.model
+                ));
             }
             // Only a settled vote is a review; a failed call is not.
             if v.verdict == VoteVerdict::NoVerdict {

@@ -9,7 +9,11 @@ use vettalon::config::{Config, Role};
 use vettalon::llm::ModelHandle;
 
 #[derive(Parser)]
-#[command(name = "vettalon", version, about = "Multi-model security audit for your own code")]
+#[command(
+    name = "vettalon",
+    version,
+    about = "Multi-model security audit for your own code"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -122,14 +126,19 @@ fn home_dir() -> PathBuf {
 /// The roster. Never read from the scanned repository: a config chooses
 /// programs to run and where API keys go, so a repo-supplied one would be
 /// code execution. `scan_root` is the repo being scanned (if any).
-fn load_config(explicit: Option<&Path>, scan_root: Option<&Path>) -> Result<(Config, String), String> {
+fn load_config(
+    explicit: Option<&Path>,
+    scan_root: Option<&Path>,
+) -> Result<(Config, String), String> {
     let path = match explicit {
         Some(p) => Some(p.to_path_buf()),
         None => Some(home_dir().join("config.toml")).filter(|p| p.is_file()),
     };
     if let Some(p) = path {
-        if let (Ok(cfg), Some(root)) = (std::fs::canonicalize(&p), scan_root.and_then(|r| std::fs::canonicalize(r).ok()))
-            && cfg.starts_with(&root)
+        if let (Ok(cfg), Some(root)) = (
+            std::fs::canonicalize(&p),
+            scan_root.and_then(|r| std::fs::canonicalize(r).ok()),
+        ) && cfg.starts_with(&root)
         {
             return Err(format!(
                 "refusing config {}: it is inside the repository being scanned (a repo must not choose the programs and endpoints vettalon runs)",
@@ -183,7 +192,6 @@ fn pick(
         .collect()
 }
 
-
 async fn cmd_models(config: Option<PathBuf>, probe: bool) -> i32 {
     let (cfg, source) = match load_config(config.as_deref(), None) {
         Ok(c) => c,
@@ -210,7 +218,12 @@ async fn cmd_models(config: Option<PathBuf>, probe: bool) -> i32 {
             Some(false) => format!("失敗：{}", vettalon::util::truncate_bytes(&s.detail, 160)),
             None => String::new(),
         };
-        println!("  {:<14} family={:<10} roles={:<22} {status}", s.id, s.family, s.roles.join(","));
+        println!(
+            "  {:<14} family={:<10} roles={:<22} {status}",
+            s.id,
+            s.family,
+            s.roles.join(",")
+        );
     }
     0
 }
@@ -271,7 +284,12 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
                 roles: roles.iter().map(|r| role_name(*r).to_string()).collect(),
             })
             .collect();
-        let ids = |ms: &[ModelHandle]| ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ");
+        let ids = |ms: &[ModelHandle]| {
+            ms.iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         eprintln!(
             "[vettalon] 模型（{source}）：finder = {}；verifier = {}",
             ids(&f),
@@ -302,7 +320,12 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
     audit::cmd_scan(&home_dir(), opts).await
 }
 
-fn cmd_disclose(input: PathBuf, finding: Option<String>, channel: Option<String>, out: Option<PathBuf>) -> i32 {
+fn cmd_disclose(
+    input: PathBuf,
+    finding: Option<String>,
+    channel: Option<String>,
+    out: Option<PathBuf>,
+) -> i32 {
     use vettalon::disclose;
     let report = match audit::load_report_for_delivery(&input) {
         Ok(r) => r,
@@ -312,14 +335,21 @@ fn cmd_disclose(input: PathBuf, finding: Option<String>, channel: Option<String>
         }
     };
     let Some(wanted) = finding else {
-        let eligible: Vec<_> = report.findings.iter().filter(|f| disclose::eligible(f).is_ok()).collect();
+        let eligible: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| disclose::eligible(f).is_ok())
+            .collect();
         if eligible.is_empty() {
             println!("沒有可提交的項目（只有經覆核「需人工研判」或已確認的項目才產生提交草稿）。");
             return 0;
         }
         println!("可產生提交草稿的項目（--finding <id>）：");
         for f in eligible {
-            let loc = f.line.map(|l| format!("{}:{l}", f.file)).unwrap_or_else(|| f.file.clone());
+            let loc = f
+                .line
+                .map(|l| format!("{}:{l}", f.file))
+                .unwrap_or_else(|| f.file.clone());
             println!("  {}  [{}] {}  ({loc})", f.id, f.severity.as_str(), f.title);
         }
         return 0;
@@ -341,7 +371,11 @@ fn cmd_disclose(input: PathBuf, finding: Option<String>, channel: Option<String>
             return 2;
         }
     };
-    let channel = match channel.as_deref().map(str::parse::<disclose::Channel>).transpose() {
+    let channel = match channel
+        .as_deref()
+        .map(str::parse::<disclose::Channel>)
+        .transpose()
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[vettalon] {e}");
@@ -357,7 +391,11 @@ fn cmd_disclose(input: PathBuf, finding: Option<String>, channel: Option<String>
     };
     eprintln!("通報管道建議：");
     for c in &pkg.channels {
-        let mark = if c.channel == pkg.draft.channel { "→" } else { " " };
+        let mark = if c.channel == pkg.draft.channel {
+            "→"
+        } else {
+            " "
+        };
         eprintln!("  {mark} {}：{}", c.label, c.reason);
     }
     eprintln!("\n送出前請逐項確認（vettalon 不會替你送出）：");
@@ -393,7 +431,12 @@ async fn main() -> ExitCode {
     let code = match cli.command {
         Command::Scan(args) => cmd_scan(args).await,
         Command::Validate { report } => audit::cmd_validate(&report).await,
-        Command::Disclose { report, finding, channel, out } => cmd_disclose(report, finding, channel, out),
+        Command::Disclose {
+            report,
+            finding,
+            channel,
+            out,
+        } => cmd_disclose(report, finding, channel, out),
         Command::Models { config, probe } => cmd_models(config, probe).await,
         Command::Agents { action } => {
             let r = match action {

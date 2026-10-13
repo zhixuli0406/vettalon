@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+"use strict";
+const { spawnSync } = require("child_process");
+const path = require("path");
+
+const PLATFORM_PACKAGES = {
+  "darwin-arm64": "@vettalon/darwin-arm64",
+  "darwin-x64": "@vettalon/darwin-x64",
+  "linux-x64": "@vettalon/linux-x64",
+  "linux-arm64": "@vettalon/linux-arm64",
+  "win32-x64": "@vettalon/win32-x64",
+};
+
+function binaryPath() {
+  const key = `${process.platform}-${process.arch}`;
+  const pkg = PLATFORM_PACKAGES[key];
+  if (!pkg) throw new Error(`vettalon does not support ${key} yet. Build from source: https://github.com/zhixuli0406/vettalon`);
+  try {
+    const dir = path.dirname(require.resolve(`${pkg}/package.json`));
+    return path.join(dir, "bin", process.platform === "win32" ? "vettalon.exe" : "vettalon");
+  } catch {
+    throw new Error(`Could not find ${pkg}. Reinstall: npm install -g vettalon`);
+  }
+}
+
+const r = spawnSync(binaryPath(), process.argv.slice(2), { stdio: "inherit", env: process.env });
+if (r.error) { console.error(`Failed to run vettalon: ${r.error.message}`); process.exit(1); }
+process.exit(r.status ?? 1);

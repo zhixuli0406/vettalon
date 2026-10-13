@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/zhixuli0406/vettalon/discussions
+    about: Ask how to set something up, or share what you built.
+  - name: Report a security vulnerability in Vettalon
+    url: https://github.com/zhixuli0406/vettalon/security/advisories/new
+    about: Report security problems in Vettalon itself privately, not in a public issue.

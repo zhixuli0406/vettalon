@@ -14,8 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// Pre-compiled ANSI escape sequence regex (compiled once, reused across calls).
 static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[^\[\]])")
-        .expect("valid ANSI regex")
+    Regex::new(r"(\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[^\[\]])").expect("valid ANSI regex")
 });
 
 /// Configuration for Unicode sanitization.
@@ -209,15 +208,18 @@ impl UnicodeNormalizer {
 
         for ch in input.chars() {
             let script = ch.script();
-            if script != Script::Common && script != Script::Inherited && script != dominant
-                && is_confusable(script) {
-                    warnings.push(MixedScriptWarning {
-                        position: byte_pos,
-                        character: ch,
-                        expected_script: format!("{:?}", dominant),
-                        actual_script: format!("{:?}", script),
-                    });
-                }
+            if script != Script::Common
+                && script != Script::Inherited
+                && script != dominant
+                && is_confusable(script)
+            {
+                warnings.push(MixedScriptWarning {
+                    position: byte_pos,
+                    character: ch,
+                    expected_script: format!("{:?}", dominant),
+                    actual_script: format!("{:?}", script),
+                });
+            }
             byte_pos += ch.len_utf8();
         }
 
@@ -440,7 +442,10 @@ mod tests {
             // Cyrillic 'р' (U+0440) mixed with Latin 'assword'
             let input = "\u{0440}assword";
             let warnings = UnicodeNormalizer::detect_mixed_script(input);
-            assert!(!warnings.is_empty(), "Should detect Cyrillic in Latin context");
+            assert!(
+                !warnings.is_empty(),
+                "Should detect Cyrillic in Latin context"
+            );
             assert_eq!(warnings[0].character, '\u{0440}');
         }
 
@@ -449,7 +454,10 @@ mod tests {
             // Mostly Cyrillic with a Latin 'a' snuck in
             let input = "\u{043F}\u{0430}\u{0440}\u{043E}\u{043B}\u{044C}a";
             let warnings = UnicodeNormalizer::detect_mixed_script(input);
-            assert!(!warnings.is_empty(), "Should detect Latin in Cyrillic context");
+            assert!(
+                !warnings.is_empty(),
+                "Should detect Latin in Cyrillic context"
+            );
         }
 
         #[test]

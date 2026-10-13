@@ -1,6 +1,12 @@
 # Vettalon
 
+[![CI](https://github.com/zhixuli0406/vettalon/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/vettalon/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/vettalon?logo=npm)](https://www.npmjs.com/package/vettalon)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
 Vettalon 找出你自己程式碼裡的安全漏洞。做法是讓多家 AI 模型分工審查，再交給另一家模型試著推翻每一個發現，留下推不翻的。
+
+![Vettalon demo](docs/assets/demo.gif)
 
 開源掃描器（semgrep、gitleaks、cargo-audit）先跑一輪確定性檢查，`--profile deep` 再加上 AI 審查。現有的 AI 安全審查工具大多綁定單一模型；Vettalon 可以混用 Claude、Codex、Grok 這類訂閱制 CLI，也能接任何 OpenAI 相容 API 和本機 Ollama。每個模型的回覆都要通過嚴格的格式合約和零 LLM 的位置檢查，捏造了檔名或行號的發現會直接證偽。
 

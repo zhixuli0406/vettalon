@@ -82,7 +82,12 @@ pub fn host_home() -> PathBuf {
 
 /// The `docker run` prefix for one agent call (everything before the CLI's
 /// own argv). Pure, so the isolation flags are unit-tested.
-pub fn run_args(name: &str, image: &str, home_mount: &Path, env: &[(String, String)]) -> Vec<String> {
+pub fn run_args(
+    name: &str,
+    image: &str,
+    home_mount: &Path,
+    env: &[(String, String)],
+) -> Vec<String> {
     let mut a: Vec<String> = [
         "run",
         "--rm",
@@ -145,7 +150,8 @@ pub fn prepare_home(root: &Path, auth_files: &[(PathBuf, String)]) -> Result<Pat
         }
         let dst = home.join(rel);
         if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
         std::fs::copy(src, &dst).map_err(|e| {
             format!(
@@ -195,10 +201,13 @@ pub fn docker_bin() -> Result<String, String> {
 }
 
 async fn image_present(docker_bin: &str, image: &str) -> bool {
-    docker(docker_bin, &["image", "inspect", "--format", "{{.Id}}", image])
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    docker(
+        docker_bin,
+        &["image", "inspect", "--format", "{{.Id}}", image],
+    )
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }
 
 /// Whether the agent image exists locally (for auto-detection).
@@ -219,7 +228,11 @@ pub async fn ensure_infra() -> Result<(), String> {
             ));
         }
     }
-    let net = docker(&bin, &["network", "inspect", "--format", "{{.Internal}}", NETWORK]).await?;
+    let net = docker(
+        &bin,
+        &["network", "inspect", "--format", "{{.Internal}}", NETWORK],
+    )
+    .await?;
     if !net.status.success() {
         let c = docker(&bin, &["network", "create", "--internal", NETWORK]).await?;
         if !c.status.success() {
@@ -233,7 +246,16 @@ pub async fn ensure_infra() -> Result<(), String> {
             "docker network {NETWORK} exists but is not --internal; remove it (`docker network rm {NETWORK}`)"
         ));
     }
-    let running = docker(&bin, &["inspect", "--format", "{{.State.Running}}", EGRESS_CONTAINER]).await?;
+    let running = docker(
+        &bin,
+        &[
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+            EGRESS_CONTAINER,
+        ],
+    )
+    .await?;
     if running.status.success() && String::from_utf8_lossy(&running.stdout).trim() == "true" {
         return Ok(());
     }
@@ -266,7 +288,14 @@ pub async fn ensure_infra() -> Result<(), String> {
     }
     let connect = docker(
         &bin,
-        &["network", "connect", "--alias", EGRESS_CONTAINER, NETWORK, EGRESS_CONTAINER],
+        &[
+            "network",
+            "connect",
+            "--alias",
+            EGRESS_CONTAINER,
+            NETWORK,
+            EGRESS_CONTAINER,
+        ],
     )
     .await?;
     if !connect.status.success() {
@@ -329,7 +358,13 @@ pub async fn teardown() -> Result<(), String> {
 /// Full `docker` argv for one call: the isolation flags, then the CLI's
 /// program and its arguments rendered with the in-container prompt/output
 /// paths. Pure, so the whole command line is unit-testable without docker.
-pub fn docker_argv(name: &str, image: &str, home_mount: &Path, env: &[(String, String)], spec: &CliSpec) -> Vec<String> {
+pub fn docker_argv(
+    name: &str,
+    image: &str,
+    home_mount: &Path,
+    env: &[(String, String)],
+    spec: &CliSpec,
+) -> Vec<String> {
     let mut argv = run_args(name, image, home_mount, env);
     argv.push(spec.program.clone());
     // Inside the container the prompt file and output file are at fixed
@@ -363,7 +398,8 @@ impl LlmCaller for ContainerCliCaller {
             .prefix("vettalon-ctr-")
             .tempdir()
             .map_err(|e| LlmError::Executor(format!("cannot create temp dir: {e}")))?;
-        let home = prepare_home(root.path(), &self.container.auth_files).map_err(LlmError::Executor)?;
+        let home =
+            prepare_home(root.path(), &self.container.auth_files).map_err(LlmError::Executor)?;
         let work = home.join("work");
         std::fs::write(work.join(WORK_PROMPT_FILE), prompt)
             .map_err(|e| LlmError::Executor(format!("cannot write prompt: {e}")))?;
@@ -372,7 +408,10 @@ impl LlmCaller for ContainerCliCaller {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(work.join(WORK_PROMPT_FILE), std::fs::Permissions::from_mode(0o666));
+            let _ = std::fs::set_permissions(
+                work.join(WORK_PROMPT_FILE),
+                std::fs::Permissions::from_mode(0o666),
+            );
         }
 
         let env: Vec<(String, String)> = self
@@ -413,7 +452,12 @@ impl LlmCaller for ContainerCliCaller {
                 crate::util::read_capped(stderr, OUTPUT_CAP_BYTES)
             );
             let status = child.wait().await;
-            (w, status, out.map(|(b, _)| b).unwrap_or_default(), err.map(|(b, _)| b).unwrap_or_default())
+            (
+                w,
+                status,
+                out.map(|(b, _)| b).unwrap_or_default(),
+                err.map(|(b, _)| b).unwrap_or_default(),
+            )
         };
         let (_w, status, out, err) = match tokio::time::timeout(self.spec.timeout, run).await {
             Ok(r) => r,
@@ -445,18 +489,26 @@ impl LlmCaller for ContainerCliCaller {
                     .map_err(|e| LlmError::Executor(format!("CLI wrote no final message: {e}")))?
                     .len();
                 if len > OUTPUT_CAP_BYTES as u64 {
-                    return Err(LlmError::Executor(format!("CLI final message too large ({len} bytes)")));
+                    return Err(LlmError::Executor(format!(
+                        "CLI final message too large ({len} bytes)"
+                    )));
                 }
                 std::fs::read_to_string(&p)
                     .map_err(|e| LlmError::Executor(format!("CLI wrote no final message: {e}")))
             }
             OutputMode::JsonField(field) => {
-                let v: serde_json::Value = serde_json::from_str(stdout_text.trim())
-                    .map_err(|e| LlmError::Executor(format!("CLI stdout is not the expected JSON envelope: {e}")))?;
+                let v: serde_json::Value =
+                    serde_json::from_str(stdout_text.trim()).map_err(|e| {
+                        LlmError::Executor(format!(
+                            "CLI stdout is not the expected JSON envelope: {e}"
+                        ))
+                    })?;
                 v.get(field)
                     .and_then(|x| x.as_str())
                     .map(str::to_string)
-                    .ok_or_else(|| LlmError::Executor(format!("CLI JSON envelope has no {field:?} string")))
+                    .ok_or_else(|| {
+                        LlmError::Executor(format!("CLI JSON envelope has no {field:?} string"))
+                    })
             }
         }
     }
@@ -468,7 +520,12 @@ mod tests {
 
     #[test]
     fn run_args_isolate_network_fs_and_privileges() {
-        let a = run_args("n", "img", Path::new("/tmp/h"), &[("OPENAI_API_KEY".into(), "k".into())]);
+        let a = run_args(
+            "n",
+            "img",
+            Path::new("/tmp/h"),
+            &[("OPENAI_API_KEY".into(), "k".into())],
+        );
         for flag in [
             "--rm",
             "--read-only",
@@ -481,12 +538,18 @@ mod tests {
         }
         let n = a.iter().position(|x| x == "--network").unwrap();
         assert_eq!(a[n + 1], NETWORK);
-        assert!(a.iter().any(|x| x == &format!("type=bind,source=/tmp/h,target={CONTAINER_HOME}")));
+        assert!(
+            a.iter()
+                .any(|x| x == &format!("type=bind,source=/tmp/h,target={CONTAINER_HOME}"))
+        );
         assert!(a.iter().any(|x| x == &format!("HTTPS_PROXY={PROXY_URL}")));
         assert!(a.iter().any(|x| x == "OPENAI_API_KEY=k"));
         assert_eq!(a.last().unwrap(), "img");
         // The host HOME is never mounted.
-        assert!(!a.iter().any(|x| x.contains(&host_home().display().to_string()) && !x.contains("/tmp/h")));
+        assert!(
+            !a.iter()
+                .any(|x| x.contains(&host_home().display().to_string()) && !x.contains("/tmp/h"))
+        );
     }
 
     #[test]
@@ -499,16 +562,32 @@ mod tests {
         let home = prepare_home(root.path(), &[(auth, ".codex/auth.json".into())]).unwrap();
         assert!(home.join(".codex/auth.json").is_file());
         assert!(home.join("work").is_dir());
-        let names: Vec<_> = std::fs::read_dir(&home).unwrap().flatten().map(|e| e.file_name()).collect();
+        let names: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
         assert_eq!(names.len(), 2, "{names:?}");
-        assert!(prepare_home(root.path(), &[(src.path().join("auth.json"), "../x".into())]).is_err());
+        assert!(
+            prepare_home(
+                root.path(),
+                &[(src.path().join("auth.json"), "../x".into())]
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn missing_auth_file_says_how_to_fix_it() {
         let root = tempfile::tempdir().unwrap();
-        let e = prepare_home(root.path(), &[(PathBuf::from("/nonexistent/auth.json"), ".grok/auth.json".into())])
-            .unwrap_err();
+        let e = prepare_home(
+            root.path(),
+            &[(
+                PathBuf::from("/nonexistent/auth.json"),
+                ".grok/auth.json".into(),
+            )],
+        )
+        .unwrap_err();
         assert!(e.contains("log in"));
     }
 
@@ -516,7 +595,10 @@ mod tests {
         let spec = CliSpec::preset("codex", None, Duration::from_secs(60)).unwrap();
         let cspec = ContainerSpec {
             image: AGENTS_IMAGE.to_string(),
-            auth_files: vec![(PathBuf::from("/host/.codex/auth.json"), ".codex/auth.json".into())],
+            auth_files: vec![(
+                PathBuf::from("/host/.codex/auth.json"),
+                ".codex/auth.json".into(),
+            )],
         };
         (spec, cspec)
     }
@@ -525,7 +607,10 @@ mod tests {
     fn docker_argv_appends_program_and_container_paths() {
         let (spec, cspec) = codex_container_spec();
         let a = docker_argv("n", &cspec.image, Path::new("/tmp/home"), &[], &spec);
-        let prog = a.iter().position(|x| x == "codex").expect("program present");
+        let prog = a
+            .iter()
+            .position(|x| x == "codex")
+            .expect("program present");
         // Everything before the program is docker isolation; the image is last.
         assert_eq!(a[prog - 1], cspec.image);
         let rest = &a[prog + 1..];
@@ -549,7 +634,10 @@ mod tests {
         spec.prompt_via = PromptVia::Arg;
         let caller = ContainerCliCaller {
             spec,
-            container: ContainerSpec { image: "img".into(), auth_files: vec![] },
+            container: ContainerSpec {
+                image: "img".into(),
+                auth_files: vec![],
+            },
         };
         let e = caller.complete("p").await.unwrap_err();
         assert!(e.to_string().contains("prompt_via = arg"));

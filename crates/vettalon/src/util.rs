@@ -32,7 +32,11 @@ pub fn vettalon_home() -> std::path::PathBuf {
 fn resolve_home(home: &Path) -> std::path::PathBuf {
     let current = home.join(".vettalon");
     let legacy = home.join(".polyaudit");
-    if !current.exists() && legacy.is_dir() { legacy } else { current }
+    if !current.exists() && legacy.is_dir() {
+        legacy
+    } else {
+        current
+    }
 }
 
 /// Truncate `s` to at most `max_bytes` bytes, walking back to a char
@@ -256,16 +260,20 @@ fn sensitive_keys_pattern() -> String {
 
 static SENSITIVE_TEXT_JSON_KV_RE: LazyLock<Regex> = LazyLock::new(|| {
     let keys = sensitive_keys_pattern();
-    Regex::new(&format!(r#"(?i)"([A-Za-z0-9_-]*?(?:{keys}))"\s*:\s*"((?:[^"\\]|\\.)*)""#))
-        .expect("static SENSITIVE_TEXT_JSON_KV_RE must compile")
+    Regex::new(&format!(
+        r#"(?i)"([A-Za-z0-9_-]*?(?:{keys}))"\s*:\s*"((?:[^"\\]|\\.)*)""#
+    ))
+    .expect("static SENSITIVE_TEXT_JSON_KV_RE must compile")
 });
 
 /// Plain `key: value` lines; consumes the rest of the line (over-masking is
 /// the accepted trade-off). Left boundary is not `\b` so CJK↔ASCII seams match.
 static SENSITIVE_TEXT_PLAIN_KV_RE: LazyLock<Regex> = LazyLock::new(|| {
     let keys = sensitive_keys_pattern();
-    Regex::new(&format!(r#"(?i)(^|[^A-Za-z0-9_])([A-Za-z0-9_]*?(?:{keys}))\b\s*[:=]\s*([^\n]+)"#))
-        .expect("static SENSITIVE_TEXT_PLAIN_KV_RE must compile")
+    Regex::new(&format!(
+        r#"(?i)(^|[^A-Za-z0-9_])([A-Za-z0-9_]*?(?:{keys}))\b\s*[:=]\s*([^\n]+)"#
+    ))
+    .expect("static SENSITIVE_TEXT_PLAIN_KV_RE must compile")
 });
 
 static SENSITIVE_TEXT_VALUE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -274,8 +282,11 @@ static SENSITIVE_TEXT_VALUE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
         .map(|p| regex::escape(p))
         .collect();
     // Left boundary so `sk-` never fires inside a word like `desk-lamp`.
-    Regex::new(&format!(r#"(^|[^A-Za-z0-9_-])(?:{})[^\s"')\]}}]*"#, alts.join("|")))
-        .expect("static SENSITIVE_TEXT_VALUE_TOKEN_RE must compile")
+    Regex::new(&format!(
+        r#"(^|[^A-Za-z0-9_-])(?:{})[^\s"')\]}}]*"#,
+        alts.join("|")
+    ))
+    .expect("static SENSITIVE_TEXT_VALUE_TOKEN_RE must compile")
 });
 
 /// A PEM private key block (multi-line).
@@ -306,7 +317,10 @@ pub fn mask_sensitive_text(text: &str) -> String {
     let masked = SENSITIVE_TEXT_JSON_KV_RE.replace_all(text, |caps: &regex::Captures| {
         format!("\"{}\":\"***\"", &caps[1])
     });
-    let masked = SENSITIVE_TEXT_PEM_RE.replace_all(&masked, "-----BEGIN PRIVATE KEY----- *** -----END PRIVATE KEY-----"); // gitleaks:allow (fake test value)
+    let masked = SENSITIVE_TEXT_PEM_RE.replace_all(
+        &masked,
+        "-----BEGIN PRIVATE KEY----- *** -----END PRIVATE KEY-----",
+    ); // gitleaks:allow (fake test value)
     let masked = SENSITIVE_TEXT_VALUE_TOKEN_RE.replace_all(&masked, "${1}***");
     let masked = SENSITIVE_TEXT_CONN_STRING_RE.replace_all(&masked, "${1}***${2}");
     let masked = SENSITIVE_TEXT_TELEGRAM_BOT_RE.replace_all(&masked, "${1}***");
@@ -348,14 +362,26 @@ mod tests {
             "XAI_API_KEY: xai-abcdef123456", // gitleaks:allow (fake test value)
             "key AIzaSyD-abcdefghijklmnop here",
             "creds ASIAABCDEFGHIJKLMNOP x", // gitleaks:allow (fake test value)
-            "stripe sk_live_abcdef123456", // gitleaks:allow (fake test value)
+            "stripe sk_live_abcdef123456",  // gitleaks:allow (fake test value)
             "openrouter sk-or-v1-abcdef123456",
             "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
             r#"{"OPENAI_API_KEY":"sk-zzz999"}"#,
         ] {
             let m = mask_sensitive_text(sample);
-            for secret in ["sk-abcdef123456", "hunter2hunter2", "ghs_abcdefghijklmnop", "wJalrXUtnFEMIabcdef",
-                "xai-abcdef123456", "AIzaSyD", "ASIAABCDEFGHIJKLMNOP", "sk_live_abcdef", "sk-or-v1", "eyJhbGci", "sk-zzz999"] { // gitleaks:allow (fake test value)
+            for secret in [
+                "sk-abcdef123456",
+                "hunter2hunter2",
+                "ghs_abcdefghijklmnop",
+                "wJalrXUtnFEMIabcdef",
+                "xai-abcdef123456",
+                "AIzaSyD",
+                "ASIAABCDEFGHIJKLMNOP", // gitleaks:allow (fake test value)
+                "sk_live_abcdef",
+                "sk-or-v1",
+                "eyJhbGci",
+                "sk-zzz999",
+            ] {
+                // gitleaks:allow (fake test value)
                 assert!(!m.contains(secret), "{sample:?} → {m:?}");
             }
         }
@@ -391,11 +417,23 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join("docs")).unwrap();
         std::fs::write(repo.path().join("docs/ok.txt"), "fine").unwrap();
-        std::os::unix::fs::symlink(outside.path().join("secret"), repo.path().join("docs/notes.txt")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            repo.path().join("docs/notes.txt"),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(outside.path(), repo.path().join("linkdir")).unwrap();
         assert_eq!(read_repo_file(repo.path(), "docs/ok.txt").unwrap(), "fine");
-        assert!(read_repo_file(repo.path(), "docs/notes.txt").unwrap_err().contains("outside"));
-        assert!(read_repo_file(repo.path(), "linkdir/secret").unwrap_err().contains("outside"));
+        assert!(
+            read_repo_file(repo.path(), "docs/notes.txt")
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(
+            read_repo_file(repo.path(), "linkdir/secret")
+                .unwrap_err()
+                .contains("outside")
+        );
         assert!(read_repo_file(repo.path(), "../x").is_err());
         assert!(read_repo_file(repo.path(), "docs").is_err());
     }
@@ -414,7 +452,10 @@ mod tests {
         let masked = mask_sensitive_text(text);
         assert!(masked.contains(r#""api_key":"***""#));
         assert!(!masked.contains("sk-live-abcdef"));
-        assert!(masked.contains(r#""status":"ok""#), "non-secret key untouched");
+        assert!(
+            masked.contains(r#""status":"ok""#),
+            "non-secret key untouched"
+        );
     }
 
     #[test]
@@ -428,7 +469,8 @@ mod tests {
 
     #[test]
     fn mask_text_masks_bare_value_prefix_tokens_mid_sentence() {
-        let text = "here is the token you asked for: sk-ant-api03-verylongsecrettoken, keep it safe";
+        let text =
+            "here is the token you asked for: sk-ant-api03-verylongsecrettoken, keep it safe";
         let masked = mask_sensitive_text(text);
         assert!(!masked.contains("verylongsecrettoken"));
         assert!(masked.contains("***"));
@@ -439,7 +481,10 @@ mod tests {
         // `author` must survive even though it contains the letters of `auth`.
         let text = "author: agnes, authorization: Bearer xyz123";
         let masked = mask_sensitive_text(text);
-        assert!(masked.contains("author: agnes"), "author must not be masked");
+        assert!(
+            masked.contains("author: agnes"),
+            "author must not be masked"
+        );
         assert!(!masked.contains("xyz123"));
     }
 

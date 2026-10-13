@@ -164,7 +164,10 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
                 lines: String::new(),
                 metadata: None,
             });
-            let cwe = extra.metadata.as_ref().and_then(crate::audit::cwe::from_semgrep_metadata);
+            let cwe = extra
+                .metadata
+                .as_ref()
+                .and_then(crate::audit::cwe::from_semgrep_metadata);
             let severity = map_severity(&extra.severity);
             let line = r.start.and_then(|s| s.line);
             let title = if extra.message.is_empty() {
@@ -240,7 +243,11 @@ mod tests {
         assert_eq!(findings[0].line, Some(10));
         assert_eq!(findings[0].severity, Severity::High);
         assert_eq!(findings[0].rule_id, "python-eval-exec-usage");
-        assert_eq!(findings[0].cwe.as_deref(), Some("CWE-95"), "CWE read from rule metadata");
+        assert_eq!(
+            findings[0].cwe.as_deref(),
+            Some("CWE-95"),
+            "CWE read from rule metadata"
+        );
         assert_eq!(findings[1].severity, Severity::Medium);
     }
 

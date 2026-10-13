@@ -213,10 +213,8 @@ async fn run_gitleaks(
     // against) — using the well-documented, stable `--report-path` flag to
     // a known temp location sidesteps the ambiguity entirely rather than
     // guessing at stdout parsing.
-    let report_path = std::env::temp_dir().join(format!(
-        "vettalon-gitleaks-{}.json",
-        uuid::Uuid::new_v4()
-    ));
+    let report_path =
+        std::env::temp_dir().join(format!("vettalon-gitleaks-{}.json", uuid::Uuid::new_v4()));
     let report_path_str = report_path.to_string_lossy().to_string();
     // Mode selection (live-fired against the real 8.30.1 binary, 2026-09-01):
     // `detect` walks *git history* — on a plain directory it logs "0 commits
