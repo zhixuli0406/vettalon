@@ -50,7 +50,7 @@ fn main() {
             100.0 * c as f64 / n.max(1) as f64
         );
     }
-    scores.sort_by(|a, b| b.0.cmp(&a.0));
+    scores.sort_by_key(|x| std::cmp::Reverse(x.0));
     for (s, p, r) in scores.iter().take(12) {
         println!("{s:>3} {p} {r:?}");
     }

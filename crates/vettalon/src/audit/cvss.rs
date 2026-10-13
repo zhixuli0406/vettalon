@@ -25,13 +25,10 @@ impl CvssScore {
     /// dropped, never guessed.
     pub fn from_vector(vector: &str) -> Option<Self> {
         let vector = vector.trim();
-        let (version, rest) = if let Some(r) = vector.strip_prefix("CVSS:3.1/") {
-            ("3.1", r)
-        } else if let Some(r) = vector.strip_prefix("CVSS:3.0/") {
-            ("3.0", r)
-        } else {
-            return None;
-        };
+        let (version, rest) = vector
+            .strip_prefix("CVSS:3.1/")
+            .map(|r| ("3.1", r))
+            .or_else(|| vector.strip_prefix("CVSS:3.0/").map(|r| ("3.0", r)))?;
         let base = BaseMetrics::parse(rest)?;
         Some(CvssScore {
             cvss_version: version.to_string(),
