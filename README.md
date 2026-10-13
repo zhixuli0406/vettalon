@@ -29,6 +29,7 @@ AI 深度審計／對抗式覆核／PoC（deep profile）：
 
 需要：
 
+- macOS 或 Linux（容器隔離、PoC 沙箱與 0600 權限用的是 Unix 專屬機制；暫不支援 Windows）
 - Rust 1.88 以上（`cargo`）
 - deep 模式至少要有一個模型，下列擇一：
   - 已登入的 `claude`（Claude Code）；`codex`、`grok` 也能用，預設會在容器沙箱裡跑（需要 Docker，先跑一次 `vettalon agents build`），細節見下面的「安全邊界」

@@ -6,7 +6,6 @@ const PLATFORM_PACKAGES = {
   "darwin-x64": "@vettalon/darwin-x64",
   "linux-x64": "@vettalon/linux-x64",
   "linux-arm64": "@vettalon/linux-arm64",
-  "win32-x64": "@vettalon/win32-x64",
 };
 const key = `${process.platform}-${process.arch}`;
 const pkg = PLATFORM_PACKAGES[key];

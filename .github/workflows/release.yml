@@ -37,9 +37,6 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: vettalon-linux-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: vettalon-windows-x64
     steps:
       - name: Validate tag
         shell: bash
@@ -75,22 +72,12 @@ jobs:
             --output-signature ${{ matrix.artifact }}.tar.gz.sig \
             --output-certificate ${{ matrix.artifact }}.tar.gz.pem \
             ${{ matrix.artifact }}.tar.gz
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory _pkg | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/vettalon.exe _pkg/
-          Copy-Item README.md,LICENSE,NOTICE _pkg/
-          Compress-Archive -Path _pkg/* -DestinationPath ${{ matrix.artifact }}.zip
-          (Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii ${{ matrix.artifact }}.zip.sha256
-          cosign sign-blob --yes --output-signature ${{ matrix.artifact }}.zip.sig --output-certificate ${{ matrix.artifact }}.zip.pem ${{ matrix.artifact }}.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
             vettalon-*.tar.gz*
-            vettalon-*.zip*
 
   release:
     needs: build
@@ -122,7 +109,6 @@ jobs:
           generate_release_notes: true
           files: |
             vettalon-*.tar.gz
-            vettalon-*.zip
             vettalon-*.sha256
             vettalon-*.sig
             vettalon-*.pem
