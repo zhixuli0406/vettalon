@@ -19,8 +19,10 @@ sha2 = { workspace = true }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+flate2 = "1"
 futures = "0.3"
 hex = "0.4"
+tar = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
@@ -28,6 +30,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 unicode-normalization = "0.1"
 unicode-script = "0.5"
 unicode-segmentation = "1.12"

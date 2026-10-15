@@ -19,6 +19,12 @@ pub const DEFAULT_POC_IMAGE: &str = "python:3.12-slim";
 
 /// Label on every PoC container, used to clean up leftovers.
 const POC_LABEL: &str = "vettalon.poc=1";
+/// Label key holding the pid of the vettalon process that started the
+/// container. Leftover cleanup only removes containers whose owner is gone:
+/// several PoCs can run at once (a hunt audits dependencies in parallel, a
+/// dashboard scan can run next to a CLI one), and one run must never remove
+/// another's live container.
+const POC_OWNER_KEY: &str = "vettalon.poc.owner";
 /// `timeout` inside the container: a little over the host-side limit.
 const IN_CONTAINER_LIMIT_SECS: &str = "125";
 /// Cap on any single `docker` housekeeping call.
@@ -71,19 +77,33 @@ impl DockerSandbox {
         Ok(sb)
     }
 
-    /// Force-remove PoC containers left by an earlier, killed run.
+    /// Force-remove PoC containers left by an earlier, killed run: ones
+    /// whose owning process no longer exists, or that carry no owner label.
     async fn remove_leftovers(&self) {
         let list = tokio::time::timeout(
             DOCKER_CALL_LIMIT,
             Command::new(&self.docker_bin)
-                .args(["ps", "-aq", "--filter", &format!("label={POC_LABEL}")])
+                .args([
+                    "ps",
+                    "-a",
+                    "--filter",
+                    &format!("label={POC_LABEL}"),
+                    "--format",
+                    &format!("{{{{.ID}}}} {{{{.Label \"{POC_OWNER_KEY}\"}}}}"),
+                ])
                 .stdin(Stdio::null())
                 .output(),
         )
         .await;
-        if let Ok(Ok(out)) = list {
-            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-                self.force_remove(id).await;
+        let Ok(Ok(out)) = list else { return };
+        let me = std::process::id();
+        for (id, owner) in parse_poc_listing(&String::from_utf8_lossy(&out.stdout)) {
+            let alive = match owner {
+                Some(pid) if pid != me => process_alive(pid).await,
+                _ => false,
+            };
+            if is_leftover(owner, me, alive) {
+                self.force_remove(&id).await;
             }
         }
     }
@@ -104,6 +124,7 @@ impl DockerSandbox {
     /// The `docker run` argument vector for one PoC. Pure, so the isolation
     /// flags are unit-tested.
     pub fn run_args(&self, name: &str, workspace: &Path, cmd: &[String]) -> Vec<String> {
+        let owner_label = format!("{POC_OWNER_KEY}={}", std::process::id());
         let mut args: Vec<String> = [
             "run",
             "--rm",
@@ -111,6 +132,8 @@ impl DockerSandbox {
             name,
             "--label",
             POC_LABEL,
+            "--label",
+            &owner_label,
             "--pull=never",
             "--network=none",
             "--read-only",
@@ -199,6 +222,11 @@ impl DockerSandbox {
             .spawn()
             .map_err(|e| format!("container create failed: {e}"))?;
 
+        // If this future is dropped mid-run (the scan was cancelled), killing
+        // the `docker run` client does not stop the container; the guard
+        // removes it. Disarmed once the run has finished on its own.
+        let mut guard = ContainerGuard::new(&self.docker_bin, &name);
+
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let collect = async {
@@ -213,7 +241,9 @@ impl DockerSandbox {
                 err.map(|(b, _)| b).unwrap_or_default(),
             )
         };
-        match tokio::time::timeout(timeout, collect).await {
+        let collected = tokio::time::timeout(timeout, collect).await;
+        guard.disarm();
+        match collected {
             Ok((Ok(status), out, err)) => {
                 let mut combined = String::from_utf8_lossy(&out).to_string();
                 combined.push_str(&String::from_utf8_lossy(&err));
@@ -239,6 +269,45 @@ impl DockerSandbox {
     }
 }
 
+/// Removes a PoC container when dropped while still armed, i.e. when the run
+/// that owns it was cancelled before the container exited. `Drop` cannot
+/// await, so `docker rm -f` runs on a detached thread that reaps it.
+struct ContainerGuard {
+    docker_bin: String,
+    name: String,
+    armed: bool,
+}
+
+impl ContainerGuard {
+    fn new(docker_bin: &str, name: &str) -> Self {
+        ContainerGuard {
+            docker_bin: docker_bin.to_string(),
+            name: name.to_string(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut cmd = std::process::Command::new(&self.docker_bin);
+        cmd.args(["rm", "-f", &self.name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        std::thread::spawn(move || {
+            let _ = cmd.status();
+        });
+    }
+}
+
 /// `docker run` exits 125 when docker itself fails; 126/127 are also what a
 /// script's own shell returns for "not executable" / "command not found",
 /// so those count as docker's only when docker's own error text is present.
@@ -254,9 +323,95 @@ fn is_docker_failure(code: i32, output: &str) -> bool {
     }
 }
 
+/// `<id> <owner pid>` lines from `docker ps --format`. A missing or
+/// malformed owner (a container made by an older vettalon) parses as `None`.
+fn parse_poc_listing(listing: &str) -> Vec<(String, Option<u32>)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let id = parts.next()?.to_string();
+            let owner = parts.next().and_then(|p| p.parse().ok());
+            Some((id, owner))
+        })
+        .collect()
+}
+
+/// Whether a PoC container is safe to remove. `owner_alive` is only
+/// meaningful for another process's container.
+fn is_leftover(owner: Option<u32>, me: u32, owner_alive: bool) -> bool {
+    match owner {
+        None => true,
+        Some(pid) if pid == me => false,
+        Some(_) => !owner_alive,
+    }
+}
+
+/// Whether `pid` is a running process. `kill -0` sends no signal; "not
+/// permitted" means it exists under another user. Where this cannot be
+/// checked (non-Unix) the container is kept: its in-container `timeout`
+/// plus `--rm` remove it on their own.
+async fn process_alive(pid: u32) -> bool {
+    if !cfg!(unix) {
+        return true;
+    }
+    match Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .await
+    {
+        Ok(out) => {
+            out.status.success() || String::from_utf8_lossy(&out.stderr).contains("not permitted")
+        }
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_args_label_the_owning_process() {
+        let sb = DockerSandbox {
+            docker_bin: "docker".into(),
+            image: "img".into(),
+        };
+        let a = sb.run_args("n", Path::new("/tmp/x"), &["true".into()]);
+        let owner = format!("{POC_OWNER_KEY}={}", std::process::id());
+        assert!(a.contains(&owner), "missing {owner}: {a:?}");
+    }
+
+    #[test]
+    fn leftover_listing_parses_owner_labels() {
+        let listing = "abc123 4242
+def456 
+  
+ghi789 notapid
+";
+        assert_eq!(
+            parse_poc_listing(listing),
+            vec![
+                ("abc123".to_string(), Some(4242)),
+                ("def456".to_string(), None),
+                ("ghi789".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_containers_of_dead_or_unknown_owners_are_leftovers() {
+        let me = 100;
+        // Our own container: another dependency of this same run is using it.
+        assert!(!is_leftover(Some(me), me, false));
+        // Another live process (a dashboard scan next to a CLI hunt).
+        assert!(!is_leftover(Some(200), me, true));
+        // Owner exited without cleaning up.
+        assert!(is_leftover(Some(200), me, false));
+        // No owner label: made by an older vettalon, keep the old behaviour.
+        assert!(is_leftover(None, me, false));
+    }
 
     #[test]
     fn run_args_carry_every_isolation_flag() {
@@ -350,5 +505,37 @@ except OSError:
         assert!(out.contains("SANDBOX_OK 42"), "{out}");
         assert!(out.contains("NET_BLOCKED"), "{out}");
         assert!(!out.contains("UID 0\n"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_guard_removes_only_while_armed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let fake = dir.path().join("docker");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = fake.display().to_string();
+
+        let mut done = ContainerGuard::new(&bin, "finished");
+        done.disarm();
+        drop(done);
+        drop(ContainerGuard::new(&bin, "cancelled"));
+
+        // The removal runs on a detached thread; wait for it briefly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let calls = loop {
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            if !calls.is_empty() || std::time::Instant::now() > deadline {
+                break calls;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(calls.trim(), "rm -f cancelled");
     }
 }

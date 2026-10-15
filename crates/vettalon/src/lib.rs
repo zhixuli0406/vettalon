@@ -10,6 +10,7 @@ pub mod audit;
 pub mod config;
 pub mod disclose;
 pub mod guard;
+pub mod hunt;
 pub mod kb;
 pub mod llm;
 pub mod sandbox;

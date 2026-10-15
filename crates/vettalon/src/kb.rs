@@ -22,6 +22,29 @@ pub struct CweEntry {
     /// `"A03:2021-Injection"`, or `None` when the CWE is in no 2021 category.
     pub owasp_top10_2021: Option<String>,
     pub kind_aliases: Vec<String>,
+    /// P0-3: MITRE CAPEC attack patterns this weakness is exploited through.
+    /// Optional — only the OWASP Top 10-mapped entries carry it so far; a
+    /// `#[serde(default)]` empty list keeps the other entries parsing
+    /// unchanged. The report turns these into reference links so a reader
+    /// sees the concrete attack pattern, not just the weakness class.
+    #[serde(default)]
+    pub capec: Vec<CapecPattern>,
+    /// P0-3: a one-paragraph zh-TW attacker's-eye narrative — entry point,
+    /// preconditions, what the attacker can chain to. Knowledge for the
+    /// report, NOT an operational exploit (the PoC sandbox is the only place
+    /// that actually exercises anything, and only against the user's own
+    /// code). `None` for entries not yet enriched.
+    #[serde(default)]
+    pub attack_scenario_zh: Option<String>,
+}
+
+/// A MITRE CAPEC attack pattern reference (`CAPEC-66`, "SQL 注入").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapecPattern {
+    /// Canonical id, `CAPEC-<n>`.
+    pub id: String,
+    pub name_zh: String,
 }
 
 const KB_JSON: &str = include_str!("cwe_kb.json");
@@ -126,6 +149,16 @@ pub fn cwe_url(cwe: &str) -> Option<String> {
     ))
 }
 
+/// P0-3: MITRE CAPEC definition page for a `CAPEC-<n>` id. Returns `None` for
+/// an id that isn't `CAPEC-<digits>`, so a malformed id never yields a link.
+pub fn capec_url(capec_id: &str) -> Option<String> {
+    let n = capec_id.trim().strip_prefix("CAPEC-")?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("https://capec.mitre.org/data/definitions/{n}.html"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,7 +182,47 @@ mod tests {
             if let Some(o) = &e.owasp_top10_2021 {
                 assert!(owasp_info(o).is_some(), "{} → {o}", e.id);
             }
+            // P0-3: every CAPEC id that ships must yield a MITRE link, and
+            // carry a zh-TW name, so the report never renders a dead ref.
+            for c in &e.capec {
+                assert!(capec_url(&c.id).is_some(), "{} → {}", e.id, c.id);
+                assert!(!c.name_zh.is_empty(), "{} → {}", e.id, c.id);
+            }
         }
+    }
+
+    #[test]
+    fn capec_url_only_accepts_well_formed_ids() {
+        assert_eq!(
+            capec_url("CAPEC-66").unwrap(),
+            "https://capec.mitre.org/data/definitions/66.html"
+        );
+        assert!(capec_url("CAPEC-").is_none());
+        assert!(capec_url("66").is_none());
+        assert!(capec_url("CAPEC-6a").is_none());
+    }
+
+    #[test]
+    fn cwe_295_carries_an_ssh_specific_mitigation() {
+        // A hunt finding in an SSH library (ssh-exec) surfaced that the generic
+        // CWE-295 mitigations read as TLS-only; this guards the SSH line.
+        let e = lookup("CWE-295").unwrap();
+        assert!(
+            e.mitigations_zh
+                .iter()
+                .any(|m| m.contains("SSH") && m.contains("主機金鑰")),
+            "{:?}",
+            e.mitigations_zh
+        );
+    }
+
+    #[test]
+    fn at_least_the_injection_classes_carry_capec_and_scenario() {
+        // P0-3 ships enrichment for the OWASP Top 10-mapped classes; SQLi is
+        // the canonical one and must be populated.
+        let sqli = lookup("CWE-89").unwrap();
+        assert!(!sqli.capec.is_empty(), "CWE-89 should carry CAPEC patterns");
+        assert!(sqli.attack_scenario_zh.is_some());
     }
 
     #[test]

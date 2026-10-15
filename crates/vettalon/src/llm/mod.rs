@@ -83,6 +83,54 @@ impl RefusalLog {
     }
 }
 
+/// P2-1: one model call, as recorded for the optional `--trace` output. No
+/// prompt or reply text is kept — only sizes, timing and outcome — so a trace
+/// is safe to keep and share and never leaks source or secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct TraceEvent {
+    pub step: String,
+    pub model: String,
+    pub family: String,
+    pub prompt_bytes: usize,
+    pub reply_bytes: usize,
+    pub latency_ms: u64,
+    /// `"ok"` | `"refused"` | `"error"`.
+    pub outcome: String,
+}
+
+/// Shared, append-only LLM-call trace for one run (P2-1). The default is
+/// DISABLED (inner `None`): `push` is a no-op and nothing is allocated, so an
+/// ordinary run carries no tracing cost. A recording log is made explicitly
+/// with [`TraceLog::recording`], only when `--trace` was requested.
+#[derive(Debug, Clone, Default)]
+pub struct TraceLog(Option<Arc<Mutex<Vec<TraceEvent>>>>);
+
+impl TraceLog {
+    /// A log that records. Used only when the run was asked to trace.
+    pub fn recording() -> Self {
+        TraceLog(Some(Arc::new(Mutex::new(Vec::new()))))
+    }
+    pub fn push(&self, e: TraceEvent) {
+        if let Some(inner) = &self.0
+            && let Ok(mut v) = inner.lock()
+        {
+            v.push(e);
+        }
+    }
+    pub fn snapshot(&self) -> Vec<TraceEvent> {
+        self.0
+            .as_ref()
+            .and_then(|i| i.lock().ok().map(|v| v.clone()))
+            .unwrap_or_default()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(|i| i.lock().map(|v| v.is_empty()).unwrap_or(true))
+            .unwrap_or(true)
+    }
+}
+
 /// Calls one model for one pipeline step. A refusal is logged and returned
 /// as an error unchanged (the step records the unit as not reviewed); it is
 /// never retried elsewhere. Also counts calls, so a step can tell a model
@@ -92,6 +140,8 @@ pub struct StepCaller {
     pub step: &'static str,
     pub log: RefusalLog,
     pub calls: std::sync::atomic::AtomicUsize,
+    /// P2-1: optional per-call trace. Default is an empty, unattached log.
+    pub trace: TraceLog,
 }
 
 impl StepCaller {
@@ -101,7 +151,14 @@ impl StepCaller {
             step,
             log,
             calls: std::sync::atomic::AtomicUsize::new(0),
+            trace: TraceLog::default(),
         }
+    }
+
+    /// Attach a run's trace log so every call this step makes is recorded.
+    pub fn with_trace(mut self, trace: TraceLog) -> Self {
+        self.trace = trace;
+        self
     }
 
     pub fn call_count(&self) -> usize {
@@ -113,7 +170,22 @@ impl StepCaller {
 impl LlmCaller for StepCaller {
     async fn complete(&self, prompt: &str) -> Result<String> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
         let r = self.model.caller.complete(prompt).await;
+        let (outcome, reply_bytes) = match &r {
+            Ok(s) => ("ok", s.len()),
+            Err(LlmError::Refused(_)) => ("refused", 0),
+            Err(LlmError::Executor(_)) => ("error", 0),
+        };
+        self.trace.push(TraceEvent {
+            step: self.step.to_string(),
+            model: self.model.id.clone(),
+            family: self.model.family.clone(),
+            prompt_bytes: prompt.len(),
+            reply_bytes,
+            latency_ms: started.elapsed().as_millis() as u64,
+            outcome: outcome.to_string(),
+        });
         if let Err(LlmError::Refused(excerpt)) = &r {
             self.log.push(RefusalEvent {
                 model: self.model.id.clone(),
@@ -199,6 +271,42 @@ mod tests {
             Err(LlmError::Executor(_))
         ));
         assert!(log.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn step_caller_traces_calls_without_keeping_text() {
+        let trace = TraceLog::recording();
+        let ok = StepCaller::new(
+            handle("m", Ok("hello".into())),
+            "audit",
+            RefusalLog::default(),
+        )
+        .with_trace(trace.clone());
+        ok.complete("a prompt").await.unwrap();
+        let refused = StepCaller::new(
+            handle("m", Err(LlmError::Refused("no".into()))),
+            "verify",
+            RefusalLog::default(),
+        )
+        .with_trace(trace.clone());
+        let _ = refused.complete("p").await;
+
+        let ev = trace.snapshot();
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].step, "audit");
+        assert_eq!(ev[0].outcome, "ok");
+        assert_eq!(ev[0].prompt_bytes, "a prompt".len());
+        assert_eq!(ev[0].reply_bytes, "hello".len());
+        assert_eq!(ev[1].step, "verify");
+        assert_eq!(ev[1].outcome, "refused");
+        assert_eq!(ev[1].reply_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn step_caller_without_trace_records_nothing() {
+        let c = StepCaller::new(handle("m", Ok("{}".into())), "audit", RefusalLog::default());
+        c.complete("p").await.unwrap();
+        assert!(c.trace.is_empty(), "an unattached trace stays empty");
     }
 
     #[tokio::test]

@@ -23,6 +23,8 @@ use super::schema::{ModuleCoverage, ModuleCoverageStatus};
 pub const DEFER_MAX_MODULES: &str = "max_modules";
 pub const DEFER_CANDIDATE_CAP: &str = "candidate_cap";
 pub const DEFER_ENGINE_UNAVAILABLE: &str = "engine_unavailable";
+/// The scan's wall-clock budget ran out before this module was audited.
+pub const DEFER_TIME_BUDGET: &str = "time_budget";
 
 fn from_report(r: &ModuleAuditReport) -> ModuleCoverage {
     let (status, reason) = match &r.outcome {

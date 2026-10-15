@@ -69,3 +69,16 @@ timeout_secs = 1200
 # args = ["--print", "{prompt}"]   # {prompt}, {output_file}, {model}
 # prompt_via = "arg"               # or "stdin"
 # output = "json:response"         # stdout | file | json:<field>
+
+# ── Metadata-only module ranker (optional) ─────────────────────────
+# TypeSafe Jev reorders which modules a deep scan audits first, using ONLY
+# metadata (paths, byte sizes, entry-point flag, git touch counts) — never
+# file contents. Opt in per scan with `scan --rank jev`; without that flag a
+# scan stays zero-network and uses the built-in heuristic ranker. If Jev is
+# unreachable the scan falls back to the heuristic order. The key is never
+# written here — give an env var name (preferred) or a 0600 key file.
+# [jev]
+# api_key_env = "TYPESAFE_API_KEY"
+# api_key_file = "/home/you/.config/vettalon/typesafe.key"   # alt: 0600 file
+# base_url = "https://api.typesafe.ai"   # optional (must be https)
+# model = "jev-latest"                   # optional

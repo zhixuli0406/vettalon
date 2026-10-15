@@ -12,7 +12,7 @@
 //! keys go), so it is never read from the repository being scanned.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +106,68 @@ fn default_roles() -> Vec<Role> {
 pub struct Config {
     #[serde(default, rename = "model")]
     pub models: Vec<ModelConfig>,
+    /// Optional metadata-only module ranker (TypeSafe Jev). Present only when
+    /// the operator opts in; `scan` stays zero-network unless `--rank jev`
+    /// actually selects it. Never holds a key value — only where to find one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev: Option<JevSettings>,
+}
+
+/// Config for the Jev metadata-only ranker. Like a model's `api_key_env`,
+/// this stores only where the key lives, never the key itself. The key is
+/// resolved at call time and never logged or written back.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JevSettings {
+    /// Name of the environment variable holding the API key (preferred).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Absolute path to a 0600 file holding the API key (used when
+    /// `api_key_env` is unset or its variable is empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_file: Option<PathBuf>,
+    /// API base (default `https://api.typesafe.ai`). Must be https.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Model id (default `jev-latest`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Rejected if present: a key must never be inlined into the config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl JevSettings {
+    pub fn base_url(&self) -> &str {
+        self.base_url
+            .as_deref()
+            .unwrap_or("https://api.typesafe.ai")
+    }
+
+    pub fn model(&self) -> &str {
+        self.model.as_deref().unwrap_or("jev-latest")
+    }
+
+    /// Resolve the API key at call time: the env var if set and non-empty,
+    /// else the key file (trimmed). Never cached, logged or serialized.
+    pub fn resolve_key(&self) -> Result<String, String> {
+        if let Some(var) = &self.api_key_env
+            && let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            return Ok(v.trim().to_string());
+        }
+        if let Some(path) = &self.api_key_file {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read Jev key file {}: {e}", path.display()))?;
+            let key = raw.trim().to_string();
+            if key.is_empty() {
+                return Err(format!("Jev key file {} is empty", path.display()));
+            }
+            return Ok(key);
+        }
+        Err("no Jev API key configured (set [jev].api_key_env or [jev].api_key_file)".to_string())
+    }
 }
 
 fn preset_family(preset: &str) -> Option<&'static str> {
@@ -161,7 +223,7 @@ impl Config {
                 temperature: None,
             })
             .collect();
-        (Config { models }, skipped)
+        (Config { models, jev: None }, skipped)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -252,6 +314,61 @@ impl Config {
                 ));
             }
             m.family()?;
+        }
+        if let Some(jev) = &self.jev {
+            jev.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl JevSettings {
+    fn validate(&self) -> Result<(), String> {
+        if self.api_key.is_some() {
+            return Err(
+                "[jev]: do not inline `api_key`; use `api_key_env` (env var name) or `api_key_file` (0600 path)"
+                    .to_string(),
+            );
+        }
+        if self.api_key_env.is_none() && self.api_key_file.is_none() {
+            return Err(
+                "[jev]: set `api_key_env` or `api_key_file` so a key can be found (never the key itself)"
+                    .to_string(),
+            );
+        }
+        if let Some(var) = &self.api_key_env
+            && !api_key_env_ok(var)
+        {
+            return Err(format!(
+                "[jev]: api_key_env {var:?} must be an UPPER_SNAKE name ending in _API_KEY, _KEY or _TOKEN"
+            ));
+        }
+        if let Some(path) = &self.api_key_file {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "[jev]: api_key_file {} must be an absolute path",
+                    path.display()
+                ));
+            }
+            let meta = std::fs::metadata(path)
+                .map_err(|e| format!("[jev]: cannot stat api_key_file {}: {e}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o077 != 0 {
+                    return Err(format!(
+                        "[jev]: api_key_file {} must be 0600 (owner-only); run `chmod 600` on it",
+                        path.display()
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = meta;
+        }
+        if let Some(url) = &self.base_url
+            && !url.starts_with("https://")
+        {
+            return Err(format!("[jev]: base_url {url:?} must be https://"));
         }
         Ok(())
     }
@@ -668,6 +785,69 @@ roles = ["finder", "verifier"]
             assert_eq!(c.auth_files.len(), 1);
             assert!(c.auth_files[0].1.ends_with("auth.json"));
         }
+    }
+
+    #[test]
+    fn jev_config_accepts_both_key_modes_and_rejects_inline_key() {
+        // env var mode
+        assert!(Config::parse("[jev]\napi_key_env = \"TYPESAFE_API_KEY\"\n").is_ok());
+        // inline key is rejected
+        assert!(
+            Config::parse("[jev]\napi_key = \"apikey_abc\"\n")
+                .unwrap_err()
+                .contains("inline")
+        );
+        // no key source at all
+        assert!(
+            Config::parse("[jev]\nmodel = \"jev-latest\"\n")
+                .unwrap_err()
+                .contains("api_key_env")
+        );
+        // bad env var name
+        assert!(Config::parse("[jev]\napi_key_env = \"SECRET\"\n").is_err());
+        // non-https base_url
+        assert!(
+            Config::parse(
+                "[jev]\napi_key_env = \"X_API_KEY\"\nbase_url = \"http://api.typesafe.ai\"\n"
+            )
+            .unwrap_err()
+            .contains("https")
+        );
+        // relative key file path
+        assert!(
+            Config::parse("[jev]\napi_key_file = \"rel/path.key\"\n")
+                .unwrap_err()
+                .contains("absolute")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jev_key_file_must_be_0600_and_resolve_reads_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("typesafe.key");
+        std::fs::write(&key, "apikey_secret_value\n").unwrap();
+        // world-readable -> rejected
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let toml = format!("[jev]\napi_key_file = {:?}\n", key.display().to_string());
+        assert!(Config::parse(&toml).unwrap_err().contains("0600"));
+        // 0600 -> accepted, and resolve_key reads (trimmed) without logging it
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = Config::parse(&toml).unwrap();
+        assert_eq!(
+            cfg.jev.as_ref().unwrap().resolve_key().unwrap(),
+            "apikey_secret_value"
+        );
+    }
+
+    #[test]
+    fn jev_to_toml_never_emits_a_key_value() {
+        // Even if a key value somehow lived in memory, it is not written back.
+        let cfg = Config::parse("[jev]\napi_key_env = \"TYPESAFE_API_KEY\"\n").unwrap();
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("api_key_env"));
+        assert!(!out.to_lowercase().contains("apikey_"));
     }
 
     #[test]

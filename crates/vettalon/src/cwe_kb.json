@@ -19,7 +19,22 @@
     "kind_aliases": [
       "xss",
       "cross_site_scripting"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-63",
+        "name_zh": "跨站腳本（XSS）"
+      },
+      {
+        "id": "CAPEC-592",
+        "name_zh": "儲存型 XSS"
+      },
+      {
+        "id": "CAPEC-591",
+        "name_zh": "反射型 XSS"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者把帶有 script 或事件屬性的字串放進會被頁面原樣輸出的欄位：留言、暱稱、搜尋關鍵字，或一個精心構造的連結。受害者載入頁面時腳本在其瀏覽器執行，攻擊者拿得到 cookie、session，或直接以受害者身分發出請求。儲存型一次污染、所有看到該內容的人都中；反射型則靠誘導點擊。這通常是帳號接管的第一步。"
   },
   {
     "id": "CWE-89",
@@ -41,7 +56,18 @@
     "kind_aliases": [
       "sql_injection",
       "sqli"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-66",
+        "name_zh": "SQL 注入"
+      },
+      {
+        "id": "CAPEC-7",
+        "name_zh": "盲注式 SQL 注入"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者從任何會進到 SQL 的輸入開始試探：登入框、搜尋欄、URL 參數，甚至 HTTP header。先丟一個單引號看回應有沒有變，確認拼接點後改寫查詢語意，用 UNION 把其他資料表撈出來，或用布林、時間延遲做盲注逐字元還原資料。拿到資料庫帳密或會員資料後，常接著拿去撞其他系統。部分設定下還能透過資料庫的檔案或指令功能跨到作業系統。"
   },
   {
     "id": "CWE-78",
@@ -64,7 +90,14 @@
       "command_injection",
       "os_command_injection",
       "shell_injection"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-88",
+        "name_zh": "作業系統指令注入"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者鎖定會把輸入帶進系統指令的功能，像 ping 工具、檔案轉檔、備份腳本。用分號、管線、$() 或反引號接上自己的指令，先跑一個 whoami 或 sleep 確認能執行，再落地 webshell 或往內網橫向移動。拿到的權限等於該服務的執行身分，設定不當時就是 root。"
   },
   {
     "id": "CWE-77",
@@ -80,7 +113,14 @@
       "以白名單驗證所有會進入指令的輸入值"
     ],
     "owasp_top10_2021": "A03:2021-Injection",
-    "kind_aliases": []
+    "kind_aliases": [],
+    "capec": [
+      {
+        "id": "CAPEC-248",
+        "name_zh": "指令注入"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者找到會把輸入組進某種指令執行或直譯介面的地方，插入分隔符接上額外指令。確認可執行後逐步擴權或落地後門。範圍不限作業系統 shell，也包含應用內部自訂的指令解析。"
   },
   {
     "id": "CWE-94",
@@ -99,7 +139,14 @@
     "owasp_top10_2021": "A03:2021-Injection",
     "kind_aliases": [
       "code_injection"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-242",
+        "name_zh": "程式碼注入"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者讓應用把外部輸入當程式碼執行：eval、動態 import、模板引擎的表達式。一旦輸入會進到直譯器，攻擊者就能跑任意邏輯，等同遠端程式碼執行。模板注入（SSTI）是近年最常見的入口。"
   },
   {
     "id": "CWE-95",
@@ -219,7 +266,14 @@
     "kind_aliases": [
       "path_traversal",
       "directory_traversal"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-126",
+        "name_zh": "路徑穿越"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者在檔名或路徑參數塞 ../ 往上跳目錄，目標是讀到設定檔、金鑰、系統密碼檔，或在可寫入時覆蓋程式檔。常見變形有 URL 編碼、雙重編碼、絕對路徑。讀到設定檔裡的資料庫帳密或 API 金鑰後，攻擊面就從單一檔案擴大到整個後端。"
   },
   {
     "id": "CWE-73",
@@ -256,7 +310,14 @@
     "kind_aliases": [
       "file_upload",
       "unrestricted_file_upload"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-650",
+        "name_zh": "上傳 Web Shell"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者上傳一個偽裝成圖片或文件的可執行檔，靠繞過副檔名或 MIME 檢查落地到可被網站執行的目錄，再用瀏覽器存取它取得 webshell。拿到 webshell 等於在伺服器上有了一個互動入口。"
   },
   {
     "id": "CWE-352",
@@ -277,7 +338,14 @@
     "kind_aliases": [
       "csrf",
       "xsrf"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-62",
+        "name_zh": "跨站請求偽造（CSRF）"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者在自己的頁面藏一個會自動送出的表單或請求，誘導已登入的受害者造訪。瀏覽器自動帶上受害者的 cookie，後端若只認 cookie 不驗 token，就會以受害者身分完成轉帳、改密碼、改 email。受害者全程不知情。"
   },
   {
     "id": "CWE-918",
@@ -298,7 +366,14 @@
     "owasp_top10_2021": "A10:2021-Server-Side Request Forgery (SSRF)",
     "kind_aliases": [
       "ssrf"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-664",
+        "name_zh": "伺服器端請求偽造（SSRF）"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者讓伺服器替自己發請求：把一個會抓取 URL 的功能（縮圖、webhook、匯入）指向內網位址或雲端 metadata 端點 169.254.169.254。目標是拿到雲端臨時憑證、打進防火牆後面只對內開放的服務，或掃內網。SSRF 常是進入雲端帳號的跳板，拿到 metadata 憑證後影響的是整個雲專案。"
   },
   {
     "id": "CWE-611",
@@ -319,7 +394,14 @@
     "kind_aliases": [
       "xxe",
       "xml_external_entity"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-221",
+        "name_zh": "XML 外部實體注入"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者在上傳或接收的 XML 裡定義外部實體，指向本機檔案或內網 URL。解析器若預設展開外部實體，就能讀出伺服器上的檔案、對內網發 SSRF，或用實體遞迴把記憶體撐爆。常見於處理 XML、SVG、DOCX 這類格式的功能。"
   },
   {
     "id": "CWE-502",
@@ -341,7 +423,14 @@
       "deserialization",
       "insecure_deserialization",
       "unsafe_deserialization"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-586",
+        "name_zh": "物件注入（不安全反序列化）"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者把惡意序列化物件丟進會反序列化外部資料的入口：cookie、快取、訊息佇列。反序列化過程觸發預期外的建構或魔術方法，串成一條 gadget chain 達到遠端程式碼執行。這類洞通常不需要認證，一旦成立就是直接拿下主機。"
   },
   {
     "id": "CWE-287",
@@ -362,7 +451,14 @@
       "auth_bypass",
       "authentication_bypass",
       "broken_authentication"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-115",
+        "name_zh": "認證繞過"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者針對認證流程的弱點下手：可預測的 token、沒驗簽的 JWT、能跳過的多步驟驗證、邏輯上可略過的環節。目標是用別人的身分登入或直接成為管理者。認證一旦被繞過，後面所有授權檢查都形同虛設。"
   },
   {
     "id": "CWE-306",
@@ -495,7 +591,14 @@
     "kind_aliases": [
       "missing_authorization",
       "missing_authz"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-1",
+        "name_zh": "存取未受 ACL 限制的功能"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者登入自己的低權限帳號，然後直接改 URL 或請求裡的物件 id、呼叫沒出現在前端的 API，試探後端有沒有真的檢查「這個人能不能動這筆資料」。缺授權檢查時就能看到或修改別人的資料（IDOR），或執行只該給管理者的操作。"
   },
   {
     "id": "CWE-863",
@@ -617,7 +720,14 @@
       "secret_exposure",
       "hardcoded_credentials",
       "hardcoded_api_key"
-    ]
+    ],
+    "capec": [
+      {
+        "id": "CAPEC-191",
+        "name_zh": "讀取執行檔內的敏感常數"
+      }
+    ],
+    "attack_scenario_zh": "攻擊者拿到原始碼、反編譯 app，或翻 git 歷史，就能直接讀出寫死在裡面的帳密、API 金鑰、簽章密鑰。這類憑證通常權限不小又難輪替，外洩後攻擊者不必突破任何防線就能登入後端或第三方服務。公開 repo 被爬，往往幾分鐘內就被利用。"
   },
   {
     "id": "CWE-259",
@@ -828,7 +938,8 @@
     "mitigations_zh": [
       "保持 TLS 憑證驗證開啟，不要設定 verify=False、InsecureSkipVerify 等略過驗證的選項",
       "驗證憑證鏈、有效期限與主機名稱",
-      "使用憑證綁定（pinning）時完整驗證憑證屬性"
+      "使用憑證綁定（pinning）時完整驗證憑證屬性",
+      "SSH 連線先驗證主機金鑰再送出帳密：核對 known_hosts 或釘選指紋，金鑰不符就在認證前中斷，不要等連線建立後才檢查（否則密碼已送給未驗證的伺服器）。"
     ],
     "owasp_top10_2021": "A07:2021-Identification and Authentication Failures",
     "kind_aliases": [

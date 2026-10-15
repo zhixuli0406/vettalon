@@ -25,7 +25,7 @@ use serde::Deserialize;
 use crate::llm::LlmCaller;
 use vettalon_contract::strict_json::{self, Violation};
 
-use super::coverage::{DEFER_CANDIDATE_CAP, DEFER_ENGINE_UNAVAILABLE};
+use super::coverage::{DEFER_CANDIDATE_CAP, DEFER_ENGINE_UNAVAILABLE, DEFER_TIME_BUDGET};
 use super::intake::HotspotFile;
 use super::llm_util::{escape_xml_tag, extract_context_window, number_lines, slugify};
 use super::precheck::{self, DiskLines};
@@ -51,6 +51,18 @@ pub const MAX_CANDIDATES_PER_MODULE: usize = 8;
 /// Secondary safety net on top of `--max-modules`: total ai_audit candidates
 /// across the whole run, regardless of how many modules were selected.
 pub const MAX_TOTAL_AI_CANDIDATES: usize = 60;
+/// Safety ceiling on how many modules ONE scan audits, even when
+/// `--max-modules 0` (all) or a very large value is requested. A hard cap so a
+/// large repo cannot grind through hundreds of slow model calls; the modules
+/// beyond it are recorded as deferred, and `--time-budget` is the complementary
+/// wall-clock guard.
+pub const MAX_AUDIT_MODULES_CEILING: usize = 40;
+
+/// P0-1 Reflector: how many times a module whose reply violated the JSON
+/// contract is re-asked (with a correction naming what it broke) before it is
+/// recorded as `ParseFailed`. Bounded on purpose — a model that keeps
+/// violating the contract is never retried forever (opus-playbook 斷路器).
+pub const AI_AUDIT_PARSE_RETRIES: usize = 1;
 /// Cap on each model-supplied free-text slot kept in the report (threat
 /// model slots, trace scope/description, conditions).
 pub const FIELD_MAX_BYTES: usize = 1000;
@@ -83,6 +95,52 @@ pub struct ModuleTarget {
 /// components (or the first, or `"."` for a root-level file) — coarse
 /// enough that a Cargo/pnpm-style monorepo groups by crate/package, fine
 /// enough that one top-level bucket doesn't swallow the whole repo.
+/// Files that are NOT source code: documentation, data, lockfiles, media and
+/// binaries. They never drive AI module selection or get sent to a finder —
+/// the deep audit reasons about code logic, and auditing `docs/` or a lockfile
+/// just burns slow model calls (this is why a `docs/` module could grind for
+/// minutes). Deterministic scanners still cover whatever they cover.
+fn is_non_code_file(path: &str) -> bool {
+    const NON_CODE_EXT: &[&str] = &[
+        // documentation / prose
+        "md", "markdown", "mdx", "rst", "adoc", "txt", "text", "rtf",
+        // data / lockfiles
+        "lock", "sum", "csv", "tsv", // images / media / fonts
+        "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "pdf", "map", "woff", "woff2",
+        "ttf", "eot", "otf", "mp4", "mov", "webm", "mp3", "wav", // archives / binaries
+        "zip", "gz", "tgz", "tar", "7z", "class", "jar", "wasm", "bin", "so", "dylib", "a", "o",
+    ];
+    // Translation catalogs: UI strings, not logic. They are also frequent
+    // git "security" hotspots (every security fix touches its error message),
+    // which would otherwise rank them above real code.
+    const CATALOG_EXT: &[&str] = &["json", "yaml", "yml", "toml", "properties", "strings"];
+    const CATALOG_DIRS: &[&str] = &[
+        "i18n",
+        "l10n",
+        "locale",
+        "locales",
+        "lang",
+        "langs",
+        "translations",
+    ];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false; // no extension: could be a script; keep it
+    };
+    let ext = ext.to_ascii_lowercase();
+    if NON_CODE_EXT.contains(&ext.as_str())
+        || matches!(ext.as_str(), "po" | "pot" | "mo" | "xliff" | "xlf")
+    {
+        return true;
+    }
+    CATALOG_EXT.contains(&ext.as_str())
+        && path
+            .split('/')
+            .rev()
+            .skip(1)
+            .any(|dir| CATALOG_DIRS.contains(&dir.to_ascii_lowercase().as_str()))
+}
+
 fn module_key(file: &str) -> String {
     let comps: Vec<&str> = file.split('/').collect();
     match comps.len() {
@@ -116,6 +174,11 @@ pub fn rank_modules(
     }
     let mut modules: HashMap<String, Acc> = HashMap::new();
     for f in all_files {
+        // Non-code files never create or feed a module: a docs/data/binary-only
+        // directory produces no audit target at all.
+        if is_non_code_file(f) {
+            continue;
+        }
         let key = module_key(f);
         let entry = modules.entry(key).or_insert(Acc {
             score: 0,
@@ -333,6 +396,25 @@ pub struct RawCandidate {
 /// exactly one JSON array of [`RawCandidate`]. Never repaired.
 pub fn parse_ai_candidates(raw: &str) -> Result<Vec<RawCandidate>, Violation> {
     strict_json::parse_strict::<Vec<RawCandidate>>(raw)
+}
+
+/// P0-1 Reflector: build a correction prompt after a contract violation. The
+/// base prompt (which carries the full schema) is re-sent with the specific
+/// violation named, so the model fixes the exact defect instead of guessing.
+/// The reply is still parsed by the same strict contract — the correction
+/// never relaxes it.
+pub fn build_reflector_prompt(base_prompt: &str, violation: &str) -> String {
+    format!(
+        "{base_prompt}\n\n\
+         --- 格式修正要求 ---\n\
+         你上一則回覆未通過格式合約，已被丟棄。違反原因：\n\
+         {violation}\n\n\
+         請完全依照上面的 JSON 合約重新輸出：只輸出一個 JSON 陣列，\
+         不要任何前後說明文字、不要 markdown code fence、不要合約未定義的欄位。\
+         沒有發現時輸出空陣列 []。",
+        base_prompt = base_prompt,
+        violation = crate::util::truncate_bytes(violation, 500),
+    )
 }
 
 /// Map the LLM's free-text `kind` into the fixed `FindingKind` bucket.
@@ -611,6 +693,7 @@ pub async fn run_ai_audit_capped<C: LlmCaller>(
             audited: &counter,
             total: modules.len() as u32,
             cross_check: &none,
+            deadline: None,
         },
     )
     .await
@@ -627,6 +710,10 @@ pub struct AuditProgress<'a> {
     pub total: u32,
     /// Modules this finder audits as the second, cross-check finder.
     pub cross_check: &'a std::collections::HashSet<String>,
+    /// Scan-wide wall-clock deadline (`--time-budget`). Once past it, the
+    /// remaining modules are deferred (`DEFER_TIME_BUDGET`) instead of audited.
+    /// Shared by every finder, so they all stop together. `None` = no budget.
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// [`run_ai_audit_capped`] that reports per-module progress (model, round
@@ -644,6 +731,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         audited,
         total,
         cross_check,
+        deadline,
     } = progress;
     if modules.is_empty() {
         return AiAuditOutcome::Unavailable {
@@ -662,6 +750,21 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
     let mut candidate_cap_hit = false;
 
     for (idx, module) in modules.iter().enumerate() {
+        // Scan-wide time budget: once spent, defer this and every remaining
+        // module instead of grinding on. Completed modules keep their results.
+        if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+        {
+            for rest in &modules[idx..] {
+                module_reports.push(ModuleAuditReport::bare(
+                    rest,
+                    ModuleOutcome::Deferred {
+                        reason: DEFER_TIME_BUDGET.to_string(),
+                    },
+                ));
+            }
+            break;
+        }
         let done = audited.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let round = if cross_check.contains(&module.module_path) {
             crate::audit::Round::CrossCheck
@@ -773,9 +876,52 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         };
         llm_reachable = true;
 
-        match parse_ai_candidates(&raw) {
+        // P0-1 Reflector: a reply that violates the JSON contract is re-asked
+        // with a correction that names what it broke, up to
+        // AI_AUDIT_PARSE_RETRIES times, before the module is recorded as
+        // ParseFailed. This recovers modules that would otherwise be dropped
+        // for a formatting slip. The first `complete` above already proved the
+        // LLM is reachable, so a failed correction call here is never treated
+        // as engine-unreachable.
+        let mut parsed = parse_ai_candidates(&raw);
+        let mut retries_used = 0usize;
+        let mut retry_note: Option<String> = None;
+        while parsed.is_err() && retries_used < AI_AUDIT_PARSE_RETRIES {
+            let violation = match parsed.as_ref() {
+                Err(v) => v.to_string(),
+                Ok(_) => break,
+            };
+            let correction = build_reflector_prompt(&mp.prompt, &violation);
+            match caller.complete(&correction).await {
+                Ok(r2) => {
+                    retries_used += 1;
+                    parsed = parse_ai_candidates(&r2);
+                }
+                Err(e) => {
+                    retry_note = Some(format!(
+                        "reflector correction call failed after {retries_used} retry(ies): {e}"
+                    ));
+                    break;
+                }
+            }
+        }
+        if parsed.is_ok() && retries_used > 0 {
+            retry_note = Some(format!(
+                "recovered after {retries_used} reflector retry(ies)"
+            ));
+        }
+
+        match parsed {
             Err(v) => {
-                let reason = format!("reply violated the JSON contract (discarded): {v}");
+                let mut reason = format!("reply violated the JSON contract (discarded): {v}");
+                if retries_used > 0 {
+                    reason.push_str(&format!(
+                        "; {retries_used} reflector retry(ies) also failed"
+                    ));
+                }
+                if let Some(n) = retry_note {
+                    reason.push_str(&format!("; {n}"));
+                }
                 engine_runs.push(module_engine_run(
                     module,
                     0,
@@ -817,6 +963,9 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                 }
                 let capped = total.saturating_sub(taken + duplicates);
                 let mut notes = Vec::new();
+                if let Some(n) = retry_note {
+                    notes.push(n);
+                }
                 if capped > 0 {
                     notes.push(format!(
                         "{capped} candidate(s) dropped by the per-module ({MAX_CANDIDATES_PER_MODULE}) or run-wide ({candidate_cap}) cap"
@@ -1324,6 +1473,168 @@ pub(crate) mod tests {
             AiAuditOutcome::Unavailable { reason, .. } => {
                 panic!("expected Ran, got Unavailable: {reason}")
             }
+        }
+    }
+
+    // ── P0-1 Reflector: bounded re-ask on contract violation ─────────
+    #[tokio::test]
+    async fn reflector_recovers_a_module_after_one_contract_violation() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn main(){}")]);
+        let modules = vec![ModuleTarget {
+            module_path: "a".to_string(),
+            score: 1,
+            high_risk: false,
+            files: vec!["a/main.rs".to_string()],
+        }];
+        // First reply breaks the contract (prose around nothing), the
+        // correction reply is a valid empty array.
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![
+                Ok("sorry, here is the result: nothing found".to_string()),
+                Ok("[]".to_string()),
+            ]),
+        };
+        let outcome = run_ai_audit(dir.path(), &modules, &caller).await;
+        match outcome {
+            AiAuditOutcome::Ran { module_reports, .. } => match &module_reports[0].outcome {
+                ModuleOutcome::Reviewed { note } => {
+                    let note = note.as_deref().unwrap_or_default();
+                    assert!(note.contains("recovered"), "note was: {note:?}");
+                }
+                other => panic!("expected Reviewed after reflector recovery, got {other:?}"),
+            },
+            AiAuditOutcome::Unavailable { reason, .. } => panic!("expected Ran: {reason}"),
+        }
+        // Exactly two replies consumed: original + one correction.
+        assert!(caller.replies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reflector_gives_up_after_the_retry_budget_and_records_parse_failed() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn main(){}")]);
+        let modules = vec![ModuleTarget {
+            module_path: "a".to_string(),
+            score: 1,
+            high_risk: false,
+            files: vec!["a/main.rs".to_string()],
+        }];
+        // Both the original and the single correction violate the contract.
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![
+                Ok("not json".to_string()),
+                Ok("still not json".to_string()),
+            ]),
+        };
+        let outcome = run_ai_audit(dir.path(), &modules, &caller).await;
+        match outcome {
+            AiAuditOutcome::Ran { module_reports, .. } => match &module_reports[0].outcome {
+                ModuleOutcome::ParseFailed { reason } => {
+                    assert!(reason.contains("reflector retry"), "reason was: {reason:?}");
+                }
+                other => panic!("expected ParseFailed after exhausting retries, got {other:?}"),
+            },
+            AiAuditOutcome::Unavailable { reason, .. } => panic!("expected Ran: {reason}"),
+        }
+        // Budget is exactly AI_AUDIT_PARSE_RETRIES, so two replies consumed.
+        assert!(caller.replies.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn translation_catalogs_are_non_code_but_config_json_is_kept() {
+        for non_code in [
+            "web/src/i18n/en.json",
+            "web/src/i18n/zh-TW.json",
+            "app/locales/fr/messages.yml",
+            "res/l10n/de.properties",
+            "po/zh_TW.po",
+            "Resources/translations/Localizable.strings",
+        ] {
+            assert!(is_non_code_file(non_code), "{non_code}");
+        }
+        for code in [
+            "package.json",
+            "web/tsconfig.json",
+            "config/settings.yaml",
+            "src/i18n/index.ts",
+            "src/lang/parser.rs",
+            "i18n.json", // a catalog dir name as a file stem is not a catalog dir
+        ] {
+            assert!(!is_non_code_file(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn rank_modules_excludes_docs_and_noncode_only_modules() {
+        let files = vec![
+            "src/app.rs".to_string(),
+            "docs/guide.md".to_string(),
+            "docs/intro.md".to_string(),
+            "assets/logo.png".to_string(),
+        ];
+        let ranked = rank_modules(&files, &[], &[]);
+        assert!(ranked.iter().any(|m| m.module_path == "src"));
+        assert!(
+            !ranked.iter().any(|m| m.module_path == "docs"),
+            "a docs-only module must not be an audit target"
+        );
+        assert!(!ranked.iter().any(|m| m.module_path == "assets"));
+        let src = ranked.iter().find(|m| m.module_path == "src").unwrap();
+        assert_eq!(src.files, vec!["src/app.rs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn time_budget_defers_remaining_modules_without_calling_the_model() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn a(){}"), ("b/main.rs", "fn b(){}")]);
+        let modules = vec![
+            ModuleTarget {
+                module_path: "a".into(),
+                score: 2,
+                high_risk: false,
+                files: vec!["a/main.rs".into()],
+            },
+            ModuleTarget {
+                module_path: "b".into(),
+                score: 1,
+                high_risk: false,
+                files: vec!["b/main.rs".into()],
+            },
+        ];
+        // Empty stub: a call would error — but the past deadline must defer
+        // every module before any model call.
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![]),
+        };
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let none = std::collections::HashSet::new();
+        let outcome = run_ai_audit_progress(
+            dir.path(),
+            &modules,
+            &caller,
+            MAX_TOTAL_AI_CANDIDATES,
+            AuditProgress {
+                sink: &crate::audit::NoProgress,
+                label: "x",
+                audited: &counter,
+                total: 2,
+                cross_check: &none,
+                deadline: Some(std::time::Instant::now()),
+            },
+        )
+        .await;
+        match outcome {
+            AiAuditOutcome::Ran {
+                module_reports,
+                findings,
+                ..
+            } => {
+                assert!(findings.is_empty());
+                assert_eq!(module_reports.len(), 2);
+                assert!(module_reports.iter().all(|r| matches!(
+                    &r.outcome,
+                    ModuleOutcome::Deferred { reason } if reason == DEFER_TIME_BUDGET
+                )));
+            }
+            AiAuditOutcome::Unavailable { reason, .. } => panic!("expected Ran: {reason}"),
         }
     }
 

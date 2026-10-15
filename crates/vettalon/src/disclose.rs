@@ -424,6 +424,32 @@ fn bullets(items: &[String], empty: &str) -> String {
 
 /// Draft the report for `channel`. `today` is injected for testability.
 pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::NaiveDate) -> Draft {
+    let d = draft_raw(f, meta, channel, today);
+    Draft {
+        subject: show_invisible(&d.subject),
+        body: show_invisible(&d.body),
+        ..d
+    }
+}
+
+/// Show bidi overrides/isolates and zero-width characters as `[U+XXXX]`.
+/// Titles and paths in a draft come from the audited code; an invisible
+/// U+202E would make the maintainer read a different file name than the one
+/// meant ("Trojan Source") in a message that is copied and sent verbatim.
+fn show_invisible(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let cp = c as u32;
+        if matches!(cp, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2069 | 0xFEFF) {
+            out.push_str(&format!("[U+{cp:04X}]"));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn draft_raw(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::NaiveDate) -> Draft {
     let disclose_by = (today + chrono::Duration::days(channel.window_days())).to_string();
     let cwe = cwe_line(f);
     let cwe_text = cwe
@@ -577,11 +603,23 @@ pub fn prepare(
         .iter()
         .find(|f| f.id == finding_id)
         .ok_or_else(|| format!("找不到 finding {finding_id}"))?;
-    eligible(f)?;
     let project = detect_project(Path::new(&report.repo));
+    package_for(f, project, channel, chrono::Local::now().date_naive())
+}
+
+/// Build the disclosure package for one finding of a known project: the
+/// ranked channels, a draft for the chosen (or top-recommended) channel, and
+/// the pre-send checklist. Shared by scan reports and supply-chain hunts.
+pub fn package_for(
+    f: &Finding,
+    project: ProjectMeta,
+    channel: Option<Channel>,
+    today: chrono::NaiveDate,
+) -> Result<DisclosurePackage, String> {
+    eligible(f)?;
     let channels = recommend(&project);
     let chosen = channel.unwrap_or(channels[0].channel);
-    let mut d = draft(f, &project, chosen, chrono::Local::now().date_naive());
+    let mut d = draft(f, &project, chosen, today);
     if d.submit.is_none() {
         d.submit = channels
             .iter()
@@ -602,6 +640,18 @@ pub fn prepare(
 mod tests {
     use super::*;
     use crate::audit::schema::{FindingKind, ThreatModel, TraceKind, TraceStep};
+
+    #[test]
+    fn draft_shows_bidi_characters_from_the_audited_code() {
+        let mut f = finding(FindingStatus::NeedsHuman);
+        f.file = "lib/run\u{202E}exe.js".into();
+        f.title = "x\u{200B}y".into();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 15).unwrap();
+        let d = draft(&f, &ProjectMeta::default(), Channel::Twcert, today);
+        assert!(d.body.contains("run[U+202E]exe.js"), "{}", d.body);
+        assert!(d.subject.contains("x[U+200B]y"));
+        assert!(!d.body.contains('\u{202E}') && !d.subject.contains('\u{200B}'));
+    }
 
     fn finding(status: FindingStatus) -> Finding {
         let mut f = Finding::candidate(

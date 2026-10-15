@@ -202,6 +202,9 @@ pub enum IncompleteReason {
     BudgetCannotFundReserves,
     ValidationBudgetExhausted,
     CriticBudgetExhausted,
+    /// The wall-clock scan budget (`--time-budget`) ran out; modules still
+    /// pending were not audited.
+    TimeBudgetExhausted,
     EngineUnavailable,
     Interrupted,
     /// A model refused part of the work; those units were not reviewed.
@@ -209,6 +212,9 @@ pub enum IncompleteReason {
     /// Some units got no usable result (call failed, reply broke the
     /// contract, or a candidate was never verified).
     UnitsFailed,
+    /// Modules carrying suspected prompt-injection could not be cross-checked
+    /// by a second family, because only one model family was in the run.
+    InjectionUncrosschecked,
 }
 
 impl fmt::Display for IncompleteReason {
@@ -217,10 +223,16 @@ impl fmt::Display for IncompleteReason {
             Self::BudgetCannotFundReserves => "the budget cannot fund the validation reserves",
             Self::ValidationBudgetExhausted => "the validation budget ran out",
             Self::CriticBudgetExhausted => "the critic budget ran out",
+            Self::TimeBudgetExhausted => {
+                "the scan time budget ran out before every module was audited"
+            }
             Self::EngineUnavailable => "an analysis engine was unavailable",
             Self::Interrupted => "the run was interrupted",
             Self::ModelRefused => "a model refused part of the work",
             Self::UnitsFailed => "some units got no usable result",
+            Self::InjectionUncrosschecked => {
+                "modules with suspected prompt-injection were not cross-checked by a second family"
+            }
         })
     }
 }

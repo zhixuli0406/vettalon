@@ -398,6 +398,14 @@ pub struct EnsembleInfo {
     /// or within --cross-check-top).
     #[serde(default)]
     pub cross_checked: usize,
+    /// Which module ranker ordered the audit: `"heuristic"` (default) or
+    /// `"jev"`. Older reports without this field read as empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ranker: String,
+    /// True when `--rank jev` was requested but Jev failed and the scan fell
+    /// back to the heuristic order.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rank_degraded: bool,
 }
 
 impl Finding {
@@ -611,6 +619,11 @@ pub const CARRIED_FROM_PRIOR_PREFIX: &str = "carried_from_prior:";
 /// Evidence `detail` prefix for a prior `Confirmed` finding that is being
 /// re-verified on unchanged source.
 pub const PRIOR_CONFIRMED_PREFIX: &str = "prior_confirmed_same_source";
+/// P2-2 episodic memory. Evidence `detail` prefix for a finding at a root
+/// fingerprint that a prior report judged, but whose source has since
+/// changed: the verdict is NOT carried, yet the prior judgement is surfaced
+/// so the operator re-examines a spot that mattered before.
+pub const PRIOR_CHANGED_PREFIX: &str = "prior_changed_source";
 /// Evidence `detail` prefix for a deterministic pre-check refutation.
 pub const PRECHECK_PREFIX: &str = "precheck:";
 /// Evidence `detail` prefix for a location correction the verifier made

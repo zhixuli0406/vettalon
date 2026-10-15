@@ -235,7 +235,10 @@ authenticated, how it is exposed, or where a configured base path points are not
 any code excerpt and are NOT required to exist. Missing deployment / auth / exposure \
 context is a BLOCKER on a plausible finding, never a reason to refute — when the \
 unsanitized input-to-sink flow is visible here, answer \"plausible\" and record those \
-unknowns in blockers. Skepticism means demanding the dangerous pattern be visible in the \
+unknowns in blockers. When the claim lists conditions (preconditions), weigh them as part \
+of reachability: a precondition the excerpt shows is already satisfied does not block, but \
+one you cannot confirm from the code is a BLOCKER on a plausible finding, never grounds to \
+refute on its own. Skepticism means demanding the dangerous pattern be visible in the \
 code, not demanding proof of the production environment. A wrong line number is NOT a \
 reason to refute: when the root cause is real but the claimed line or a trace step's \
 location is off, answer \"plausible\" and give the real locations in corrected_line / \

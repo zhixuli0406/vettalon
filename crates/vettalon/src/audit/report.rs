@@ -275,9 +275,13 @@ fn incomplete_reason_zh(r: vettalon_contract::coverage::IncompleteReason) -> &'s
         }
         R::BudgetCannotFundReserves => "預算不足以保留覆核額度",
         R::CriticBudgetExhausted => "覆核預算用盡",
+        R::TimeBudgetExhausted => "已達掃描時間預算，部分模組未審（--time-budget）",
         R::Interrupted => "執行被中斷",
         R::ModelRefused => "有模型拒答，對應的模組或發現未審",
         R::UnitsFailed => "部分模組或候選沒有得到可用結果（呼叫失敗、回覆不合格式或未覆核）",
+        R::InjectionUncrosschecked => {
+            "偵測到疑似 prompt injection 的模組，因本次只有單一模型家族，無法交叉覆審（建議加入不同家族的模型）"
+        }
     }
 }
 

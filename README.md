@@ -66,8 +66,14 @@ vettalon scan . --profile deep --save
 # 檢查報告檔有沒有被改壞
 vettalon validate report.json
 
-# 全部模組都審（--max-modules 0；大型 repo 較慢、較花費）
+# 全部模組都審（--max-modules 0；受安全上限 40 個模組約束，其餘列為 deferred）
 vettalon scan . --profile deep --max-modules 0 --report report.json
+
+# 給 AI 深審一個整體時間預算：用完就把待審模組 deferred、標為 incomplete，不再無止境磨
+vettalon scan . --profile deep --time-budget 1200 --report report.json
+
+# 記錄每次模型呼叫的追蹤（JSON Lines：步驟、模型、位元組數、延遲、結果，不含內文）
+vettalon scan . --profile deep --trace trace.jsonl
 
 # 政策門檻（可重複）：跨家族覆核成立或人工確認的「高」以上發現超過 0 筆就讓 CI 失敗
 # 有 --gate 而沒指定 --fail-on 時，只由門檻條件決定結束碼
@@ -78,7 +84,23 @@ vettalon scan . --profile deep \
 # （只產生草稿，不會替你送出；只有經覆核「需人工研判」或人工確認的項目才能產生）
 vettalon disclose report.json
 vettalon disclose report.json --finding <id> --channel twcert --out draft.txt
+
+# 供應鏈獵捕：稽核專案相依 OSS 套件的原始碼，找尚未登錄的新漏洞
+# 先預覽會審哪些（不花 token），再真的跑
+vettalon hunt . --dry-run
+vettalon hunt . --finders claude --verifiers codex --max-deps 20
+
+# 寫出完整報告，並為新漏洞候選產上游揭露草稿（只草稿，不會送出）
+vettalon hunt . --report hunt.json --disclose-dir drafts/
 ```
+
+### 供應鏈獵捕（`vettalon hunt`）
+
+`vettalon hunt <project>` 從專案的 lockfile（Cargo.lock、npm `package-lock.json`、pip `requirements.txt`、Go `go.sum`）解出相依套件，抓它們的官方發佈原始碼來審，找**還沒被登錄成 CVE** 的新漏洞——和既有 SCA 工具（比對已知 CVE）互補。先查 OSV 分出「已知」與「可能是新的」，預設只審**直接依賴**、跳過 OSV 已有 CVE 的版本（那些 SCA 已在追），把 AI 預算集中在未登錄的；每個相依用跟 `scan --profile deep` 一樣的跨家族對抗覆核。確認且 PoC 跑通的新發現才列為揭露候選。
+
+旗標：`--max-deps N`（上限，預設 20）、`--include-transitive`（連間接依賴）、`--reaudit-known`（連已知 CVE 版本也審）、`--dry-run`（只預覽選取，不抓取不花 token）、`--report <檔>`（寫出完整 JSON）、`--disclose-dir <目錄>`（為新候選產上游負責任揭露草稿，附送出前檢查清單，只草稿、永不送出）、`--dep-timeout <秒>`（每個相依 fetch+audit 的時限，預設 300，逾時記錯誤並續跑）、`--dep-concurrency N`（同時審查幾個相依，1–4，預設 2；總 token 用量不變，但每個模型同時收到 N 個呼叫，CLI 帳號遇到限流就調低）、`--poc`、`--finders`／`--verifiers`。OSV 以批次查詢，大型相依樹也只打少數幾次。獵捕模式會連網抓原始碼與查 OSV，出口限定套件登錄處與 `api.osv.dev`；被稽核專案自己的私有程式碼不出境，送出去的只有相依套件的 `name@version`。`scan` 的零網路行為不受影響。
+
+付費的 Vettalon Pro 另可把獵捕報告產成企業供應鏈報告（Word／PDF／HTML）。
 
 ### 漏洞提交草稿
 
@@ -98,6 +120,33 @@ vettalon disclose report.json --finding <id> --channel twcert --out draft.txt
 沒給 `--fail-on` 又有 `--gate` 時，`--fail-on` 視為 `none`；兩者都給時任一不通過即失敗。報告後續的人工判定會重算門檻結果。`summary.policy` 只證明「結果與報告內的條件一致」，不證明條件沒被改過；以掃描當下的結束碼為準。
 
 結束碼：`0` 沒有達到 `--fail-on` 門檻、`--gate` 條件全部通過；`1` 未通過；`2` 掃描本身沒能完成（路徑錯誤、門檻條件寫錯、報告寫不出來等等）。
+
+### 模組排序（`--rank`）
+
+深掃預設用內建的啟發式排序器決定模組審查順序（git 熱點、進入點、風險分數），**零網路**。另有選配的 `--rank jev`：把模組的**metadata**（路徑、副檔名、位元組大小、是否進入點、git 熱點數——**不含任何程式碼內容**）送到 TypeSafe Jev，排序後把高風險檔排進審查名額內。基準上 Jev 把深掃的 hit@40 從 6/9 提到 8/9（見 `benchmarks/ranking/`）。
+
+```bash
+# 預設啟發式（零網路）
+vettalon scan . --profile deep
+
+# 用 Jev 排序（需 config 設好 [jev]）
+vettalon scan . --profile deep --rank jev
+```
+
+- **只有 `--rank jev` 才連網**；不給這個旗標，scan 維持零網路。
+- 送出前由 `assert_metadata_only` 逐檔比對原始碼，任何程式碼內容外洩就 fail-closed。
+- Jev 不可用（斷線／逾時／回錯）時自動退回啟發式，出一行提示，不中斷掃描。
+- Jev 只排序，**不取代** finder／verifier。
+
+金鑰設定（兩種，config 一律不存 key 本身）：
+```toml
+[jev]
+api_key_env = "TYPESAFE_API_KEY"                            # 法一：環境變數名
+# api_key_file = "/home/you/.config/vettalon/typesafe.key" # 法二：0600 金鑰檔
+```
+解析順序：環境變數有值優先，否則讀金鑰檔。金鑰只活在呼叫當下，不落檔、不進報告、不進 log。
+
+**給終端客戶**：Jev 預設關閉，由客戶自己決定要不要開。CLI 每次用 `--rank jev` 都會在輸出印一行「把 metadata 送到 <host>」。客戶用**自己的 TypeSafe 金鑰**（BYOK），計費與資料處理關係在客戶與 TypeSafe 之間。檔案路徑本身可能透露內部專案名稱，想完全不出境就用啟發式排序（預設）。TypeSafe 的資料保留期限依其條款而定（非企業方案無固定天數、零保留 ZDR 僅企業方案）。
 
 ### 模型設定
 
@@ -162,7 +211,7 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 
 ## 怎麼運作
 
-1. **intake**：統計語言、找進入點，讀 git 歷史，把常出安全修補的檔案標為熱點，再依風險排序模組。
+1. **intake**：統計語言、找進入點，讀 git 歷史，把常出安全修補的檔案標為熱點，再依風險排序模組。文件與非程式碼檔（`.md`、`.rst`、圖片、鎖檔、二進位、翻譯檔…）不列為可審模組（AI 深審只推理程式碼），巢狀的獨立 clone 與根 `.gitignore` 排除的目錄也不列入；單次審查的模組數有安全上限（40），`--time-budget` 另給整體時間預算。排序預設用內建啟發式（零網路）；`--rank jev` 可改用只看 metadata 的 Jev 排序（見「模組排序」）。
 2. **分工找洞**：前 `--max-modules` 個模組依序輪流分配給各個 finder，一個模組只交給一個模型審，所以成本跟單一模型差不多。
 3. **前置檢查**：不呼叫任何模型，只核對模型講的檔案、行號和呼叫鏈是否真的存在，對不上就直接證偽。
 4. **高風險模組雙審**：git 安全熱點或進入點的模組（天然少數）會自動再交給一家不同家族的 finder 審一次，兩家各讀一遍；加 `--cross-check-top N` 可把前 N 個高分模組也納入。一家漏看、另一家補上。
@@ -187,7 +236,7 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 
 **AI 不會自動宣告「確認」。** AI 能做到的最高狀態是 `needs_human`，`confirmed` 只能由人來標。
 
-報告格式定義在 [`crates/vettalon/src/audit/schema.rs`](crates/vettalon/src/audit/schema.rs)，寫檔前一律先跑 validator。SARIF 2.1.0 輸出可以直接上傳到 GitHub code scanning，被證偽的發現會標成 suppressed，不會刪掉。
+報告格式定義在 [`crates/vettalon/src/audit/schema.rs`](crates/vettalon/src/audit/schema.rs)，寫檔前一律先跑 validator。SARIF 2.1.0 輸出可以直接上傳到 GitHub code scanning，被證偽的發現會標成 suppressed，不會刪掉；result 的 properties 另帶該發現對應的 CAPEC 攻擊模式（`vettalon.capec`）與依前置條件推導的可利用性分級（`vettalon.exploitability`：direct／conditional／hard_to_reach）。有 CWE 對應的發現，報告會多一段攻擊情境與 CAPEC 參考連結。`--trace` 會另寫一份逐次模型呼叫的 JSON Lines（只記步驟、模型、位元組數、延遲、結果，不含內文）。
 
 ## 已知限制
 
@@ -213,7 +262,9 @@ cargo clippy --all-targets
 
 這個 repo 是 Vettalon 的開源核心：上面列的掃描、多模型分工與跨家族覆核、PoC 沙箱、SARIF、提交草稿全部免費，沒有功能鎖或次數限制。
 
-另有付費的 Vettalon Pro，提供桌面 App、本機 dashboard，以及對齊台灣資安檢測報告慣例的企業報告產生器（PDF／Word／HTML）。Pro 讀的是同一份 `scan --report` JSON，核心不依賴 Pro。
+另有付費的 Vettalon Pro，提供桌面 App、本機 dashboard（可設時間預算、隨時取消掃描，並有檢視供應鏈獵捕結果、產生上游揭露草稿的「供應鏈」分頁），以及對齊台灣資安檢測報告慣例的企業報告產生器（PDF／Word／HTML）。Pro 讀的是同一份 `scan --report` JSON，核心不依賴 Pro。
+
+Pro 需要授權金鑰，詳見 [官網](https://vettalon.dudustudio.monster/#editions)。開源核心不需要授權，也不會檢查授權。
 
 ## License
 

@@ -51,13 +51,81 @@ const MAX_WALK_DEPTH: usize = 16;
 /// filesystem-touching function in this module — `census_languages` and
 /// `detect_entry_points` are pure functions over the returned list so they
 /// can be unit-tested with literal fixture data.
+///
+/// Also skipped, so audit slots go to the project's own code:
+/// - nested independent clones (a subdirectory whose `.git` is a directory —
+///   another project checked out inside this one; a submodule's `.git` is a
+///   file and is kept, it is part of the product);
+/// - directories the root `.gitignore` excludes with a plain, glob-free
+///   directory pattern (only when the root is a git work tree; git cannot
+///   re-include anything under an excluded directory, so this is exact).
 pub fn walk_repo_files(root: &Path) -> Vec<String> {
+    let ignored = RootIgnoredDirs::load(root);
     let mut out = Vec::new();
-    walk_dir(root, root, 0, &mut out);
+    walk_dir(root, root, 0, &ignored, &mut out);
     out
 }
 
-fn walk_dir(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+/// The glob-free directory patterns of the root `.gitignore`. A deliberate
+/// subset of gitignore: patterns with wildcards or negation are not
+/// interpreted (they only ever skip less, never more).
+#[derive(Debug, Default)]
+struct RootIgnoredDirs {
+    /// Patterns containing a `/`: relative to the root.
+    anchored: Vec<String>,
+    /// Bare names: match a directory of that name at any depth.
+    names: Vec<String>,
+}
+
+impl RootIgnoredDirs {
+    fn load(root: &Path) -> Self {
+        if !root.join(".git").exists() {
+            return Self::default();
+        }
+        match std::fs::read_to_string(root.join(".gitignore")) {
+            Ok(text) => Self::parse(&text),
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with('!')
+                || line.contains(['*', '?', '[', '\\'])
+            {
+                continue;
+            }
+            let pat = line.trim_end_matches('/');
+            if pat.is_empty() {
+                continue;
+            }
+            if pat.contains('/') {
+                out.anchored.push(pat.trim_start_matches('/').to_string());
+            } else {
+                out.names.push(pat.to_string());
+            }
+        }
+        out
+    }
+
+    /// `rel` is the directory's repo-relative POSIX path.
+    fn matches(&self, rel: &str) -> bool {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        self.anchored.iter().any(|a| a == rel) || self.names.iter().any(|n| n == name)
+    }
+}
+
+fn walk_dir(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    ignored: &RootIgnoredDirs,
+    out: &mut Vec<String>,
+) {
     if depth > MAX_WALK_DEPTH || out.len() >= MAX_WALK_FILES {
         return;
     }
@@ -85,10 +153,15 @@ fn walk_dir(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
         if file_type.is_dir() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if SKIP_DIR_NAMES.contains(&name.as_ref()) {
+            if SKIP_DIR_NAMES.contains(&name.as_ref()) || path.join(".git").is_dir() {
                 continue;
             }
-            walk_dir(root, &path, depth + 1, out);
+            if let Ok(rel) = path.strip_prefix(root)
+                && ignored.matches(&rel.to_string_lossy().replace('\\', "/"))
+            {
+                continue;
+            }
+            walk_dir(root, &path, depth + 1, ignored, out);
         } else if file_type.is_file()
             && let Ok(rel) = path.strip_prefix(root)
         {
@@ -294,7 +367,35 @@ pub enum GitHistoryStatus {
     Unavailable { reason: String },
 }
 
-/// Run `git log --since=1.year.ago --no-merges --name-only` against
+/// Hotspot look-back window. Anchored to the HEAD commit rather than today,
+/// so an old checkout (benchmark fixtures, vendored snapshots, a repo nobody
+/// has touched in a year) still yields its security-fix history.
+const HOTSPOT_WINDOW_SECS: i64 = 365 * 24 * 60 * 60;
+
+/// `--since` argument for the hotspot window ending at `head_epoch`. Falls
+/// back to the wall-clock window when the HEAD date is unknown or too small
+/// to subtract from (git treats `@0` as no lower bound at all).
+fn hotspot_since_arg(head_epoch: Option<i64>) -> String {
+    match head_epoch {
+        Some(ts) if ts > HOTSPOT_WINDOW_SECS => format!("--since=@{}", ts - HOTSPOT_WINDOW_SECS),
+        _ => "--since=1.year.ago".to_string(),
+    }
+}
+
+/// Committer date of HEAD as a unix timestamp, or `None` on any failure.
+async fn head_commit_epoch(repo_root_str: &str) -> Option<i64> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", repo_root_str, "log", "-1", "--format=%ct", "HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Run `git log --since=<HEAD - 1 year> --no-merges --name-only` against
 /// `repo_root` and reduce it to hotspots. Any failure (git missing, not a
 /// repo, empty history) degrades to `Unavailable { reason }` — never an
 /// `Err` that would abort the whole intake pass.
@@ -316,12 +417,13 @@ pub async fn compute_git_history(repo_root: &Path) -> GitHistoryStatus {
     // directly in the array does not type-unify.
     let repo_root_str = repo_root.to_string_lossy().into_owned();
     let pretty_arg = format!("--pretty=format:{GIT_LOG_COMMIT_MARKER}%s");
+    let since_arg = hotspot_since_arg(head_commit_epoch(&repo_root_str).await);
     let output = tokio::process::Command::new("git")
         .args([
             "-C",
             repo_root_str.as_str(),
             "log",
-            "--since=1.year.ago",
+            since_arg.as_str(),
             "--no-merges",
             "--name-only",
             pretty_arg.as_str(),
@@ -378,6 +480,69 @@ mod tests {
     use super::*;
 
     // ── walk_repo_files ──────────────────────────────────────────────
+
+    #[test]
+    fn walk_skips_nested_clones_and_root_gitignored_dirs_but_keeps_submodules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mk = |p: &str, body: &str| {
+            let full = root.join(p);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        };
+        std::fs::create_dir(root.join(".git")).unwrap();
+        mk(
+            ".gitignore",
+            "# comment\n/third_party/\nartifacts/\ncrates/app/gen\n*.log\n!keep/\n",
+        );
+        mk("src/main.rs", "fn main() {}");
+        // A nested independent clone (its .git is a directory): skipped.
+        mk("upstream-layer/.git/HEAD", "ref");
+        mk("upstream-layer/recipe.py", "x");
+        // A submodule (.git is a file): part of the product, kept.
+        mk("libs/own/.git", "gitdir: ../../.git/modules/own");
+        mk("libs/own/lib.rs", "x");
+        mk("third_party/a.c", "x"); // anchored pattern
+        mk("crates/app/artifacts/out.rs", "x"); // bare name, any depth
+        mk("crates/app/gen/x.rs", "x"); // anchored, no trailing slash
+        mk("crates/app/src/ok.rs", "x");
+        mk("app.log", "x"); // glob patterns are not interpreted (kept)
+
+        let files = walk_repo_files(root);
+        for kept in [
+            "src/main.rs",
+            "libs/own/lib.rs",
+            "crates/app/src/ok.rs",
+            "app.log",
+        ] {
+            assert!(
+                files.contains(&kept.to_string()),
+                "{kept} missing: {files:?}"
+            );
+        }
+        for gone in [
+            "upstream-layer",
+            "third_party",
+            "artifacts",
+            "crates/app/gen",
+        ] {
+            assert!(
+                !files.iter().any(|f| f.contains(gone)),
+                "{gone} not skipped: {files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_gitignore_applies_only_inside_a_git_work_tree() {
+        // An extracted package tarball (hunt) has no .git: its .gitignore
+        // describes the author's repo, not what was shipped, so it is ignored.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "dist/\nlib/\n").unwrap();
+        std::fs::create_dir(dir.path().join("lib")).unwrap();
+        std::fs::write(dir.path().join("lib/index.js"), "x").unwrap();
+        assert!(walk_repo_files(dir.path()).contains(&"lib/index.js".to_string()));
+    }
 
     #[test]
     fn walk_skips_vendor_dirs_and_symlinks() {
@@ -536,6 +701,60 @@ mod tests {
                 );
             }
             GitHistoryStatus::Available { .. } => panic!("expected Unavailable for a non-git dir"),
+        }
+    }
+
+    #[test]
+    fn hotspot_window_is_anchored_to_head_commit() {
+        let head = 1_792_036_661; // 2026-10-15
+        assert_eq!(
+            hotspot_since_arg(Some(head)),
+            format!("--since=@{}", head - HOTSPOT_WINDOW_SECS)
+        );
+        // Unknown or implausible HEAD date falls back to the wall-clock window.
+        assert_eq!(hotspot_since_arg(None), "--since=1.year.ago");
+        assert_eq!(hotspot_since_arg(Some(0)), "--since=1.year.ago");
+    }
+
+    #[tokio::test]
+    async fn old_checkout_still_gets_hotspots() {
+        if crate::util::which_cli("git").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Every commit is two years old: a now-anchored window sees nothing.
+        let old = "2024-06-01T12:00:00+00:00";
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_AUTHOR_DATE", old)
+                .env("GIT_COMMITTER_DATE", old)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("auth.rs"), "fn a() {}").unwrap();
+        git(&["add", "auth.rs"]);
+        git(&["commit", "-q", "-m", "fix: sql injection in login"]);
+
+        match compute_git_history(root).await {
+            GitHistoryStatus::Available { hotspots } => {
+                assert_eq!(hotspots.len(), 1, "expected the old security fix to count");
+                assert_eq!(hotspots[0].file, "auth.rs");
+            }
+            GitHistoryStatus::Unavailable { reason } => panic!("unexpected: {reason}"),
         }
     }
 

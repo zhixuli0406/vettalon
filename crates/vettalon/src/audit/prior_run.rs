@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use super::schema::{
     AuditReport, CARRIED_FROM_PRIOR_PREFIX, CURRENT_SCHEMA_VERSION, EvidenceItem, EvidenceKind,
-    Finding, FindingStatus, PRIOR_CONFIRMED_PREFIX, PriorRunInfo,
+    Finding, FindingStatus, PRIOR_CHANGED_PREFIX, PRIOR_CONFIRMED_PREFIX, PriorRunInfo,
 };
 
 /// Reports bigger than this are not read (a corrupted or hostile file must
@@ -172,6 +172,31 @@ pub fn decide(current_hash: Option<&str>, prior: &[PriorEntry]) -> CarryDecision
     CarryDecision::None
 }
 
+/// P2-2: distinct prior statuses at one fingerprint, in a stable order, as a
+/// short zh-TW list for the episodic note (e.g. `confirmed、refuted`).
+fn prior_status_summary(entries: &[PriorEntry]) -> String {
+    let mut seen: Vec<FindingStatus> = Vec::new();
+    for e in entries {
+        if !seen.contains(&e.status) {
+            seen.push(e.status);
+        }
+    }
+    seen.iter()
+        .map(|s| status_word(*s))
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+fn status_word(s: FindingStatus) -> &'static str {
+    match s {
+        FindingStatus::Candidate => "candidate",
+        FindingStatus::NeedsHuman => "needs_human",
+        FindingStatus::Confirmed => "confirmed",
+        FindingStatus::Refuted => "refuted",
+        FindingStatus::Suppressed => "suppressed",
+    }
+}
+
 fn push_prior_evidence(f: &mut Finding, detail: String) {
     f.evidence.push(EvidenceItem {
         kind: EvidenceKind::AdversarialReview,
@@ -196,7 +221,20 @@ pub fn apply_prior(findings: &mut [Finding], prior: &PriorIndex) -> PriorRunInfo
         };
         match decide(f.file_hash.as_deref(), entries) {
             CarryDecision::None => {}
-            CarryDecision::ChangedSource => info.changed_source += 1,
+            CarryDecision::ChangedSource => {
+                info.changed_source += 1;
+                // P2-2 episodic memory: the verdict is NOT carried (source
+                // changed), but a spot a prior run judged is worth another
+                // look, so the prior judgement is surfaced as a note.
+                push_prior_evidence(
+                    f,
+                    format!(
+                        "{PRIOR_CHANGED_PREFIX}: {} 先前在此根因曾判定為 {}，但來源已變動，判定未沿用，建議重新研判",
+                        prior.report_file,
+                        prior_status_summary(entries),
+                    ),
+                );
+            }
             CarryDecision::Suppressed => {
                 f.status = FindingStatus::Suppressed;
                 push_prior_evidence(
@@ -405,7 +443,18 @@ mod tests {
                 .detail
                 .starts_with(PRIOR_CONFIRMED_PREFIX)
         );
-        assert!(current[3].evidence.is_empty());
+        // P2-2: the changed-source finding is NOT carried (stays Candidate)
+        // but carries an episodic note naming the prior verdict.
+        assert_eq!(current[3].status, FindingStatus::Candidate);
+        assert!(
+            current[3].evidence.iter().any(|e| {
+                e.detail.starts_with(PRIOR_CHANGED_PREFIX) && e.detail.contains("refuted")
+            }),
+            "changed-source finding should carry an episodic note: {:?}",
+            current[3].evidence
+        );
+        // The genuinely-new finding (no prior fingerprint) carries nothing.
+        assert!(current[4].evidence.is_empty());
         assert_eq!(
             info,
             PriorRunInfo {

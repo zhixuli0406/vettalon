@@ -33,14 +33,17 @@ mod assign;
 mod coverage;
 pub mod cvss;
 pub mod cwe;
+pub mod exploitability;
 pub mod gate;
 mod injection;
 mod intake;
+mod jev;
 mod llm_util;
 mod poc;
 mod precheck;
 mod prior_run;
 mod prompts;
+pub mod rank_snapshot;
 mod report;
 pub mod sarif;
 mod scanners;
@@ -53,7 +56,7 @@ use std::path::{Path, PathBuf};
 
 use vettalon_contract::coverage::{IncompleteReason, RunStatus};
 
-use crate::llm::{ModelHandle, RefusalLog, StepCaller};
+use crate::llm::{ModelHandle, RefusalLog, StepCaller, TraceLog};
 
 use ai_audit::{AiAuditOutcome, ModuleAuditReport, ModuleOutcome, ModuleTarget};
 use schema::{
@@ -63,6 +66,18 @@ use schema::{
 };
 
 pub use poc::set_poc_image;
+
+/// Which module ranker a deep scan uses. `Heuristic` is the default,
+/// zero-network built-in ranker. `Jev` reorders modules with the TypeSafe
+/// Jev API using metadata only (opt-in via `--rank jev`); it carries the
+/// resolved settings so the audit step can reach the API, and on any failure
+/// the scan falls back to the heuristic order.
+#[derive(Clone, Default)]
+pub enum RankStrategy {
+    #[default]
+    Heuristic,
+    Jev(crate::config::JevSettings),
+}
 
 /// Flags of `vettalon scan`, with the model roster already resolved.
 pub struct ScanOptions {
@@ -86,6 +101,14 @@ pub struct ScanOptions {
     pub cross_check_top: usize,
     pub fail_on_needs_human: bool,
     pub no_prior: bool,
+    /// Module ranker (`--rank`). Default heuristic; `Jev` sends metadata only.
+    pub rank: RankStrategy,
+    /// P2-1: write a per-call LLM trace (JSONL) here. `None` disables tracing.
+    pub trace: Option<PathBuf>,
+    /// Wall-clock budget for the whole AI deep-audit. When it runs out, the
+    /// modules still pending are deferred and the run is marked incomplete
+    /// (`TimeBudgetExhausted`) instead of grinding on. `None` = no budget.
+    pub time_budget: Option<std::time::Duration>,
     pub finders: Vec<ModelHandle>,
     pub verifiers: Vec<ModelHandle>,
     pub poc_models: Vec<ModelHandle>,
@@ -292,14 +315,30 @@ pub async fn run_scan_with_progress(
     };
 
     let refusals = RefusalLog::default();
+    // P2-1: only a --trace run records; an ordinary run keeps a disabled log.
+    let trace = if opts.trace.is_some() {
+        TraceLog::recording()
+    } else {
+        TraceLog::default()
+    };
     let mut coverage: Vec<ModuleCoverage> = Vec::new();
     let mut incomplete_reason: Option<IncompleteReason> = None;
     let mut ai_ran = false;
     let mut suspected_injection: Vec<injection::InjectionSignal> = Vec::new();
     let mut cross_checked = 0usize;
+    let mut ranker = String::new();
+    let mut rank_degraded = false;
     if let Some(intake_profile) = intake_profile.as_ref() {
         progress.phase(Phase::AiAudit, "finder models auditing modules");
-        let step = run_audit_step(&repo_root, opts, intake_profile, &refusals, progress).await;
+        let step = run_audit_step(
+            &repo_root,
+            opts,
+            intake_profile,
+            &refusals,
+            &trace,
+            progress,
+        )
+        .await;
         engines_run.extend(step.engine_runs);
         engines_missing.extend(step.missing);
         findings.extend(step.findings);
@@ -308,6 +347,8 @@ pub async fn run_scan_with_progress(
         ai_ran = step.ran;
         suspected_injection = step.injection;
         cross_checked = step.cross_checked;
+        ranker = step.ranker.to_string();
+        rank_degraded = step.rank_degraded;
     }
 
     let dropped = dedup_by_id(&mut findings);
@@ -328,11 +369,11 @@ pub async fn run_scan_with_progress(
     if ai_ran {
         if findings.iter().any(adversarial::is_eligible) {
             progress.phase(Phase::Review, "cross-family verifiers reviewing candidates");
-            findings = review_step(&repo_root, findings, opts, &refusals, progress).await;
+            findings = review_step(&repo_root, findings, opts, &refusals, &trace, progress).await;
         }
         if opts.poc {
             progress.phase(Phase::Poc, "sandboxed PoC generation");
-            poc_step(&repo_root, &mut findings, opts, &refusals, progress).await;
+            poc_step(&repo_root, &mut findings, opts, &refusals, &trace, progress).await;
         }
     }
 
@@ -346,8 +387,14 @@ pub async fn run_scan_with_progress(
             schema::ModuleCoverageStatus::LlmFailed | schema::ModuleCoverageStatus::ParseFailed
         )
     });
+    let time_budget_hit = coverage.iter().any(|c| {
+        matches!(c.status, schema::ModuleCoverageStatus::Deferred)
+            && c.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET)
+    });
     if incomplete_reason.is_none() {
-        incomplete_reason = if !refusal_events.is_empty() {
+        incomplete_reason = if time_budget_hit {
+            Some(IncompleteReason::TimeBudgetExhausted)
+        } else if !refusal_events.is_empty() {
             Some(IncompleteReason::ModelRefused)
         } else if unverified || units_failed {
             Some(IncompleteReason::UnitsFailed)
@@ -394,6 +441,8 @@ pub async fn run_scan_with_progress(
             refusals: refusal_events,
             suspected_injection,
             cross_checked,
+            ranker,
+            rank_degraded,
         },
     };
 
@@ -405,8 +454,28 @@ pub async fn run_scan_with_progress(
             violations.iter().map(|v| v.to_string()).collect(),
         ));
     }
+    if let Some(path) = &opts.trace
+        && let Err(e) = write_trace_jsonl(path, &trace.snapshot())
+    {
+        eprintln!("[vettalon] 無法寫入追蹤檔 {}：{e}", path.display());
+    }
     progress.phase(Phase::Done, "complete");
     Ok(audit_report)
+}
+
+/// P2-1: write the LLM-call trace as JSON Lines (one [`crate::llm::TraceEvent`]
+/// per line). Sizes, timing and outcome only — no prompt or reply text — so
+/// the file is safe to keep and share.
+fn write_trace_jsonl(path: &Path, events: &[crate::llm::TraceEvent]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut s = String::with_capacity(events.len() * 128);
+    for e in events {
+        if let Ok(line) = serde_json::to_string(e) {
+            s.push_str(&line);
+            s.push('\n');
+        }
+    }
+    std::fs::File::create(path)?.write_all(s.as_bytes())
 }
 
 /// `vettalon scan`: run the audit, print the summary, write the requested
@@ -567,6 +636,19 @@ struct AuditStep {
     injection: Vec<injection::InjectionSignal>,
     /// How many modules were audited by more than one finder.
     cross_checked: usize,
+    /// Which ranker ordered the modules (`"heuristic"` | `"jev"`).
+    ranker: &'static str,
+    /// True when Jev was requested but failed and the heuristic order was used.
+    rank_degraded: bool,
+}
+
+/// The host a Jev config would reach, for the egress notice.
+fn jev_host(cfg: &crate::config::JevSettings) -> String {
+    cfg.base_url()
+        .strip_prefix("https://")
+        .and_then(|r| r.split(['/', ':']).next())
+        .unwrap_or("api.typesafe.ai")
+        .to_string()
 }
 
 /// Step 3b: rank modules, deal the first `--max-modules` to the finders
@@ -577,25 +659,52 @@ async fn run_audit_step(
     opts: &ScanOptions,
     intake_profile: &intake::RepoProfile,
     refusals: &RefusalLog,
+    trace: &TraceLog,
     progress: &dyn Progress,
 ) -> AuditStep {
-    let hotspots: Vec<intake::HotspotFile> = match &intake_profile.git_history {
-        intake::GitHistoryStatus::Available { hotspots } => hotspots.clone(),
-        intake::GitHistoryStatus::Unavailable { .. } => Vec::new(),
+    // Shared with `rank_snapshot` (benchmark dump) so the two cannot drift.
+    let ranked = rank_snapshot::ranked_modules(repo_root, intake_profile);
+    // Opt-in metadata-only re-ranking (`--rank jev`). On any failure keep the
+    // heuristic order and tell the operator; a ranker outage must not block a
+    // scan. Only metadata leaves the machine, guarded inside `jev::rerank`.
+    let (ranked, ranker, rank_degraded) = match &opts.rank {
+        RankStrategy::Heuristic => (ranked, "heuristic", false),
+        RankStrategy::Jev(cfg) => {
+            // Make the third-party egress visible in the log/CI output: only
+            // module metadata is sent, never code (guarded in jev::rerank).
+            eprintln!(
+                "[vettalon] Jev 排序：把模組 metadata（路徑／大小／git 熱點，不含程式碼）送到 {}",
+                jev_host(cfg)
+            );
+            match jev::rerank(repo_root, intake_profile, ranked.clone(), cfg).await {
+                Ok(reordered) => (reordered, "jev", false),
+                Err(e) => {
+                    eprintln!("[vettalon] Jev 排序不可用，改用啟發式排序：{e}");
+                    (ranked, "jev", true)
+                }
+            }
+        }
     };
-    let all_files = intake::walk_repo_files(repo_root);
-    let ranked = ai_audit::rank_modules(&all_files, &hotspots, &intake_profile.entry_points);
     // Split oversized modules into pages so a large high-signal file in a
     // populous flat directory is audited, not dropped once the budget fills.
     let ranked =
         ai_audit::paginate_modules(repo_root, ranked, ai_audit::MODULE_PROMPT_BUDGET_BYTES);
     // `max_modules == 0` means "every ranked module" (the GUI's "完整" / full
-    // coverage); any positive value caps it to the top-N by risk.
-    let take = if opts.max_modules == 0 {
+    // coverage); any positive value caps it to the top-N by risk. A hard
+    // safety ceiling then bounds the worst case so a big repo cannot grind
+    // through hundreds of slow model calls; the rest are deferred.
+    let requested = if opts.max_modules == 0 {
         ranked.len()
     } else {
         opts.max_modules.min(ranked.len())
     };
+    let take = requested.min(ai_audit::MAX_AUDIT_MODULES_CEILING);
+    if take < requested {
+        eprintln!(
+            "[vettalon] 提示：本次審查模組上限 {}（要求 {requested}），其餘列為 deferred；要控整體時間用 --time-budget。",
+            ai_audit::MAX_AUDIT_MODULES_CEILING
+        );
+    }
 
     if take == 0 || opts.finders.is_empty() {
         let reason = if take == 0 {
@@ -619,6 +728,8 @@ async fn run_audit_step(
             ran: false,
             injection: Vec::new(),
             cross_checked: 0,
+            ranker,
+            rank_degraded,
         };
     }
 
@@ -671,6 +782,8 @@ async fn run_audit_step(
     let cap = (ai_audit::MAX_TOTAL_AI_CANDIDATES / busy).max(ai_audit::MAX_CANDIDATES_PER_MODULE);
     let audited = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let total_modules = take as u32;
+    // Scan-wide wall-clock deadline shared by every finder (--time-budget).
+    let deadline = opts.time_budget.map(|d| std::time::Instant::now() + d);
     let runs = futures::future::join_all(
         opts.finders
             .iter()
@@ -682,7 +795,8 @@ async fn run_audit_step(
                     if share.is_empty() {
                         return None;
                     }
-                    let caller = StepCaller::new(finder.clone(), "audit", refusals.clone());
+                    let caller = StepCaller::new(finder.clone(), "audit", refusals.clone())
+                        .with_trace(trace.clone());
                     let outcome = ai_audit::run_ai_audit_progress(
                         repo_root,
                         share,
@@ -694,6 +808,7 @@ async fn run_audit_step(
                             audited: &audited,
                             total: total_modules,
                             cross_check: second,
+                            deadline,
                         },
                     )
                     .await;
@@ -712,6 +827,8 @@ async fn run_audit_step(
         ran: false,
         injection,
         cross_checked,
+        ranker,
+        rank_degraded,
     };
     let mut reports: Vec<ModuleAuditReport> = Vec::new();
     let mut unreachable = false;
@@ -765,7 +882,7 @@ async fn run_audit_step(
         // A finder never reached its model: its share of modules is unreviewed.
         Some(IncompleteReason::EngineUnavailable)
     } else if !step.injection.is_empty() && single_family {
-        Some(IncompleteReason::UnitsFailed)
+        Some(IncompleteReason::InjectionUncrosschecked)
     } else {
         None
     };
@@ -822,6 +939,7 @@ async fn review_step(
     findings: Vec<Finding>,
     opts: &ScanOptions,
     refusals: &RefusalLog,
+    trace: &TraceLog,
     progress: &dyn Progress,
 ) -> Vec<Finding> {
     if opts.verifiers.is_empty() {
@@ -864,7 +982,7 @@ async fn review_step(
         let log = refusals.clone();
         let reviewed = reviewed.clone();
         jobs.push(async move {
-            let caller = StepCaller::new(verifier.clone(), "verify", log);
+            let caller = StepCaller::new(verifier.clone(), "verify", log).with_trace(trace.clone());
             let mut answered_once = false;
             let mut dead = false;
             let mut out = Vec::with_capacity(batch.len());
@@ -933,6 +1051,7 @@ async fn poc_step(
     findings: &mut [Finding],
     opts: &ScanOptions,
     refusals: &RefusalLog,
+    trace: &TraceLog,
     progress: &dyn Progress,
 ) {
     if opts.poc_models.is_empty() {
@@ -940,6 +1059,8 @@ async fn poc_step(
         return;
     }
     let total = findings.len() as u32;
+    // P0-2: one run-wide PoC execution budget shared across every finding.
+    let budget = poc::PocBudget::new(poc::POC_MAX_RUNS);
     for (nth, f) in findings.iter_mut().enumerate() {
         let pick = finder_of(f, opts)
             .and_then(|finder| assign::verifier_for(finder, &opts.poc_models, nth))
@@ -955,8 +1076,9 @@ async fn poc_step(
                 total: total.max(1),
             },
         );
-        let caller = StepCaller::new(opts.poc_models[pick].clone(), "poc", refusals.clone());
-        poc::maybe_run_poc(repo_root, f, &caller, opts.poc).await;
+        let caller = StepCaller::new(opts.poc_models[pick].clone(), "poc", refusals.clone())
+            .with_trace(trace.clone());
+        poc::maybe_run_poc(repo_root, f, &caller, opts.poc, &budget).await;
     }
 }
 
@@ -1122,6 +1244,9 @@ mod tests {
             cross_check_top: 0,
             fail_on_needs_human: false,
             no_prior: true,
+            rank: RankStrategy::Heuristic,
+            trace: None,
+            time_budget: None,
             finders: Vec::new(),
             verifiers: Vec::new(),
             poc_models: Vec::new(),
@@ -1850,6 +1975,9 @@ mod tests {
         cmd_scan(home.path(), o).await;
         let v = read_report(&report_path);
         assert_eq!(v["run_status"], "incomplete");
+        // The single-family injection case has its own reason, not the generic
+        // units_failed, so the operator sees why (no cross-family check).
+        assert_eq!(v["incomplete_reason"], "injection_uncrosschecked");
         assert!(
             !v["ensemble"]["suspected_injection"]
                 .as_array()

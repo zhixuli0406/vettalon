@@ -85,6 +85,14 @@ fn result(f: &Finding) -> Value {
     });
     if let Some(cwe) = &f.cwe {
         r["properties"]["vettalon.cwe"] = json!(cwe);
+        // P0-3: the CAPEC attack patterns mapped to this CWE, machine-readable
+        // alongside the weakness id.
+        let capec: Vec<&str> = crate::kb::lookup(cwe)
+            .map(|e| e.capec.iter().map(|c| c.id.as_str()).collect())
+            .unwrap_or_default();
+        if !capec.is_empty() {
+            r["properties"]["vettalon.capec"] = json!(capec);
+        }
     }
     if !f.cve.is_empty() {
         r["properties"]["vettalon.cve"] = json!(f.cve);
@@ -92,6 +100,12 @@ fn result(f: &Finding) -> Value {
     if let Some(cvss) = &f.cvss {
         r["properties"]["vettalon.cvss"] = json!(cvss);
     }
+    // P1-2: deterministic exploitability tier from the finding's preconditions.
+    r["properties"]["vettalon.exploitability"] = json!(
+        crate::audit::exploitability::assess(&f.conditions)
+            .tier
+            .key()
+    );
     if matches!(f.status, FindingStatus::Refuted | FindingStatus::Suppressed) {
         let why = f
             .evidence

@@ -78,6 +78,21 @@ struct ScanArgs {
     /// Ignore the newest saved report for this repo.
     #[arg(long)]
     no_prior: bool,
+    /// Write a per-call LLM trace (JSON Lines) here: one line per model call
+    /// with step, model, byte sizes, latency and outcome (no prompt or reply
+    /// text). Useful for cost/latency review and benchmark regression checks.
+    #[arg(long)]
+    trace: Option<PathBuf>,
+    /// Overall wall-clock budget for the AI deep-audit, in seconds. When it
+    /// runs out, pending modules are deferred and the run is marked incomplete
+    /// instead of grinding on. Unset = no budget.
+    #[arg(long)]
+    time_budget: Option<u64>,
+    /// Module ranker for the deep audit: `heuristic` (default, zero-network)
+    /// or `jev` (TypeSafe Jev, metadata-only; requires a `[jev]` config
+    /// block). `jev` is the only way a scan reaches the network.
+    #[arg(long, default_value = "heuristic")]
+    rank: String,
 }
 
 // Parsed once at startup; boxing the big variant buys nothing.
@@ -116,6 +131,11 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Hunt for not-yet-disclosed vulnerabilities in a project's OSS
+    /// dependencies (supply-chain mode). Audits dependency SOURCE with the
+    /// deep engine, uses OSV to focus on what is NOT already a known CVE, and
+    /// surfaces verified novelty candidates for responsible disclosure.
+    Hunt(HuntArgs),
 }
 
 #[derive(Subcommand)]
@@ -124,6 +144,61 @@ enum AgentsAction {
     Build,
     /// Remove the egress proxy and the internal network.
     Stop,
+}
+
+#[derive(clap::Args)]
+struct HuntArgs {
+    /// Project directory holding the lockfile(s): Cargo.lock,
+    /// package-lock.json, requirements.txt, go.sum.
+    path: PathBuf,
+    /// Model roster (default: ~/.vettalon/config.toml, else detected CLIs).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Finder model ids (overrides roles).
+    #[arg(long, value_delimiter = ',')]
+    finders: Vec<String>,
+    /// Verifier model ids (overrides roles).
+    #[arg(long, value_delimiter = ',')]
+    verifiers: Vec<String>,
+    /// Maximum dependencies to fetch + audit (cost guard).
+    #[arg(long, default_value_t = 20)]
+    max_deps: usize,
+    /// Audit transitive dependencies too (default: direct only).
+    #[arg(long)]
+    include_transitive: bool,
+    /// Audit versions that already have a known CVE (default: skip them;
+    /// SCA tools already track those).
+    #[arg(long)]
+    reaudit_known: bool,
+    /// Ranked modules audited per dependency (passed to the deep audit).
+    #[arg(long, default_value_t = 5)]
+    max_modules: usize,
+    /// Per-dependency wall-clock budget in seconds (fetch + audit). A slow
+    /// dependency is recorded as timed-out and the hunt moves on.
+    #[arg(long, default_value_t = 300)]
+    dep_timeout: u64,
+    /// Dependencies audited at the same time (1-4). Token use is unchanged;
+    /// each model receives this many simultaneous calls, so lower it if a CLI
+    /// account hits rate limits.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=vettalon::hunt::run::MAX_DEP_CONCURRENCY as u64))]
+    dep_concurrency: u64,
+    /// Run sandboxed PoCs for plausible High+ findings in each dependency.
+    #[arg(long)]
+    poc: bool,
+    /// Sandbox image for --poc (must already be pulled).
+    #[arg(long, default_value = vettalon::sandbox::DEFAULT_POC_IMAGE)]
+    poc_image: String,
+    /// Preview only: intake + OSV + selection, no fetch or audit (no model
+    /// cost). Shows what a full hunt would audit.
+    #[arg(long)]
+    dry_run: bool,
+    /// Write the full hunt report (JSON) here.
+    #[arg(long)]
+    report: Option<PathBuf>,
+    /// Write upstream responsible-disclosure drafts for the novelty candidates
+    /// into this directory (drafts only; nothing is ever sent).
+    #[arg(long)]
+    disclose_dir: Option<PathBuf>,
 }
 
 fn home_dir() -> PathBuf {
@@ -253,6 +328,9 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         poc_image,
         save,
         no_prior,
+        trace,
+        time_budget,
+        rank,
     } = args;
     let gates = match audit::gate::parse_all(&gates) {
         Ok(g) => g,
@@ -265,7 +343,16 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
     // Same parser the pipeline uses (case-insensitive), so `--profile Deep`
     // loads the roster too; a bad value is reported by the pipeline (exit 2).
     let deep = profile.parse::<ProfileMode>() == Ok(ProfileMode::Deep);
-    let (finders, verifiers, poc_models, roster) = if deep {
+    let want_jev = rank.eq_ignore_ascii_case("jev");
+    if !matches!(rank.to_ascii_lowercase().as_str(), "heuristic" | "jev") {
+        eprintln!("[vettalon] --rank 必須是 heuristic 或 jev（收到 {rank:?}）");
+        return 2;
+    }
+    if want_jev && !deep {
+        eprintln!("[vettalon] --rank jev 只在 --profile deep 有效（quick 不跑 AI 審查）");
+        return 2;
+    }
+    let (finders, verifiers, poc_models, roster, rank_strategy) = if deep {
         let (cfg, source) = match load_config(config.as_deref(), Some(&path)) {
             Ok(c) => c,
             Err(e) => {
@@ -311,9 +398,36 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
             ids(&f),
             ids(&v)
         );
-        (f, v, p, roster)
+        let rank_strategy = if want_jev {
+            match &cfg.jev {
+                Some(j) => {
+                    // Fail fast: the operator asked for Jev, so a missing key
+                    // or bad config is an error, not a silent fallback.
+                    if let Err(e) = j.resolve_key() {
+                        eprintln!("[vettalon] --rank jev：{e}");
+                        return 2;
+                    }
+                    audit::RankStrategy::Jev(j.clone())
+                }
+                None => {
+                    eprintln!(
+                        "[vettalon] --rank jev 需要 config 有 [jev] 區塊（api_key_env 或 api_key_file）"
+                    );
+                    return 2;
+                }
+            }
+        } else {
+            audit::RankStrategy::Heuristic
+        };
+        (f, v, p, roster, rank_strategy)
     } else {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            audit::RankStrategy::Heuristic,
+        )
     };
     audit::set_poc_image(&poc_image);
     let opts = ScanOptions {
@@ -329,6 +443,9 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         cross_check_top,
         fail_on_needs_human,
         no_prior,
+        rank: rank_strategy,
+        trace,
+        time_budget: time_budget.map(std::time::Duration::from_secs),
         finders,
         verifiers,
         poc_models,
@@ -442,6 +559,233 @@ fn cmd_disclose(
     }
 }
 
+/// `vettalon hunt`: supply-chain mode. Audits a project's OSS dependency
+/// source for not-yet-disclosed vulnerabilities, focusing (by default) on
+/// direct dependencies whose version OSV reports no known CVE for.
+async fn cmd_hunt(args: HuntArgs) -> i32 {
+    use vettalon::hunt::fetch::HttpSourceFetcher;
+    use vettalon::hunt::osv::HttpOsvClient;
+    use vettalon::hunt::run::{
+        EngineAuditor, HuntOptions, disclosure_drafts, plan_hunt, render_plan, render_summary,
+        run_hunt_with_progress,
+    };
+
+    let opts = HuntOptions {
+        max_deps: args.max_deps,
+        include_transitive: args.include_transitive,
+        reaudit_known: args.reaudit_known,
+        per_dep_timeout: std::time::Duration::from_secs(args.dep_timeout),
+        dep_concurrency: args.dep_concurrency as usize,
+    };
+    let osv = HttpOsvClient::new();
+
+    if args.dry_run {
+        return match plan_hunt(&args.path, &opts, &osv).await {
+            Ok(plan) => {
+                print!("{}", render_plan(&plan));
+                0
+            }
+            Err(e) => {
+                eprintln!("[vettalon] {e}");
+                2
+            }
+        };
+    }
+
+    // A real hunt audits each dependency with the deep engine, so resolve the
+    // roster (same rules as `scan --profile deep`).
+    let (cfg, source) = match load_config(args.config.as_deref(), Some(&args.path)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[vettalon] {e}");
+            return 2;
+        }
+    };
+    let all = match cfg.handles() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[vettalon] {e}");
+            return 2;
+        }
+    };
+    let (finders, verifiers, poc_models) = match (
+        pick(&all, &args.finders, Role::Finder),
+        pick(&all, &args.verifiers, Role::Verifier),
+        pick(&all, &[], Role::Poc),
+    ) {
+        (Ok(f), Ok(v), Ok(p)) => (f, v, p),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            eprintln!("[vettalon] {e}");
+            return 2;
+        }
+    };
+    let roster: Vec<ModelInfo> = all
+        .iter()
+        .map(|(m, roles)| ModelInfo {
+            id: m.id.clone(),
+            family: m.family.clone(),
+            roles: roles.iter().map(|r| role_name(*r).to_string()).collect(),
+        })
+        .collect();
+    eprintln!(
+        "[vettalon] 模型（{source}）：finder = {}；verifier = {}",
+        finders
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        verifiers
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    vettalon::audit::set_poc_image(&args.poc_image);
+
+    let auditor = EngineAuditor {
+        home: home_dir(),
+        finders,
+        verifiers,
+        poc_models,
+        roster,
+        max_modules: args.max_modules,
+        poc: args.poc,
+    };
+    let fetcher = HttpSourceFetcher::new();
+    // Each dependency takes up to --dep-timeout and up to --dep-concurrency run
+    // at once, so report progress per dependency to stderr (the JSON report is
+    // stdout). Lines name the dependency because they interleave.
+    struct CliHuntProgress {
+        finished: std::sync::atomic::AtomicUsize,
+    }
+    impl vettalon::hunt::run::HuntProgress for CliHuntProgress {
+        fn start(&self, i: usize, total: usize, t: &vettalon::hunt::DependencyTarget) {
+            eprintln!(
+                "[vettalon] ({i}/{total}) 審查 {} {}@{} …",
+                t.ecosystem.as_str(),
+                t.name,
+                t.version
+            );
+        }
+        fn done(&self, _index: usize, total: usize, h: &vettalon::hunt::run::DependencyHunt) {
+            let outcome = if !h.audited {
+                format!("未完成（{}）", h.error.as_deref().unwrap_or("原因不明"))
+            } else {
+                let novel = h
+                    .findings
+                    .iter()
+                    .filter(|f| {
+                        matches!(
+                            f.status,
+                            vettalon::audit::schema::FindingStatus::Confirmed
+                                | vettalon::audit::schema::FindingStatus::NeedsHuman
+                        )
+                    })
+                    .count();
+                if novel > 0 {
+                    format!("新漏洞候選 {novel}")
+                } else {
+                    "未發現".to_string()
+                }
+            };
+            // The index is the plan position; with parallel audits they finish
+            // out of order, so the line counts completions instead.
+            let n = self
+                .finished
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            eprintln!(
+                "[vettalon] 完成 {n}/{total}：{}@{} → {outcome}",
+                h.target.name, h.target.version
+            );
+        }
+    }
+    match run_hunt_with_progress(
+        &args.path,
+        &opts,
+        &osv,
+        &fetcher,
+        &auditor,
+        &CliHuntProgress {
+            finished: std::sync::atomic::AtomicUsize::new(0),
+        },
+    )
+    .await
+    {
+        Ok(report) => {
+            print!("{}", render_summary(&report));
+            if let Some(path) = &args.report {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(json) => match vettalon::util::write_private(path, json.as_bytes()) {
+                        Ok(()) => eprintln!("[vettalon] 報告已寫入 {}", path.display()),
+                        Err(e) => eprintln!("[vettalon] 無法寫入報告 {}：{e}", path.display()),
+                    },
+                    Err(e) => eprintln!("[vettalon] 報告序列化失敗：{e}"),
+                }
+            }
+            if let Some(dir) = &args.disclose_dir {
+                write_disclosure_drafts(
+                    dir,
+                    &disclosure_drafts(&report, chrono::Utc::now().date_naive()),
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("[vettalon] {e}");
+            2
+        }
+    }
+}
+
+/// Write each upstream disclosure draft to `<dir>/<dep>-<finding>.md` with the
+/// pre-send checklist. Drafts only — nothing is sent.
+fn write_disclosure_drafts(dir: &std::path::Path, drafts: &[vettalon::hunt::run::HuntDisclosure]) {
+    if drafts.is_empty() {
+        eprintln!("[vettalon] 沒有可揭露的新漏洞候選（需確認或 needs_human，且 OSV 查無已知）。");
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("[vettalon] 無法建立草稿目錄 {}：{e}", dir.display());
+        return;
+    }
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    let mut written = 0;
+    for d in drafts {
+        let name = format!("{}-{}.md", safe(&d.dependency), safe(&d.finding_id));
+        let checklist = vettalon::disclose::CHECKLIST
+            .iter()
+            .map(|c| format!("- [ ] {c}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!(
+            "# {}\n\n> 上游負責任揭露草稿（{}）。只是草稿，送出前請逐項確認下方清單。\n> 建議公開時程：{}{}\n\n{}\n\n---\n\n## 送出前檢查清單\n\n{checklist}\n",
+            d.draft.subject,
+            d.dependency,
+            d.draft.disclose_by,
+            d.draft
+                .submit
+                .as_deref()
+                .map(|s| format!("\n> 送交位置：{s}"))
+                .unwrap_or_default(),
+            d.draft.body,
+        );
+        let path = dir.join(&name);
+        match vettalon::util::write_private(&path, content.as_bytes()) {
+            Ok(()) => written += 1,
+            Err(e) => eprintln!("[vettalon] 無法寫入草稿 {}：{e}", path.display()),
+        }
+    }
+    eprintln!(
+        "[vettalon] 已寫入 {written} 份揭露草稿到 {}（草稿而已，不會自動送出）。",
+        dir.display()
+    );
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -454,6 +798,7 @@ async fn main() -> ExitCode {
             channel,
             out,
         } => cmd_disclose(report, finding, channel, out),
+        Command::Hunt(args) => cmd_hunt(args).await,
         Command::Models { config, probe } => cmd_models(config, probe).await,
         Command::Agents { action } => {
             let r = match action {
