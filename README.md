@@ -1,7 +1,6 @@
 # Vettalon
 
 [![CI](https://github.com/zhixuli0406/vettalon/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/vettalon/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/vettalon?logo=npm)](https://www.npmjs.com/package/vettalon)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 Vettalon 找出你自己程式碼裡的安全漏洞。做法是讓多家 AI 模型分工審查，再交給另一家模型試著推翻每一個發現，留下推不翻的。
@@ -43,6 +42,19 @@ git clone <this repo> vettalon && cd vettalon
 cargo install --path crates/vettalon
 vettalon models --probe      # 確認找得到哪些模型、能不能連上
 docker pull python:3.12-slim  # 只有要用 --poc 才需要
+```
+
+也可以直接下載預先建置的執行檔（macOS arm64／x64、Linux x64／arm64）：到 [Releases](https://github.com/zhixuli0406/vettalon/releases) 下載對應平台的 `vettalon-<平台>.tar.gz`，用同名的 `.sha256` 核對，或用 cosign 驗證簽章（`.sig`、`.pem`）。
+
+在 GitHub Actions 裡掃描、把結果送進 code scanning，用 [vettalon-action](https://github.com/zhixuli0406/vettalon-action)：
+
+```yaml
+permissions:
+  contents: read
+  security-events: write
+steps:
+  - uses: actions/checkout@v7
+  - uses: zhixuli0406/vettalon-action@v1
 ```
 
 ## 使用

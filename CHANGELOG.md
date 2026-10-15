@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-15
+
 ### Added
 - **`vettalon hunt --dep-concurrency N`：相依套件平行審查**（1–4，預設 2）。原本相依一個接一個審，每個最長 `--dep-timeout`，20 個相依可以跑上一兩個小時。總 token 用量與串行相同，增加的是每個模型同時收到的呼叫數（每個進行中的相依各一個），CLI 帳號遇到限流時調低即可。報告裡相依的順序維持計畫順序，不受誰先審完影響；逐相依進度訊息會交錯：開始行標的是計畫中的位置，完成行改標「完成 N/總數」並帶套件名稱。解壓縮改在 blocking 執行緒跑，不會卡住同時進行的其他相依與它們的逾時計時。函式庫 API：`HuntOptions::dep_concurrency`、`hunt::run::MAX_DEP_CONCURRENCY`。
 - **選配的 metadata-only 模組排序 `scan --rank jev`**（TypeSafe Jev）：把模組的 metadata（路徑、副檔名、位元組大小、是否進入點、git 熱點數，**不含程式碼內容**）送 Jev 排序，把高風險檔排進審查名額內。基準上深掃 hit@40 從啟發式 6/9 提到 8/9。**預設關閉**：不給 `--rank jev`，scan 維持零網路、用內建啟發式排序。送出前由 `assert_metadata_only` 逐檔比對原始碼 fail-closed，確保碼不離機；Jev 不可用時自動退回啟發式並出一行提示（報告記 `ensemble.rank_degraded`），不取代 finder／verifier。金鑰兩種存法：`[jev].api_key_env`（環境變數名，優先）或 `[jev].api_key_file`（0600 金鑰檔），config 一律不存 key 本身，key 不進 log／報告。CLI `--rank <heuristic|jev>`、`vettalon.example.toml` 範例。BYOK（自備 TypeSafe 金鑰），CLI 每次執行印出 metadata 送出目的地。
@@ -54,6 +56,7 @@
 - `ai_audit::run_ai_audit_progress` 改收 `AuditProgress` 結構（函式庫 API）。
 
 ### Fixed
+- semgrep 的規則 ID 前面會被加上規則檔所在的暫存目錄（macOS 是 `var.folders.….T.`，每次執行都不同），SARIF 的 `ruleId` 因此每次都變，GitHub code scanning 會把同一條規則當成新規則，警示反覆關閉又重開。內建規則的 ID 現在會還原成原本的名稱（例如 `python-eval-exec-usage`）。
 - `--poc` 的殘留容器清理會刪掉其他正在執行中的 PoC 容器：每次執行 PoC 前都會強制移除所有帶 PoC 標籤的容器，原本只在串行時安全。相依平行審查、或兩個掃描同時跑時，一邊的 PoC 會被另一邊砍掉，結果被記成 PoC 失敗。現在容器帶建立它的程序 PID 標籤（`vettalon.poc.owner`），清理只移除 owner 已不存在、或沒有 owner 標籤（舊版留下）的容器。
 - git 安全熱點的一年時間窗改從 HEAD commit 的日期往回算，原本從今天往回算。最後一次 commit 超過一年的 checkout（基準測試的舊版本、很久沒動的 repo）原本完全拿不到熱點訊號，模組排序退化成只看檔名；實測 sprockets v3.7.1（HEAD 2016-12）從 0 個檔案有熱點訊號變成 11 個。
 - `vettalon hunt` 在 Cargo workspace（虛擬 manifest）把所有相依都判為間接相依，預設設定下一個都不審；改從 Cargo.lock 裡專案自身套件（無 `source`）的 `dependencies` 判定直接相依，雙版本並存時精確到版本。npm lock v3 的 workspace 成員（`packages/*`）原本被當成第三方套件，現在視為專案自身，其相依標為直接相依。

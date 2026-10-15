@@ -91,6 +91,26 @@ impl Drop for TempRulesFile {
     }
 }
 
+/// IDs of the bundled rules (the `- id:` lines of [`BUNDLED_RULES_YAML`]).
+fn bundled_rule_ids() -> impl Iterator<Item = &'static str> {
+    BUNDLED_RULES_YAML
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("- id:"))
+        .map(str::trim)
+}
+
+/// semgrep prefixes the rule id with the config file's directory, dot-joined
+/// (`var.folders.….T.python-eval-exec-usage` on macOS, `tmp.…` on Linux). The
+/// temp directory changes every run, which would make SARIF consumers such as
+/// GitHub code scanning treat each run's alerts as new rules. Map such ids
+/// back to the bundled id; leave any other id as semgrep reported it.
+fn normalize_check_id(raw: &str) -> String {
+    bundled_rule_ids()
+        .find(|id| raw == *id || raw.strip_suffix(id).is_some_and(|p| p.ends_with('.')))
+        .map(str::to_string)
+        .unwrap_or_else(|| raw.to_string())
+}
+
 /// semgrep `--json` top-level shape (subset — only what we use).
 #[derive(Debug, Deserialize)]
 struct SemgrepReport {
@@ -158,6 +178,7 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
         .results
         .into_iter()
         .map(|r| {
+            let check_id = normalize_check_id(&r.check_id);
             let extra = r.extra.unwrap_or(SemgrepExtra {
                 message: String::new(),
                 severity: String::new(),
@@ -171,7 +192,7 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
             let severity = map_severity(&extra.severity);
             let line = r.start.and_then(|s| s.line);
             let title = if extra.message.is_empty() {
-                format!("semgrep rule {}", r.check_id)
+                format!("semgrep rule {check_id}")
             } else {
                 extra.message.clone()
             };
@@ -193,7 +214,7 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
                 r.path,
                 line,
                 &extra.lines,
-                r.check_id,
+                check_id,
                 evidence,
             );
             f.cwe = cwe;
@@ -205,6 +226,34 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_rule_ids_lose_the_temp_dir_prefix_semgrep_adds() {
+        // semgrep prefixes a local config's directory, dot-joined; on macOS
+        // that directory changes every run, so code scanning would see a new
+        // rule each time.
+        assert_eq!(
+            normalize_check_id("var.folders.n5.abc123.T.python-eval-exec-usage"),
+            "python-eval-exec-usage"
+        );
+        assert_eq!(
+            normalize_check_id("tmp.python-yaml-load-unsafe"),
+            "python-yaml-load-unsafe"
+        );
+        assert_eq!(
+            normalize_check_id("python-eval-exec-usage"),
+            "python-eval-exec-usage"
+        );
+        // Anything that is not a bundled rule is left untouched.
+        assert_eq!(
+            normalize_check_id("custom.rules.my-check"),
+            "custom.rules.my-check"
+        );
+        assert_eq!(
+            normalize_check_id("xpython-eval-exec-usage"),
+            "xpython-eval-exec-usage"
+        );
+    }
 
     const FIXTURE: &str = r#"{
       "results": [
