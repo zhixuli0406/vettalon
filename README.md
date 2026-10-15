@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/brand/vettalon-readme-banner.png" alt="Vettalon: multiple AI models review your code, and a model from a different vendor challenges each finding" width="880">
+</p>
+
 # Vettalon
 
 <div align="center">

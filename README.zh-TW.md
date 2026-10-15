@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/brand/vettalon-readme-banner.png" alt="Vettalon：多家 AI 模型審查你的程式碼，再由另一家模型挑戰每一個發現" width="880">
+</p>
+
 # Vettalon
 
 <div align="center">

@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Changed
+- **README 頂端加上 Vettalon 品牌橫幅**（Dudu C1 識別：V 形標誌，深藍＋青綠 `#0C7580`），圖檔在 `docs/assets/brand/vettalon-readme-banner.png`，英文與繁中 README 共用。
 - **README 改成英文為主**：`README.md` 換成完整英文版（開頭加 Quick start），原本的繁中版移到 `README.zh-TW.md`，兩份頂端互相切換。終端摘要輸出目前仍只有繁中，英文版 README 附了對照說明。
 
 ### Fixed
