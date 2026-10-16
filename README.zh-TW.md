@@ -56,6 +56,8 @@ docker pull python:3.12-slim  # 只有要用 --poc 才需要
 
 也可以直接下載預先建置的執行檔（macOS arm64／x64、Linux x64／arm64）：到 [Releases](https://github.com/zhixuli0406/vettalon/releases) 下載對應平台的 `vettalon-<平台>.tar.gz`，用同名的 `.sha256` 核對，或用 cosign 驗證簽章（`.sig`、`.pem`）。
 
+同一批發佈的執行檔也放在 npm 上，不想裝 Rust 的話可以直接 `npm install -g vettalon`（macOS arm64／x64、Linux x64／arm64）。
+
 在 GitHub Actions 裡掃描、把結果送進 code scanning，用 [vettalon-action](https://github.com/zhixuli0406/vettalon-action)：
 
 ```yaml

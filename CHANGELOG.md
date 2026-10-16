@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Changed
+- **README 加上 npm 安裝方式**：`npm install -g vettalon` 裝的是同一批簽章發佈的執行檔（macOS arm64／x64、Linux x64／arm64），不需要 Rust 工具鏈；英文版 Quick start 改以 npm 開頭。
 - **README 頂端加上 Vettalon 品牌橫幅**（Dudu C1 識別：V 形標誌，深藍＋青綠 `#0C7580`），圖檔在 `docs/assets/brand/vettalon-readme-banner.png`，英文與繁中 README 共用。
 - **README 改成英文為主**：`README.md` 換成完整英文版（開頭加 Quick start），原本的繁中版移到 `README.zh-TW.md`，兩份頂端互相切換。終端摘要輸出目前仍只有繁中，英文版 README 附了對照說明。
 

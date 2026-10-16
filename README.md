@@ -22,8 +22,7 @@ Open-source scanners (semgrep, gitleaks, cargo-audit) run a deterministic pass f
 ## Quick start
 
 ```bash
-git clone https://github.com/zhixuli0406/vettalon.git vettalon && cd vettalon
-cargo install --path crates/vettalon   # or download a prebuilt binary, see "Install"
+npm install -g vettalon                # macOS / Linux; or build from source, see "Install"
 vettalon scan .                        # open-source scanners only (free, offline)
 vettalon scan . --profile deep --report report.json --sarif report.sarif   # add the AI audit
 ```
@@ -68,6 +67,8 @@ docker pull python:3.12-slim  # only needed for --poc
 ```
 
 You can also download a prebuilt binary (macOS arm64/x64, Linux x64/arm64): get the `vettalon-<platform>.tar.gz` for your platform from [Releases](https://github.com/zhixuli0406/vettalon/releases) and check it against the `.sha256` file of the same name, or verify the signature with cosign (`.sig`, `.pem`).
+
+The same release binaries are on npm, so you can skip the Rust toolchain: `npm install -g vettalon` (macOS arm64/x64, Linux x64/arm64).
 
 To scan in GitHub Actions and send the results to code scanning, use [vettalon-action](https://github.com/zhixuli0406/vettalon-action):
 
