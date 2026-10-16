@@ -9,6 +9,7 @@
 - **README 改成英文為主**：`README.md` 換成完整英文版（開頭加 Quick start），原本的繁中版移到 `README.zh-TW.md`，兩份頂端互相切換。終端摘要輸出目前仍只有繁中，英文版 README 附了對照說明。
 
 ### Fixed
+- **npm 發佈腳本解不出執行檔**：發佈用的壓縮檔裡執行檔存成 `./vettalon`，`npm/scripts/publish.sh` 卻指名解出 `vettalon`，GNU tar 找不到就失敗，0.1.0 因此沒有自動上 npm。改成整包解到暫存目錄再複製，找不到執行檔會明確報錯。0.1.0 已用 release 上簽章過的壓縮檔（sha256 核對過）手動發佈。
 - **README 的壞連結與錯誤引用**：Jev 排序基準原本指向沒有公開的 `benchmarks/ranking/`，改連官網基準測試段落；injection 偵測原本寫「見第 5 點」，實際是「怎麼運作」第 6 點。
 
 ## [0.1.0] - 2026-10-15

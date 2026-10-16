@@ -26,7 +26,13 @@ for artifact in "${!PLATFORM_MAP[@]}"; do
   [ -f "$tarball" ] || { echo "  SKIP: ${tarball} not found"; continue; }
   bin_dir="${NPM_DIR}/${PLATFORM_MAP[$artifact]}/bin"
   mkdir -p "$bin_dir"
-  tar xzf "$tarball" -C "$bin_dir" vettalon
+  # Release archives store the binary as ./vettalon; extract everything to a
+  # scratch dir instead of naming the member, which depends on that prefix.
+  unpack="$(mktemp -d)"
+  tar xzf "$tarball" -C "$unpack"
+  [ -f "$unpack/vettalon" ] || { echo "  ERROR: no vettalon binary in ${tarball}"; exit 1; }
+  cp "$unpack/vettalon" "$bin_dir/vettalon"
+  rm -rf "$unpack"
   chmod +x "${bin_dir}/vettalon"
 done
 
