@@ -372,14 +372,23 @@ pub fn targets_from_dir(project: &std::path::Path) -> Result<Vec<DependencyTarge
         found = true;
         match cargo_targets_from_dir(project) {
             Ok(t) => all.extend(t),
-            Err(e) => eprintln!("[vettalon] 略過 Cargo.lock：{e}"),
+            Err(e) => eprintln!(
+                "[vettalon] {}",
+                crate::tr!("略過 Cargo.lock：{e}", "skipping Cargo.lock: {e}")
+            ),
         }
     }
     if let Ok(text) = std::fs::read_to_string(project.join("package-lock.json")) {
         found = true;
         match parse_npm_lock(&text) {
             Ok(t) => all.extend(t),
-            Err(e) => eprintln!("[vettalon] 略過 package-lock.json：{e}"),
+            Err(e) => eprintln!(
+                "[vettalon] {}",
+                crate::tr!(
+                    "略過 package-lock.json：{e}",
+                    "skipping package-lock.json: {e}"
+                )
+            ),
         }
     }
     if let Ok(text) = std::fs::read_to_string(project.join("requirements.txt")) {

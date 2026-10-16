@@ -77,11 +77,13 @@ fn parse_status(s: &str) -> Result<FindingStatus, String> {
         "candidate" => Ok(FindingStatus::Candidate),
         "confirmed" => Ok(FindingStatus::Confirmed),
         "needs_human" | "needs-human" => Ok(FindingStatus::NeedsHuman),
-        "refuted" | "suppressed" => Err(format!(
-            "狀態 {s} 是已結案的發現，不能作為門檻條件（只接受 candidate、confirmed、needs_human）"
+        "refuted" | "suppressed" => Err(crate::tr!(
+            "狀態 {s} 是已結案的發現，不能作為門檻條件（只接受 candidate、confirmed、needs_human）",
+            "status {s} marks a closed finding and cannot be a gate condition (use candidate, confirmed or needs_human)"
         )),
-        other => Err(format!(
-            "未知的狀態 {other:?}（只接受 candidate、confirmed、needs_human）"
+        other => Err(crate::tr!(
+            "未知的狀態 {other:?}（只接受 candidate、confirmed、needs_human）",
+            "unknown status {other:?} (use candidate, confirmed or needs_human)"
         )),
     }
 }
@@ -110,7 +112,11 @@ impl std::str::FromStr for GateCondition {
                     }
                 }
                 if list.is_empty() {
-                    return Err("status= 後面至少要有一個狀態".into());
+                    return Err(crate::lang::pick(
+                        "status= 後面至少要有一個狀態",
+                        "status= needs at least one status",
+                    )
+                    .into());
                 }
                 statuses = Some(list);
             } else if lower == "cross_family" || lower == "cross-family" {
@@ -120,15 +126,24 @@ impl std::str::FromStr for GateCondition {
             } else if let Some(v) = lower.strip_prefix("count>") {
                 count = Some((CountOp::Gt, parse_threshold(v)?));
             } else {
-                return Err(format!(
-                    "看不懂門檻條件中的 {tok:?}（可用：severity>=LEVEL、status=a,b、cross_family、count>N / count>=N）"
+                return Err(crate::tr!(
+                    "看不懂門檻條件中的 {tok:?}（可用：severity>=LEVEL、status=a,b、cross_family、count>N / count>=N）",
+                    "unrecognised gate token {tok:?} (use severity>=LEVEL, status=a,b, cross_family, count>N / count>=N)"
                 ));
             }
         }
-        let (op, threshold) =
-            count.ok_or_else(|| format!("門檻條件 {expr:?} 缺少 count>N 或 count>=N"))?;
+        let (op, threshold) = count.ok_or_else(|| {
+            crate::tr!(
+                "門檻條件 {expr:?} 缺少 count>N 或 count>=N",
+                "gate condition {expr:?} is missing count>N or count>=N"
+            )
+        })?;
         if op == CountOp::Gte && threshold == 0 {
-            return Err("count>=0 永遠成立，請改用 count>0 或更大的門檻".into());
+            return Err(crate::lang::pick(
+                "count>=0 永遠成立，請改用 count>0 或更大的門檻",
+                "count>=0 always holds; use count>0 or a larger threshold",
+            )
+            .into());
         }
         let mut statuses = statuses.unwrap_or_else(|| DEFAULT_STATUSES.to_vec());
         statuses.sort_by_key(|s| status_name(*s));
@@ -143,8 +158,12 @@ impl std::str::FromStr for GateCondition {
 }
 
 fn parse_threshold(v: &str) -> Result<usize, String> {
-    v.parse()
-        .map_err(|_| format!("門檻數量 {v:?} 不是非負整數"))
+    v.parse().map_err(|_| {
+        crate::tr!(
+            "門檻數量 {v:?} 不是非負整數",
+            "gate threshold {v:?} is not a non-negative integer"
+        )
+    })
 }
 
 impl std::fmt::Display for GateCondition {
@@ -201,7 +220,10 @@ pub fn parse_all(exprs: &[String]) -> Result<Vec<GateCondition>, String> {
     exprs
         .iter()
         .filter(|e| !e.trim().is_empty())
-        .map(|e| e.parse().map_err(|err| format!("--gate {e:?}：{err}")))
+        .map(|e| {
+            e.parse()
+                .map_err(|err| crate::tr!("--gate {e:?}：{err}", "--gate {e:?}: {err}"))
+        })
         .collect()
 }
 
@@ -227,6 +249,22 @@ pub fn any_failed(results: &[GateResult]) -> bool {
 mod tests {
     use super::*;
     use crate::audit::schema::{FindingKind, VerifierVote};
+
+    #[test]
+    fn parse_errors_follow_the_language() {
+        use crate::lang::{Lang, with};
+        let en = with(Lang::En, || {
+            "severity>=high".parse::<GateCondition>().unwrap_err()
+        });
+        assert_eq!(
+            en,
+            "gate condition \"severity>=high\" is missing count>N or count>=N"
+        );
+        let zh = with(Lang::ZhTw, || {
+            "bogus count>0".parse::<GateCondition>().unwrap_err()
+        });
+        assert!(zh.starts_with("看不懂門檻條件"));
+    }
 
     fn finding(sev: Severity, status: FindingStatus) -> Finding {
         let mut f = Finding::candidate(

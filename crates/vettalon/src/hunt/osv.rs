@@ -212,11 +212,23 @@ impl OsvClient for HttpOsvClient {
             match parsed {
                 Ok(mut rows) if rows.len() == chunk.len() => out.append(&mut rows),
                 Ok(_) => {
-                    eprintln!("[vettalon] OSV 批次回應筆數不符，該批視為查無");
+                    eprintln!(
+                        "[vettalon] {}",
+                        crate::lang::pick(
+                            "OSV 批次回應筆數不符，該批視為查無",
+                            "OSV batch reply has the wrong row count; treating the batch as no known vulnerabilities",
+                        )
+                    );
                     out.extend(chunk.iter().map(|_| Vec::new()));
                 }
                 Err(e) => {
-                    eprintln!("[vettalon] OSV 批次查詢失敗（該批視為查無）：{e}");
+                    eprintln!(
+                        "[vettalon] {}",
+                        crate::tr!(
+                            "OSV 批次查詢失敗（該批視為查無）：{e}",
+                            "OSV batch query failed (treating the batch as no known vulnerabilities): {e}"
+                        )
+                    );
                     out.extend(chunk.iter().map(|_| Vec::new()));
                 }
             }
@@ -251,7 +263,13 @@ pub async fn scan_known<C: OsvClient>(
     // One batch request where the client supports it; a whole-batch failure
     // degrades every row to "none known" rather than dropping dependencies.
     let batch = client.known_vulns_batch(targets).await.unwrap_or_else(|e| {
-        eprintln!("[vettalon] OSV 批次查詢失敗，全部視為查無：{e}");
+        eprintln!(
+            "[vettalon] {}",
+            crate::tr!(
+                "OSV 批次查詢失敗，全部視為查無：{e}",
+                "OSV batch query failed; treating everything as no known vulnerabilities: {e}"
+            )
+        );
         Vec::new()
     });
     targets

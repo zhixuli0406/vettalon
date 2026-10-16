@@ -15,6 +15,11 @@ use vettalon::llm::ModelHandle;
     about = "Multi-model security audit for your own code"
 )]
 struct Cli {
+    /// Language of terminal output: `en` or `zh-TW`. Default: VETTALON_LANG,
+    /// then the locale (LC_ALL, LC_MESSAGES, LANG); English otherwise.
+    /// Reports and SARIF are the same in either language.
+    #[arg(long, global = true, value_name = "LANG")]
+    lang: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -232,9 +237,14 @@ fn load_config(
     let (cfg, skipped) = Config::autodetect();
     if !skipped.is_empty() {
         eprintln!(
-            "[vettalon] 提示：偵測到 {}，但這些 CLI 的工具無法完全關閉（可能讀取本機檔案），沒有設定檔時不會使用。\
+            "[vettalon] {}",
+            vettalon::tr!(
+                "提示：偵測到 {}，但這些 CLI 的工具無法完全關閉（可能讀取本機檔案），沒有設定檔時不會使用。\
 要使用請在 ~/.vettalon/config.toml 加入；預設會在容器沙箱執行（先跑 `vettalon agents build`），或設 allow_agent_tools = true 直接在本機跑。",
-            skipped.join("、")
+                "note: found {}, but their tools cannot be fully disabled (they may read local files), so they are not used without a config file. \
+Add them to ~/.vettalon/config.toml: by default they run in the container sandbox (run `vettalon agents build` first), or set allow_agent_tools = true to run them directly.",
+                skipped.join(vettalon::lang::pick("、", ", "))
+            )
         );
     }
     Ok((cfg, "auto-detected CLIs on PATH".into()))
@@ -282,9 +292,18 @@ async fn cmd_models(config: Option<PathBuf>, probe: bool) -> i32 {
             return 2;
         }
     };
-    println!("模型清單來源：{source}");
+    println!(
+        "{}",
+        vettalon::tr!("模型清單來源：{source}", "Model roster: {source}")
+    );
     if cfg.models.is_empty() {
-        println!("（沒有任何模型。請建立 vettalon.toml，或安裝 claude / codex / grok CLI）");
+        println!(
+            "{}",
+            vettalon::lang::pick(
+                "（沒有任何模型。請建立 vettalon.toml，或安裝 claude / codex / grok CLI）",
+                "(no models; create vettalon.toml or install the claude / codex / grok CLI)"
+            )
+        );
         return 0;
     }
     let statuses = match cfg.model_statuses(probe).await {
@@ -296,8 +315,16 @@ async fn cmd_models(config: Option<PathBuf>, probe: bool) -> i32 {
     };
     for s in &statuses {
         let status = match s.reachable {
-            Some(true) => format!("OK（{}）", vettalon::util::truncate_bytes(&s.detail, 60)),
-            Some(false) => format!("失敗：{}", vettalon::util::truncate_bytes(&s.detail, 160)),
+            Some(true) => vettalon::tr!(
+                "OK（{}）",
+                "OK ({})",
+                vettalon::util::truncate_bytes(&s.detail, 60)
+            ),
+            Some(false) => vettalon::tr!(
+                "失敗：{}",
+                "failed: {}",
+                vettalon::util::truncate_bytes(&s.detail, 160)
+            ),
             None => String::new(),
         };
         println!(
@@ -345,11 +372,23 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
     let deep = profile.parse::<ProfileMode>() == Ok(ProfileMode::Deep);
     let want_jev = rank.eq_ignore_ascii_case("jev");
     if !matches!(rank.to_ascii_lowercase().as_str(), "heuristic" | "jev") {
-        eprintln!("[vettalon] --rank 必須是 heuristic 或 jev（收到 {rank:?}）");
+        eprintln!(
+            "[vettalon] {}",
+            vettalon::tr!(
+                "--rank 必須是 heuristic 或 jev（收到 {rank:?}）",
+                "--rank must be heuristic or jev (got {rank:?})"
+            )
+        );
         return 2;
     }
     if want_jev && !deep {
-        eprintln!("[vettalon] --rank jev 只在 --profile deep 有效（quick 不跑 AI 審查）");
+        eprintln!(
+            "[vettalon] {}",
+            vettalon::lang::pick(
+                "--rank jev 只在 --profile deep 有效（quick 不跑 AI 審查）",
+                "--rank jev only applies to --profile deep (quick runs no AI audit)"
+            )
+        );
         return 2;
     }
     let (finders, verifiers, poc_models, roster, rank_strategy) = if deep {
@@ -394,9 +433,13 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
                 .join(", ")
         };
         eprintln!(
-            "[vettalon] 模型（{source}）：finder = {}；verifier = {}",
-            ids(&f),
-            ids(&v)
+            "[vettalon] {}",
+            vettalon::tr!(
+                "模型（{source}）：finder = {}；verifier = {}",
+                "models ({source}): finder = {}; verifier = {}",
+                ids(&f),
+                ids(&v)
+            )
         );
         let rank_strategy = if want_jev {
             match &cfg.jev {
@@ -404,14 +447,18 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
                     // Fail fast: the operator asked for Jev, so a missing key
                     // or bad config is an error, not a silent fallback.
                     if let Err(e) = j.resolve_key() {
-                        eprintln!("[vettalon] --rank jev：{e}");
+                        eprintln!("[vettalon] --rank jev: {e}");
                         return 2;
                     }
                     audit::RankStrategy::Jev(j.clone())
                 }
                 None => {
                     eprintln!(
-                        "[vettalon] --rank jev 需要 config 有 [jev] 區塊（api_key_env 或 api_key_file）"
+                        "[vettalon] {}",
+                        vettalon::lang::pick(
+                            "--rank jev 需要 config 有 [jev] 區塊（api_key_env 或 api_key_file）",
+                            "--rank jev needs a [jev] block in the config (api_key_env or api_key_file)"
+                        )
                     );
                     return 2;
                 }
@@ -475,10 +522,22 @@ fn cmd_disclose(
             .filter(|f| disclose::eligible(f).is_ok())
             .collect();
         if eligible.is_empty() {
-            println!("沒有可提交的項目（只有經覆核「需人工研判」或已確認的項目才產生提交草稿）。");
+            println!(
+                "{}",
+                vettalon::lang::pick(
+                    "沒有可提交的項目（只有經覆核「需人工研判」或已確認的項目才產生提交草稿）。",
+                    "Nothing to report (drafts are only made for findings verified as needs-human-review or confirmed)."
+                )
+            );
             return 0;
         }
-        println!("可產生提交草稿的項目（--finding <id>）：");
+        println!(
+            "{}",
+            vettalon::lang::pick(
+                "可產生提交草稿的項目（--finding <id>）：",
+                "Findings you can draft a report for (--finding <id>):"
+            )
+        );
         for f in eligible {
             let loc = f
                 .line
@@ -497,11 +556,20 @@ fn cmd_disclose(
     let id = match matches.as_slice() {
         [one] => one.to_string(),
         [] => {
-            eprintln!("[vettalon] 找不到 finding {wanted}");
+            eprintln!(
+                "[vettalon] {}",
+                vettalon::tr!("找不到 finding {wanted}", "no finding {wanted}")
+            );
             return 2;
         }
         _ => {
-            eprintln!("[vettalon] {wanted} 對應到多個 finding，請給更長的 id");
+            eprintln!(
+                "[vettalon] {}",
+                vettalon::tr!(
+                    "{wanted} 對應到多個 finding，請給更長的 id",
+                    "{wanted} matches several findings; give a longer id"
+                )
+            );
             return 2;
         }
     };
@@ -523,32 +591,59 @@ fn cmd_disclose(
             return 2;
         }
     };
-    eprintln!("通報管道建議：");
+    eprintln!(
+        "{}",
+        vettalon::lang::pick("通報管道建議：", "Suggested channels:")
+    );
     for c in &pkg.channels {
         let mark = if c.channel == pkg.draft.channel {
             "→"
         } else {
             " "
         };
-        eprintln!("  {mark} {}：{}", c.label, c.reason);
+        eprintln!(
+            "  {mark} {}{}{}",
+            c.label,
+            vettalon::lang::pick("：", ": "),
+            c.reason
+        );
     }
-    eprintln!("\n送出前請逐項確認（vettalon 不會替你送出）：");
+    eprintln!(
+        "\n{}",
+        vettalon::lang::pick(
+            "送出前請逐項確認（vettalon 不會替你送出）：",
+            "Check each item before sending (vettalon never sends anything for you):"
+        )
+    );
     for item in &pkg.checklist {
         eprintln!("  [ ] {item}");
     }
     if let Some(s) = &pkg.draft.submit {
-        eprintln!("\n提交位置：{s}");
+        eprintln!("\n{}", vettalon::tr!("提交位置：{s}", "Submit at: {s}"));
     }
-    eprintln!("建議公開日期：{}\n", pkg.draft.disclose_by);
+    eprintln!(
+        "{}\n",
+        vettalon::tr!(
+            "建議公開日期：{}",
+            "Suggested disclosure date: {}",
+            pkg.draft.disclose_by
+        )
+    );
     let text = format!("{}\n\n{}\n", pkg.draft.subject, pkg.draft.body);
     match out {
         Some(path) => match vettalon::util::write_private(&path, text.as_bytes()) {
             Ok(()) => {
-                eprintln!("草稿已寫入：{}", path.display());
+                eprintln!(
+                    "{}",
+                    vettalon::tr!("草稿已寫入：{}", "Draft written: {}", path.display())
+                );
                 0
             }
             Err(e) => {
-                eprintln!("[vettalon] 無法寫入 {}：{e}", path.display());
+                eprintln!(
+                    "[vettalon] {}",
+                    vettalon::tr!("無法寫入 {}：{e}", "cannot write {}: {e}", path.display())
+                );
                 2
             }
         },
@@ -628,17 +723,21 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
         })
         .collect();
     eprintln!(
-        "[vettalon] 模型（{source}）：finder = {}；verifier = {}",
-        finders
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        verifiers
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
+        "[vettalon] {}",
+        vettalon::tr!(
+            "模型（{source}）：finder = {}；verifier = {}",
+            "models ({source}): finder = {}; verifier = {}",
+            finders
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            verifiers
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     );
     vettalon::audit::set_poc_image(&args.poc_image);
 
@@ -661,15 +760,25 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
     impl vettalon::hunt::run::HuntProgress for CliHuntProgress {
         fn start(&self, i: usize, total: usize, t: &vettalon::hunt::DependencyTarget) {
             eprintln!(
-                "[vettalon] ({i}/{total}) 審查 {} {}@{} …",
-                t.ecosystem.as_str(),
-                t.name,
-                t.version
+                "[vettalon] {}",
+                vettalon::tr!(
+                    "({i}/{total}) 審查 {} {}@{} …",
+                    "({i}/{total}) auditing {} {}@{} …",
+                    t.ecosystem.as_str(),
+                    t.name,
+                    t.version
+                )
             );
         }
         fn done(&self, _index: usize, total: usize, h: &vettalon::hunt::run::DependencyHunt) {
             let outcome = if !h.audited {
-                format!("未完成（{}）", h.error.as_deref().unwrap_or("原因不明"))
+                vettalon::tr!(
+                    "未完成（{}）",
+                    "incomplete ({})",
+                    h.error
+                        .as_deref()
+                        .unwrap_or_else(|| vettalon::lang::pick("原因不明", "reason unknown"))
+                )
             } else {
                 let novel = h
                     .findings
@@ -683,9 +792,9 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
                     })
                     .count();
                 if novel > 0 {
-                    format!("新漏洞候選 {novel}")
+                    vettalon::tr!("新漏洞候選 {novel}", "{novel} novelty candidate(s)")
                 } else {
-                    "未發現".to_string()
+                    vettalon::lang::pick("未發現", "nothing found").to_string()
                 }
             };
             // The index is the plan position; with parallel audits they finish
@@ -695,8 +804,13 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 + 1;
             eprintln!(
-                "[vettalon] 完成 {n}/{total}：{}@{} → {outcome}",
-                h.target.name, h.target.version
+                "[vettalon] {}",
+                vettalon::tr!(
+                    "完成 {n}/{total}：{}@{} → {outcome}",
+                    "done {n}/{total}: {}@{} → {outcome}",
+                    h.target.name,
+                    h.target.version
+                )
             );
         }
     }
@@ -717,10 +831,23 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
             if let Some(path) = &args.report {
                 match serde_json::to_string_pretty(&report) {
                     Ok(json) => match vettalon::util::write_private(path, json.as_bytes()) {
-                        Ok(()) => eprintln!("[vettalon] 報告已寫入 {}", path.display()),
-                        Err(e) => eprintln!("[vettalon] 無法寫入報告 {}：{e}", path.display()),
+                        Ok(()) => eprintln!(
+                            "[vettalon] {}",
+                            vettalon::tr!("報告已寫入 {}", "report written: {}", path.display())
+                        ),
+                        Err(e) => eprintln!(
+                            "[vettalon] {}",
+                            vettalon::tr!(
+                                "無法寫入報告 {}：{e}",
+                                "cannot write the report {}: {e}",
+                                path.display()
+                            )
+                        ),
                     },
-                    Err(e) => eprintln!("[vettalon] 報告序列化失敗：{e}"),
+                    Err(e) => eprintln!(
+                        "[vettalon] {}",
+                        vettalon::tr!("報告序列化失敗：{e}", "cannot serialise the report: {e}")
+                    ),
                 }
             }
             if let Some(dir) = &args.disclose_dir {
@@ -742,11 +869,24 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
 /// pre-send checklist. Drafts only — nothing is sent.
 fn write_disclosure_drafts(dir: &std::path::Path, drafts: &[vettalon::hunt::run::HuntDisclosure]) {
     if drafts.is_empty() {
-        eprintln!("[vettalon] 沒有可揭露的新漏洞候選（需確認或 needs_human，且 OSV 查無已知）。");
+        eprintln!(
+            "[vettalon] {}",
+            vettalon::lang::pick(
+                "沒有可揭露的新漏洞候選（需確認或 needs_human，且 OSV 查無已知）。",
+                "no novelty candidates to disclose (they must be confirmed or needs_human and unknown to OSV)."
+            )
+        );
         return;
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
-        eprintln!("[vettalon] 無法建立草稿目錄 {}：{e}", dir.display());
+        eprintln!(
+            "[vettalon] {}",
+            vettalon::tr!(
+                "無法建立草稿目錄 {}：{e}",
+                "cannot create the draft directory {}: {e}",
+                dir.display()
+            )
+        );
         return;
     }
     let safe = |s: &str| -> String {
@@ -777,18 +917,36 @@ fn write_disclosure_drafts(dir: &std::path::Path, drafts: &[vettalon::hunt::run:
         let path = dir.join(&name);
         match vettalon::util::write_private(&path, content.as_bytes()) {
             Ok(()) => written += 1,
-            Err(e) => eprintln!("[vettalon] 無法寫入草稿 {}：{e}", path.display()),
+            Err(e) => eprintln!(
+                "[vettalon] {}",
+                vettalon::tr!(
+                    "無法寫入草稿 {}：{e}",
+                    "cannot write the draft {}: {e}",
+                    path.display()
+                )
+            ),
         }
     }
     eprintln!(
-        "[vettalon] 已寫入 {written} 份揭露草稿到 {}（草稿而已，不會自動送出）。",
-        dir.display()
+        "[vettalon] {}",
+        vettalon::tr!(
+            "已寫入 {written} 份揭露草稿到 {}（草稿而已，不會自動送出）。",
+            "wrote {written} disclosure drafts to {} (drafts only; nothing is sent).",
+            dir.display()
+        )
     );
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(l) = cli.lang.as_deref()
+        && !matches!(l.to_ascii_lowercase().get(..2), Some("en" | "zh"))
+    {
+        eprintln!("[vettalon] --lang must be en or zh-TW (got {l:?})");
+        return ExitCode::from(2);
+    }
+    vettalon::lang::set(vettalon::lang::detect(cli.lang.as_deref()));
     let code = match cli.command {
         Command::Scan(args) => cmd_scan(args).await,
         Command::Validate { report } => audit::cmd_validate(&report).await,
@@ -807,7 +965,7 @@ async fn main() -> ExitCode {
             };
             match r {
                 Ok(()) => {
-                    println!("完成");
+                    println!("{}", vettalon::lang::pick("完成", "Done"));
                     0
                 }
                 Err(e) => {

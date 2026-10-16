@@ -12,6 +12,7 @@ pub mod disclose;
 pub mod guard;
 pub mod hunt;
 pub mod kb;
+pub mod lang;
 pub mod llm;
 pub mod sandbox;
 pub mod util;

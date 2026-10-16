@@ -87,6 +87,9 @@ vettalon scan . --profile deep --cross-check-top 5
 # 存一份到 ~/.vettalon/reports，下次掃描時，沒改過的檔案沿用上次的判定
 vettalon scan . --profile deep --save
 
+# 終端輸出語言：系統語系是中文就用繁中，否則英文；可用 --lang 或 VETTALON_LANG 指定（報告與 SARIF 內容不受影響）
+vettalon scan . --lang zh-TW
+
 # 檢查報告檔有沒有被改壞
 vettalon validate report.json
 

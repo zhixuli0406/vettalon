@@ -99,20 +99,38 @@ pub fn load_prior(home_dir: &Path, canonical_repo: &str) -> Option<PriorIndex> {
             .map(|m| m.len() > MAX_REPORT_BYTES)
             .unwrap_or(true);
         if too_big {
-            eprintln!("[vettalon] 略過先前報告 {name}：檔案無法讀取或過大");
+            eprintln!(
+                "[vettalon] {}",
+                crate::tr!(
+                    "略過先前報告 {name}：檔案無法讀取或過大",
+                    "skipping previous report {name}: unreadable or too large"
+                )
+            );
             continue;
         }
         let raw = match std::fs::read_to_string(&path) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[vettalon] 略過先前報告 {name}：無法讀取（{e}）");
+                eprintln!(
+                    "[vettalon] {}",
+                    crate::tr!(
+                        "略過先前報告 {name}：無法讀取（{e}）",
+                        "skipping previous report {name}: cannot read it ({e})"
+                    )
+                );
                 continue;
             }
         };
         let report: AuditReport = match serde_json::from_str(&raw) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[vettalon] 略過先前報告 {name}：格式無法解析（{e}）");
+                eprintln!(
+                    "[vettalon] {}",
+                    crate::tr!(
+                        "略過先前報告 {name}：格式無法解析（{e}）",
+                        "skipping previous report {name}: cannot parse it ({e})"
+                    )
+                );
                 continue;
             }
         };
@@ -121,8 +139,12 @@ pub fn load_prior(home_dir: &Path, canonical_repo: &str) -> Option<PriorIndex> {
         }
         if report.schema_version < CURRENT_SCHEMA_VERSION {
             eprintln!(
-                "[vettalon] 略過先前報告 {name}：舊版格式（schema_version {}），沒有可比對的根因指紋",
-                report.schema_version
+                "[vettalon] {}",
+                crate::tr!(
+                    "略過先前報告 {name}：舊版格式（schema_version {}），沒有可比對的根因指紋",
+                    "skipping previous report {name}: old format (schema_version {}) without root-cause fingerprints",
+                    report.schema_version
+                )
             );
             continue;
         }

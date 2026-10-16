@@ -135,18 +135,23 @@ pub enum ScanError {
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScanError::BadProfile(e) => write!(f, "無效的 --profile：{e}"),
-            ScanError::UnresolvablePath { path, detail } => {
-                write!(f, "無法解析掃描目標路徑 {path}：{detail}")
-            }
-            ScanError::NotADirectory(p) => write!(f, "掃描目標不是資料夾：{p}"),
-            ScanError::ReportInvalid(vs) => {
-                write!(
-                    f,
-                    "報告未通過內部驗證（這是 vettalon 本身的錯誤）：{}",
-                    vs.join("; ")
-                )
-            }
+            ScanError::BadProfile(e) => f.write_str(&crate::tr!(
+                "無效的 --profile：{e}",
+                "invalid --profile: {e}"
+            )),
+            ScanError::UnresolvablePath { path, detail } => f.write_str(&crate::tr!(
+                "無法解析掃描目標路徑 {path}：{detail}",
+                "cannot resolve the target path {path}: {detail}"
+            )),
+            ScanError::NotADirectory(p) => f.write_str(&crate::tr!(
+                "掃描目標不是資料夾：{p}",
+                "the target is not a directory: {p}"
+            )),
+            ScanError::ReportInvalid(vs) => f.write_str(&crate::tr!(
+                "報告未通過內部驗證（這是 vettalon 本身的錯誤）：{}",
+                "the report failed internal validation (a bug in vettalon itself): {}",
+                vs.join("; ")
+            )),
         }
     }
 }
@@ -290,7 +295,13 @@ pub async fn run_scan_with_progress(
         .parse()
         .map_err(|e: String| ScanError::BadProfile(e))?;
     if opts.poc && profile_mode != ProfileMode::Deep {
-        eprintln!("[vettalon] 提示：--poc 需搭配 --profile deep 才會有作用。");
+        eprintln!(
+            "[vettalon] {}",
+            crate::lang::pick(
+                "提示：--poc 需搭配 --profile deep 才會有作用。",
+                "note: --poc only takes effect with --profile deep."
+            )
+        );
     }
     let repo_root =
         std::fs::canonicalize(&opts.repo_path).map_err(|e| ScanError::UnresolvablePath {
@@ -353,7 +364,13 @@ pub async fn run_scan_with_progress(
 
     let dropped = dedup_by_id(&mut findings);
     if dropped > 0 {
-        eprintln!("[vettalon] 提示：{dropped} 筆完全相同（同一 id）的發現已合併為一筆。");
+        eprintln!(
+            "[vettalon] {}",
+            crate::tr!(
+                "提示：{dropped} 筆完全相同（同一 id）的發現已合併為一筆。",
+                "note: merged {dropped} duplicate findings (same id)."
+            )
+        );
     }
 
     // Prior-run carry-over runs BEFORE review: carried Refuted/Suppressed
@@ -457,7 +474,14 @@ pub async fn run_scan_with_progress(
     if let Some(path) = &opts.trace
         && let Err(e) = write_trace_jsonl(path, &trace.snapshot())
     {
-        eprintln!("[vettalon] 無法寫入追蹤檔 {}：{e}", path.display());
+        eprintln!(
+            "[vettalon] {}",
+            crate::tr!(
+                "無法寫入追蹤檔 {}：{e}",
+                "cannot write the trace file {}: {e}",
+                path.display()
+            )
+        );
     }
     progress.phase(Phase::Done, "complete");
     Ok(audit_report)
@@ -488,7 +512,10 @@ pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
         match opts.fail_on.parse() {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("[vettalon] 無效的 --fail-on：{e}");
+                eprintln!(
+                    "[vettalon] {}",
+                    crate::tr!("無效的 --fail-on：{e}", "invalid --fail-on: {e}")
+                );
                 return 2;
             }
         }
@@ -511,23 +538,56 @@ pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
 
     if let Some(path) = &opts.report {
         if let Err(e) = report::write_json_report(&audit_report, path) {
-            eprintln!("[vettalon] 無法寫入報告檔 {}：{e}", path.display());
+            eprintln!(
+                "[vettalon] {}",
+                crate::tr!(
+                    "無法寫入報告檔 {}：{e}",
+                    "cannot write the report {}: {e}",
+                    path.display()
+                )
+            );
             return 2;
         }
-        println!("報告已寫入：{}", path.display());
+        println!(
+            "{}",
+            crate::tr!("報告已寫入：{}", "Report written: {}", path.display())
+        );
     }
     if let Some(path) = &opts.sarif {
         if let Err(e) = sarif::write_sarif(&audit_report, path) {
-            eprintln!("[vettalon] 無法寫入 SARIF {}：{e}", path.display());
+            eprintln!(
+                "[vettalon] {}",
+                crate::tr!(
+                    "無法寫入 SARIF {}：{e}",
+                    "cannot write SARIF {}: {e}",
+                    path.display()
+                )
+            );
             return 2;
         }
-        println!("SARIF 已寫入：{}", path.display());
+        println!(
+            "{}",
+            crate::tr!("SARIF 已寫入：{}", "SARIF written: {}", path.display())
+        );
     }
     if opts.save {
         match report::save_report(home_dir, &audit_report) {
-            Ok(path) => println!("報告副本已存至：{}", path.display()),
+            Ok(path) => println!(
+                "{}",
+                crate::tr!(
+                    "報告副本已存至：{}",
+                    "Report copy saved: {}",
+                    path.display()
+                )
+            ),
             Err(e) => {
-                eprintln!("[vettalon] 無法寫入 --save 報告副本：{e}");
+                eprintln!(
+                    "[vettalon] {}",
+                    crate::tr!(
+                        "無法寫入 --save 報告副本：{e}",
+                        "cannot write the --save copy: {e}"
+                    )
+                );
                 return 2;
             }
         }
@@ -673,13 +733,23 @@ async fn run_audit_step(
             // Make the third-party egress visible in the log/CI output: only
             // module metadata is sent, never code (guarded in jev::rerank).
             eprintln!(
-                "[vettalon] Jev 排序：把模組 metadata（路徑／大小／git 熱點，不含程式碼）送到 {}",
-                jev_host(cfg)
+                "[vettalon] {}",
+                crate::tr!(
+                    "Jev 排序：把模組 metadata（路徑／大小／git 熱點，不含程式碼）送到 {}",
+                    "Jev ranking: sending module metadata (path / size / git hotspots, no code) to {}",
+                    jev_host(cfg)
+                )
             );
             match jev::rerank(repo_root, intake_profile, ranked.clone(), cfg).await {
                 Ok(reordered) => (reordered, "jev", false),
                 Err(e) => {
-                    eprintln!("[vettalon] Jev 排序不可用，改用啟發式排序：{e}");
+                    eprintln!(
+                        "[vettalon] {}",
+                        crate::tr!(
+                            "Jev 排序不可用，改用啟發式排序：{e}",
+                            "Jev ranking unavailable, using the heuristic ranking: {e}"
+                        )
+                    );
                     (ranked, "jev", true)
                 }
             }
@@ -701,8 +771,12 @@ async fn run_audit_step(
     let take = requested.min(ai_audit::MAX_AUDIT_MODULES_CEILING);
     if take < requested {
         eprintln!(
-            "[vettalon] 提示：本次審查模組上限 {}（要求 {requested}），其餘列為 deferred；要控整體時間用 --time-budget。",
-            ai_audit::MAX_AUDIT_MODULES_CEILING
+            "[vettalon] {}",
+            crate::tr!(
+                "提示：本次審查模組上限 {}（要求 {requested}），其餘列為 deferred；要控整體時間用 --time-budget。",
+                "note: this run reviews at most {} modules ({requested} requested); the rest are deferred. Use --time-budget to bound the total time.",
+                ai_audit::MAX_AUDIT_MODULES_CEILING
+            )
         );
     }
 
@@ -944,7 +1018,11 @@ async fn review_step(
 ) -> Vec<Finding> {
     if opts.verifiers.is_empty() {
         eprintln!(
-            "[vettalon] 提示：沒有設定 verifier 模型，候選發現維持 candidate（未覆核），本次執行標為 incomplete。"
+            "[vettalon] {}",
+            crate::lang::pick(
+                "提示：沒有設定 verifier 模型，候選發現維持 candidate（未覆核），本次執行標為 incomplete。",
+                "note: no verifier model configured, so candidates stay unverified and the run is marked incomplete."
+            )
         );
         return findings;
     }
@@ -993,7 +1071,7 @@ async fn review_step(
                     ModelStep {
                         model: &verifier.id,
                         round: Round::Verify,
-                        message: &format!("{} 覆核 {}", verifier.id, f.file),
+                        message: &crate::tr!("{} 覆核 {}", "{} verifying {}", verifier.id, f.file),
                         current: done.min(review_total),
                         total: review_total.max(1),
                     },
@@ -1055,7 +1133,13 @@ async fn poc_step(
     progress: &dyn Progress,
 ) {
     if opts.poc_models.is_empty() {
-        eprintln!("[vettalon] 提示：沒有設定 poc 模型，略過 PoC。");
+        eprintln!(
+            "[vettalon] {}",
+            crate::lang::pick(
+                "提示：沒有設定 poc 模型，略過 PoC。",
+                "note: no poc model configured, skipping PoCs."
+            )
+        );
         return;
     }
     let total = findings.len() as u32;
@@ -1071,7 +1155,12 @@ async fn poc_step(
             ModelStep {
                 model: &opts.poc_models[pick].id,
                 round: Round::Poc,
-                message: &format!("{} 檢查 PoC 條件 {}", opts.poc_models[pick].id, f.file),
+                message: &crate::tr!(
+                    "{} 檢查 PoC 條件 {}",
+                    "{} checking PoC preconditions for {}",
+                    opts.poc_models[pick].id,
+                    f.file
+                ),
                 current: nth as u32 + 1,
                 total: total.max(1),
             },
@@ -1098,23 +1187,31 @@ pub fn validation_errors(report: &AuditReport) -> Vec<String> {
 /// a client deliverable must not be built on one.
 pub fn load_report_for_delivery(path: &Path) -> Result<AuditReport, String> {
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
-    let meta = std::fs::metadata(path).map_err(|e| format!("無法讀取 {}：{e}", path.display()))?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| crate::tr!("無法讀取 {}：{e}", "cannot read {}: {e}", path.display()))?;
     if meta.len() > MAX_BYTES {
-        return Err(format!(
+        return Err(crate::tr!(
             "報告檔過大（{} bytes，上限 {MAX_BYTES}）",
+            "report file too large ({} bytes, limit {MAX_BYTES})",
             meta.len()
         ));
     }
-    let raw = std::fs::read(path).map_err(|e| format!("無法讀取 {}：{e}", path.display()))?;
-    let report: AuditReport =
-        serde_json::from_slice(&raw).map_err(|e| format!("不是有效的 vettalon 報告：{e}"))?;
+    let raw = std::fs::read(path)
+        .map_err(|e| crate::tr!("無法讀取 {}：{e}", "cannot read {}: {e}", path.display()))?;
+    let report: AuditReport = serde_json::from_slice(&raw).map_err(|e| {
+        crate::tr!(
+            "不是有效的 vettalon 報告：{e}",
+            "not a valid vettalon report: {e}"
+        )
+    })?;
     let errors = validation_errors(&report);
     if !errors.is_empty() {
         let head: Vec<&str> = errors.iter().take(5).map(String::as_str).collect();
-        return Err(format!(
+        return Err(crate::tr!(
             "報告未通過驗證（{} 項）：{}",
+            "the report failed validation ({} issues): {}",
             errors.len(),
-            head.join("；")
+            head.join(crate::lang::pick("；", "; "))
         ));
     }
     Ok(report)
@@ -1125,17 +1222,25 @@ pub async fn cmd_validate(report_path: &Path) -> i32 {
     match std::fs::metadata(report_path) {
         Ok(m) if m.len() > MAX_BYTES => {
             eprintln!(
-                "[vettalon validate] 報告檔過大（{} bytes，上限 {MAX_BYTES}）：{}",
-                m.len(),
-                report_path.display()
+                "[vettalon validate] {}",
+                crate::tr!(
+                    "報告檔過大（{} bytes，上限 {MAX_BYTES}）：{}",
+                    "report file too large ({} bytes, limit {MAX_BYTES}): {}",
+                    m.len(),
+                    report_path.display()
+                )
             );
             return 2;
         }
         Ok(_) => {}
         Err(e) => {
             eprintln!(
-                "[vettalon validate] 無法讀取 {}：{e}",
-                report_path.display()
+                "[vettalon validate] {}",
+                crate::tr!(
+                    "無法讀取 {}：{e}",
+                    "cannot read {}: {e}",
+                    report_path.display()
+                )
             );
             return 2;
         }
@@ -1144,8 +1249,12 @@ pub async fn cmd_validate(report_path: &Path) -> i32 {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
-                "[vettalon validate] 無法讀取 {}：{e}",
-                report_path.display()
+                "[vettalon validate] {}",
+                crate::tr!(
+                    "無法讀取 {}：{e}",
+                    "cannot read {}: {e}",
+                    report_path.display()
+                )
             );
             return 2;
         }
@@ -1153,7 +1262,10 @@ pub async fn cmd_validate(report_path: &Path) -> i32 {
     let value: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[vettalon validate] 不是 JSON：{e}");
+            eprintln!(
+                "[vettalon validate] {}",
+                crate::tr!("不是 JSON：{e}", "not JSON: {e}")
+            );
             return 2;
         }
     };
@@ -1166,7 +1278,14 @@ pub async fn cmd_validate(report_path: &Path) -> i32 {
     };
     let violations = validator::validate_report(&parsed);
     if violations.is_empty() {
-        println!("報告驗證通過：{}", report_path.display());
+        println!(
+            "{}",
+            crate::tr!(
+                "報告驗證通過：{}",
+                "Report is valid: {}",
+                report_path.display()
+            )
+        );
         0
     } else {
         for v in &violations {

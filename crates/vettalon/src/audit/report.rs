@@ -1,4 +1,4 @@
-//! Report rendering (zh-TW human summary) + JSON file output + CI exit code.
+//! Report rendering (human summary in the [`crate::lang`] language) + JSON file output + CI exit code.
 //!
 //! Mirrors the usual CI-gate convention: a human-readable summary is
 //! always printed; `--report <path>` additionally writes the full JSON
@@ -18,6 +18,8 @@ use crate::audit::schema::{
     AuditReport, ProfileMode, Severity, SeverityCounts, VerifierIndependence,
 };
 use crate::audit::validator::validate_report;
+use crate::lang::pick;
+use crate::tr;
 
 /// CI exit code for a completed scan. `0` unless at least one finding the
 /// gate reads ([`crate::audit::schema::Summary::gate_counts`] =
@@ -54,58 +56,81 @@ pub fn render_summary(report: &AuditReport, fail_on: Severity) -> String {
 /// [`render_summary`] with `--fail-on` optional and the policy gate shown.
 pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> String {
     let mut out = String::new();
-    out.push_str("程式碼安全審計（vettalon）\n");
-    out.push_str(&format!("  掃描目標：{}\n", report.repo));
-    out.push_str(&format!(
+    out.push_str(pick(
+        "程式碼安全審計（vettalon）\n",
+        "Code security audit (vettalon)\n",
+    ));
+    out.push_str(&tr!("  掃描目標：{}\n", "  Target:  {}\n", report.repo));
+    out.push_str(&tr!(
         "  掃描模式：{}\n",
+        "  Profile: {}\n",
         match report.profile.mode {
             crate::audit::schema::ProfileMode::Quick => "quick",
             crate::audit::schema::ProfileMode::Deep => "deep",
         }
     ));
-    out.push_str(&format!("  開始時間：{}\n", report.started_at));
+    out.push_str(&tr!(
+        "  開始時間：{}\n",
+        "  Started: {}\n",
+        report.started_at
+    ));
     out.push('\n');
 
-    out.push_str("引擎執行狀況：\n");
+    out.push_str(pick("引擎執行狀況：\n", "Engines:\n"));
     for run in &report.engines_run {
         if let Some(err) = &run.parse_error {
-            out.push_str(&format!(
+            let detail = if run.timed_out {
+                tr!("逾時：{err}", "timed out: {err}")
+            } else {
+                err.clone()
+            };
+            out.push_str(&tr!(
                 "  [異常] {} — {}\n",
+                "  [error]   {} — {}\n",
                 run.engine,
-                if run.timed_out {
-                    format!("逾時：{err}")
-                } else {
-                    err.clone()
-                }
+                detail
             ));
         } else {
-            out.push_str(&format!(
+            out.push_str(&tr!(
                 "  [完成] {} — {} 個發現（{} ms）\n",
-                run.engine, run.findings_count, run.duration_ms
+                "  [done]    {} — {} findings ({} ms)\n",
+                run.engine,
+                run.findings_count,
+                run.duration_ms
             ));
         }
     }
     for missing in &report.engines_missing {
-        out.push_str(&format!(
+        out.push_str(&tr!(
             "  [略過] {} — {}\n",
-            missing.engine, missing.reason
+            "  [skipped] {} — {}\n",
+            missing.engine,
+            missing.reason
         ));
     }
     if report.engines_run.is_empty() && report.engines_missing.is_empty() {
-        out.push_str("  （無引擎資訊）\n");
+        out.push_str(pick("  （無引擎資訊）\n", "  (no engine information)\n"));
     }
     out.push('\n');
 
-    out.push_str("Findings 統計：\n");
+    out.push_str(pick("Findings 統計：\n", "Findings:\n"));
     let (gated, needs_human, inert) = finding_buckets(report);
     if needs_human + inert > 0 {
-        out.push_str(&format!(
+        out.push_str(&tr!(
             "  總計：{}（計入 fail-on {gated}、待人工判斷 {needs_human}、已證偽/已壓制 {inert}）\n",
+            "  Total: {} ({gated} counted for --fail-on, {needs_human} need human review, {inert} refuted/suppressed)\n",
             report.summary.total_findings
         ));
-        out.push_str("  （已證偽/已壓制的發現永遠不計入嚴重度統計與 fail-on 判定）\n");
+        out.push_str(pick(
+            "  （已證偽/已壓制的發現永遠不計入嚴重度統計與 fail-on 判定）\n",
+            "  (refuted and suppressed findings never count toward severities or --fail-on)\n",
+        ));
     } else {
-        out.push_str(&format!("  總計：{}\n", report.summary.total_findings));
+        out.push_str(&tr!(
+            "  總計：{}\n",
+            "  Total: {}\n",
+            report.summary.total_findings
+        ));
     }
     out.push_str(&format!(
         "  {}\n",
@@ -120,31 +145,38 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
         );
         let nh = with_nh.total().saturating_sub(without_nh.total());
         if nh > 0 {
-            out.push_str(&format!(
-                "  待人工判斷：{nh} 筆（模型自評、已計入上方統計與 fail-on，--fail-on-needs-human）\n"
+            out.push_str(&tr!(
+                "  待人工判斷：{nh} 筆（模型自評、已計入上方統計與 fail-on，--fail-on-needs-human）\n",
+                "  Needs human review: {nh} (model self-assessed; included above and in --fail-on, --fail-on-needs-human)\n"
             ));
         }
     } else {
         let nh = &report.summary.needs_human_by_severity;
         if nh.total() > 0 {
-            out.push_str(&format!(
+            out.push_str(&tr!(
                 "  待人工判斷（模型自評、不計入 fail-on）：{}\n",
+                "  Needs human review (model self-assessed, not counted for --fail-on): {}\n",
                 severity_row(nh)
             ));
         }
     }
     if report.summary.carried_from_prior > 0 {
-        out.push_str(&format!(
+        out.push_str(&tr!(
             "  沿用先前報告判定：{}（原始碼未變更，未重新呼叫模型）\n",
+            "  Carried over from the previous report: {} (source unchanged, models not called again)\n",
             report.summary.carried_from_prior
         ));
     }
 
     if report.profile.mode == ProfileMode::Deep {
         out.push('\n');
-        out.push_str("AI 深度審計／對抗式覆核／PoC（deep profile）：\n");
-        out.push_str(&format!(
+        out.push_str(pick(
+            "AI 深度審計／對抗式覆核／PoC（deep profile）：\n",
+            "AI audit / adversarial verification / PoC (deep profile):\n",
+        ));
+        out.push_str(&tr!(
             "  AI 候選：{}　已證偽：{}（其中前置檢查證偽 {}）　待人工覆核：{}　PoC 已執行：{}\n",
+            "  AI candidates: {}  refuted: {} ({} by pre-checks)  needs human review: {}  PoCs run: {}\n",
             report.summary.ai_audit_candidates,
             report.summary.ai_audit_refuted,
             report.summary.precheck_refuted,
@@ -155,39 +187,56 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
         render_verifier_and_prior(report, &mut out);
     }
     if report.run_status == RunStatus::Incomplete {
-        out.push_str(&format!(
+        out.push_str(&tr!(
             "  執行狀態：未完成（{}）\n",
+            "  Run status: incomplete ({})\n",
             report
                 .incomplete_reason
-                .map(incomplete_reason_zh)
-                .unwrap_or("原因未記錄")
+                .map(incomplete_reason)
+                .unwrap_or_else(|| pick("原因未記錄", "reason not recorded"))
         ));
     }
 
     if let Some(intake) = &report.profile.intake {
         out.push('\n');
-        out.push_str("Intake / 威脅建模（deep profile）：\n");
+        out.push_str(pick(
+            "Intake / 威脅建模（deep profile）：\n",
+            "Intake / threat modelling (deep profile):\n",
+        ));
         match &intake.git_history {
             crate::audit::intake::GitHistoryStatus::Available { hotspots } => {
                 if hotspots.is_empty() {
-                    out.push_str("  git 熱點：近一年內無安全關鍵詞相關 commit\n");
+                    out.push_str(pick(
+                        "  git 熱點：近一年內無安全關鍵詞相關 commit\n",
+                        "  git hotspots: no security-keyword commits in the past year\n",
+                    ));
                 } else {
-                    out.push_str("  git 熱點（近一年，安全關鍵詞 commit 觸及的檔案）：\n");
+                    out.push_str(pick(
+                        "  git 熱點（近一年，安全關鍵詞 commit 觸及的檔案）：\n",
+                        "  git hotspots (files touched by security-keyword commits in the past year):\n",
+                    ));
                     for h in hotspots.iter().take(10) {
-                        out.push_str(&format!(
+                        out.push_str(&tr!(
                             "    {} — 安全相關異動 {} 次（總異動 {} 次）\n",
-                            h.file, h.security_touches, h.total_touches
+                            "    {} — {} security-related changes ({} in total)\n",
+                            h.file,
+                            h.security_touches,
+                            h.total_touches
                         ));
                     }
                 }
             }
             crate::audit::intake::GitHistoryStatus::Unavailable { reason } => {
-                out.push_str(&format!("  git 熱點：不可用（{reason}）\n"));
+                out.push_str(&tr!(
+                    "  git 熱點：不可用（{reason}）\n",
+                    "  git hotspots: unavailable ({reason})\n"
+                ));
             }
         }
         if !intake.entry_points.is_empty() {
-            out.push_str(&format!(
+            out.push_str(&tr!(
                 "  偵測到的進入點：{}\n",
+                "  Entry points detected: {}\n",
                 intake.entry_points.join(", ")
             ));
         }
@@ -198,17 +247,26 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
                 .take(5)
                 .map(|s| format!("{}×{}", s.extension, s.file_count))
                 .collect();
-            out.push_str(&format!("  語言統計（前 5）：{}\n", top.join("、")));
+            out.push_str(&tr!(
+                "  語言統計（前 5）：{}\n",
+                "  Languages (top 5): {}\n",
+                top.join(pick("、", ", "))
+            ));
         }
     }
 
     out.push('\n');
     if !report.summary.policy.is_empty() {
-        out.push_str("政策門檻（--gate）：\n");
+        out.push_str(pick("政策門檻（--gate）：\n", "Policy gate (--gate):\n"));
         for r in &report.summary.policy {
-            out.push_str(&format!(
+            out.push_str(&tr!(
                 "  [{}] {} — 實際 {} 筆\n",
-                if r.failed { "未通過" } else { "通過" },
+                "  [{}] {} — {} matched\n",
+                if r.failed {
+                    pick("未通過", "fail")
+                } else {
+                    pick("通過", "pass")
+                },
                 r.expr,
                 r.count
             ));
@@ -218,25 +276,35 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
     let policy_failed = crate::audit::gate::any_failed(&report.summary.policy);
     let severity_hits = fail_on.map(|s| (s, report.summary.gate_counts().count_at_or_above(s)));
     match severity_hits {
-        Some((s, n)) if n > 0 => out.push_str(&format!(
+        Some((s, n)) if n > 0 => out.push_str(&tr!(
             "結論：發現 {n} 項 {} 以上等級的問題，未通過。\n",
+            "Result: FAIL, {n} finding(s) at {} or above.\n",
             s.as_str()
         )),
-        _ if policy_failed => out.push_str("結論：政策門檻有條件未通過，未通過。\n"),
-        Some((s, _)) => out.push_str(&format!(
+        _ if policy_failed => out.push_str(pick(
+            "結論：政策門檻有條件未通過，未通過。\n",
+            "Result: FAIL, a policy gate condition failed.\n",
+        )),
+        Some((s, _)) => out.push_str(&tr!(
             "結論：未達 --fail-on 門檻（{}），視為通過。\n",
+            "Result: PASS, nothing reached the --fail-on threshold ({}).\n",
             s.as_str()
         )),
-        None if report.summary.policy.is_empty() => {
-            out.push_str("結論：未設定 --fail-on 或 --gate 門檻，僅供參考。\n")
-        }
-        None => out.push_str("結論：政策門檻全部通過。\n"),
+        None if report.summary.policy.is_empty() => out.push_str(pick(
+            "結論：未設定 --fail-on 或 --gate 門檻，僅供參考。\n",
+            "Result: no --fail-on or --gate threshold set; for information only.\n",
+        )),
+        None => out.push_str(pick(
+            "結論：政策門檻全部通過。\n",
+            "Result: PASS, every policy gate condition passed.\n",
+        )),
     }
     let failed = policy_failed || severity_hits.is_some_and(|(_, n)| n > 0);
     if !failed && report.run_status == RunStatus::Incomplete {
-        out.push_str(
+        out.push_str(pick(
             "注意：本次掃描不完整，通過只代表「已審查的部分」沒有達到門檻，不代表沒有問題。\n",
-        );
+            "Note: this scan is incomplete. A pass only means the reviewed part stayed under the threshold, not that there are no problems.\n",
+        ));
     }
     out
 }
@@ -266,29 +334,44 @@ fn severity_row(c: &SeverityCounts) -> String {
     )
 }
 
-fn incomplete_reason_zh(r: vettalon_contract::coverage::IncompleteReason) -> &'static str {
+fn incomplete_reason(r: vettalon_contract::coverage::IncompleteReason) -> &'static str {
     use vettalon_contract::coverage::IncompleteReason as R;
     match r {
-        R::EngineUnavailable => "AI 引擎無法使用",
-        R::ValidationBudgetExhausted => {
-            "候選數已達全程上限（多模型時由各 finder 分攤），部分候選或模組未處理"
-        }
-        R::BudgetCannotFundReserves => "預算不足以保留覆核額度",
-        R::CriticBudgetExhausted => "覆核預算用盡",
-        R::TimeBudgetExhausted => "已達掃描時間預算，部分模組未審（--time-budget）",
-        R::Interrupted => "執行被中斷",
-        R::ModelRefused => "有模型拒答，對應的模組或發現未審",
-        R::UnitsFailed => "部分模組或候選沒有得到可用結果（呼叫失敗、回覆不合格式或未覆核）",
-        R::InjectionUncrosschecked => {
-            "偵測到疑似 prompt injection 的模組，因本次只有單一模型家族，無法交叉覆審（建議加入不同家族的模型）"
-        }
+        R::EngineUnavailable => pick("AI 引擎無法使用", "the AI engine was unavailable"),
+        R::ValidationBudgetExhausted => pick(
+            "候選數已達全程上限（多模型時由各 finder 分攤），部分候選或模組未處理",
+            "the run-wide candidate cap was reached (shared across finders), so some candidates or modules were not processed",
+        ),
+        R::BudgetCannotFundReserves => pick(
+            "預算不足以保留覆核額度",
+            "the budget could not reserve verification capacity",
+        ),
+        R::CriticBudgetExhausted => pick("覆核預算用盡", "the verification budget ran out"),
+        R::TimeBudgetExhausted => pick(
+            "已達掃描時間預算，部分模組未審（--time-budget）",
+            "the time budget ran out and some modules were not reviewed (--time-budget)",
+        ),
+        R::Interrupted => pick("執行被中斷", "the run was interrupted"),
+        R::ModelRefused => pick(
+            "有模型拒答，對應的模組或發現未審",
+            "a model refused, so the affected modules or findings were not reviewed",
+        ),
+        R::UnitsFailed => pick(
+            "部分模組或候選沒有得到可用結果（呼叫失敗、回覆不合格式或未覆核）",
+            "some modules or candidates got no usable result (call failed, malformed reply, or not verified)",
+        ),
+        R::InjectionUncrosschecked => pick(
+            "偵測到疑似 prompt injection 的模組，因本次只有單一模型家族，無法交叉覆審（建議加入不同家族的模型）",
+            "modules with suspected prompt injection could not be cross-checked because only one model family was available (add a model from another family)",
+        ),
     }
 }
 
 fn render_coverage(report: &AuditReport, out: &mut String) {
     let c = &report.summary.coverage;
-    out.push_str(&format!(
+    out.push_str(&tr!(
         "  模組覆蓋：共 {}　已審 {}（無候選 {}、有候選 {}）　延後 {}　失敗 {}\n",
+        "  Module coverage: {} total, {} reviewed ({} clean, {} with candidates), {} deferred, {} failed\n",
         c.modules_total,
         c.covered + c.candidate,
         c.covered,
@@ -297,40 +380,56 @@ fn render_coverage(report: &AuditReport, out: &mut String) {
         c.failed
     ));
     if c.partial {
-        out.push_str(&format!("  部分覆蓋：{} 模組未審\n", c.deferred + c.failed));
+        out.push_str(&tr!(
+            "  部分覆蓋：{} 模組未審\n",
+            "  Partial coverage: {} modules not reviewed\n",
+            c.deferred + c.failed
+        ));
     }
 }
 
 fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
     let v = &report.verifier;
-    let who = |a: &Option<String>| a.clone().unwrap_or_else(|| "（無）".to_string());
+    let who = |a: &Option<String>| {
+        a.clone()
+            .unwrap_or_else(|| pick("（無）", "(none)").to_string())
+    };
     let line = match v.independence {
-        VerifierIndependence::NotRun => "未執行覆核".to_string(),
-        VerifierIndependence::SameAgent => {
-            format!("同一 agent 覆核（{}）", who(&v.verifier_agent))
-        }
-        VerifierIndependence::DifferentAgent => format!(
+        VerifierIndependence::NotRun => pick("未執行覆核", "not run").to_string(),
+        VerifierIndependence::SameAgent => tr!(
+            "同一 agent 覆核（{}）",
+            "verified by the same agent ({})",
+            who(&v.verifier_agent)
+        ),
+        VerifierIndependence::DifferentAgent => tr!(
             "獨立 agent 覆核（審計：{}；覆核：{}）",
+            "verified by a separate agent (audit: {}; verify: {})",
             who(&v.audit_agent),
             who(&v.verifier_agent)
         ),
-        VerifierIndependence::CrossFamily => format!(
+        VerifierIndependence::CrossFamily => tr!(
             "全部跨家族覆核（找洞：{}；覆核：{}）",
+            "all cross-family (find: {}; verify: {})",
             who(&v.audit_agent),
             who(&v.verifier_agent)
         ),
-        VerifierIndependence::MixedFamily => format!(
+        VerifierIndependence::MixedFamily => tr!(
             "部分跨家族覆核，部分同家族（找洞：{}；覆核：{}）",
+            "partly cross-family, partly same-family (find: {}; verify: {})",
             who(&v.audit_agent),
             who(&v.verifier_agent)
         ),
-        VerifierIndependence::SameFamily => format!(
+        VerifierIndependence::SameFamily => tr!(
             "同家族覆核，模型清單裡沒有其他家族（找洞：{}；覆核：{}）",
+            "same-family only, no other family in the roster (find: {}; verify: {})",
             who(&v.audit_agent),
             who(&v.verifier_agent)
         ),
     };
-    out.push_str(&format!("  覆核獨立性：{line}\n"));
+    out.push_str(&tr!(
+        "  覆核獨立性：{line}\n",
+        "  Verifier independence: {line}\n"
+    ));
     let self_reviews = report
         .findings
         .iter()
@@ -338,8 +437,9 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
         .filter(|v| v.same_model && v.verdict != super::schema::VoteVerdict::NoVerdict)
         .count();
     if self_reviews > 0 {
-        out.push_str(&format!(
-            "  自我覆核：{self_reviews} 筆由 finder 自己覆核（模型清單裡沒有其他可用的 verifier）\n"
+        out.push_str(&tr!(
+            "  自我覆核：{self_reviews} 筆由 finder 自己覆核（模型清單裡沒有其他可用的 verifier）\n",
+            "  Self-review: {self_reviews} verified by their own finder (no other verifier available in the roster)\n"
         ));
     }
     let unverified = report
@@ -351,19 +451,22 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
         })
         .count();
     if unverified > 0 {
-        out.push_str(&format!(
-            "  未覆核：{unverified} 筆 AI 候選沒有得到覆核結論（見各發現的 verify_error）\n"
+        out.push_str(&tr!(
+            "  未覆核：{unverified} 筆 AI 候選沒有得到覆核結論（見各發現的 verify_error）\n",
+            "  Unverified: {unverified} AI candidates got no verification verdict (see each finding's verify_error)\n"
         ));
     }
     if report.ensemble.cross_checked > 0 {
-        out.push_str(&format!(
+        out.push_str(&tr!(
             "  雙模型複審：{} 個模組由兩家族各審一次（高風險、疑似 injection 或 --cross-check-top）\n",
+            "  Cross-checked: {} modules reviewed once by each of two families (high risk, suspected injection, or --cross-check-top)\n",
             report.ensemble.cross_checked
         ));
     }
     if !report.ensemble.suspected_injection.is_empty() {
-        out.push_str(&format!(
+        out.push_str(&tr!(
             "  疑似 prompt injection：{} 個模組的原始碼含有針對審查模型的文字（已另交不同家族模型覆審；見 ensemble.suspected_injection）\n",
+            "  Suspected prompt injection: {} modules contain text aimed at the reviewing model (sent to a different-family model for review; see ensemble.suspected_injection)\n",
             report.ensemble.suspected_injection.len()
         ));
         for s in &report.ensemble.suspected_injection {
@@ -375,24 +478,34 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
         }
     }
     if !report.ensemble.refusals.is_empty() {
-        out.push_str(&format!(
+        out.push_str(&tr!(
             "  模型拒答：{} 次（對應的模組／發現未審，未轉給其他模型）\n",
+            "  Model refusals: {} (the affected modules/findings were not reviewed or passed to another model)\n",
             report.ensemble.refusals.len()
         ));
         for r in &report.ensemble.refusals {
-            out.push_str(&format!("    [refused:{}] 步驟 {}\n", r.model, r.step));
+            out.push_str(&tr!(
+                "    [refused:{}] 步驟 {}\n",
+                "    [refused:{}] step {}\n",
+                r.model,
+                r.step
+            ));
         }
     }
     match &report.prior_run {
-        Some(p) => out.push_str(&format!(
+        Some(p) => out.push_str(&tr!(
             "  先前報告承接：{}　沿用已壓制 {}、沿用已證偽 {}、重新覆核先前確認 {}、原始碼已變更 {}\n",
+            "  Previous report: {}  carried suppressed {}, carried refuted {}, re-verified previously confirmed {}, source changed {}\n",
             p.report_file,
             p.carried_suppressed,
             p.carried_refuted,
             p.revalidated_prior_confirmed,
             p.changed_source
         )),
-        None => out.push_str("  先前報告承接：無（沒有可承接的先前報告，或已用 --no-prior 停用）\n"),
+        None => out.push_str(pick(
+            "  先前報告承接：無（沒有可承接的先前報告，或已用 --no-prior 停用）\n",
+            "  Previous report: none (no earlier report to carry over, or --no-prior)\n",
+        )),
     }
 }
 
@@ -723,6 +836,48 @@ mod tests {
         let quick = base_report(vec![]); // mode defaults to Quick in base_report
         let text = render_summary(&quick, Severity::High);
         assert!(!text.contains("AI 深度審計"));
+    }
+
+    fn has_cjk(s: &str) -> bool {
+        s.chars().any(|c| {
+            ('\u{4e00}'..='\u{9fff}').contains(&c)
+                || ('\u{3000}'..='\u{303f}').contains(&c)
+                || ('\u{ff00}'..='\u{ffef}').contains(&c)
+        })
+    }
+
+    #[test]
+    fn render_summary_in_english_has_no_chinese() {
+        use crate::lang::{Lang, with};
+        let findings = vec![Finding::candidate(
+            "semgrep",
+            FindingKind::StaticAnalysis,
+            Severity::High,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        )];
+        let mut deep = base_report(findings);
+        deep.profile.mode = ProfileMode::Deep;
+        deep.summary.ai_audit_candidates = 3;
+        deep.run_status = RunStatus::Incomplete;
+        deep.incomplete_reason =
+            Some(vettalon_contract::coverage::IncompleteReason::TimeBudgetExhausted);
+        let text = with(Lang::En, || render_summary(&deep, Severity::High));
+        assert!(text.starts_with("Code security audit (vettalon)"));
+        assert!(text.contains("Total: 1"));
+        assert!(text.contains("AI candidates: 3"));
+        assert!(text.contains("Run status: incomplete (the time budget ran out"));
+        assert!(text.contains("Result: FAIL, 1 finding(s) at high or above."));
+        assert!(!has_cjk(&text), "Chinese text in English summary:\n{text}");
+
+        let clean = base_report(vec![]);
+        let text = with(Lang::En, || render_summary(&clean, Severity::High));
+        assert!(text.contains("Result: PASS"));
+        assert!(!has_cjk(&text), "Chinese text in English summary:\n{text}");
     }
 
     // ── save_timestamp_basic / save_report ───────────────────────────

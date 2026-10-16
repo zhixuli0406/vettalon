@@ -332,7 +332,10 @@ pub async fn build_images() -> Result<(), String> {
     write("egress/tinyproxy.conf", EGRESS_CONF)?;
     write("egress/allowlist", EGRESS_ALLOWLIST)?;
     for (tag, dir) in [(EGRESS_IMAGE, "egress"), (AGENTS_IMAGE, "agents")] {
-        eprintln!("[vettalon] 建置 {tag}…");
+        eprintln!(
+            "[vettalon] {}",
+            crate::tr!("建置 {tag}…", "building {tag}…")
+        );
         let status = Command::new(&bin)
             .args(["build", "-t", tag])
             .arg(ctx.path().join(dir))

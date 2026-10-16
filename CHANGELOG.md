@@ -4,10 +4,17 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-16
+
+### Added
+- **CLI 英文輸出**：新增全域參數 `--lang en|zh-TW`。終端摘要、進度、提示與錯誤訊息都有英文版；未指定時依序看 `VETTALON_LANG`、`LC_ALL`、`LC_MESSAGES`、`LANG`，中文語系用繁中，其他一律英文。JSON 報告、SARIF、揭露草稿內文與送給模型的 prompt 不受語言影響。函式庫 API：`vettalon::lang`（`set`、`get`、`detect`、`pick`、`tr!`），函式庫預設仍是繁中，不呼叫 `set` 的嵌入方行為不變。
+
 ### Changed
+- **README 示範 GIF 改成英文畫面**：用新版 CLI 重錄一次真實的深度掃描（claude 找洞、codex 覆核），等待時間剪掉，輸出未修改。
+- **CLI 預設輸出語言改為依系統語系**：原本固定繁中；現在非中文語系（含未設定）會輸出英文。要維持繁中可加 `--lang zh-TW` 或設 `VETTALON_LANG=zh-TW`。
 - **README 加上 npm 安裝方式**：`npm install -g vettalon` 裝的是同一批簽章發佈的執行檔（macOS arm64／x64、Linux x64／arm64），不需要 Rust 工具鏈；英文版 Quick start 改以 npm 開頭。
 - **README 頂端加上 Vettalon 品牌橫幅**（Dudu C1 識別：V 形標誌，深藍＋青綠 `#0C7580`），圖檔在 `docs/assets/brand/vettalon-readme-banner.png`，英文與繁中 README 共用。
-- **README 改成英文為主**：`README.md` 換成完整英文版（開頭加 Quick start），原本的繁中版移到 `README.zh-TW.md`，兩份頂端互相切換。終端摘要輸出目前仍只有繁中，英文版 README 附了對照說明。
+- **README 改成英文為主**：`README.md` 換成完整英文版（開頭加 Quick start），原本的繁中版移到 `README.zh-TW.md`，兩份頂端互相切換。
 
 ### Fixed
 - **npm 發佈腳本解不出執行檔**：發佈用的壓縮檔裡執行檔存成 `./vettalon`，`npm/scripts/publish.sh` 卻指名解出 `vettalon`，GNU tar 找不到就失敗，0.1.0 因此沒有自動上 npm。改成整包解到暫存目錄再複製，找不到執行檔會明確報錯。0.1.0 已用 release 上簽章過的壓縮檔（sha256 核對過）手動發佈。

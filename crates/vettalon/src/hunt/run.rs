@@ -381,17 +381,21 @@ fn skip_counts(skipped: &[SkippedDep]) -> (usize, usize, usize) {
     (t, k, b)
 }
 
-/// zh-TW preview for `--dry-run`: what would be audited and what is skipped.
+/// Preview for `--dry-run`: what would be audited and what is skipped.
 pub fn render_plan(plan: &HuntPlan) -> String {
     let (t, k, b) = skip_counts(&plan.skipped);
-    let mut out = format!(
+    let mut out = crate::tr!(
         "供應鏈獵捕（預覽）：{}\n  相依總數：{}　將審：{}　略過：{}（transitive {t}、已知 CVE {k}、超出上限 {b}）\n",
+        "Supply-chain hunt (preview): {}\n  Dependencies: {}  to audit: {}  skipped: {} (transitive {t}, known CVE {k}, over the cap {b})\n",
         plan.project,
         plan.total_targets,
         plan.selected.len(),
         plan.skipped.len(),
     );
-    out.push_str("  將審查（OSV 查無已知漏洞、優先直接依賴）：\n");
+    out.push_str(crate::lang::pick(
+        "  將審查（OSV 查無已知漏洞、優先直接依賴）：\n",
+        "  Will audit (no known vulnerability in OSV, direct dependencies first):\n",
+    ));
     for row in &plan.selected {
         out.push_str(&format!(
             "    - {} {}@{}{}\n",
@@ -401,20 +405,21 @@ pub fn render_plan(plan: &HuntPlan) -> String {
             if row.target.direct {
                 ""
             } else {
-                "（transitive）"
+                crate::lang::pick("（transitive）", " (transitive)")
             },
         ));
     }
     out
 }
 
-/// zh-TW summary of a completed hunt.
+/// Summary of a completed hunt.
 pub fn render_summary(report: &HuntReport) -> String {
     let (t, k, b) = skip_counts(&report.skipped);
     let novel = report.novel_candidates();
     let errors: Vec<&DependencyHunt> = report.audited.iter().filter(|d| !d.audited).collect();
-    let mut out = format!(
+    let mut out = crate::tr!(
         "供應鏈獵捕：{}\n  相依總數：{}　已審：{}　略過：{}（transitive {t}、已知 CVE {k}、超出上限 {b}）\n  可能的新漏洞（OSV 查無、待揭露候選）：{}\n",
+        "Supply-chain hunt: {}\n  Dependencies: {}  audited: {}  skipped: {} (transitive {t}, known CVE {k}, over the cap {b})\n  Possible new vulnerabilities (not in OSV, disclosure candidates): {}\n",
         report.project,
         report.total_targets,
         report.audited.len(),
@@ -422,8 +427,9 @@ pub fn render_summary(report: &HuntReport) -> String {
         novel.len(),
     );
     for (dep, f) in &novel {
-        out.push_str(&format!(
+        out.push_str(&crate::tr!(
             "    - [{}] {}@{} — {}（{}）@ {}{}\n",
+            "    - [{}] {}@{} — {} ({}) @ {}{}\n",
             f.severity.as_str(),
             dep.target.name,
             dep.target.version,
@@ -434,10 +440,14 @@ pub fn render_summary(report: &HuntReport) -> String {
         ));
     }
     if !errors.is_empty() {
-        out.push_str("  抓取／審查失敗：\n");
+        out.push_str(crate::lang::pick(
+            "  抓取／審查失敗：\n",
+            "  Fetch / audit failures:\n",
+        ));
         for d in errors {
-            out.push_str(&format!(
+            out.push_str(&crate::tr!(
                 "    - {}@{}：{}\n",
+                "    - {}@{}: {}\n",
                 d.target.name,
                 d.target.version,
                 d.error.as_deref().unwrap_or("unknown"),
@@ -520,7 +530,12 @@ pub fn disclosure_package(
         .find(|(d, f)| {
             f.id == finding_id && format!("{}@{}", d.target.name, d.target.version) == dependency
         })
-        .ok_or_else(|| format!("{dependency} 沒有可揭露的新漏洞候選 {finding_id}"))?;
+        .ok_or_else(|| {
+            crate::tr!(
+                "{dependency} 沒有可揭露的新漏洞候選 {finding_id}",
+                "{dependency} has no disclosable novelty candidate {finding_id}"
+            )
+        })?;
     crate::disclose::package_for(f, project_meta_for(dep), channel, today)
 }
 
@@ -529,15 +544,23 @@ pub fn disclosure_package(
 /// or come from elsewhere, so it is never trusted beyond its shape.
 pub fn load_hunt_report(path: &std::path::Path) -> Result<HuntReport, String> {
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
-    let meta = std::fs::metadata(path).map_err(|e| format!("無法讀取 {}：{e}", path.display()))?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| crate::tr!("無法讀取 {}：{e}", "cannot read {}: {e}", path.display()))?;
     if meta.len() > MAX_BYTES {
-        return Err(format!(
+        return Err(crate::tr!(
             "報告檔過大（{} bytes，上限 {MAX_BYTES}）",
+            "report file too large ({} bytes, limit {MAX_BYTES})",
             meta.len()
         ));
     }
-    let raw = std::fs::read(path).map_err(|e| format!("無法讀取 {}：{e}", path.display()))?;
-    serde_json::from_slice(&raw).map_err(|e| format!("不是有效的供應鏈獵捕報告：{e}"))
+    let raw = std::fs::read(path)
+        .map_err(|e| crate::tr!("無法讀取 {}：{e}", "cannot read {}: {e}", path.display()))?;
+    serde_json::from_slice(&raw).map_err(|e| {
+        crate::tr!(
+            "不是有效的供應鏈獵捕報告：{e}",
+            "not a valid supply-chain hunt report: {e}"
+        )
+    })
 }
 
 fn status_word(s: FindingStatus) -> &'static str {

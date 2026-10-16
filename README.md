@@ -33,16 +33,16 @@ Deep mode needs at least one model; see [Install](#install) for the options.
 
 ```
 $ vettalon scan fixtures/demo-app --profile deep --poc --finders claude --verifiers codex
-程式碼安全審計（vettalon）
+Code security audit (vettalon)
   ...
-AI 深度審計／對抗式覆核／PoC（deep profile）：
-  AI 候選：2　已證偽：0（其中前置檢查證偽 0）　待人工覆核：2　PoC 已執行：2
-  模組覆蓋：共 4　已審 4（無候選 2、有候選 2）　延後 0　失敗 0
-  覆核獨立性：全部跨家族覆核（找洞：claude；覆核：codex）
-結論：未達 --fail-on 門檻（high），視為通過。
+AI audit / adversarial verification / PoC (deep profile):
+  AI candidates: 2  refuted: 0 (0 by pre-checks)  needs human review: 2  PoCs run: 2
+  Module coverage: 4 total, 4 reviewed (2 clean, 2 with candidates), 0 deferred, 0 failed
+  Verifier independence: all cross-family (find: claude; verify: codex)
+Result: PASS, nothing reached the --fail-on threshold (high).
 ```
 
-The terminal summary is currently printed in Traditional Chinese only. In English, the lines above read: "AI candidates: 2, refuted: 0 (0 of them by the pre-check), awaiting human review: 2, PoCs run: 2; modules: 4 total, 4 audited (2 with no candidates, 2 with candidates), 0 deferred, 0 failed; verification independence: all cross-family (finder: claude, verifier: codex); result: below the `--fail-on` threshold (high), treated as a pass."
+Terminal output follows your locale: Traditional Chinese when it is Chinese, English otherwise. Force it with `--lang en` or `--lang zh-TW` (or `VETTALON_LANG`). The JSON report and SARIF are the same in either language.
 
 (A finding the AI reported but no human has confirmed yet has the status `needs_human`. By default it doesn't count toward `--fail-on`; add `--fail-on-needs-human` to make it fail CI.)
 
@@ -98,6 +98,9 @@ vettalon scan . --profile deep --cross-check-top 5
 
 # Save a copy to ~/.vettalon/reports; on the next scan, files that haven't changed reuse the previous verdicts
 vettalon scan . --profile deep --save
+
+# Terminal output language (default: your locale; reports and SARIF are unaffected)
+vettalon scan . --lang en
 
 # Check whether a report file has been broken or altered
 vettalon validate report.json

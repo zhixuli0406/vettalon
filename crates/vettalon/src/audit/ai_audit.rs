@@ -776,7 +776,11 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
             crate::audit::ModelStep {
                 model: label,
                 round,
-                message: &format!("{label} 審查模組 {}", module.module_path),
+                message: &crate::tr!(
+                    "{label} 審查模組 {}",
+                    "{label} reviewing {}",
+                    module.module_path
+                ),
                 current: done.min(total),
                 total: total.max(1),
             },
