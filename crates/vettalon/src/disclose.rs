@@ -26,9 +26,9 @@ pub enum Channel {
     GithubAdvisory,
     /// The project's own security contact (SECURITY.md / manifest).
     VendorEmail,
-    /// TWCERT/CC — product vulnerabilities, CVE assignment (CNA), 90 days.
+    /// TWCERT/CC — product vulnerability coordination.
     Twcert,
-    /// HITCON ZeroDay — websites / online services, 60 days.
+    /// HITCON ZeroDay — website / online service coordination.
     HitconZeroday,
 }
 
@@ -48,7 +48,7 @@ impl std::str::FromStr for Channel {
 }
 
 impl Channel {
-    /// Standard public-disclosure window, in days.
+    /// Legacy suggested coordination interval, not a platform policy or publication grant.
     pub fn window_days(self) -> i64 {
         match self {
             Channel::HitconZeroday => 60,
@@ -87,7 +87,7 @@ pub struct Draft {
     pub subject: String,
     pub body: String,
     pub submit: Option<String>,
-    /// Suggested public-disclosure date (today + the channel's window).
+    /// Suggested coordination checkpoint; the legacy field name does not grant publication.
     pub disclose_by: String,
 }
 
@@ -104,11 +104,12 @@ pub struct DisclosurePackage {
 }
 
 pub const CHECKLIST: &[&str] = &[
-    "已人工重現此問題，並確認可利用性與影響範圍（自動分析結果不能直接當成已證實的漏洞）",
+    "已完成獨立的人工覆核，確認可利用性與影響範圍；自動分析或草稿產生不等於人工確認",
+    "已保存對應目標與來源識別（版本、commit 或摘要）及沙盒重現紀錄，並核對結果與限制",
     "測試全程在授權範圍內進行，未對他人的正式環境做未經授權的存取",
     "草稿中沒有真實帳密、金鑰、個資或客戶資料",
-    "已確認通報對象正確（產品漏洞找原廠或 TWCERT/CC，網站服務找 HITCON ZeroDay）",
-    "已決定署名方式（具名或匿名）與公開時程，並準備好與對方溝通",
+    "已核對維護者現行政策、授權範圍、正確收件管道與已知公告，未代替任何人同意公開",
+    "已取得本次私下通報核准並留下核准人、內容與署名方式；公開須另行核准，建議日期或期限到期不代表公開授權",
 ];
 
 // ── eligibility ──────────────────────────────────────────────────────────
@@ -274,7 +275,7 @@ pub fn recommend(meta: &ProjectMeta) -> Vec<ChannelOption> {
         out.push(ChannelOption {
             channel: Channel::GithubAdvisory,
             label: "GitHub 私密漏洞回報".into(),
-            reason: format!("專案託管於 GitHub（{slug}），可用私密回報直接通知維護者，不會公開。"),
+            reason: format!("專案託管於 GitHub（{slug}），可優先核對維護者的私密回報設定與安全政策，經核准後私下通報。"),
             submit: Some(format!("https://github.com/{slug}/security/advisories/new")),
             window_days: Channel::GithubAdvisory.window_days(),
         });
@@ -294,14 +295,14 @@ pub fn recommend(meta: &ProjectMeta) -> Vec<ChannelOption> {
     out.push(ChannelOption {
         channel: Channel::Twcert,
         label: "TWCERT/CC（台灣漏洞通報，可申請 CVE）".into(),
-        reason: "適用軟體／韌體產品漏洞；原廠無回應或為台灣廠商時優先。TWCERT/CC 為 CVE 編號管理者，自報告完整起 90 日曆天內公開基本資訊。".into(),
+        reason: "軟體／韌體產品漏洞的協調管道候選；送出前須核對受理範圍、現行政策與聯絡方式。建議日期不代表公開授權。".into(),
         submit: Some("mailto:cve@cert.org.tw".into()),
         window_days: Channel::Twcert.window_days(),
     });
     out.push(ChannelOption {
         channel: Channel::HitconZeroday,
         label: "HITCON ZeroDay（網站／服務漏洞）".into(),
-        reason: "適用網站與線上服務（使用者無法自行修補的 SaaS）；第 60 天自動公開。程式庫／產品漏洞不適用。".into(),
+        reason: "網站與線上服務的協調管道候選；送出前須核對受理範圍、現行政策與公開設定。建議日期不代表公開授權。".into(),
         submit: Some("https://zeroday.hitcon.org/".into()),
         window_days: Channel::HitconZeroday.window_days(),
     });
@@ -424,7 +425,16 @@ fn bullets(items: &[String], empty: &str) -> String {
 
 /// Draft the report for `channel`. `today` is injected for testability.
 pub fn draft(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::NaiveDate) -> Draft {
-    let d = draft_raw(f, meta, channel, today);
+    let mut d = draft_raw(f, meta, channel, today);
+    let notice = match channel {
+        Channel::GithubAdvisory | Channel::VendorEmail => {
+            "UNAPPROVED LOCAL DRAFT — not sent. Before sending, document independent human review and a sandbox reproduction record tied to the target and source identity (version, commit or digest), then obtain explicit approval before sending. Automated analysis and draft generation do not establish human confirmation. A proposed date does not authorize publication; publication requires separate approval."
+        }
+        Channel::Twcert | Channel::HitconZeroday => {
+            "未核准的本機草稿，尚未送出。送出前須留下獨立人工覆核、對應目標與來源識別（版本、commit 或摘要）的沙盒重現紀錄，並取得送出前明確核准。自動分析與產生草稿不等於人工確認；建議日期不代表公開授權，公開須另行核准。"
+        }
+    };
+    d.body = format!("{notice}\n\n{}", d.body);
     Draft {
         subject: show_invisible(&d.subject),
         body: show_invisible(&d.body),
@@ -497,7 +507,7 @@ fn draft_raw(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
         Channel::GithubAdvisory => {
             let subject = f.title.clone();
             let mut body = format!(
-                "<!-- GitHub Security Advisory fields\nTitle: {title}\nEcosystem: {eco}\nPackage name: {pkg}\nAffected versions: {ver}\nPatched versions: (leave empty until a fix ships)\nSeverity: {sev}\nCWE: {cwe_text}\n-->\n\n### Summary\n{summary}\n\n### Details\nLocation: `{loc}`\n\n{steps_md}\n\n### PoC\nVerification status: {verified_en}\n{poc}\n\n### Impact\n{impact}\n\n### Suggested fix\n{fix}\n\n### Disclosure\nI'd like to coordinate disclosure: details stay private until a fix is released or {date}, whichever comes first.",
+                "<!-- GitHub Security Advisory fields\nTitle: {title}\nEcosystem: {eco}\nPackage name: {pkg}\nAffected versions: {ver}\nPatched versions: (leave empty until a fix ships)\nSeverity: {sev}\nCWE: {cwe_text}\n-->\n\n### Summary\n{summary}\n\n### Details\nLocation: `{loc}`\n\n{steps_md}\n\n### PoC\nVerification status: {verified_en}\n{poc}\n\n### Impact\n{impact}\n\n### Suggested fix\n{fix}\n\n### Disclosure\nSuggested coordination checkpoint: {date}. Please discuss the repair and disclosure plan with us. Reaching this date does not authorize publication; any publication requires separate approval after checking repair status, public advisories and coordination agreements.",
                 title = f.title,
                 eco = meta.ecosystem.as_deref().unwrap_or("(choose)"),
                 pkg = meta.name.as_deref().unwrap_or("(package name)"),
@@ -533,7 +543,7 @@ fn draft_raw(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
                 meta.name.as_deref().unwrap_or("your project")
             );
             let body = format!(
-                "Hello maintainers,\n\nI'd like to privately report a security issue in {affected}.\n\nSummary: {title}\nSeverity (assessed): {sev}; {cvss}\nWeakness: {cwe_text}\nLocation: {loc}\nVerification status: [manually reproduced / not yet reproduced — pick one]\n\nDetails:\n{analysis}\n\nSteps to reproduce:\n{steps}\n\nImpact:\n{impact}\n\nSuggested fix:\n{fix}{poc}\n\nI propose coordinated disclosure: I will keep this private until a fix is released or {date} ({days} days), whichever comes first. Please let me know if you need more time.\n\nThanks,\n[your name or handle]",
+                "Hello maintainers,\n\nI'd like to privately report a security issue in {affected}.\n\nSummary: {title}\nSeverity (assessed): {sev}; {cvss}\nWeakness: {cwe_text}\nLocation: {loc}\nVerification status: [manually reproduced / not yet reproduced — pick one]\n\nDetails:\n{analysis}\n\nSteps to reproduce:\n{steps}\n\nImpact:\n{impact}\n\nSuggested fix:\n{fix}{poc}\n\nI propose {date} ({days} days) as a coordination checkpoint, subject to agreement. Reaching this date does not authorize publication; any publication requires separate approval after checking repair status, public advisories and coordination agreements. Please let me know if the coordination plan needs adjustment.\n\nThanks,\n[your name or handle]",
                 title = f.title,
                 sev = severity_en(f.severity),
                 steps = numbered(&steps),
@@ -553,7 +563,7 @@ fn draft_raw(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
         Channel::Twcert => {
             let subject = format!("[漏洞通報] {affected}：{}", f.title);
             let body = format!(
-                "TWCERT/CC 您好：\n\n以下通報 {affected} 之安全弱點，請協助確認並與原廠協調處理。\n\n一、漏洞概述：{title}\n二、受影響產品與版本：{affected}；問題位置：{loc}\n三、弱點類型：{cwe_zh}\n四、風險評估：{sev}；{cvss}\n五、驗證狀態：{verified}\n六、漏洞技術描述：\n{analysis}\n七、重現方法：\n{steps}\n八、潛在影響：{impact}\n九、建議修補方式：\n{fix}{poc}\n十、揭露意願：同意依貴中心漏洞揭露政策，自報告確認完整之日起 90 日曆天內公開基本資訊（預計 {date} 前）；署名方式：【具名稱呼／匿名】\n十一、通報者聯絡資訊：【姓名／Email／電話】；是否同意提供聯絡方式予原廠：【是／否】\n\n（可選擇以 PGP 加密寄送，TWCERT/CC 公開金鑰 KeyID 1E9D1F1B）",
+                "TWCERT/CC 您好：\n\n以下通報 {affected} 之安全弱點，請協助確認並與原廠協調處理。\n\n一、漏洞概述：{title}\n二、受影響產品與版本：{affected}；問題位置：{loc}\n三、弱點類型：{cwe_zh}\n四、風險評估：{sev}；{cvss}\n五、驗證狀態：{verified}\n六、漏洞技術描述：\n{analysis}\n七、重現方法：\n{steps}\n八、潛在影響：{impact}\n九、建議修補方式：\n{fix}{poc}\n十、揭露意願與協調：尚待人工核准；建議於 {date} 協調進度，日期不代表公開授權。修補、公告、公開範圍與時程須另行核對、協商及核准；署名方式：【具名稱呼／匿名】\n十一、通報者聯絡資訊：【姓名／Email／電話】；是否同意提供聯絡方式予原廠：【是／否】\n\n（送出前請核對現行受理政策、聯絡管道及加密方式。）",
                 title = f.title,
                 sev = severity_zh(f.severity),
                 steps = numbered(&steps),
@@ -572,7 +582,7 @@ fn draft_raw(f: &Finding, meta: &ProjectMeta, channel: Channel, today: chrono::N
         Channel::HitconZeroday => {
             let subject = f.title.clone();
             let body = format!(
-                "標題：{title}\n風險等級：{sev}\n類型：{cwe_zh}\n受影響網站／服務：【網址】\n\n敘述：\n{analysis}\n\n驗證狀態：{verified}\n\n重現步驟：\n{steps}\n\n處理建議：\n{fix}{poc}\n\n（HITCON ZeroDay 適用網站與線上服務；程式庫或產品漏洞請改通報原廠或 TWCERT/CC。平台於第 60 天自動公開，預計 {date}。）",
+                "標題：{title}\n風險等級：{sev}\n類型：{cwe_zh}\n受影響網站／服務：【網址】\n\n敘述：\n{analysis}\n\n驗證狀態：{verified}\n\n重現步驟：\n{steps}\n\n處理建議：\n{fix}{poc}\n\n（送出前請核對 HITCON ZeroDay 的受理範圍、現行政策與公開設定。建議於 {date} 協調進度，日期不代表公開授權；未取得本次公開核准前，不同意公開任何內容。）",
                 title = f.title,
                 sev = severity_zh(f.severity),
                 steps = numbered(&steps),
@@ -777,6 +787,99 @@ mod tests {
         assert!(gh.body.contains("### Impact") && gh.body.contains("Ecosystem: Rust"));
         let hc = draft(&f, &m, Channel::HitconZeroday, today);
         assert_eq!(hc.disclose_by, "2026-12-12", "HITCON 60 days");
+    }
+
+    #[test]
+    fn every_channel_requires_independent_review_sandbox_and_approval() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        for status in [FindingStatus::NeedsHuman, FindingStatus::Confirmed] {
+            let f = finding(status);
+            for channel in [
+                Channel::GithubAdvisory,
+                Channel::VendorEmail,
+                Channel::Twcert,
+                Channel::HitconZeroday,
+            ] {
+                let d = draft(&f, &ProjectMeta::default(), channel, today);
+                let english = matches!(channel, Channel::GithubAdvisory | Channel::VendorEmail);
+                let required = if english {
+                    [
+                        "UNAPPROVED LOCAL DRAFT",
+                        "human review",
+                        "source identity",
+                        "sandbox reproduction record",
+                        "explicit approval before sending",
+                        "does not authorize publication",
+                    ]
+                } else {
+                    [
+                        "未核准的本機草稿",
+                        "人工覆核",
+                        "來源識別",
+                        "沙盒重現紀錄",
+                        "送出前明確核准",
+                        "不代表公開授權",
+                    ]
+                };
+                for needle in required {
+                    assert!(
+                        d.body.contains(needle),
+                        "{channel:?}/{status:?} missing {needle:?}"
+                    );
+                }
+                for forbidden in [
+                    "whichever comes first",
+                    "同意依貴中心漏洞揭露政策",
+                    "第 60 天自動公開",
+                    "KeyID 1E9D1F1B",
+                ] {
+                    assert!(
+                        !d.body.contains(forbidden),
+                        "{channel:?} retains {forbidden:?}"
+                    );
+                }
+                let expected_date = if channel == Channel::HitconZeroday {
+                    "2026-12-12"
+                } else {
+                    "2027-01-11"
+                };
+                assert_eq!(d.disclose_by, expected_date);
+                assert!(d.body.contains(expected_date));
+                assert_eq!(f.status, status, "drafting must not promote the finding");
+                let serialized = serde_json::to_value(&d).unwrap();
+                let keys: std::collections::BTreeSet<_> = serialized
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(
+                    keys,
+                    ["body", "channel", "disclose_by", "subject", "submit"]
+                        .into_iter()
+                        .collect()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checklist_and_recommendations_do_not_grant_publication() {
+        let checklist = CHECKLIST.join("\n");
+        for needle in [
+            "人工覆核",
+            "來源識別",
+            "沙盒重現紀錄",
+            "通報核准",
+            "公開須另行核准",
+        ] {
+            assert!(checklist.contains(needle), "checklist missing {needle:?}");
+        }
+        for option in recommend(&ProjectMeta::default()) {
+            assert!(!option.reason.contains("自動公開"));
+            assert!(!option.reason.contains("90 日曆天內公開"));
+            assert!(option.reason.contains("核對"));
+        }
     }
 
     #[test]

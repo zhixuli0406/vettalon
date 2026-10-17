@@ -12,6 +12,7 @@
 //! (SCA tools already track those — the AI budget goes to finding the NOT-yet
 //! disclosed), and at most `max_deps` are audited.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -19,9 +20,10 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::fetch::SourceFetcher;
-use super::osv::{DependencyAdvisories, KnownVuln, OsvClient, scan_known};
-use super::{DependencyTarget, Ecosystem, targets_from_dir};
+use super::osv::{DependencyAdvisories, KnownVuln, OsvClient, OsvEvidence, OsvStatus, scan_known};
+use super::{DependencyTarget, Ecosystem, IntakeEvidence, intake_from_dir};
 use crate::audit::schema::{Finding, FindingStatus};
+use vettalon_contract::coverage::{IncompleteReason, RunStatus};
 
 /// Knobs for one hunt. Defaults match the agreed cost policy.
 #[derive(Debug, Clone)]
@@ -65,6 +67,8 @@ impl Default for HuntOptions {
 pub enum SkipReason {
     /// Transitive, and `--include-transitive` was not set.
     Transitive,
+    /// Directness could not be established; do not silently call it transitive.
+    DirectnessUnknown,
     /// Already has a known CVE for this version (SCA already covers it).
     KnownCve,
     /// Past the `max_deps` budget.
@@ -76,6 +80,8 @@ pub struct SkippedDep {
     pub target: DependencyTarget,
     pub reason: SkipReason,
     pub known: Vec<KnownVuln>,
+    #[serde(default)]
+    pub osv: OsvEvidence,
 }
 
 /// Where an upstream disclosure for this dependency would go, derived from the
@@ -89,6 +95,43 @@ pub struct UpstreamInfo {
     pub security_emails: Vec<String>,
 }
 
+/// Stage evidence is unknown for reports written before this ledger existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageStatus {
+    #[default]
+    Unknown,
+    NotStarted,
+    Succeeded,
+    Incomplete,
+    Failed,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageEvidence {
+    pub status: StageStatus,
+    pub duration_ms: u64,
+    pub files: Option<usize>,
+    pub bytes: Option<u64>,
+}
+
+/// Private child-scan evidence. Findings stay in DependencyHunt; this retains
+/// scope and engine gaps without duplicating source snippets or transcripts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DependencyAuditEvidence {
+    pub run_status: Option<RunStatus>,
+    pub incomplete_reason: Option<IncompleteReason>,
+    pub coverage: Vec<crate::audit::schema::ModuleCoverage>,
+    pub summary: Option<crate::audit::schema::CoverageSummary>,
+    pub engines_missing: Vec<crate::audit::schema::EngineMissing>,
+}
+
+pub struct DirAuditResult {
+    pub findings: Vec<Finding>,
+    pub evidence: DependencyAuditEvidence,
+}
+
 /// One audited dependency and what the deep audit found in its source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyHunt {
@@ -99,9 +142,25 @@ pub struct DependencyHunt {
     pub error: Option<String>,
     pub upstream: UpstreamInfo,
     pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub osv: OsvEvidence,
+    #[serde(default)]
+    pub fetch: StageEvidence,
+    #[serde(default)]
+    pub audit: StageEvidence,
+    #[serde(default)]
+    pub audit_evidence: DependencyAuditEvidence,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 impl DependencyHunt {
+    pub fn has_completed_audit(&self) -> bool {
+        self.audited
+            && self.audit.status == StageStatus::Succeeded
+            && self.audit_evidence.run_status == Some(RunStatus::Complete)
+    }
+
     /// Findings worth a human's attention: confirmed or needs-human. In a
     /// dependency OSV reports no advisory for, these are novelty candidates
     /// (nothing known matches them).
@@ -117,20 +176,36 @@ impl DependencyHunt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HuntReport {
+    /// None for legacy reports; absence never proves successful intake.
+    #[serde(default)]
+    pub intake: Option<IntakeEvidence>,
     pub project: String,
     /// Every dependency resolved from the lockfiles.
     pub total_targets: usize,
     pub audited: Vec<DependencyHunt>,
     pub skipped: Vec<SkippedDep>,
+    /// Unknown for reports predating the dependency evidence ledger.
+    #[serde(default)]
+    pub run_status: Option<RunStatus>,
+    #[serde(default)]
+    pub incomplete_reasons: Vec<String>,
 }
 
 impl HuntReport {
+    pub fn has_complete_scope_evidence(&self) -> bool {
+        self.run_status == Some(RunStatus::Complete)
+            && self
+                .intake
+                .as_ref()
+                .is_some_and(|v| v.is_complete() && v.resolved_targets == self.total_targets)
+    }
+
     /// Novelty candidates: actionable findings in dependencies with no known
     /// OSV advisory. These are the responsible-disclosure candidates.
     pub fn novel_candidates(&self) -> Vec<(&DependencyHunt, &Finding)> {
         self.audited
             .iter()
-            .filter(|d| d.known.is_empty())
+            .filter(|d| d.known.is_empty() && d.osv.status == OsvStatus::Unmatched)
             .flat_map(|d| d.actionable().map(move |f| (d, f)))
             .collect()
     }
@@ -141,6 +216,15 @@ impl HuntReport {
 #[async_trait]
 pub trait DirAuditor: Send + Sync {
     async fn audit(&self, dir: &Path) -> Result<Vec<Finding>, String>;
+
+    /// Existing third-party auditors stay source-compatible. A finding list
+    /// alone cannot establish completion or source coverage.
+    async fn audit_with_evidence(&self, dir: &Path) -> Result<DirAuditResult, String> {
+        Ok(DirAuditResult {
+            findings: self.audit(dir).await?,
+            evidence: DependencyAuditEvidence::default(),
+        })
+    }
 }
 
 /// The real auditor: runs the deep engine ([`crate::audit::run_scan`]) on a
@@ -160,6 +244,10 @@ pub struct EngineAuditor {
 #[async_trait]
 impl DirAuditor for EngineAuditor {
     async fn audit(&self, dir: &Path) -> Result<Vec<Finding>, String> {
+        Ok(self.audit_with_evidence(dir).await?.findings)
+    }
+
+    async fn audit_with_evidence(&self, dir: &Path) -> Result<DirAuditResult, String> {
         let opts = crate::audit::ScanOptions {
             repo_path: dir.to_path_buf(),
             profile: "deep".into(),
@@ -184,7 +272,16 @@ impl DirAuditor for EngineAuditor {
         let report = crate::audit::run_scan(&self.home, &opts)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(report.findings)
+        Ok(DirAuditResult {
+            findings: report.findings,
+            evidence: DependencyAuditEvidence {
+                run_status: Some(report.run_status),
+                incomplete_reason: report.incomplete_reason,
+                coverage: report.coverage,
+                summary: Some(report.summary.coverage),
+                engines_missing: report.engines_missing,
+            },
+        })
     }
 }
 
@@ -205,12 +302,14 @@ pub fn partition(
                 target: row.target,
                 reason: SkipReason::KnownCve,
                 known: row.known,
+                osv: row.osv,
             });
         } else if selected.len() >= opts.max_deps {
             skipped.push(SkippedDep {
                 target: row.target,
                 reason: SkipReason::OverBudget,
                 known: row.known,
+                osv: row.osv,
             });
         } else {
             selected.push(row);
@@ -223,6 +322,8 @@ pub fn partition(
 /// so `--dry-run` can preview the cost before spending tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HuntPlan {
+    #[serde(default)]
+    pub intake: Option<IntakeEvidence>,
     pub project: String,
     pub total_targets: usize,
     pub selected: Vec<DependencyAdvisories>,
@@ -236,8 +337,15 @@ pub async fn plan_hunt<O: OsvClient>(
     opts: &HuntOptions,
     osv: &O,
 ) -> Result<HuntPlan, String> {
-    let targets = targets_from_dir(project)?;
-    let total_targets = targets.len();
+    let intake = intake_from_dir(project)?;
+    let total_targets = intake.targets.len();
+    let evidence = intake.evidence;
+    let targets = intake.targets;
+    let unknown_directness: HashSet<_> = evidence
+        .directness_unknown
+        .iter()
+        .map(|t| (t.ecosystem.as_str(), t.name.as_str(), t.version.as_str()))
+        .collect();
 
     let mut skipped: Vec<SkippedDep> = Vec::new();
     let candidates: Vec<DependencyTarget> = targets
@@ -246,8 +354,17 @@ pub async fn plan_hunt<O: OsvClient>(
             if !opts.include_transitive && !t.direct {
                 skipped.push(SkippedDep {
                     target: t.clone(),
-                    reason: SkipReason::Transitive,
+                    reason: if unknown_directness.contains(&(
+                        t.ecosystem.as_str(),
+                        t.name.as_str(),
+                        t.version.as_str(),
+                    )) {
+                        SkipReason::DirectnessUnknown
+                    } else {
+                        SkipReason::Transitive
+                    },
                     known: Vec::new(),
+                    osv: OsvEvidence::default(),
                 });
                 false
             } else {
@@ -261,6 +378,7 @@ pub async fn plan_hunt<O: OsvClient>(
     skipped.extend(known_or_budget);
 
     Ok(HuntPlan {
+        intake: Some(evidence),
         project: project.display().to_string(),
         total_targets,
         selected,
@@ -334,12 +452,44 @@ where
             .collect()
             .await;
     finished.sort_by_key(|(i, _)| *i);
-    let audited = finished.into_iter().map(|(_, hunt)| hunt).collect();
+    let audited: Vec<DependencyHunt> = finished.into_iter().map(|(_, hunt)| hunt).collect();
+    let mut incomplete_reasons = Vec::new();
+    if !plan
+        .intake
+        .as_ref()
+        .is_some_and(IntakeEvidence::is_complete)
+    {
+        incomplete_reasons.push("dependency_intake_incomplete".into());
+    }
+    if audited.iter().any(|d| !d.audited) {
+        incomplete_reasons.push("dependency_audit_incomplete".into());
+    }
+    if audited
+        .iter()
+        .any(|d| matches!(d.osv.status, OsvStatus::Failed | OsvStatus::Unknown))
+    {
+        incomplete_reasons.push("advisory_query_unknown".into());
+    }
+    if plan
+        .skipped
+        .iter()
+        .any(|d| d.reason == SkipReason::OverBudget)
+    {
+        incomplete_reasons.push("dependency_budget_exhausted".into());
+    }
+    let run_status = Some(if incomplete_reasons.is_empty() {
+        RunStatus::Complete
+    } else {
+        RunStatus::Incomplete
+    });
     Ok(HuntReport {
+        intake: plan.intake,
         project: plan.project,
         total_targets: plan.total_targets,
         audited,
         skipped: plan.skipped,
+        run_status,
+        incomplete_reasons,
     })
 }
 
@@ -351,47 +501,160 @@ async fn audit_within_timeout<F: SourceFetcher, A: DirAuditor>(
     fetcher: &F,
     auditor: &A,
 ) -> DependencyHunt {
-    match tokio::time::timeout(timeout, audit_one(row, fetcher, auditor)).await {
-        Ok(h) => h,
-        Err(_) => DependencyHunt {
-            target: row.target.clone(),
-            known: row.known.clone(),
-            audited: false,
-            error: Some(format!(
-                "timed out after {}s (fetch + audit)",
-                timeout.as_secs()
-            )),
-            upstream: UpstreamInfo::default(),
-            findings: Vec::new(),
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let elapsed =
+        |since: std::time::Instant| since.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let mut result = DependencyHunt {
+        target: row.target.clone(),
+        known: row.known.clone(),
+        osv: row.osv.clone(),
+        audited: false,
+        error: None,
+        upstream: UpstreamInfo::default(),
+        findings: Vec::new(),
+        fetch: StageEvidence {
+            status: StageStatus::NotStarted,
+            ..Default::default()
         },
+        audit: StageEvidence {
+            status: StageStatus::NotStarted,
+            ..Default::default()
+        },
+        audit_evidence: DependencyAuditEvidence::default(),
+        duration_ms: 0,
+    };
+    let tmp = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            result.fetch.status = StageStatus::Failed;
+            result.error = Some(format!("scratch dir failed: {error}"));
+            return result;
+        }
+    };
+    let fetching = std::time::Instant::now();
+    let fetch =
+        tokio::time::timeout_at(deadline, fetcher.fetch_into(&row.target, tmp.path())).await;
+    result.fetch.duration_ms = elapsed(fetching);
+    match fetch {
+        Ok(Ok(stats)) => {
+            result.fetch.status = StageStatus::Succeeded;
+            result.fetch.files = Some(stats.files);
+            result.fetch.bytes = Some(stats.bytes);
+        }
+        Ok(Err(error)) => {
+            result.fetch.status = StageStatus::Failed;
+            result.error = Some(format!(
+                "fetch failed: {}",
+                crate::util::mask_sensitive_text(&error)
+            ));
+        }
+        Err(_) => {
+            result.fetch.status = StageStatus::TimedOut;
+            result.error = Some(format!("timed out after {}s (fetch)", timeout.as_secs()));
+        }
     }
+    if result.fetch.status != StageStatus::Succeeded {
+        result.duration_ms = elapsed(started);
+        return result;
+    }
+    result.upstream = detect_upstream(tmp.path(), &row.target);
+    let auditing = std::time::Instant::now();
+    let audit = tokio::time::timeout_at(deadline, auditor.audit_with_evidence(tmp.path())).await;
+    result.audit.duration_ms = elapsed(auditing);
+    match audit {
+        Ok(Ok(audit)) => {
+            result.findings = audit.findings;
+            result.audit_evidence = audit.evidence;
+            result.audit.status = match result.audit_evidence.run_status {
+                Some(RunStatus::Complete) => StageStatus::Succeeded,
+                Some(RunStatus::Incomplete) => StageStatus::Incomplete,
+                None => StageStatus::Unknown,
+            };
+            result.audited = result.audit.status == StageStatus::Succeeded;
+            if !result.audited {
+                result.error = Some(match result.audit_evidence.run_status {
+                    Some(_) => {
+                        "child scan incomplete; inspect audit_evidence for scope and reason".into()
+                    }
+                    None => "auditor returned findings without child-scan coverage evidence".into(),
+                });
+            }
+        }
+        Ok(Err(error)) => {
+            result.audit.status = StageStatus::Failed;
+            result.error = Some(format!(
+                "audit failed: {}",
+                crate::util::mask_sensitive_text(&error)
+            ));
+        }
+        Err(_) => {
+            result.audit.status = StageStatus::TimedOut;
+            result.error = Some(format!("timed out after {}s (audit)", timeout.as_secs()));
+        }
+    }
+    result.duration_ms = elapsed(started);
+    result
 }
 
-fn skip_counts(skipped: &[SkippedDep]) -> (usize, usize, usize) {
+fn skip_counts(skipped: &[SkippedDep]) -> (usize, usize, usize, usize) {
     let mut t = 0;
     let mut k = 0;
     let mut b = 0;
+    let mut u = 0;
     for s in skipped {
         match s.reason {
             SkipReason::Transitive => t += 1,
+            SkipReason::DirectnessUnknown => u += 1,
             SkipReason::KnownCve => k += 1,
             SkipReason::OverBudget => b += 1,
         }
     }
-    (t, k, b)
+    (t, k, b, u)
+}
+
+/// Summarize intake without exposing raw parser messages or input lines.
+pub fn render_intake(intake: Option<&IntakeEvidence>, total: usize) -> String {
+    let Some(evidence) = intake else {
+        return "  Intake: unknown (legacy evidence); resolved count is not a complete inventory.\n".into();
+    };
+    let complete = evidence.is_complete() && evidence.resolved_targets == total;
+    let mut out = format!(
+        "  Intake: {}; resolved targets only; failed-source denominator unknown.\n",
+        if complete {
+            "complete for supported scope"
+        } else {
+            "incomplete"
+        }
+    );
+    for source in &evidence.sources {
+        if !matches!(
+            source.status,
+            super::IntakeSourceStatus::Parsed | super::IntakeSourceStatus::Absent
+        ) {
+            out.push_str(&format!(
+                "    - {}: {} ({})\n",
+                source.file,
+                source.status.as_str(),
+                source.reason_codes.join(", ")
+            ));
+        }
+    }
+    out
 }
 
 /// Preview for `--dry-run`: what would be audited and what is skipped.
 pub fn render_plan(plan: &HuntPlan) -> String {
-    let (t, k, b) = skip_counts(&plan.skipped);
+    let (t, k, b, u) = skip_counts(&plan.skipped);
     let mut out = crate::tr!(
-        "供應鏈獵捕（預覽）：{}\n  相依總數：{}　將審：{}　略過：{}（transitive {t}、已知 CVE {k}、超出上限 {b}）\n",
-        "Supply-chain hunt (preview): {}\n  Dependencies: {}  to audit: {}  skipped: {} (transitive {t}, known CVE {k}, over the cap {b})\n",
+        "供應鏈獵捕（預覽）：{}\n  已解析相依：{}　將審：{}　略過：{}（transitive {t}、已知 CVE {k}、超出上限 {b}、直接性未知 {u}）\n",
+        "Supply-chain hunt (preview): {}\n  Resolved dependencies: {}  to audit: {}  skipped: {} (transitive {t}, known CVE {k}, over the cap {b}, directness unknown {u})\n",
         plan.project,
         plan.total_targets,
         plan.selected.len(),
         plan.skipped.len(),
     );
+    out.push_str(&render_intake(plan.intake.as_ref(), plan.total_targets));
     out.push_str(crate::lang::pick(
         "  將審查（OSV 查無已知漏洞、優先直接依賴）：\n",
         "  Will audit (no known vulnerability in OSV, direct dependencies first):\n",
@@ -414,18 +677,41 @@ pub fn render_plan(plan: &HuntPlan) -> String {
 
 /// Summary of a completed hunt.
 pub fn render_summary(report: &HuntReport) -> String {
-    let (t, k, b) = skip_counts(&report.skipped);
+    let (t, k, b, u) = skip_counts(&report.skipped);
     let novel = report.novel_candidates();
     let errors: Vec<&DependencyHunt> = report.audited.iter().filter(|d| !d.audited).collect();
     let mut out = crate::tr!(
-        "供應鏈獵捕：{}\n  相依總數：{}　已審：{}　略過：{}（transitive {t}、已知 CVE {k}、超出上限 {b}）\n  可能的新漏洞（OSV 查無、待揭露候選）：{}\n",
-        "Supply-chain hunt: {}\n  Dependencies: {}  audited: {}  skipped: {} (transitive {t}, known CVE {k}, over the cap {b})\n  Possible new vulnerabilities (not in OSV, disclosure candidates): {}\n",
+        "供應鏈獵捕：{}\n  已解析相依：{}　已審：{}　略過：{}（transitive {t}、已知 CVE {k}、超出上限 {b}、直接性未知 {u}）\n  OSV 未命中的待人工候選（不代表已確認的新漏洞）：{}\n",
+        "Supply-chain hunt: {}\n  Resolved dependencies: {}  audited: {}  skipped: {} (transitive {t}, known CVE {k}, over the cap {b}, directness unknown {u})\n  OSV-unmatched candidates for human review (not confirmed novel vulnerabilities): {}\n",
         report.project,
         report.total_targets,
-        report.audited.len(),
+        report
+            .audited
+            .iter()
+            .filter(|d| d.has_completed_audit())
+            .count(),
         report.skipped.len(),
         novel.len(),
     );
+    out.push_str(&render_intake(report.intake.as_ref(), report.total_targets));
+    if !report.has_complete_scope_evidence() {
+        out.push_str(crate::lang::pick("  範圍狀態：不完整或舊報告缺乏證據，請查看每個依賴的 fetch/audit/OSV 紀錄。\n", "  Scope status: incomplete or legacy evidence unknown; inspect per-dependency fetch/audit/OSV records.\n"));
+    }
+    for dep in report
+        .audited
+        .iter()
+        .filter(|d| matches!(d.osv.status, OsvStatus::Unknown | OsvStatus::Failed))
+    {
+        out.push_str(&format!(
+            "  OSV unknown: {}@{} ({})\n",
+            dep.target.name,
+            dep.target.version,
+            dep.osv
+                .error
+                .as_deref()
+                .unwrap_or("legacy query evidence unavailable")
+        ));
+    }
     for (dep, f) in &novel {
         out.push_str(&crate::tr!(
             "    - [{}] {}@{} — {}（{}）@ {}{}\n",
@@ -555,12 +841,19 @@ pub fn load_hunt_report(path: &std::path::Path) -> Result<HuntReport, String> {
     }
     let raw = std::fs::read(path)
         .map_err(|e| crate::tr!("無法讀取 {}：{e}", "cannot read {}: {e}", path.display()))?;
-    serde_json::from_slice(&raw).map_err(|e| {
+    let report: HuntReport = serde_json::from_slice(&raw).map_err(|e| {
         crate::tr!(
             "不是有效的供應鏈獵捕報告：{e}",
             "not a valid supply-chain hunt report: {e}"
         )
-    })
+    })?;
+    if report.run_status == Some(RunStatus::Complete)
+        && report.intake.is_some()
+        && !report.has_complete_scope_evidence()
+    {
+        return Err("complete hunt report contradicts dependency intake evidence".into());
+    }
+    Ok(report)
 }
 
 fn status_word(s: FindingStatus) -> &'static str {
@@ -570,52 +863,6 @@ fn status_word(s: FindingStatus) -> &'static str {
         FindingStatus::Confirmed => "confirmed",
         FindingStatus::Refuted => "refuted",
         FindingStatus::Suppressed => "suppressed",
-    }
-}
-
-async fn audit_one<F: SourceFetcher, A: DirAuditor>(
-    row: &DependencyAdvisories,
-    fetcher: &F,
-    auditor: &A,
-) -> DependencyHunt {
-    let base = DependencyHunt {
-        target: row.target.clone(),
-        known: row.known.clone(),
-        audited: false,
-        error: None,
-        upstream: UpstreamInfo::default(),
-        findings: Vec::new(),
-    };
-    let tmp = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            return DependencyHunt {
-                error: Some(format!("scratch dir failed: {e}")),
-                ..base
-            };
-        }
-    };
-    if let Err(e) = fetcher.fetch_into(&row.target, tmp.path()).await {
-        return DependencyHunt {
-            error: Some(format!("fetch failed: {e}")),
-            ..base
-        };
-    }
-    // Derive the upstream disclosure target from the fetched source while it is
-    // still on disk.
-    let upstream = detect_upstream(tmp.path(), &row.target);
-    match auditor.audit(tmp.path()).await {
-        Ok(findings) => DependencyHunt {
-            audited: true,
-            upstream,
-            findings,
-            ..base
-        },
-        Err(e) => DependencyHunt {
-            error: Some(format!("audit failed: {e}")),
-            upstream,
-            ..base
-        },
     }
 }
 
@@ -706,6 +953,14 @@ mod tests {
     fn adv(name: &str, direct: bool, known: &[&str]) -> DependencyAdvisories {
         DependencyAdvisories {
             target: target(name, direct),
+            osv: OsvEvidence {
+                status: if known.is_empty() {
+                    OsvStatus::Unmatched
+                } else {
+                    OsvStatus::Matched
+                },
+                ..Default::default()
+            },
             known: known
                 .iter()
                 .map(|id| KnownVuln {
@@ -777,6 +1032,15 @@ mod tests {
     struct FakeAuditor;
     #[async_trait]
     impl DirAuditor for FakeAuditor {
+        async fn audit_with_evidence(&self, dir: &Path) -> Result<DirAuditResult, String> {
+            Ok(DirAuditResult {
+                findings: self.audit(dir).await?,
+                evidence: DependencyAuditEvidence {
+                    run_status: Some(RunStatus::Complete),
+                    ..Default::default()
+                },
+            })
+        }
         async fn audit(&self, _dir: &Path) -> Result<Vec<Finding>, String> {
             let mut f = Finding::candidate(
                 "ai_audit",
@@ -807,6 +1071,240 @@ mod tests {
              [[package]]\nname=\"deep\"\nversion=\"2.0.0\"\nsource=\"registry+x\"\n",
         )
         .unwrap();
+    }
+
+    struct IncompleteAuditor;
+    #[async_trait]
+    impl DirAuditor for IncompleteAuditor {
+        async fn audit(&self, _: &Path) -> Result<Vec<Finding>, String> {
+            panic!("use evidence seam")
+        }
+        async fn audit_with_evidence(&self, _: &Path) -> Result<DirAuditResult, String> {
+            let coverage = vec![crate::audit::schema::ModuleCoverage {
+                module_path: "omitted".into(),
+                status: crate::audit::schema::ModuleCoverageStatus::Deferred,
+                reason: Some("max_modules".into()),
+                scope_paths: vec!["lib.rs".into()],
+                selected: false,
+                reviewed_paths: vec![],
+                truncated_paths: vec![],
+                candidate_ids: vec![],
+                attempts: vec![],
+            }];
+            let summary = crate::audit::schema::CoverageSummary::from_coverage(&coverage);
+            Ok(DirAuditResult {
+                findings: vec![],
+                evidence: DependencyAuditEvidence {
+                    run_status: Some(RunStatus::Incomplete),
+                    incomplete_reason: Some(IncompleteReason::ScopeNotFullyReviewed),
+                    coverage,
+                    summary: Some(summary),
+                    engines_missing: vec![],
+                },
+            })
+        }
+    }
+
+    struct LegacyAuditor;
+    #[async_trait]
+    impl DirAuditor for LegacyAuditor {
+        async fn audit(&self, _: &Path) -> Result<Vec<Finding>, String> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn hunt_retains_child_incomplete_scope_instead_of_promoting_to_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cargo_project(dir.path());
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &IncompleteAuditor,
+        )
+        .await
+        .unwrap();
+        let dep = &report.audited[0];
+        assert!(!dep.audited);
+        assert_eq!(dep.audit.status, StageStatus::Incomplete);
+        assert_eq!(dep.fetch.status, StageStatus::Succeeded);
+        assert_eq!((dep.fetch.files, dep.fetch.bytes), (Some(1), Some(8)));
+        assert_eq!(dep.audit_evidence.run_status, Some(RunStatus::Incomplete));
+        assert_eq!(dep.audit_evidence.coverage[0].scope_paths, vec!["lib.rs"]);
+        assert_eq!(
+            dep.audit_evidence.incomplete_reason,
+            Some(IncompleteReason::ScopeNotFullyReviewed)
+        );
+        assert_eq!(report.run_status, Some(RunStatus::Incomplete));
+        if let Some(output) = std::env::var_os("VETTALON_HUNT_ARTIFACT_DIR") {
+            std::fs::create_dir_all(&output).unwrap();
+            std::fs::write(
+                std::path::PathBuf::from(output).join("child-scope-incomplete.json"),
+                serde_json::to_string_pretty(&report).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_auditor_preserves_real_child_ledger_with_a_mock_model() {
+        struct EmptyModel;
+        #[async_trait]
+        impl crate::llm::LlmCaller for EmptyModel {
+            async fn complete(&self, _: &str) -> crate::llm::Result<String> {
+                Ok("[]".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_cargo_project(dir.path());
+        let auditor = EngineAuditor {
+            home: home.path().into(),
+            finders: vec![crate::llm::ModelHandle {
+                id: "mock-model".into(),
+                family: "fixture".into(),
+                caller: std::sync::Arc::new(EmptyModel),
+            }],
+            verifiers: vec![],
+            poc_models: vec![],
+            roster: vec![],
+            max_modules: 5,
+            poc: false,
+        };
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &auditor,
+        )
+        .await
+        .unwrap();
+        let dep = &report.audited[0];
+        assert!(dep.has_completed_audit());
+        assert_eq!(dep.audit_evidence.coverage.len(), 1);
+        assert_eq!(dep.audit_evidence.coverage[0].scope_paths, vec!["lib.rs"]);
+        assert_eq!(
+            dep.audit_evidence.coverage[0].attempts[0].model,
+            "mock-model"
+        );
+        assert_eq!(
+            dep.audit_evidence.coverage[0].attempts[0].files[0].submitted_bytes,
+            8
+        );
+        assert_eq!(dep.osv.status, OsvStatus::Unmatched);
+        assert_eq!(report.run_status, Some(RunStatus::Complete));
+        if let Some(output) = std::env::var_os("VETTALON_HUNT_ARTIFACT_DIR") {
+            std::fs::create_dir_all(&output).unwrap();
+            std::fs::write(
+                std::path::PathBuf::from(output).join("complete-child-ledger.json"),
+                serde_json::to_string_pretty(&report).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_custom_auditor_without_child_evidence_stays_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cargo_project(dir.path());
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &LegacyAuditor,
+        )
+        .await
+        .unwrap();
+        assert!(!report.audited[0].has_completed_audit());
+        assert_eq!(report.audited[0].audit.status, StageStatus::Unknown);
+        assert!(report.audited[0].audit_evidence.run_status.is_none());
+        assert_eq!(report.run_status, Some(RunStatus::Incomplete));
+    }
+
+    struct FailedOsv;
+    #[async_trait]
+    impl OsvClient for FailedOsv {
+        async fn known_vulns(&self, _: &DependencyTarget) -> Result<Vec<KnownVuln>, String> {
+            Err("network unavailable".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_advisory_query_never_becomes_a_novel_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cargo_project(dir.path());
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FailedOsv,
+            &FakeFetcher,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        assert!(
+            report.audited[0].has_completed_audit(),
+            "the source audit can still finish"
+        );
+        assert_eq!(report.audited[0].findings.len(), 1);
+        assert_eq!(report.audited[0].osv.status, OsvStatus::Failed);
+        assert!(report.audited[0].osv.error.is_some());
+        assert!(report.novel_candidates().is_empty());
+        assert!(
+            disclosure_drafts(
+                &report,
+                chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap()
+            )
+            .is_empty()
+        );
+        assert_eq!(report.run_status, Some(RunStatus::Incomplete));
+        assert!(
+            report
+                .incomplete_reasons
+                .iter()
+                .any(|r| r == "advisory_query_unknown")
+        );
+    }
+
+    struct FailedFetcher;
+    #[async_trait]
+    impl SourceFetcher for FailedFetcher {
+        async fn fetch_into(
+            &self,
+            _: &DependencyTarget,
+            _: &Path,
+        ) -> Result<super::super::fetch::ExtractStats, String> {
+            Err("registry unavailable".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_failure_records_stage_and_never_calls_auditor() {
+        let row = adv("good", true, &[]);
+        let dep = audit_within_timeout(
+            &row,
+            std::time::Duration::from_secs(1),
+            &FailedFetcher,
+            &IncompleteAuditor,
+        )
+        .await;
+        assert_eq!(dep.fetch.status, StageStatus::Failed);
+        assert_eq!(dep.audit.status, StageStatus::NotStarted);
+        assert!(!dep.audited);
+        assert!(dep.audit_evidence.run_status.is_none());
+    }
+
+    #[test]
+    fn legacy_dependency_json_does_not_acquire_new_query_or_audit_proof() {
+        let raw = r#"{"target":{"ecosystem":"cargo","name":"legacy","version":"1.0.0","direct":true},"known":[],"audited":true,"error":null,"upstream":{"github":null,"security_emails":[]},"findings":[]}"#;
+        let dep: DependencyHunt = serde_json::from_str(raw).unwrap();
+        assert_eq!(dep.osv.status, OsvStatus::Unknown);
+        assert_eq!(dep.audit.status, StageStatus::Unknown);
+        assert!(!dep.has_completed_audit());
     }
 
     #[tokio::test]
@@ -856,6 +1354,14 @@ mod tests {
         );
         nh.status = FindingStatus::NeedsHuman;
         let clean_dep = DependencyHunt {
+            osv: OsvEvidence {
+                status: OsvStatus::Unmatched,
+                ..Default::default()
+            },
+            fetch: StageEvidence::default(),
+            audit: StageEvidence::default(),
+            audit_evidence: DependencyAuditEvidence::default(),
+            duration_ms: 0,
             target: target("vuln-lib", true),
             known: vec![],
             audited: true,
@@ -868,6 +1374,14 @@ mod tests {
         };
         // A dependency with a known CVE is NOT a novelty candidate → no draft.
         let known_dep = DependencyHunt {
+            osv: OsvEvidence {
+                status: OsvStatus::Matched,
+                ..Default::default()
+            },
+            fetch: StageEvidence::default(),
+            audit: StageEvidence::default(),
+            audit_evidence: DependencyAuditEvidence::default(),
+            duration_ms: 0,
             target: target("known", true),
             known: vec![KnownVuln {
                 id: "CVE-x".into(),
@@ -893,6 +1407,9 @@ mod tests {
             }],
         };
         let report = HuntReport {
+            intake: None,
+            run_status: None,
+            incomplete_reasons: Vec::new(),
             project: "p".into(),
             total_targets: 2,
             audited: vec![clean_dep, known_dep],
@@ -925,6 +1442,9 @@ mod tests {
     fn load_hunt_report_round_trips_and_rejects_garbage() {
         let dir = tempfile::tempdir().unwrap();
         let report = HuntReport {
+            intake: None,
+            run_status: None,
+            incomplete_reasons: Vec::new(),
             project: "p".into(),
             total_targets: 0,
             audited: vec![],
@@ -936,6 +1456,83 @@ mod tests {
         let bad = dir.path().join("bad.json");
         std::fs::write(&bad, b"{\"findings\": []}").unwrap();
         assert!(load_hunt_report(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_intake_is_not_complete_zero_and_dry_run_is_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "[ broken =").unwrap();
+        let opts = HuntOptions::default();
+        let plan = plan_hunt(dir.path(), &opts, &FakeOsv(HashMap::new()))
+            .await
+            .unwrap();
+        assert!(render_plan(&plan).to_ascii_lowercase().contains("intake"));
+        let report = run_hunt(
+            dir.path(),
+            &opts,
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.run_status, Some(RunStatus::Incomplete));
+        assert!(
+            report
+                .incomplete_reasons
+                .iter()
+                .any(|v| v == "dependency_intake_incomplete")
+        );
+        assert_eq!(report.total_targets, 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_intake_audits_valid_targets_but_scope_stays_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "[ broken =").unwrap();
+        std::fs::write(dir.path().join("requirements.txt"), "flask==2.3.3\n").unwrap();
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.total_targets, 1);
+        assert_eq!(report.audited.len(), 1);
+        assert_eq!(report.run_status, Some(RunStatus::Incomplete));
+        assert!(!report.has_complete_scope_evidence());
+        let mut forged = report;
+        forged.run_status = Some(RunStatus::Complete);
+        assert!(!forged.has_complete_scope_evidence());
+        let path = dir.path().join("forged.json");
+        std::fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
+        assert!(load_hunt_report(&path).is_err());
+        let mut json = serde_json::to_value(&forged).unwrap();
+        json.as_object_mut().unwrap().remove("intake");
+        let legacy: HuntReport = serde_json::from_value(json).unwrap();
+        assert!(legacy.intake.is_none());
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(load_hunt_report(&path).unwrap().intake.is_none());
+        assert!(!legacy.has_complete_scope_evidence());
+    }
+
+    #[tokio::test]
+    async fn unknown_directness_is_typed_skip_and_not_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "version=3\n[[package]]\nname='dep'\nversion='1.0.0'\nsource='registry+https://example.invalid'\n").unwrap();
+        let plan = plan_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+        )
+        .await
+        .unwrap();
+        assert!(plan.selected.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].reason, SkipReason::DirectnessUnknown);
     }
 
     struct SlowAuditor;
@@ -966,6 +1563,10 @@ mod tests {
         .unwrap();
         assert_eq!(report.audited.len(), 1);
         assert!(!report.audited[0].audited);
+        assert_eq!(report.audited[0].fetch.status, StageStatus::Succeeded);
+        assert_eq!(report.audited[0].fetch.files, Some(1));
+        assert_eq!(report.audited[0].audit.status, StageStatus::TimedOut);
+        assert!(report.audited[0].audit_evidence.run_status.is_none());
         assert!(
             report.audited[0]
                 .error
@@ -1035,6 +1636,15 @@ mod tests {
     }
     #[async_trait]
     impl DirAuditor for OverlapAuditor {
+        async fn audit_with_evidence(&self, dir: &Path) -> Result<DirAuditResult, String> {
+            Ok(DirAuditResult {
+                findings: self.audit(dir).await?,
+                evidence: DependencyAuditEvidence {
+                    run_status: Some(RunStatus::Complete),
+                    ..Default::default()
+                },
+            })
+        }
         async fn audit(&self, _dir: &Path) -> Result<Vec<Finding>, String> {
             use std::sync::atomic::Ordering::SeqCst;
             let nth = self.calls.fetch_add(1, SeqCst);

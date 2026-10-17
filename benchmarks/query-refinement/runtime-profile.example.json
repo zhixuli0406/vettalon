@@ -1,0 +1,43 @@
+{
+  "schema": 2,
+  "kind": "public-query-runtime-v2",
+  "platform": "darwin",
+  "scanner_version": "1.181.0",
+  "python_minor": "REPLACE_WITH_X.Y",
+  "controller_python_version": "REPLACE_WITH_X.Y.Z",
+  "venv_root": "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV",
+  "bindings": {
+    "launcher": {
+      "path": "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV/bin/semgrep",
+      "sha256": "REPLACE_WITH_REVIEWED_FILE_SHA256"
+    },
+    "core": {
+      "path": "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV/lib/pythonREPLACE_WITH_X.Y/site-packages/semgrep/bin/semgrep-core",
+      "sha256": "REPLACE_WITH_REVIEWED_FILE_SHA256"
+    },
+    "policy": {
+      "path": "/REPLACE_WITH_REVIEWED_CHECKOUT/benchmarks/query-refinement/deny-network-public-v2.sb",
+      "sha256": "REPLACE_WITH_REVIEWED_FILE_SHA256"
+    },
+    "sandbox": {
+      "path": "/usr/bin/sandbox-exec",
+      "sha256": "REPLACE_WITH_REVIEWED_FILE_SHA256"
+    },
+    "launcher_python": {
+      "path": "/REPLACE_WITH_REVIEWED_LAUNCHER_PYTHON",
+      "sha256": "REPLACE_WITH_REVIEWED_FILE_SHA256"
+    },
+    "controller_python": {
+      "path": "/REPLACE_WITH_REVIEWED_CONTROLLER_PYTHON",
+      "sha256": "REPLACE_WITH_REVIEWED_FILE_SHA256"
+    }
+  },
+  "runtime_files": {
+    "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV/lib/pythonREPLACE_WITH_X.Y/site-packages/semgrep/__init__.py": "REPLACE_WITH_REVIEWED_FILE_SHA256",
+    "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV/lib/pythonREPLACE_WITH_X.Y/site-packages/semgrep/console_scripts/entrypoint.py": "REPLACE_WITH_REVIEWED_FILE_SHA256",
+    "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV/lib/pythonREPLACE_WITH_X.Y/site-packages/semgrep/semgrep_core.py": "REPLACE_WITH_REVIEWED_FILE_SHA256",
+    "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV/lib/pythonREPLACE_WITH_X.Y/site-packages/semgrep-1.181.0.dist-info/METADATA": "REPLACE_WITH_REVIEWED_FILE_SHA256",
+    "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV/lib/pythonREPLACE_WITH_X.Y/site-packages/semgrep-1.181.0.dist-info/entry_points.txt": "REPLACE_WITH_REVIEWED_FILE_SHA256",
+    "/REPLACE_WITH_REVIEWED_ABSOLUTE_VENV/pyvenv.cfg": "REPLACE_WITH_REVIEWED_FILE_SHA256"
+  }
+}

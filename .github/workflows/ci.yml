@@ -44,3 +44,54 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy ${{ env.CORE }} --all-targets -- -D warnings
       - run: cargo test ${{ env.CORE }}
+      - name: Set up Python for macOS query contracts
+        if: matrix.os == 'macos-latest'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Query refinement public V2 offline contracts
+        if: matrix.os == 'macos-latest'
+        run: python -m unittest discover -s benchmarks/query-refinement -p 'test_*.py'
+
+  trust:
+    name: trust tools (no signing or publishing)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r scripts/trust/requirements.txt
+      - run: python -m unittest discover -s scripts/trust/tests -p 'test_*.py'
+      - run: bash -n scripts/trust/verify-release.sh scripts/trust/scorecard.sh
+
+  scanner-windows:
+    name: scanner process limits (Windows native)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Record native toolchain and runner
+        shell: pwsh
+        run: |
+          rustc -Vv
+          if ($LASTEXITCODE -ne 0) { throw "rustc metadata failed: $LASTEXITCODE" }
+          Write-Host "Runner OS: $env:RUNNER_OS / $env:RUNNER_ARCH"
+      - name: Require Windows scanner test discovery
+        shell: pwsh
+        run: |
+          $testList = @(cargo test --locked -p vettalon --lib audit::scanners::exec::windows::tests -- --list)
+          $listExit = $LASTEXITCODE
+          $testList | ForEach-Object { Write-Host $_ }
+          if ($listExit -ne 0) { throw "Windows scanner test listing failed: $listExit" }
+          $nativeTests = @($testList | Where-Object { $_ -match '^audit::scanners::exec::windows::tests::windows_[^ ]+: test$' })
+          if ($nativeTests.Count -lt 2) { throw "Expected at least two Windows scanner tests; found $($nativeTests.Count)" }
+      - name: Run Windows scanner tests serially
+        shell: pwsh
+        run: |
+          cargo test --locked -p vettalon --lib audit::scanners::exec::windows::tests -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Windows scanner tests failed: $LASTEXITCODE" }

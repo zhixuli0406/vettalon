@@ -100,7 +100,7 @@ pub struct ModuleTarget {
 /// the deep audit reasons about code logic, and auditing `docs/` or a lockfile
 /// just burns slow model calls (this is why a `docs/` module could grind for
 /// minutes). Deterministic scanners still cover whatever they cover.
-fn is_non_code_file(path: &str) -> bool {
+pub(crate) fn is_non_code_file(path: &str) -> bool {
     const NON_CODE_EXT: &[&str] = &[
         // documentation / prose
         "md", "markdown", "mdx", "rst", "adoc", "txt", "text", "rtf",
@@ -124,6 +124,9 @@ fn is_non_code_file(path: &str) -> bool {
         "translations",
     ];
     let name = path.rsplit('/').next().unwrap_or(path);
+    if crate::util::is_secret_file(name) || is_repo_metadata_file(name) {
+        return true;
+    }
     let Some((_, ext)) = name.rsplit_once('.') else {
         return false; // no extension: could be a script; keep it
     };
@@ -139,6 +142,38 @@ fn is_non_code_file(path: &str) -> bool {
             .rev()
             .skip(1)
             .any(|dir| CATALOG_DIRS.contains(&dir.to_ascii_lowercase().as_str()))
+}
+
+/// Repository housekeeping and prose without an extension: ignore and
+/// attribute lists, editor settings, licence and ownership files. No logic to
+/// audit, and the extension rule cannot catch them. `name` is the basename.
+fn is_repo_metadata_file(name: &str) -> bool {
+    const DOTFILES: &[&str] = &[
+        ".gitignore",
+        ".gitattributes",
+        ".gitmodules",
+        ".gitkeep",
+        ".mailmap",
+        ".dockerignore",
+        ".npmignore",
+        ".prettierignore",
+        ".eslintignore",
+        ".editorconfig",
+    ];
+    const PROSE: &[&str] = &[
+        "license",
+        "licence",
+        "copying",
+        "notice",
+        "authors",
+        "contributors",
+        "codeowners",
+        "changelog",
+        "changes",
+        "readme",
+    ];
+    let lower = name.to_ascii_lowercase();
+    DOTFILES.contains(&lower.as_str()) || PROSE.contains(&lower.as_str())
 }
 
 fn module_key(file: &str) -> String {
@@ -217,12 +252,6 @@ pub fn rank_modules(
     ranked
 }
 
-/// Decide which of a module's ranked candidate files fit inside
-/// `budget_bytes`, and how many bytes of each to keep. Pure — takes each
-/// file's on-disk byte length (not content) so it's unit-testable without a
-/// filesystem. The first file is always included (capped at the full budget
-/// if it alone exceeds it) so a non-empty module is never audited with zero
-/// files.
 /// Max pages one oversized module is split into — a cost ceiling so a huge
 /// flat directory cannot explode into dozens of audits. Files beyond this are
 /// recorded as deferred coverage, not silently dropped.
@@ -259,17 +288,14 @@ pub fn paginate_modules(
             continue;
         }
         // Greedy pack in ranked order; a file bigger than the budget gets its
-        // own page (truncated later by plan_file_budget).
+        // own page (truncated later by build_module_prompt).
         let mut pages: Vec<Vec<String>> = Vec::new();
         let mut cur: Vec<String> = Vec::new();
         let mut used = 0usize;
         for (f, len) in sizes {
-            if !cur.is_empty() && used + len > budget {
+            if pages.len() < MAX_PAGES_PER_MODULE - 1 && !cur.is_empty() && used + len > budget {
                 pages.push(std::mem::take(&mut cur));
                 used = 0;
-                if pages.len() >= MAX_PAGES_PER_MODULE {
-                    break;
-                }
             }
             used += len;
             cur.push(f);
@@ -290,30 +316,6 @@ pub fn paginate_modules(
                 files,
             });
         }
-    }
-    out
-}
-
-pub fn plan_file_budget(
-    files_with_len: &[(String, u64)],
-    budget_bytes: usize,
-) -> Vec<(String, usize)> {
-    let mut out = Vec::new();
-    let mut remaining = budget_bytes;
-    for (i, (path, len)) in files_with_len.iter().enumerate() {
-        let len = *len as usize;
-        if i == 0 {
-            let cap = len.min(budget_bytes);
-            out.push((path.clone(), cap));
-            remaining = budget_bytes.saturating_sub(cap);
-            continue;
-        }
-        if remaining == 0 {
-            break;
-        }
-        let cap = len.min(remaining);
-        out.push((path.clone(), cap));
-        remaining -= cap;
     }
     out
 }
@@ -530,48 +532,71 @@ struct ModulePrompt {
     files: Vec<(String, String)>,
     /// Files that went in only partially (prompt byte budget).
     truncated: Vec<String>,
+    evidence: Vec<super::schema::FileCoverage>,
 }
 
-fn build_module_prompt(repo_root: &Path, module: &ModuleTarget) -> Option<ModulePrompt> {
-    let lens: Vec<(String, u64)> = module
-        .files
-        .iter()
-        .filter_map(|f| {
-            std::fs::metadata(repo_root.join(f))
-                .ok()
-                .map(|m| (f.clone(), m.len()))
-        })
-        .collect();
-    if lens.is_empty() {
-        return None;
-    }
-    let len_of: HashMap<&str, u64> = lens.iter().map(|(p, l)| (p.as_str(), *l)).collect();
-    let plan = plan_file_budget(&lens, MODULE_PROMPT_BUDGET_BYTES);
+fn build_module_prompt(repo_root: &Path, module: &ModuleTarget) -> ModulePrompt {
+    use super::schema::{FileCoverage, FileReadStatus};
     let mut files = Vec::new();
     let mut truncated = Vec::new();
-    for (path, cap) in plan {
-        if cap == 0 {
+    let mut evidence = Vec::new();
+    let mut remaining = MODULE_PROMPT_BUDGET_BYTES;
+    for path in &module.files {
+        let mut file = FileCoverage {
+            path: path.clone(),
+            read_status: FileReadStatus::BudgetExcluded,
+            source_bytes: None,
+            source_lines: None,
+            submitted_bytes: 0,
+            start_line: None,
+            end_line: None,
+            truncated: false,
+            reason: Some("prompt_byte_budget".into()),
+        };
+        if remaining == 0 {
+            evidence.push(file);
             continue;
         }
-        if let Ok(content) = crate::util::read_repo_file(repo_root, &path) {
-            let kept = crate::util::truncate_bytes(&content, cap).to_string();
-            let full_len = len_of.get(path.as_str()).copied().unwrap_or(0) as usize;
-            if kept.len() < content.len() || cap < full_len {
-                truncated.push(path.clone());
+        match crate::util::read_repo_file(repo_root, path) {
+            Ok(content) => {
+                file.source_bytes = Some(content.len());
+                file.source_lines = Some(content.lines().count());
+                file.reason = None;
+                if content.is_empty() {
+                    file.read_status = FileReadStatus::Empty;
+                } else {
+                    let kept = crate::util::truncate_bytes(&content, remaining).to_string();
+                    file.submitted_bytes = kept.len();
+                    file.truncated = kept.len() < content.len();
+                    if kept.is_empty() {
+                        file.read_status = FileReadStatus::BudgetExcluded;
+                        file.reason = Some("prompt_byte_budget_utf8_boundary".into());
+                    } else {
+                        file.read_status = FileReadStatus::Included;
+                        file.start_line = Some(1);
+                        file.end_line = Some(kept.lines().count());
+                        remaining -= kept.len();
+                        files.push((path.clone(), kept));
+                    }
+                    if file.truncated {
+                        truncated.push(path.clone());
+                    }
+                }
             }
-            files.push((path, kept));
+            Err(_) => {
+                // Do not copy source text or arbitrary OS diagnostics into reports.
+                file.read_status = FileReadStatus::Unreadable;
+                file.reason = Some("read_failed_or_outside_repository".into());
+            }
         }
-        // Binary / non-UTF8 files skipped — best-effort, matches the rest of
-        // secaudit's fail-open-on-unreadable-file convention.
+        evidence.push(file);
     }
-    if files.is_empty() {
-        return None;
-    }
-    Some(ModulePrompt {
+    ModulePrompt {
         prompt: build_ai_audit_prompt(&module.module_path, &files),
         files,
         truncated,
-    })
+        evidence,
+    }
 }
 
 /// How one module's audit attempt ended.
@@ -608,6 +633,11 @@ pub struct ModuleAuditReport {
     /// Ids of the findings this module produced (including pre-check
     /// refutations).
     pub candidate_ids: Vec<String>,
+    pub model: String,
+    pub family: String,
+    pub files: Vec<super::schema::FileCoverage>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
 }
 
 impl ModuleAuditReport {
@@ -618,6 +648,11 @@ impl ModuleAuditReport {
             reviewed_paths: Vec::new(),
             truncated_paths: Vec::new(),
             candidate_ids: Vec::new(),
+            model: String::new(),
+            family: String::new(),
+            files: Vec::new(),
+            duration_ms: 0,
+            timed_out: false,
         }
     }
 }
@@ -716,6 +751,32 @@ pub struct AuditProgress<'a> {
     pub deadline: Option<std::time::Instant>,
 }
 
+/// Bound an in-flight finder or reflector call by the shared scan deadline.
+/// A timeout describes missing evidence, never an empty/clean reply.
+async fn complete_before_deadline<C: LlmCaller>(
+    caller: &C,
+    prompt: &str,
+    deadline: Option<std::time::Instant>,
+) -> (crate::llm::Result<String>, bool) {
+    match deadline {
+        None => (caller.complete(prompt).await, false),
+        Some(deadline) => match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            caller.complete(prompt),
+        )
+        .await
+        {
+            Ok(result) => (result, false),
+            Err(_) => (
+                Err(crate::llm::LlmError::Executor(
+                    "scan time budget exhausted during model call".into(),
+                )),
+                true,
+            ),
+        },
+    }
+}
+
 /// [`run_ai_audit_capped`] that reports per-module progress (model, round
 /// and a module counter shared across finders).
 pub async fn run_ai_audit_progress<C: LlmCaller>(
@@ -805,7 +866,8 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         }
 
         let started = std::time::Instant::now();
-        let Some(mp) = build_module_prompt(repo_root, module) else {
+        let mp = build_module_prompt(repo_root, module);
+        if mp.files.is_empty() {
             let reason =
                 "no readable text content in this module (binary files, unreadable, or all budget-excluded)"
                     .to_string();
@@ -815,15 +877,17 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                 started.elapsed().as_millis(),
                 Some(reason.clone()),
             ));
-            module_reports.push(ModuleAuditReport::bare(
-                module,
-                ModuleOutcome::Unreadable { reason },
-            ));
+            module_reports.push(ModuleAuditReport {
+                files: mp.evidence,
+                duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                ..ModuleAuditReport::bare(module, ModuleOutcome::Unreadable { reason })
+            });
             continue;
-        };
+        }
         let reviewed_paths: Vec<String> = mp.files.iter().map(|(p, _)| p.clone()).collect();
 
-        let raw = match caller.complete(&mp.prompt).await {
+        let (result, mut timed_out) = complete_before_deadline(caller, &mp.prompt, deadline).await;
+        let raw = match result {
             Ok(r) => r,
             Err(e) => {
                 let refused = matches!(e, crate::llm::LlmError::Refused(_));
@@ -837,7 +901,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                 };
                 // A refusal proves the model is reachable: record this module
                 // as not reviewed and keep going with the rest.
-                if refused {
+                if refused || timed_out {
                     llm_reachable = true;
                 }
                 if !llm_reachable {
@@ -846,7 +910,9 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     // hammer a dead endpoint N more times). The modules not
                     // attempted are recorded as deferred.
                     module_reports.push(ModuleAuditReport {
-                        reviewed_paths,
+                        reviewed_paths: Vec::new(),
+                        files: mp.evidence,
+                        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                         truncated_paths: mp.truncated,
                         ..ModuleAuditReport::bare(module, ModuleOutcome::LlmFailed { reason })
                     });
@@ -870,8 +936,14 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     started.elapsed().as_millis(),
                     Some(reason.clone()),
                 ));
+                if let Some(run) = engine_runs.last_mut() {
+                    run.timed_out = timed_out;
+                }
                 module_reports.push(ModuleAuditReport {
-                    reviewed_paths,
+                    reviewed_paths: Vec::new(),
+                    files: mp.evidence,
+                    timed_out,
+                    duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     truncated_paths: mp.truncated,
                     ..ModuleAuditReport::bare(module, ModuleOutcome::LlmFailed { reason })
                 });
@@ -896,7 +968,10 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                 Ok(_) => break,
             };
             let correction = build_reflector_prompt(&mp.prompt, &violation);
-            match caller.complete(&correction).await {
+            let (correction_result, correction_timeout) =
+                complete_before_deadline(caller, &correction, deadline).await;
+            timed_out |= correction_timeout;
+            match correction_result {
                 Ok(r2) => {
                     retries_used += 1;
                     parsed = parse_ai_candidates(&r2);
@@ -932,8 +1007,14 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     started.elapsed().as_millis(),
                     Some(reason.clone()),
                 ));
+                if let Some(run) = engine_runs.last_mut() {
+                    run.timed_out = timed_out;
+                }
                 module_reports.push(ModuleAuditReport {
-                    reviewed_paths,
+                    reviewed_paths: Vec::new(),
+                    files: mp.evidence,
+                    timed_out,
+                    duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     truncated_paths: mp.truncated,
                     ..ModuleAuditReport::bare(module, ModuleOutcome::ParseFailed { reason })
                 });
@@ -971,6 +1052,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     notes.push(n);
                 }
                 if capped > 0 {
+                    candidate_cap_hit = true;
                     notes.push(format!(
                         "{capped} candidate(s) dropped by the per-module ({MAX_CANDIDATES_PER_MODULE}) or run-wide ({candidate_cap}) cap"
                     ));
@@ -997,6 +1079,11 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     reviewed_paths,
                     truncated_paths: mp.truncated,
                     candidate_ids: ids,
+                    files: mp.evidence,
+                    duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    timed_out,
+                    model: String::new(),
+                    family: String::new(),
                 });
             }
         }
@@ -1173,37 +1260,52 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn plan_file_budget_includes_all_files_within_budget() {
-        let files = vec![("a".to_string(), 100u64), ("b".to_string(), 100u64)];
-        let plan = plan_file_budget(&files, 1000);
-        assert_eq!(plan, vec![("a".to_string(), 100), ("b".to_string(), 100)]);
+    fn pagination_retains_every_scoped_file_under_page_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<String> = (0..20).map(|i| format!("f{i}.rs")).collect();
+        for file in &files {
+            std::fs::write(
+                dir.path().join(file),
+                "x".repeat(MODULE_PROMPT_BUDGET_BYTES),
+            )
+            .unwrap();
+        }
+        let pages = paginate_modules(
+            dir.path(),
+            vec![ModuleTarget {
+                module_path: ".".into(),
+                score: 1,
+                high_risk: false,
+                files: files.clone(),
+            }],
+            MODULE_PROMPT_BUDGET_BYTES,
+        );
+        assert!(pages.len() <= MAX_PAGES_PER_MODULE);
+        assert_eq!(
+            pages.into_iter().flat_map(|p| p.files).collect::<Vec<_>>(),
+            files
+        );
     }
 
-    #[test]
-    fn plan_file_budget_caps_a_single_oversized_first_file() {
-        let files = vec![("a".to_string(), 10_000u64)];
-        let plan = plan_file_budget(&files, 100);
-        assert_eq!(plan, vec![("a".to_string(), 100)]);
-    }
-
-    #[test]
-    fn plan_file_budget_stops_once_exhausted_but_always_keeps_the_first_file() {
-        let files = vec![
-            ("a".to_string(), 90u64),
-            ("b".to_string(), 90u64),
-            ("c".to_string(), 90u64),
-        ];
-        let plan = plan_file_budget(&files, 100);
-        // First file always included in full (or capped to the whole budget);
-        // budget then exhausted so later files are dropped entirely.
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0], ("a".to_string(), 90));
-        assert_eq!(plan[1], ("b".to_string(), 10));
-    }
-
-    #[test]
-    fn plan_file_budget_empty_input_is_empty_output() {
-        assert!(plan_file_budget(&[], 1000).is_empty());
+    #[tokio::test]
+    async fn failed_model_read_is_not_reviewed() {
+        let dir = tmp_repo_with_files(&[("a.rs", "fn main() {}")]);
+        let module = ModuleTarget {
+            module_path: ".".into(),
+            score: 1,
+            high_risk: false,
+            files: vec!["a.rs".into()],
+        };
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Err("offline".into())]),
+        };
+        let outcome = run_ai_audit(dir.path(), &[module], &caller).await;
+        match outcome {
+            AiAuditOutcome::Unavailable { module_reports, .. } => {
+                assert!(module_reports[0].reviewed_paths.is_empty())
+            }
+            _ => panic!("expected unavailable"),
+        }
     }
 
     // ── parse_ai_candidates (strict contract) ─────────────────────────
@@ -1383,6 +1485,174 @@ pub(crate) mod tests {
         dir
     }
 
+    fn evidence_target(files: &[&str]) -> ModuleTarget {
+        ModuleTarget {
+            module_path: "fixture".into(),
+            score: 1,
+            high_risk: false,
+            files: files.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn coverage_records_missing_empty_binary_and_included_files() {
+        use super::super::schema::FileReadStatus as S;
+        let dir = tmp_repo_with_files(&[("ok.rs", "one\ntwo\n"), ("empty.rs", "")]);
+        std::fs::write(dir.path().join("binary.rs"), [0xff, 0xfe]).unwrap();
+        let prompt = build_module_prompt(
+            dir.path(),
+            &evidence_target(&["missing.rs", "empty.rs", "binary.rs", "ok.rs"]),
+        );
+        assert_eq!(
+            prompt
+                .evidence
+                .iter()
+                .map(|f| f.read_status)
+                .collect::<Vec<_>>(),
+            vec![S::Unreadable, S::Empty, S::Unreadable, S::Included]
+        );
+        assert_eq!(prompt.evidence[3].source_lines, Some(2));
+        assert_eq!(prompt.evidence[3].start_line, Some(1));
+        assert_eq!(prompt.evidence[3].end_line, Some(2));
+        assert_eq!(prompt.evidence[3].submitted_bytes, 8);
+    }
+
+    #[test]
+    fn coverage_budget_exclusions_and_utf8_truncation_have_precise_ranges() {
+        use super::super::schema::FileReadStatus as S;
+        let text = format!("first\n{}", "界".repeat(MODULE_PROMPT_BUDGET_BYTES));
+        let dir = tmp_repo_with_files(&[("big.rs", &text), ("other.rs", "untouched")]);
+        let prompt = build_module_prompt(dir.path(), &evidence_target(&["big.rs", "other.rs"]));
+        let file = &prompt.evidence[0];
+        assert!(file.truncated);
+        assert_eq!(file.end_line, Some(2));
+        assert!(file.submitted_bytes <= MODULE_PROMPT_BUDGET_BYTES);
+        assert!(text.is_char_boundary(file.submitted_bytes));
+        assert_eq!(prompt.files[0].1.len(), file.submitted_bytes);
+        // The UTF8 remainder can hold a byte of the next file, which is also
+        // a partial review; neither file can be claimed fully covered.
+        assert!(
+            prompt.evidence[1].truncated || prompt.evidence[1].read_status == S::BudgetExcluded
+        );
+        assert!(
+            prompt
+                .files
+                .iter()
+                .map(|(_, text)| text.len())
+                .sum::<usize>()
+                <= MODULE_PROMPT_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn coverage_exact_byte_budget_excludes_remaining_paths_without_reading_them() {
+        use super::super::schema::FileReadStatus as S;
+        let dir = tmp_repo_with_files(&[
+            ("full.rs", &"x".repeat(MODULE_PROMPT_BUDGET_BYTES)),
+            ("later.rs", "later"),
+        ]);
+        let prompt = build_module_prompt(dir.path(), &evidence_target(&["full.rs", "later.rs"]));
+        assert!(!prompt.evidence[0].truncated);
+        assert_eq!(prompt.evidence[1].read_status, S::BudgetExcluded);
+        assert_eq!(prompt.evidence[1].source_bytes, None);
+        assert_eq!(prompt.evidence[1].submitted_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn coverage_parse_failure_keeps_prompt_evidence_without_review_claim() {
+        let dir = tmp_repo_with_files(&[("a.rs", "fn main() {}")]);
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Ok("invalid".into()), Ok("still invalid".into())]),
+        };
+        let result = run_ai_audit(dir.path(), &[evidence_target(&["a.rs"])], &caller).await;
+        let AiAuditOutcome::Ran { module_reports, .. } = result else {
+            panic!("model reached")
+        };
+        assert!(matches!(
+            module_reports[0].outcome,
+            ModuleOutcome::ParseFailed { .. }
+        ));
+        assert!(module_reports[0].reviewed_paths.is_empty());
+        assert_eq!(module_reports[0].files[0].submitted_bytes, 12);
+    }
+
+    #[tokio::test]
+    async fn coverage_successful_partial_prompt_is_incomplete_not_covered() {
+        use super::super::{
+            coverage::build_module_coverage,
+            schema::{CoverageSummary, ModuleCoverageStatus},
+        };
+        let dir = tmp_repo_with_files(&[("a.rs", &"x".repeat(MODULE_PROMPT_BUDGET_BYTES + 10))]);
+        let modules = vec![evidence_target(&["a.rs", "missing.rs"])];
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Ok("[]".into())]),
+        };
+        let AiAuditOutcome::Ran { module_reports, .. } =
+            run_ai_audit(dir.path(), &modules, &caller).await
+        else {
+            panic!("model reached")
+        };
+        let coverage = build_module_coverage(&modules, &module_reports);
+        assert_eq!(coverage[0].status, ModuleCoverageStatus::PartiallyReviewed);
+        let summary = CoverageSummary::from_coverage(&coverage);
+        assert!(summary.partial);
+        assert_eq!(
+            (summary.selected, summary.scanned, summary.skipped),
+            (1, 1, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn coverage_inflight_timeout_is_not_a_clean_or_unavailable_engine() {
+        struct SlowCaller;
+        #[async_trait::async_trait]
+        impl LlmCaller for SlowCaller {
+            async fn complete(&self, _: &str) -> crate::llm::Result<String> {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                Ok("[]".into())
+            }
+        }
+        let dir = tmp_repo_with_files(&[("a.rs", "fn main() {}")]);
+        let modules = vec![
+            evidence_target(&["a.rs"]),
+            ModuleTarget {
+                module_path: "later".into(),
+                ..evidence_target(&["a.rs"])
+            },
+        ];
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let none = HashSet::new();
+        let outcome = run_ai_audit_progress(
+            dir.path(),
+            &modules,
+            &SlowCaller,
+            MAX_TOTAL_AI_CANDIDATES,
+            AuditProgress {
+                sink: &crate::audit::NoProgress,
+                label: "slow",
+                audited: &counter,
+                total: 2,
+                cross_check: &none,
+                deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(20)),
+            },
+        )
+        .await;
+        let AiAuditOutcome::Ran {
+            module_reports,
+            engine_runs,
+            ..
+        } = outcome
+        else {
+            panic!("timeout is a budget gap")
+        };
+        assert!(module_reports[0].timed_out);
+        assert!(module_reports[0].reviewed_paths.is_empty());
+        assert!(engine_runs[0].timed_out);
+        assert!(
+            matches!(&module_reports[1].outcome, ModuleOutcome::Deferred { reason } if reason == DEFER_TIME_BUDGET)
+        );
+    }
+
     #[tokio::test]
     async fn run_ai_audit_empty_modules_is_unavailable_without_calling_llm() {
         struct PanicCaller;
@@ -1541,6 +1811,61 @@ pub(crate) mod tests {
         }
         // Budget is exactly AI_AUDIT_PARSE_RETRIES, so two replies consumed.
         assert!(caller.replies.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repo_housekeeping_files_are_not_audit_targets() {
+        for meta in [
+            ".gitignore",
+            "web/.dockerignore",
+            ".editorconfig",
+            "LICENSE",
+            "NOTICE",
+            ".github/CODEOWNERS",
+        ] {
+            assert!(is_non_code_file(meta), "{meta}");
+        }
+        // Extensionless scripts stay auditable.
+        for code in [
+            "Makefile",
+            "Dockerfile",
+            "bin/deploy",
+            "Rakefile",
+            "scripts/notice.sh",
+        ] {
+            assert!(!is_non_code_file(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn secret_bearing_files_are_never_sent_to_a_model() {
+        for secret in [
+            ".env",
+            "app/.env.local",
+            "deploy/.env.production",
+            ".env.example",
+            "certs/server.key",
+            "certs/server.pem",
+            "keys/release.p12",
+            "android/app/upload.jks",
+            "ops/id_rsa",
+            "ops/id_ed25519",
+            ".npmrc",
+            "pkg/.pypirc",
+            ".netrc",
+            ".git-credentials",
+        ] {
+            assert!(is_non_code_file(secret), "{secret}");
+        }
+        for code in [
+            "src/env.rs",
+            "lib/dotenv.js",
+            "config/keys.py",
+            "ops/id_rsa.pub.rs",
+            "envoy.yaml",
+        ] {
+            assert!(!is_non_code_file(code), "{code}");
+        }
     }
 
     #[test]

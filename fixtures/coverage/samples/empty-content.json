@@ -1,0 +1,150 @@
+{
+  "schema_version": 2,
+  "repo": "synthetic-coverage-empty-content",
+  "started_at": "2026-10-16T11:08:03.194958+00:00",
+  "profile": {
+    "mode": "deep",
+    "intake": {
+      "language_census": [
+        {
+          "extension": "py",
+          "file_count": 1
+        }
+      ],
+      "entry_points": [],
+      "git_history": {
+        "status": "unavailable",
+        "reason": "not a git repository (no .git found at repo root)"
+      }
+    }
+  },
+  "engines_run": [
+    {
+      "engine": "gitleaks",
+      "findings_count": 0,
+      "duration_ms": 22,
+      "parse_error": null,
+      "timed_out": false
+    },
+    {
+      "engine": "ai_audit[public-mock]:a",
+      "findings_count": 0,
+      "duration_ms": 0,
+      "parse_error": "Fixture environment engine error; raw diagnostics not published.",
+      "timed_out": false
+    }
+  ],
+  "engines_missing": [
+    {
+      "engine": "semgrep",
+      "reason": "not installed: fixture environment; raw diagnostics not published."
+    },
+    {
+      "engine": "osv-scanner",
+      "reason": "not installed: fixture environment; raw diagnostics not published."
+    },
+    {
+      "engine": "cargo-audit",
+      "reason": "not applicable: fixture environment; raw diagnostics not published."
+    }
+  ],
+  "findings": [],
+  "summary": {
+    "total_findings": 0,
+    "by_severity": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    },
+    "engines_run_count": 2,
+    "engines_missing_count": 3,
+    "ai_audit_candidates": 0,
+    "ai_audit_refuted": 0,
+    "ai_audit_needs_human": 0,
+    "poc_ran": 0,
+    "needs_human_by_severity": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    },
+    "gate_includes_needs_human": false,
+    "coverage": {
+      "modules_total": 1,
+      "selected": 1,
+      "scanned": 0,
+      "skipped": 1,
+      "partially_reviewed": 0,
+      "covered": 0,
+      "candidate": 0,
+      "deferred": 0,
+      "failed": 1,
+      "partial": true
+    },
+    "precheck_refuted": 0,
+    "carried_from_prior": 0
+  },
+  "run_status": "incomplete",
+  "incomplete_reason": "units_failed",
+  "coverage": [
+    {
+      "module_path": "a",
+      "status": "unreadable",
+      "reason": "no readable text content in this module (binary files, unreadable, or all budget-excluded)",
+      "scope_paths": [
+        "a/util.py"
+      ],
+      "selected": true,
+      "attempts": [
+        {
+          "model": "public-mock",
+          "family": "fixture",
+          "status": "unreadable",
+          "reason": "no readable text content in this module (binary files, unreadable, or all budget-excluded)",
+          "files": [
+            {
+              "path": "a/util.py",
+              "read_status": "empty",
+              "source_bytes": 0,
+              "source_lines": 0,
+              "submitted_bytes": 0,
+              "start_line": null,
+              "end_line": null,
+              "truncated": false,
+              "reason": null
+            }
+          ],
+          "duration_ms": 0,
+          "timed_out": false
+        }
+      ],
+      "reviewed_paths": [],
+      "truncated_paths": [],
+      "candidate_ids": []
+    }
+  ],
+  "prior_run": null,
+  "verifier": {
+    "independence": "not_run",
+    "audit_agent": "public-mock",
+    "verifier_agent": null
+  },
+  "ensemble": {
+    "models": [
+      {
+        "id": "public-mock",
+        "family": "fixture",
+        "roles": [
+          "finder"
+        ]
+      }
+    ],
+    "refusals": [],
+    "suspected_injection": [],
+    "cross_checked": 0,
+    "ranker": "heuristic"
+  }
+}

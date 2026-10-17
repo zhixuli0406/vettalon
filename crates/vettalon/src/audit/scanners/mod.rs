@@ -9,19 +9,21 @@
 //!
 //! `osv-scanner` is a deliberate exception: this wave never invokes it at
 //! all (see [`osv_scanner_missing`]) because it queries the network OSV
-//! database, and `vettalon scan` runs fully offline this wave.
+//! database. Baseline scanner policy avoids that lookup; deep model providers,
+//! optional Jev ranking and third-party scanner behavior have separate network
+//! boundaries. This module is not an OS egress firewall.
 //!
-//! The orchestration functions here (`run_all` and friends) touch the real
-//! filesystem/PATH/subprocesses and are therefore environment-dependent —
-//! deliberately NOT unit-tested directly (mirrors why the usual live
-//! CLI spawn path isn't unit-tested either). What IS unit-tested here are
-//! the pure decision functions extracted specifically so they can be
-//! (`osv_scanner_missing`, `cargo_lock_present`, `record_stdout_scanner`'s
-//! outcome-classification logic). Each scanner's actual JSON normalizer is
-//! fixture-tested in its own module (`gitleaks.rs`/`semgrep.rs`/`cargo_audit.rs`).
+//! Tool discovery is environment-dependent. Private executable-injection seams
+//! exercise the same production dispatch with fixed, self-authored subprocess
+//! stubs, without changing PATH or invoking installed third-party scanners.
+//! JSON contracts also have pure fixture tests in each normalizer.
 
 pub mod cargo_audit;
 mod exec;
+pub use exec::{
+    RunLimits as SubprocessLimits, RunOutcome as SubprocessOutcome,
+    run_capped as run_bounded_subprocess,
+};
 pub mod gitleaks;
 pub mod semgrep;
 
@@ -66,16 +68,43 @@ pub async fn run_all(repo_root: &Path) -> (Vec<EngineRun>, Vec<EngineMissing>, V
     (engines_run, engines_missing, findings)
 }
 
+/// Executed engines with failed or partial output cannot prove a complete scan.
+pub(super) fn runs_failed(runs: &[EngineRun]) -> bool {
+    runs.iter()
+        .any(|run| run.parse_error.is_some() || run.timed_out)
+}
+
 /// Shared tail for scanners that stream their report as JSON on stdout
 /// (semgrep, cargo-audit): classify the capped-subprocess outcome into
 /// either a successful `EngineRun` (+ findings) or one with `parse_error`
 /// set. Extracted as a free function (not a closure inline in each caller)
 /// specifically so its branching is unit-testable without spawning a real
 /// process.
+fn record_cleanup_error(runs: &mut [EngineRun], error: Option<String>) {
+    if let (Some(run), Some(error)) = (runs.last_mut(), error) {
+        run.parse_error = Some(match run.parse_error.take() {
+            Some(prior) => format!("{prior}; {error}"),
+            None => error,
+        });
+    }
+}
+
 fn record_stdout_scanner(
     engine: &str,
     outcome: exec::RunOutcome,
-    parse: impl FnOnce(&str) -> Result<Vec<Finding>, String>,
+    parse: impl FnOnce(&str) -> Result<(Vec<Finding>, Option<String>), String>,
+    engines_run: &mut Vec<EngineRun>,
+    findings: &mut Vec<Finding>,
+) {
+    let cleanup_error = outcome.cleanup_error.clone();
+    record_stdout_scanner_inner(engine, outcome, parse, engines_run, findings);
+    record_cleanup_error(engines_run, cleanup_error);
+}
+
+fn record_stdout_scanner_inner(
+    engine: &str,
+    outcome: exec::RunOutcome,
+    parse: impl FnOnce(&str) -> Result<(Vec<Finding>, Option<String>), String>,
     engines_run: &mut Vec<EngineRun>,
     findings: &mut Vec<Finding>,
 ) {
@@ -117,14 +146,28 @@ fn record_stdout_scanner(
         return;
     }
     match parse(&outcome.stdout) {
-        Ok(parsed) => {
+        Ok((parsed, diagnostic)) => {
             let count = parsed.len();
             findings.extend(parsed);
             engines_run.push(EngineRun {
                 engine: engine.to_string(),
                 findings_count: count,
                 duration_ms: outcome.duration.as_millis(),
-                parse_error: None,
+                parse_error: diagnostic
+                    .or_else(|| {
+                        let findings_exit = outcome.exit_code == Some(1)
+                            && count > 0
+                            && engine == cargo_audit::ENGINE_NAME;
+                        (outcome.exit_code != Some(0) && !findings_exit)
+                            .then(|| "scanner failed".to_string())
+                    })
+                    .map(|error| {
+                        format!(
+                            "{error} (exit_code={:?}, stderr_tail={:?})",
+                            outcome.exit_code,
+                            crate::util::truncate_bytes(outcome.stderr_tail.trim(), 300)
+                        )
+                    }),
                 timed_out: false,
             });
         }
@@ -160,6 +203,16 @@ async fn run_semgrep(
             return;
         }
     };
+    run_semgrep_with_bin(repo_root, &bin, engines_run, engines_missing, findings).await;
+}
+
+async fn run_semgrep_with_bin(
+    repo_root: &Path,
+    bin: &str,
+    engines_run: &mut Vec<EngineRun>,
+    engines_missing: &mut Vec<EngineMissing>,
+    findings: &mut Vec<Finding>,
+) {
     let rules_file = match semgrep::TempRulesFile::create() {
         Ok(f) => f,
         Err(e) => {
@@ -175,17 +228,13 @@ async fn run_semgrep(
     // (unlike `--config auto` / `--config p/<pack>`; see semgrep.rs module doc).
     // `.as_str()` (not `&rules_path`) so every array element is a plain
     // `&str`, matching the string literals with no coercion involved.
-    let outcome = run_capped(
-        &bin,
-        &["scan", "--json", "--config", rules_path.as_str()],
-        repo_root,
-        &RunLimits::default(),
-    )
-    .await;
+    let args = semgrep::args(rules_path.as_str());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let outcome = run_capped(bin, &arg_refs, repo_root, &RunLimits::default()).await;
     record_stdout_scanner(
         semgrep::ENGINE_NAME,
         outcome,
-        semgrep::parse,
+        semgrep::parse_with_diagnostics,
         engines_run,
         findings,
     );
@@ -208,6 +257,15 @@ async fn run_gitleaks(
             return;
         }
     };
+    run_gitleaks_with_bin(repo_root, &bin, engines_run, findings).await;
+}
+
+async fn run_gitleaks_with_bin(
+    repo_root: &Path,
+    bin: &str,
+    engines_run: &mut Vec<EngineRun>,
+    findings: &mut Vec<Finding>,
+) {
     // gitleaks' stdout-vs-report-file default behavior is not verified in
     // this offline sandbox (no gitleaks binary / no network to check docs
     // against) — using the well-documented, stable `--report-path` flag to
@@ -227,10 +285,21 @@ async fn run_gitleaks(
     let git_mode = repo_root.join(".git").exists();
     let args = gitleaks_args(git_mode, report_path_str.as_str());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let outcome = run_capped(&bin, &arg_refs, repo_root, &RunLimits::default()).await;
+    let outcome = run_capped(bin, &arg_refs, repo_root, &RunLimits::default()).await;
 
+    let cleanup_error = outcome.cleanup_error.clone();
+    record_gitleaks_outcome(outcome, &report_path, engines_run, findings);
+    record_cleanup_error(engines_run, cleanup_error);
+}
+
+fn record_gitleaks_outcome(
+    outcome: exec::RunOutcome,
+    report_path: &Path,
+    engines_run: &mut Vec<EngineRun>,
+    findings: &mut Vec<Finding>,
+) {
     if let Some(err) = outcome.spawn_error {
-        let _ = std::fs::remove_file(&report_path);
+        let _ = std::fs::remove_file(report_path);
         engines_run.push(EngineRun {
             engine: gitleaks::ENGINE_NAME.to_string(),
             findings_count: 0,
@@ -241,7 +310,7 @@ async fn run_gitleaks(
         return;
     }
     if outcome.timed_out {
-        let _ = std::fs::remove_file(&report_path);
+        let _ = std::fs::remove_file(report_path);
         engines_run.push(EngineRun {
             engine: gitleaks::ENGINE_NAME.to_string(),
             findings_count: 0,
@@ -273,27 +342,30 @@ async fn run_gitleaks(
         return;
     }
 
-    // Some gitleaks versions may not create the report file at all when
-    // there are zero leaks — treat a clean (exit 0) process exit with no
-    // file as "zero findings", not a failure (documented uncertainty, see
-    // above).
+    // The requested report file is the completion evidence; no file is not an empty report.
     // Report-file size is capped the same as stdout for the other scanners
     // (task spec: "輸出上限 16MB") — `run_capped` only bounds the piped
     // stdout/stderr it reads itself, not a file gitleaks writes on its own,
     // so this file needs its own explicit bound before we read it in full.
-    let raw = match std::fs::metadata(&report_path) {
-        Err(_) => Ok(String::new()),
+    let raw = match std::fs::metadata(report_path) {
+        Err(e) => Err(format!("could not stat gitleaks report file: {e}")),
         Ok(meta) if meta.len() > exec::DEFAULT_MAX_OUTPUT_BYTES as u64 => Err(format!(
             "gitleaks report file too large ({} bytes > {}-byte cap) — not read",
             meta.len(),
             exec::DEFAULT_MAX_OUTPUT_BYTES
         )),
-        Ok(_) => std::fs::read_to_string(&report_path)
+        Ok(_) => std::fs::read_to_string(report_path)
             .map_err(|e| format!("could not read gitleaks report file: {e}")),
     };
-    let _ = std::fs::remove_file(&report_path);
+    let _ = std::fs::remove_file(report_path);
 
-    match raw.and_then(|r| gitleaks::parse(&r)) {
+    match raw.and_then(|r| {
+        if r.trim().is_empty() {
+            Err("gitleaks report file is empty (expected a JSON array)".to_string())
+        } else {
+            gitleaks::parse(&r)
+        }
+    }) {
         Ok(parsed) => {
             let count = parsed.len();
             findings.extend(parsed);
@@ -301,7 +373,10 @@ async fn run_gitleaks(
                 engine: gitleaks::ENGINE_NAME.to_string(),
                 findings_count: count,
                 duration_ms: outcome.duration.as_millis(),
-                parse_error: None,
+                parse_error: (outcome.exit_code != Some(0)).then(|| format!(
+                    "gitleaks failed despite a readable report (exit_code={:?}, stderr_tail={:?})",
+                    outcome.exit_code, crate::util::truncate_bytes(outcome.stderr_tail.trim(), 300)
+                )),
                 timed_out: false,
             });
         }
@@ -395,6 +470,15 @@ async fn run_cargo_audit(
         });
         return;
     }
+    run_cargo_audit_with_bin(repo_root, "cargo", engines_run, findings).await;
+}
+
+async fn run_cargo_audit_with_bin(
+    repo_root: &Path,
+    bin: &str,
+    engines_run: &mut Vec<EngineRun>,
+    findings: &mut Vec<Finding>,
+) {
     // Invoked via `cargo audit`, not the `cargo-audit` binary directly —
     // lets cargo's own subcommand resolution handle argv shaping.
     // `--no-fetch` uses whatever advisory-db is already cached locally
@@ -402,7 +486,7 @@ async fn run_cargo_audit(
     // cache exists at all the command fails, which surfaces below as a
     // normal parse_error, not a crash).
     let outcome = run_capped(
-        "cargo",
+        bin,
         &["audit", "--json", "--no-fetch"],
         repo_root,
         &RunLimits::default(),
@@ -411,7 +495,7 @@ async fn run_cargo_audit(
     record_stdout_scanner(
         cargo_audit::ENGINE_NAME,
         outcome,
-        cargo_audit::parse,
+        |raw| cargo_audit::parse(raw).map(|findings| (findings, None)),
         engines_run,
         findings,
     );
@@ -431,6 +515,7 @@ mod tests {
             duration: Duration::from_millis(5),
             timed_out: false,
             spawn_error: None,
+            cleanup_error: None,
         }
     }
 
@@ -464,17 +549,20 @@ mod tests {
             "fake-engine",
             ok_outcome("anything"),
             |_raw| {
-                Ok(vec![Finding::candidate(
-                    "fake-engine",
-                    crate::audit::schema::FindingKind::Other,
-                    crate::audit::schema::Severity::Low,
-                    "t",
-                    "f",
+                Ok((
+                    vec![Finding::candidate(
+                        "fake-engine",
+                        crate::audit::schema::FindingKind::Other,
+                        crate::audit::schema::Severity::Low,
+                        "t",
+                        "f",
+                        None,
+                        "s",
+                        "r",
+                        vec![],
+                    )],
                     None,
-                    "s",
-                    "r",
-                    vec![],
-                )])
+                ))
             },
             &mut engines_run,
             &mut findings,
@@ -509,6 +597,30 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_failure_keeps_candidates_but_marks_the_run_failed() {
+        let mut outcome =
+            ok_outcome(r#"{"results":[{"check_id":"fixture","path":"fixture.py"}],"errors":[]}"#);
+        outcome.cleanup_error = Some("owned group cleanup failed".into());
+        let (mut runs, mut findings) = (vec![], vec![]);
+        record_stdout_scanner(
+            semgrep::ENGINE_NAME,
+            outcome,
+            semgrep::parse_with_diagnostics,
+            &mut runs,
+            &mut findings,
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(runs_failed(&runs));
+        assert!(
+            runs[0]
+                .parse_error
+                .as_ref()
+                .unwrap()
+                .contains("owned group cleanup failed")
+        );
+    }
+
+    #[test]
     fn record_stdout_scanner_spawn_error_is_reported() {
         let mut engines_run = Vec::new();
         let mut findings = Vec::new();
@@ -520,11 +632,12 @@ mod tests {
             duration: Duration::from_millis(1),
             timed_out: false,
             spawn_error: Some("no such file".to_string()),
+            cleanup_error: None,
         };
         record_stdout_scanner(
             "fake-engine",
             outcome,
-            |_| Ok(vec![]),
+            |_| Ok((vec![], None)),
             &mut engines_run,
             &mut findings,
         );
@@ -576,11 +689,12 @@ mod tests {
             duration: Duration::from_secs(300),
             timed_out: true,
             spawn_error: None,
+            cleanup_error: None,
         };
         record_stdout_scanner(
             "fake-engine",
             outcome,
-            |_| Ok(vec![]),
+            |_| Ok((vec![], None)),
             &mut engines_run,
             &mut findings,
         );
@@ -604,10 +718,147 @@ mod tests {
     }
 
     #[test]
+    fn run_failure_summary_distinguishes_missing_success_error_and_timeout() {
+        assert!(
+            !runs_failed(&[]),
+            "missing engines use a separate scope record"
+        );
+        let mut run = EngineRun {
+            engine: "fixture".into(),
+            findings_count: 0,
+            duration_ms: 1,
+            parse_error: None,
+            timed_out: false,
+        };
+        assert!(!runs_failed(std::slice::from_ref(&run)));
+        run.parse_error = Some("failed output contract".into());
+        assert!(runs_failed(std::slice::from_ref(&run)));
+        run.parse_error = None;
+        run.timed_out = true;
+        assert!(
+            runs_failed(&[run]),
+            "timeout remains failed without a parse diagnostic"
+        );
+    }
+
+    #[test]
     fn cargo_lock_present_detects_file_existence() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!cargo_lock_present(dir.path()));
         std::fs::write(dir.path().join("Cargo.lock"), "").unwrap();
         assert!(cargo_lock_present(dir.path()));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod subprocess_contract_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // A self-authored fixed script is the scanner executable. No repository
+    // content is evaluated, and production discovery/PATH is never mutated.
+    fn stub(dir: &Path, body: &str) -> String {
+        let path = dir.join("scanner-stub");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    fn emit(raw: &str, exit: i32) -> String {
+        let quoted = raw.replace('\'', "'\"'\"'");
+        format!("printf '%s' '{quoted}'; printf '%s' 'fixture diagnostic' >&2; exit {exit}")
+    }
+
+    #[tokio::test]
+    async fn cargo_subprocess_failure_and_findings_exits_remain_distinct() {
+        let valid = r#"{"vulnerabilities":{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-fixture"},"package":{"name":"fixture","version":"1"}}]}}"#;
+        let clean = r#"{"vulnerabilities":{"found":false,"count":0,"list":[]}}"#;
+        for (raw, exit, count, failed) in [
+            ("", 1, 0, true),
+            ("{}", 0, 0, true),
+            (clean, 1, 0, true),
+            (clean, 0, 0, false),
+            (valid, 1, 1, false),
+            (valid, 2, 1, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = stub(dir.path(), &emit(raw, exit));
+            let (mut runs, mut findings) = (vec![], vec![]);
+            run_cargo_audit_with_bin(dir.path(), &bin, &mut runs, &mut findings).await;
+            assert_eq!(findings.len(), count, "{raw} / {exit}");
+            assert_eq!(runs_failed(&runs), failed, "{raw} / {exit}: {runs:?}");
+            assert_eq!(runs[0].findings_count, count);
+            assert!(
+                findings
+                    .iter()
+                    .all(|f| f.status == crate::audit::schema::FindingStatus::Candidate)
+            );
+            if raw.is_empty() {
+                let error = runs[0].parse_error.as_deref().unwrap();
+                assert!(
+                    error.contains("exit_code=Some(1)") && error.contains("fixture diagnostic")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn semgrep_subprocess_partial_errors_retain_candidates_and_fail_completion() {
+        let partial = r#"{"results":[{"check_id":"fixture","path":"fixture.py"}],"errors":[{"type":"PartialParsing","level":"warn"}]}"#;
+        let valid = r#"{"results":[{"check_id":"fixture","path":"fixture.py"}],"errors":[]}"#;
+        for (raw, exit, count, failed) in [
+            ("", 0, 0, true),
+            ("{}", 0, 0, true),
+            (r#"{"results":[],"errors":[]}"#, 0, 0, false),
+            (partial, 0, 1, true),
+            (valid, 2, 1, true),
+            (valid, 1, 1, true),
+            (valid, 0, 1, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let body = format!(
+                "[ \"$4\" = '--disable-version-check' ] || exit 93; {}",
+                emit(raw, exit)
+            );
+            let bin = stub(dir.path(), &body);
+            let (mut runs, mut missing, mut findings) = (vec![], vec![], vec![]);
+            run_semgrep_with_bin(dir.path(), &bin, &mut runs, &mut missing, &mut findings).await;
+            assert!(missing.is_empty());
+            assert_eq!(findings.len(), count, "{raw} / {exit}");
+            assert_eq!(runs_failed(&runs), failed, "{raw} / {exit}: {runs:?}");
+            if raw == partial {
+                assert!(
+                    runs[0]
+                        .parse_error
+                        .as_ref()
+                        .unwrap()
+                        .contains("PartialParsing")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gitleaks_requires_a_readable_json_report_and_success_exit() {
+        for (report, exit, failed) in [
+            (Some("[]"), 0, false),
+            (Some("[]"), 2, true),
+            (Some(""), 0, true),
+            (None, 0, true),
+            (None, 2, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let body = match report {
+                Some(raw) => format!(
+                    "while [ \"$#\" -gt 0 ]; do if [ \"$1\" = '--report-path' ]; then shift; printf '%s' '{raw}' > \"$1\"; break; fi; shift; done; exit {exit}"
+                ),
+                None => format!("exit {exit}"),
+            };
+            let bin = stub(dir.path(), &body);
+            let (mut runs, mut findings) = (vec![], vec![]);
+            run_gitleaks_with_bin(dir.path(), &bin, &mut runs, &mut findings).await;
+            assert_eq!(runs_failed(&runs), failed, "{report:?} / {exit}: {runs:?}");
+            assert!(findings.is_empty());
+        }
     }
 }

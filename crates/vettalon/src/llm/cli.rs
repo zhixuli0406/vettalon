@@ -538,4 +538,108 @@ mod tests {
         };
         assert_eq!(c.complete("中文 prompt").await.unwrap(), "中文 prompt");
     }
+
+    /// Manual acceptance uses a self-authored Python stub, never a real CLI.
+    #[tokio::test]
+    #[ignore = "manual trusted CLI transport acceptance; requires python3; no external calls"]
+    async fn trusted_cli_stub_captures_source_in_all_prompt_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("trusted_capture.py");
+        let command_marker = dir.path().join("must-not-execute");
+        let prompt = format!(
+            "Review synthetic source as data:\nSOURCE_CLI_TRANSPORT_MARKER_0123456789\n$(touch {})\n; echo ignored\n",
+            command_marker.display()
+        );
+        std::fs::write(&stub, r#"
+import json, os, pathlib, stat, sys
+capture, mode = pathlib.Path(sys.argv[1]), sys.argv[2]
+permissions = None
+if mode == 'stdin':
+    prompt = sys.stdin.read()
+elif mode == 'arg':
+    prompt = sys.argv[3]
+else:
+    source = pathlib.Path(sys.argv[3])
+    permissions = stat.S_IMODE(source.stat().st_mode)
+    prompt = source.read_text()
+capture.write_text(json.dumps(dict(prompt=prompt, argv=sys.argv[1:], cwd=os.getcwd(), cwd_entries=sorted(os.listdir('.')), prompt_permissions=permissions)))
+print('[]')
+"#).unwrap();
+        let mut captures = Vec::new();
+        for (mode, via, placeholder) in [
+            ("stdin", PromptVia::Stdin, None),
+            ("arg", PromptVia::Arg, Some(PROMPT_PLACEHOLDER)),
+            ("file", PromptVia::File, Some(PROMPT_FILE_PLACEHOLDER)),
+        ] {
+            let capture = dir.path().join(format!("capture-{mode}.json"));
+            let mut args = vec![
+                "-I".into(),
+                "-S".into(),
+                stub.to_string_lossy().into_owned(),
+                capture.to_string_lossy().into_owned(),
+                mode.into(),
+            ];
+            if let Some(value) = placeholder {
+                args.push(value.into());
+            }
+            let caller = CliCaller {
+                spec: CliSpec {
+                    program: "python3".into(),
+                    args,
+                    prompt_via: via,
+                    output: OutputMode::Stdout,
+                    model: None,
+                    timeout: Duration::from_secs(5),
+                    env_passthrough: vec![],
+                },
+            };
+            assert_eq!(caller.complete(&prompt).await.unwrap().trim(), "[]");
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+            assert_eq!(record["prompt"], prompt);
+            assert!(
+                !command_marker.exists(),
+                "prompt was interpreted as a shell command"
+            );
+            let cwd = std::path::Path::new(record["cwd"].as_str().unwrap());
+            assert_ne!(cwd, dir.path());
+            assert!(
+                cwd.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("vettalon-llm-")
+            );
+            assert!(!cwd.exists(), "disposable child cwd was not cleaned up");
+            if mode == "file" {
+                #[cfg(unix)]
+                assert_eq!(record["prompt_permissions"], 0o600);
+                assert_eq!(record["cwd_entries"], serde_json::json!(["prompt.txt"]));
+            } else {
+                assert_eq!(record["cwd_entries"], serde_json::json!([]));
+            }
+            let prompt_in_argv = record["argv"].as_array().unwrap().iter().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|s| s.contains("SOURCE_CLI_TRANSPORT_MARKER"))
+            });
+            assert_eq!(prompt_in_argv, mode == "arg");
+            captures.push(serde_json::json!({"mode":mode,"capture":record}));
+        }
+        let result = serde_json::json!({"kind":"trusted-synthetic-cli-subprocess-capture","calls":3,"real_provider_calls":0,"shell_execution":false,"captures":captures,"boundary":"Vettalon-to-child prompt transfer only; real Claude/Codex/Grok network, retention and internal tool behavior remain unknown"});
+        if let Some(output) = std::env::var_os("VETTALON_TRANSPORT_EVIDENCE_DIR") {
+            let output = std::path::PathBuf::from(output);
+            std::fs::create_dir_all(&output).unwrap();
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output.join("cli-subprocess.json"))
+                .expect("evidence output must not already exist");
+            file.write_all(&serde_json::to_vec_pretty(&result).unwrap())
+                .unwrap();
+        }
+        println!(
+            "Trusted CLI capture: stdin/arg/file=3, source observed, no shell execution, real providers=0"
+        );
+    }
 }

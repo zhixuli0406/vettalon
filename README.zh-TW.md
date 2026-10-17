@@ -123,15 +123,15 @@ vettalon hunt . --report hunt.json --disclose-dir drafts/
 
 ### 供應鏈獵捕（`vettalon hunt`）
 
-`vettalon hunt <project>` 從專案的 lockfile（Cargo.lock、npm `package-lock.json`、pip `requirements.txt`、Go `go.sum`）解出相依套件，抓它們的官方發佈原始碼來審，找**還沒被登錄成 CVE** 的新漏洞——和既有 SCA 工具（比對已知 CVE）互補。先查 OSV 分出「已知」與「可能是新的」，預設只審**直接依賴**、跳過 OSV 已有 CVE 的版本（那些 SCA 已在追），把 AI 預算集中在未登錄的；每個相依用跟 `scan --profile deep` 一樣的跨家族對抗覆核。確認且 PoC 跑通的新發現才列為揭露候選。
+`vettalon hunt <project>` 從專案的 lockfile（Cargo.lock、npm `package-lock.json`、pip `requirements.txt`、Go `go.sum`）解出相依套件，抓它們的官方發佈原始碼來審，找**還沒被登錄成 CVE** 的新漏洞——和既有 SCA 工具（比對已知 CVE）互補。先查 OSV 分出「已知」與「可能是新的」，預設只審**直接依賴**、跳過 OSV 已有 CVE 的版本（那些 SCA 已在追），把 AI 預算集中在未登錄的；每個相依用跟 `scan --profile deep` 一樣的跨家族對抗覆核。OSV 未命中且覆核留下的發現仍是待人工研判候選（`needs_human`）；未命中不等於已證明新穎性，pattern PoC 跑通也不等於確認。
 
-旗標：`--max-deps N`（上限，預設 20）、`--include-transitive`（連間接依賴）、`--reaudit-known`（連已知 CVE 版本也審）、`--dry-run`（只預覽選取，不抓取不花 token）、`--report <檔>`（寫出完整 JSON）、`--disclose-dir <目錄>`（為新候選產上游負責任揭露草稿，附送出前檢查清單，只草稿、永不送出）、`--dep-timeout <秒>`（每個相依 fetch+audit 的時限，預設 300，逾時記錯誤並續跑）、`--dep-concurrency N`（同時審查幾個相依，1–4，預設 2；總 token 用量不變，但每個模型同時收到 N 個呼叫，CLI 帳號遇到限流就調低）、`--poc`、`--finders`／`--verifiers`。OSV 以批次查詢，大型相依樹也只打少數幾次。獵捕模式會連網抓原始碼與查 OSV，出口限定套件登錄處與 `api.osv.dev`；被稽核專案自己的私有程式碼不出境，送出去的只有相依套件的 `name@version`。`scan` 的零網路行為不受影響。
+旗標：`--max-deps N`（上限，預設 20）、`--include-transitive`（連間接依賴）、`--reaudit-known`（連已知 CVE 版本也審）、`--dry-run`（只預覽選取，不抓取不花 token）、`--report <檔>`（寫出完整 JSON）、`--disclose-dir <目錄>`（為新候選產上游負責任揭露草稿，附送出前檢查清單，只草稿、永不送出）、`--dep-timeout <秒>`（每個相依 fetch+audit 的時限，預設 300，逾時記錯誤並續跑）、`--dep-concurrency N`（同時審查幾個相依，1–4，預設 2；總 token 用量不變，但每個模型同時收到 N 個呼叫，CLI 帳號遇到限流就調低）、`--poc`、`--finders`／`--verifiers`。OSV 以批次查詢，大型相依樹也只打少數幾次。獵捕模式會連網抓原始碼與查 OSV，出口限定套件登錄處與 `api.osv.dev`；登錄處／OSV 查詢傳送相依套件身分；深審仍會把相依套件原始碼送往設定的模型 provider。抓取 allowlist 不限制模型流量，詳見[資料流](docs/DATA-FLOW.md)。
 
 付費的 Vettalon Pro 另可把獵捕報告產成企業供應鏈報告（Word／PDF／HTML）。
 
 ### 漏洞提交草稿
 
-`vettalon disclose` 從 repo 本身（git remote、SECURITY.md、套件設定，不連網）判斷通報管道，產生 GitHub 私密漏洞回報、專案安全信箱、TWCERT/CC（建議 90 天公開）、HITCON ZeroDay（60 天）格式的草稿與建議公開日期。草稿裡「已人工重現／尚未重現」一欄必須自己填。只有經覆核留下的 `needs_human` 或人工確認的發現可以產生草稿，沒覆核過或已證偽的會被拒絕。vettalon 不會替你送出任何東西。
+`vettalon disclose` 依本機 repo 資訊（git remote、SECURITY.md、套件設定，不連網）建議管道，產生 GitHub、專案安全信箱、TWCERT/CC 或 HITCON ZeroDay 格式的未核准本機草稿。送出前須留下獨立人工覆核、對應目標與來源識別的沙盒重現紀錄，核對維護者／管道現行政策，再取得明確核准。`needs_human` 或人工確認可產草稿，不代表上述條件已成立。日期僅供協調檢查；保留的 90／60 天計算不是已核實的平台政策，也不授權公開。公開須另行核准，vettalon 不會替你送出任何東西。
 
 ### 政策門檻（`--gate`）
 
@@ -150,7 +150,7 @@ vettalon hunt . --report hunt.json --disclose-dir drafts/
 
 ### 模組排序（`--rank`）
 
-深掃預設用內建的啟發式排序器決定模組審查順序（git 熱點、進入點、風險分數），**零網路**。另有選配的 `--rank jev`：把模組的**metadata**（路徑、副檔名、位元組大小、是否進入點、git 熱點數——**不含任何程式碼內容**）送到 TypeSafe Jev，排序後把高風險檔排進審查名額內。基準上 Jev 把深掃的 hit@40 從 6/9 提到 8/9（見[官網基準測試](https://vettalon.dudustudio.monster/#benchmarks)）。
+深掃預設用內建的啟發式排序器決定模組審查順序（git 熱點、進入點、風險分數），**排序器本身不連網**；雲端模型仍接收程式碼。另有選配的 `--rank jev`：把模組的**metadata**（路徑、副檔名、位元組大小、是否進入點、git 熱點數——**不含任何程式碼內容**）送到 TypeSafe Jev，排序後把高風險檔排進審查名額內。基準上 Jev 把深掃的 hit@40 從 6/9 提到 8/9（見[官網基準測試](https://vettalon.dudustudio.monster/#benchmarks)）。
 
 ```bash
 # 預設啟發式（零網路）
@@ -160,7 +160,7 @@ vettalon scan . --profile deep
 vettalon scan . --profile deep --rank jev
 ```
 
-- **只有 `--rank jev` 才連網**；不給這個旗標，scan 維持零網路。
+- **只有 `--rank jev` 才啟用 Jev metadata 請求**；啟發式排序本身不連網，使用雲端 HTTP 或訂閱 CLI 的 deep 掃描仍會把程式碼送往模型 provider。
 - 送出前由 `assert_metadata_only` 逐檔比對原始碼，任何程式碼內容外洩就 fail-closed。
 - Jev 不可用（斷線／逾時／回錯）時自動退回啟發式，出一行提示，不中斷掃描。
 - Jev 只排序，**不取代** finder／verifier。
@@ -173,7 +173,9 @@ api_key_env = "TYPESAFE_API_KEY"                            # 法一：環境變
 ```
 解析順序：環境變數有值優先，否則讀金鑰檔。金鑰只活在呼叫當下，不落檔、不進報告、不進 log。
 
-**給終端客戶**：Jev 預設關閉，由客戶自己決定要不要開。CLI 每次用 `--rank jev` 都會在輸出印一行「把 metadata 送到 <host>」。客戶用**自己的 TypeSafe 金鑰**（BYOK），計費與資料處理關係在客戶與 TypeSafe 之間。檔案路徑本身可能透露內部專案名稱，想完全不出境就用啟發式排序（預設）。TypeSafe 的資料保留期限依其條款而定（非企業方案無固定天數、零保留 ZDR 僅企業方案）。
+**給終端客戶**：Jev 預設關閉，由客戶自己決定要不要開。CLI 每次用 `--rank jev` 都會在輸出印一行「把 metadata 送到 <host>」。客戶用**自己的 TypeSafe 金鑰**（BYOK），計費與資料處理關係在客戶與 TypeSafe 之間。檔案路徑本身可能透露內部專案名稱，要避免 Jev 流量可用啟發式排序（預設）；整次掃描要離線，還需所有模型角色本機化、預載掃描器／規則／DB／映像，並另外封鎖外部連線。TypeSafe 的資料保留期限依其條款而定（非企業方案無固定天數、零保留 ZDR 僅企業方案）。
+
+詳見[資料流與離線前置條件](docs/DATA-FLOW.md)、[發版驗證](docs/TRUST.md)及[信任工具](scripts/trust/README.md)。
 
 ### 模型設定
 
@@ -212,6 +214,7 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 
 - 每次呼叫 CLI 都在全新的空暫存目錄裡執行，只傳遞白名單內的環境變數，例如 `HOME`、`PATH`，以及該 CLI 認證需要的變數。
 - 模型講出的任何路徑，一律先 canonicalize，確認仍在 repo 內才讀取，指到 repo 外的 symlink 不會被讀。
+- 深掃不會把存放密鑰的檔案送給模型：`.env` 與 `.env.*`、私鑰與憑證（`*.pem`、`*.key`、`id_rsa` 等）、存帳密或狀態的檔案（`.npmrc`、`.netrc`、`credentials.json`、`*.tfvars`、`terraform.tfstate` 等），透過 symlink 指過去也一樣擋。這些檔案仍由 gitleaks 在本機掃描。清單依常見慣例整理，不是完整保證：被審查模組裡的其他檔案會原樣送出，寫死在原始碼裡的密鑰也會跟著送出。
 - 報告和 SARIF 寫出前，所有自由文字欄位都會遮蔽秘密，檔案權限一建立就是 0600。SARIF 裡不包含本機的絕對路徑。
 - 審查前先掃出藏在程式碼裡、寫給模型看的指令（見「怎麼運作」第 6 點），不讓「叫模型回報乾淨」的注入悄悄過關。
 
@@ -292,6 +295,12 @@ cargo clippy --all-targets
 另有付費的 Vettalon Pro，提供桌面 App、本機 dashboard（可設時間預算、隨時取消掃描，並有檢視供應鏈獵捕結果、產生上游揭露草稿的「供應鏈」分頁），以及對齊台灣資安檢測報告慣例的企業報告產生器（PDF／Word／HTML）。Pro 讀的是同一份 `scan --report` JSON，核心不依賴 Pro。
 
 Pro 需要授權金鑰，詳見 [官網](https://vettalon.dudustudio.monster/#editions)。開源核心不需要授權，也不會檢查授權。
+
+## Coverage 與證據紀錄（下版預覽）
+
+參閱[coverage 與 proof 契約](docs/COVERAGE.md)及[公開合成範例](fixtures/coverage/README.md)。`vettalon evidence attach` 核對本機 artifact hash 並保留操作人提供的 run／修補對照／control 紀錄，不執行任何命令，也不會將 finding 改為 confirmed。歷史證據缺失維持 unknown；既有沙箱 PoC 仍是獨立模式示範。
+
+[實驗工具（預覽）](docs/EXPERIMENTAL-TOOLS.md)：自建樣本、有限離線原型與重現限制；未證明模型效能優勢。
 
 ## License
 

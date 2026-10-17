@@ -40,6 +40,7 @@ mod intake;
 mod jev;
 mod llm_util;
 mod poc;
+pub use poc::attach_proof_evidence;
 mod precheck;
 mod prior_run;
 mod prompts;
@@ -47,6 +48,13 @@ pub mod rank_snapshot;
 mod report;
 pub mod sarif;
 mod scanners;
+/// Bounded subprocess capture and owned-process cleanup, shared with local renderers.
+/// Unix owns a private process group with an unreaped leader; this does not contain
+/// processes that escape via setsid. Windows uses a kill-on-close Job Object, whose
+/// native Windows runtime acceptance remains pending. This is not an OS sandbox.
+/// The stderr field retains at most a 64 KiB prefix, not a complete diagnostic log.
+/// The capture deadline and finite cleanup do not preempt synchronous OS spawn.
+pub use scanners::{SubprocessLimits, SubprocessOutcome, run_bounded_subprocess};
 pub mod schema;
 pub mod triage;
 mod validator;
@@ -398,23 +406,31 @@ pub async fn run_scan_with_progress(
     refusal_events.sort_by(|a, b| (&a.step, &a.model).cmp(&(&b.step, &b.model)));
     // Precedence: whole shares lost > budget cap > refusals > other gaps.
     let unverified = findings.iter().any(adversarial::is_eligible);
+    let scanner_failed = scanners::runs_failed(&engines_run);
     let units_failed = coverage.iter().any(|c| {
         matches!(
             c.status,
-            schema::ModuleCoverageStatus::LlmFailed | schema::ModuleCoverageStatus::ParseFailed
-        )
+            schema::ModuleCoverageStatus::LlmFailed
+                | schema::ModuleCoverageStatus::ParseFailed
+                | schema::ModuleCoverageStatus::Unreadable
+        ) || c.attempts.iter().any(|a| a.status.is_failed())
     });
     let time_budget_hit = coverage.iter().any(|c| {
-        matches!(c.status, schema::ModuleCoverageStatus::Deferred)
-            && c.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET)
+        (matches!(c.status, schema::ModuleCoverageStatus::Deferred)
+            && c.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET))
+            || c.attempts
+                .iter()
+                .any(|a| a.timed_out || a.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET))
     });
     if incomplete_reason.is_none() {
         incomplete_reason = if time_budget_hit {
             Some(IncompleteReason::TimeBudgetExhausted)
         } else if !refusal_events.is_empty() {
             Some(IncompleteReason::ModelRefused)
-        } else if unverified || units_failed {
+        } else if unverified || units_failed || scanner_failed {
             Some(IncompleteReason::UnitsFailed)
+        } else if schema::CoverageSummary::from_coverage(&coverage).partial {
+            Some(IncompleteReason::ScopeNotFullyReviewed)
         } else {
             None
         };
@@ -919,7 +935,16 @@ async fn run_audit_step(
                     reason,
                 });
                 unreachable |= engine_unreachable;
-                reports.extend(module_reports);
+                reports.extend(module_reports.into_iter().map(|mut report| {
+                    report.model = model.clone();
+                    report.family = opts
+                        .finders
+                        .iter()
+                        .find(|f| f.id == model)
+                        .map(|f| f.family.clone())
+                        .unwrap_or_default();
+                    report
+                }));
             }
             AiAuditOutcome::Ran {
                 engine_runs,
@@ -940,7 +965,16 @@ async fn run_audit_step(
                     f.found_by = vec![model.clone()];
                     f
                 }));
-                reports.extend(module_reports);
+                reports.extend(module_reports.into_iter().map(|mut report| {
+                    report.model = model.clone();
+                    report.family = opts
+                        .finders
+                        .iter()
+                        .find(|f| f.id == model)
+                        .map(|f| f.family.clone())
+                        .unwrap_or_default();
+                    report
+                }));
             }
         }
     }
@@ -994,6 +1028,11 @@ fn deferred_report(m: &ModuleTarget, reason: &str) -> ModuleAuditReport {
         reviewed_paths: Vec::new(),
         truncated_paths: Vec::new(),
         candidate_ids: Vec::new(),
+        model: String::new(),
+        family: String::new(),
+        files: Vec::new(),
+        duration_ms: 0,
+        timed_out: false,
     }
 }
 
@@ -1619,6 +1658,60 @@ mod tests {
     }
 
     /// Two finders, two modules: each module goes to exactly one finder.
+    /// Mock integration artifacts are opt-in and never call a paid provider.
+    /// Each scenario is run through the real intake/ranking/audit/report path.
+    #[tokio::test]
+    async fn coverage_evidence_complete_and_incomplete_reports() {
+        for (name, module_count, cap, expected) in [
+            ("complete", 1, 5, RunStatus::Complete),
+            ("module-cap-incomplete", 2, 1, RunStatus::Incomplete),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            for i in 0..module_count {
+                let path = dir.path().join(format!("m{i}"));
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("util.rs"), "fn helper() {}\n").unwrap();
+            }
+            let home = tempfile::tempdir().unwrap();
+            let (finder, calls) = model("mock-finder", "mock-family", vec![Ok("[]".into())]);
+            let mut options = opts(dir.path().to_path_buf());
+            options.profile = "deep".into();
+            options.max_modules = cap;
+            options.roster = info(&[&finder]);
+            options.finders = vec![finder];
+            let report = run_scan(home.path(), &options).await.unwrap();
+            assert_eq!(report.run_status, expected, "{name}");
+            assert!(validator::validate_report(&report).is_empty(), "{name}");
+            assert_eq!(report.coverage.len(), module_count);
+            assert_eq!(report.summary.coverage.selected, 1);
+            assert_eq!(report.summary.coverage.scanned, 1);
+            assert_eq!(calls.prompts.lock().unwrap().len(), 1);
+            assert_eq!(report.coverage[0].attempts[0].model, "mock-finder");
+            assert_eq!(report.coverage[0].attempts[0].family, "mock-family");
+            if expected == RunStatus::Incomplete {
+                assert_eq!(
+                    report.incomplete_reason,
+                    Some(IncompleteReason::ScopeNotFullyReviewed)
+                );
+                assert_eq!(report.summary.coverage.skipped, 1);
+            }
+            if let Some(output) = std::env::var_os("VETTALON_COVERAGE_ARTIFACT_DIR") {
+                let output = PathBuf::from(output);
+                std::fs::create_dir_all(&output).unwrap();
+                std::fs::write(
+                    output.join(format!("{name}.json")),
+                    serde_json::to_string_pretty(&report).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    output.join(format!("{name}.txt")),
+                    report::render_summary_with(&report, None),
+                )
+                .unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn modules_are_split_between_finders() {
         let dir = tempfile::tempdir().unwrap();

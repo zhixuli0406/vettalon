@@ -11,6 +11,8 @@
 //! still reserved for a later wave (an operator action via the dashboard),
 //! never auto-set by this pipeline.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -279,6 +281,71 @@ pub struct PrecheckResult {
     pub violations: Vec<String>,
 }
 
+/// Describes the supplied evidence, not a finding verdict or exploit result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofLevel {
+    #[default]
+    Unknown,
+    PatternDemo,
+    TargetExecution,
+    DifferentialOracle,
+}
+
+impl ProofLevel {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::PatternDemo => "pattern_demo",
+            Self::TargetExecution => "target_execution",
+            Self::DifferentialOracle => "differential_oracle",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofOrigin {
+    GeneratedPattern,
+    OperatorSupplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofArtifact {
+    /// Closed role set checked by the validator; path is local and relative.
+    pub role: String,
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofHumanDecision {
+    pub actor: String,
+    pub decision: String,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofEvidence {
+    pub level: ProofLevel,
+    pub origin: ProofOrigin,
+    pub run_id: String,
+    pub pair_id: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub transcript_sha256: Option<String>,
+    pub artifacts: Vec<ProofArtifact>,
+    /// An operator-supplied record, never an automatic status transition.
+    pub human_decision: Option<ProofHumanDecision>,
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     /// Deterministic id derived from `(source_engine, rule_id, file, line,
@@ -300,6 +367,9 @@ pub struct Finding {
     pub snippet: String,
     pub rule_id: String,
     pub evidence: Vec<EvidenceItem>,
+    /// Missing on historical reports means unknown; never inferred from exit 0.
+    #[serde(default)]
+    pub proof_evidence: Vec<ProofEvidence>,
     pub status: FindingStatus,
 
     // ── v2 (all `#[serde(default)]` so a v1 report still reads) ─────────
@@ -450,6 +520,7 @@ impl Finding {
             snippet,
             rule_id,
             evidence,
+            proof_evidence: Vec::new(),
             status: FindingStatus::Candidate,
             root_fingerprint,
             file_hash: None,
@@ -466,6 +537,42 @@ impl Finding {
             cve: Vec::new(),
             cvss: None,
         }
+    }
+
+    pub fn proof_summary(&self) -> String {
+        let mut lines = vec!["Proof limits: exit 0, links, and artifact hashes do not confirm a vulnerability; operator-supplied artifacts are not trusted provenance or an independently verified oracle.".to_string()];
+        if self.proof_evidence.is_empty() {
+            lines.push("proof_level=unknown (no structured proof evidence; legacy transcripts remain unknown)".into());
+        }
+        for proof in &self.proof_evidence {
+            lines.push(format!(
+                "proof_level={} run_id={} origin={:?}",
+                proof.level.key(),
+                proof.run_id,
+                proof.origin
+            ));
+            if let Some(pair) = &proof.pair_id {
+                lines.push(format!("pair_id={pair}"));
+            }
+            if let Some(digest) = &proof.manifest_sha256 {
+                lines.push(format!(
+                    "manifest_sha256={digest}; local artifact digests checked at attachment only"
+                ));
+            }
+            if let Some(digest) = &proof.transcript_sha256 {
+                lines.push(format!("pattern transcript_sha256={digest}; standalone demonstration, target repository was not executed"));
+            }
+            for artifact in &proof.artifacts {
+                lines.push(format!(
+                    "artifact role={} path={} sha256={} bytes={}",
+                    artifact.role, artifact.path, artifact.sha256, artifact.bytes
+                ));
+            }
+            if let Some(human) = &proof.human_decision {
+                lines.push(format!("operator-supplied human_decision: {} by {} at {}; finding status unchanged by attachment", human.decision, human.actor, human.recorded_at));
+            }
+        }
+        lines.join("\n")
     }
 
     /// The precheck verdict, when one was recorded and it failed.
@@ -707,6 +814,8 @@ pub struct GatePolicy {
 pub enum ModuleCoverageStatus {
     /// Reviewed, zero candidates.
     Covered,
+    /// A valid model reply reviewed only part of the scoped files.
+    PartiallyReviewed,
     /// Reviewed, at least one candidate (including ones the pre-check
     /// refuted).
     Candidate,
@@ -723,6 +832,13 @@ pub enum ModuleCoverageStatus {
 }
 
 impl ModuleCoverageStatus {
+    pub fn has_valid_reply(self) -> bool {
+        matches!(
+            self,
+            Self::Covered | Self::Candidate | Self::PartiallyReviewed
+        )
+    }
+
     pub fn is_failed(self) -> bool {
         matches!(
             self,
@@ -733,13 +849,60 @@ impl ModuleCoverageStatus {
     }
 }
 
+/// What actually happened to a scoped file before the model call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileReadStatus {
+    Included,
+    Unreadable,
+    Empty,
+    BudgetExcluded,
+}
+
+/// Prompt provenance. Ranges are 1-based and refer to the submitted prefix;
+/// the final line can be partial when `truncated` is true. Reading does not
+/// establish that the model reviewed or understood the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileCoverage {
+    pub path: String,
+    pub read_status: FileReadStatus,
+    pub source_bytes: Option<usize>,
+    pub source_lines: Option<usize>,
+    pub submitted_bytes: usize,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub truncated: bool,
+    pub reason: Option<String>,
+}
+
+/// One required finder attempt. Every attempt survives aggregation, including
+/// failures beside another finder's successful result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleAttempt {
+    pub model: String,
+    pub family: String,
+    pub status: ModuleCoverageStatus,
+    pub reason: Option<String>,
+    pub files: Vec<FileCoverage>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
+}
+
 /// One entry per ranked module, including the ones never sent to the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleCoverage {
     pub module_path: String,
     pub status: ModuleCoverageStatus,
     pub reason: Option<String>,
-    /// Paths whose content went into the audit prompt.
+    /// Complete file denominator for this module/page, including omitted files.
+    #[serde(default)]
+    pub scope_paths: Vec<String>,
+    /// Selected by the module budget, even if a later budget prevented a call.
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub attempts: Vec<ModuleAttempt>,
+    /// Prompt paths with a valid model reply (not just successful disk reads).
     #[serde(default)]
     pub reviewed_paths: Vec<String>,
     /// Paths that went into the prompt only partially (prompt byte budget).
@@ -750,9 +913,94 @@ pub struct ModuleCoverage {
     pub candidate_ids: Vec<String>,
 }
 
+impl ModuleCoverage {
+    pub fn has_ledger(&self) -> bool {
+        self.selected || !self.scope_paths.is_empty() || !self.attempts.is_empty()
+    }
+
+    /// A non-vacuous source denominator and a usable reply containing actual
+    /// source bytes. A disk read or an empty collection cannot prove review.
+    pub fn has_effective_review(&self) -> bool {
+        let scope: HashSet<&str> = self.scope_paths.iter().map(String::as_str).collect();
+        if !self.status.has_valid_reply()
+            || !self.selected
+            || scope.is_empty()
+            || scope.len() != self.scope_paths.len()
+        {
+            return false;
+        }
+        let valid = |attempt: &ModuleAttempt| {
+            let files: HashSet<&str> = attempt
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect();
+            attempt.status.has_valid_reply()
+                && !attempt.timed_out
+                && files == scope
+                && attempt.files.len() == scope.len()
+                && attempt.files.iter().any(|file| {
+                    file.read_status == FileReadStatus::Included && file.submitted_bytes > 0
+                })
+        };
+        if !self.attempts.iter().any(valid) {
+            return false;
+        }
+        let expected: HashSet<&str> = self
+            .attempts
+            .iter()
+            .filter(|attempt| valid(attempt))
+            .flat_map(|attempt| attempt.files.iter())
+            .filter(|file| file.read_status == FileReadStatus::Included && file.submitted_bytes > 0)
+            .map(|file| file.path.as_str())
+            .collect();
+        let reviewed: HashSet<&str> = self.reviewed_paths.iter().map(String::as_str).collect();
+        !reviewed.is_empty() && reviewed == expected && reviewed.len() == self.reviewed_paths.len()
+    }
+
+    /// All scheduled finder attempts must cover the complete source scope.
+    pub fn has_full_review(&self) -> bool {
+        self.has_effective_review()
+            && self.truncated_paths.is_empty()
+            && self.attempts.iter().all(|attempt| {
+                let files: HashSet<&str> = attempt
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .collect();
+                let scope: HashSet<&str> = self.scope_paths.iter().map(String::as_str).collect();
+                matches!(
+                    attempt.status,
+                    ModuleCoverageStatus::Covered | ModuleCoverageStatus::Candidate
+                ) && !attempt.timed_out
+                    && files == scope
+                    && attempt.files.len() == scope.len()
+                    && attempt.files.iter().any(|file| {
+                        file.read_status == FileReadStatus::Included && file.submitted_bytes > 0
+                    })
+                    && attempt.files.iter().all(|file| {
+                        !file.truncated
+                            && matches!(
+                                file.read_status,
+                                FileReadStatus::Included | FileReadStatus::Empty
+                            )
+                    })
+            })
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageSummary {
     pub modules_total: usize,
+    #[serde(default)]
+    pub selected: usize,
+    /// Modules with at least one valid model reply, including partial replies.
+    #[serde(default)]
+    pub scanned: usize,
+    #[serde(default)]
+    pub skipped: usize,
+    #[serde(default)]
+    pub partially_reviewed: usize,
     pub covered: usize,
     pub candidate: usize,
     pub deferred: usize,
@@ -771,11 +1019,45 @@ impl CoverageSummary {
             match m.status {
                 ModuleCoverageStatus::Covered => s.covered += 1,
                 ModuleCoverageStatus::Candidate => s.candidate += 1,
+                ModuleCoverageStatus::PartiallyReviewed => s.partially_reviewed += 1,
                 ModuleCoverageStatus::Deferred => s.deferred += 1,
                 _ => s.failed += 1,
             }
         }
-        s.partial = s.deferred + s.failed > 0;
+        let has_ledger = coverage.iter().any(ModuleCoverage::has_ledger);
+        if has_ledger {
+            s.selected = coverage.iter().filter(|m| m.selected).count();
+            s.scanned = coverage.iter().filter(|m| m.has_effective_review()).count();
+            s.skipped = s.modules_total.saturating_sub(s.scanned);
+        }
+        s.partial = s.deferred + s.failed + s.partially_reviewed > 0
+            || (has_ledger
+                && coverage.iter().any(|module| {
+                    module.status.has_valid_reply()
+                        && (!module.has_effective_review()
+                            || (module.status == ModuleCoverageStatus::Covered
+                                && !module.has_full_review()))
+                }))
+            || coverage.iter().any(|m| {
+                !m.attempts.is_empty()
+                    && (!m.truncated_paths.is_empty()
+                        || m.attempts.iter().any(|a| {
+                            a.status.is_failed()
+                                || matches!(
+                                    a.status,
+                                    ModuleCoverageStatus::Deferred
+                                        | ModuleCoverageStatus::PartiallyReviewed
+                                )
+                                || a.files.iter().any(|f| {
+                                    f.truncated
+                                        || matches!(
+                                            f.read_status,
+                                            FileReadStatus::Unreadable
+                                                | FileReadStatus::BudgetExcluded
+                                        )
+                                })
+                        }))
+            });
         s
     }
 }
@@ -1250,6 +1532,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_coverage_summary_remains_valid_without_fabricated_evidence() {
+        let coverage: Vec<ModuleCoverage> = serde_json::from_str(r#"[{"module_path":"src","status":"covered","reason":null,"reviewed_paths":["src/a.rs"],"truncated_paths":["src/a.rs"],"candidate_ids":[]}]"#).unwrap();
+        let legacy: CoverageSummary = serde_json::from_str(r#"{"modules_total":1,"covered":1,"candidate":0,"deferred":0,"failed":0,"partial":false}"#).unwrap();
+        assert_eq!(CoverageSummary::from_coverage(&coverage), legacy);
+        assert!(coverage[0].attempts.is_empty());
+        assert!(coverage[0].scope_paths.is_empty());
+        assert!(!coverage[0].selected);
+        assert_eq!(
+            legacy.scanned, 0,
+            "absence of evidence stays unknown for legacy reports"
+        );
+    }
+
+    #[test]
     fn summary_counts_precheck_refuted_carried_and_coverage() {
         let mut pre = Finding::candidate(
             AI_AUDIT_ENGINE_NAME,
@@ -1293,6 +1589,9 @@ mod tests {
                 reviewed_paths: vec!["a/x".into()],
                 truncated_paths: vec![],
                 candidate_ids: vec![],
+                scope_paths: vec![],
+                selected: false,
+                attempts: vec![],
             },
             ModuleCoverage {
                 module_path: "b".into(),
@@ -1301,6 +1600,9 @@ mod tests {
                 reviewed_paths: vec![],
                 truncated_paths: vec![],
                 candidate_ids: vec![],
+                scope_paths: vec![],
+                selected: false,
+                attempts: vec![],
             },
             ModuleCoverage {
                 module_path: "c".into(),
@@ -1309,6 +1611,9 @@ mod tests {
                 reviewed_paths: vec!["c/x".into()],
                 truncated_paths: vec![],
                 candidate_ids: vec![],
+                scope_paths: vec![],
+                selected: false,
+                attempts: vec![],
             },
         ];
         let s = Summary::from_findings(&[pre, carried], 1, 0, GatePolicy::default(), &coverage);

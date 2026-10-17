@@ -107,8 +107,9 @@ pub struct Config {
     #[serde(default, rename = "model")]
     pub models: Vec<ModelConfig>,
     /// Optional metadata-only module ranker (TypeSafe Jev). Present only when
-    /// the operator opts in; `scan` stays zero-network unless `--rank jev`
-    /// actually selects it. Never holds a key value — only where to find one.
+    /// the operator opts in via `--rank jev`; heuristic ranking itself is local.
+    /// Cloud model calls and scanner database updates have separate network
+    /// boundaries. Never holds a key value — only where to find one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jev: Option<JevSettings>,
 }
