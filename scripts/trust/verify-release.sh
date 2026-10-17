@@ -17,9 +17,10 @@ identity="https://github.com/zhixuli0406/vettalon/.github/workflows/release.yml@
 cosign verify-blob --bundle "$asset.sigstore.json" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com "$asset"
+# Exact certificate identity already pins the workflow and tag. Current gh
+# treats --cert-identity and --signer-workflow as mutually exclusive selectors.
 gh attestation verify "$asset" --repo zhixuli0406/vettalon \
   --cert-identity "$identity" --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  --signer-workflow zhixuli0406/vettalon/.github/workflows/release.yml \
   --source-ref "refs/tags/$tag" --source-digest "$source_sha" \
   --deny-self-hosted-runners --format json
 
@@ -27,6 +28,5 @@ gh attestation verify "$asset" --repo zhixuli0406/vettalon \
 # merely by preserving the archive digest property.
 gh attestation verify "$asset.cdx.json" --repo zhixuli0406/vettalon \
   --cert-identity "$identity" --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  --signer-workflow zhixuli0406/vettalon/.github/workflows/release.yml \
   --source-ref "refs/tags/$tag" --source-digest "$source_sha" \
   --deny-self-hosted-runners --format json

@@ -45,8 +45,10 @@ The example tag is illustrative; use an existing reviewed release. The verifier:
 2. Uses `cosign verify-blob` with exact
    `https://github.com/zhixuli0406/vettalon/.github/workflows/release.yml@refs/tags/<tag>`
    identity and `https://token.actions.githubusercontent.com` issuer.
-3. Uses `gh attestation verify` with repository, signer workflow, expected source
-   ref/SHA and GitHub-hosted runner requirement. GitHub verification hashes the
+3. Uses `gh attestation verify` with repository, exact certificate identity
+   (workflow path and tag), OIDC issuer, expected source ref/SHA and GitHub-hosted
+   runner requirement. It uses one identity selector because current `gh` treats
+   `--cert-identity` and `--signer-workflow` as mutually exclusive. GitHub verification hashes the
    actual downloaded archive and checks the attestation subject.
 
 Wrong identity, issuer, source, missing proof or modified archive must fail. No

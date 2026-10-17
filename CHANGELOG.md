@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Release verifier 改用單一 exact certificate identity，避免新版 GitHub CLI 拒絕同時指定 `--cert-identity` 與 `--signer-workflow`；workflow／tag、issuer、來源 SHA 與 hosted runner 限制保留。此修正不改已發布的 binary 或版本 tag。
+
 ## [0.2.0] - 2026-10-17
 
 此版本在 1.0 前以次版號承載 Rust API 的破壞性變更；從 0.1.x 升級須依下列 migration 調整。既有實驗預覽及尚未驗證項目保留各自限制，版本發布不代表完成產品或模型驗收。
