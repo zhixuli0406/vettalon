@@ -38,8 +38,9 @@ use vettalon_contract::safe_path::SafeRepoPath;
 use super::precheck::trace_shape_violations;
 use super::schema::{
     AI_AUDIT_ENGINE_NAME, AuditReport, CURRENT_SCHEMA_VERSION, EvidenceKind, Finding,
-    FindingStatus, GatePolicy, ModuleCoverageStatus, PLAUSIBLE_PREFIX, SeverityBasis, Summary,
-    VERIFIER_CORRECTED_PREFIX, VerifierIndependence, VoteVerdict, has_operator_review,
+    FindingStatus, GatePolicy, ModuleCoverage, ModuleCoverageStatus, PLAUSIBLE_PREFIX,
+    SeverityBasis, Summary, VERIFIER_CORRECTED_PREFIX, VerifierIndependence, VoteVerdict,
+    has_operator_review,
 };
 
 /// Closed set of report violations.
@@ -60,6 +61,10 @@ pub enum ReportViolation {
     },
     InvalidRootFingerprint {
         id: String,
+    },
+    ProofShape {
+        id: String,
+        detail: String,
     },
     TraceShape {
         id: String,
@@ -136,6 +141,7 @@ impl fmt::Display for ReportViolation {
             InvalidRootFingerprint { id } => {
                 write!(f, "finding {id}: root_fingerprint is missing or malformed")
             }
+            ProofShape { id, detail } => write!(f, "finding {id}: proof shape: {detail}"),
             TraceShape { id, detail } => write!(f, "finding {id}: trace shape: {detail}"),
             RefutedWithoutReviewEvidence { id } => write!(
                 f,
@@ -199,6 +205,12 @@ impl fmt::Display for ReportViolation {
 impl std::error::Error for ReportViolation {}
 
 fn check_finding(f: &Finding, out: &mut Vec<ReportViolation>) {
+    for detail in super::poc::proof_violations(f) {
+        out.push(ReportViolation::ProofShape {
+            id: f.id.clone(),
+            detail,
+        });
+    }
     let id = || f.id.clone();
     // A pre-check refutation keeps the model's claim verbatim (an unsafe
     // path, line 0, a malformed trace) as the record of WHY it was refuted;
@@ -379,6 +391,16 @@ fn check_summary(r: &AuditReport, out: &mut Vec<ReportViolation>) {
 }
 
 fn check_coverage(r: &AuditReport, ids: &HashSet<&str>, out: &mut Vec<ReportViolation>) {
+    let modern = r.coverage.iter().any(ModuleCoverage::has_ledger);
+    if modern
+        && super::schema::CoverageSummary::from_coverage(&r.coverage).partial
+        && r.run_status == RunStatus::Complete
+    {
+        out.push(ReportViolation::CoverageStatusShape {
+            module_path: "(run)".into(),
+            detail: "new coverage evidence is partial but run_status is complete".into(),
+        });
+    }
     let mut seen: HashSet<&str> = HashSet::new();
     for m in &r.coverage {
         if !seen.insert(m.module_path.as_str()) {
@@ -398,6 +420,128 @@ fn check_coverage(r: &AuditReport, ids: &HashSet<&str>, out: &mut Vec<ReportViol
             module_path: m.module_path.clone(),
             detail: detail.to_string(),
         };
+        if modern {
+            use super::schema::FileReadStatus;
+            let partial =
+                super::schema::CoverageSummary::from_coverage(std::slice::from_ref(m)).partial;
+            if partial && r.run_status == RunStatus::Complete {
+                out.push(shape(
+                    "new coverage evidence is partial but run_status is complete",
+                ));
+            }
+            if m.status == ModuleCoverageStatus::Covered && partial {
+                out.push(shape(
+                    "covered status with incomplete source or finder evidence",
+                ));
+            }
+            if !m.selected && !m.attempts.is_empty() {
+                out.push(shape("finder attempts exist on an unselected module"));
+            }
+            if m.scope_paths
+                .iter()
+                .any(|p| SafeRepoPath::parse(p).is_err())
+            {
+                out.push(shape("scope contains an unsafe repository path"));
+            }
+            let scope: HashSet<&str> = m.scope_paths.iter().map(String::as_str).collect();
+            if scope.len() != m.scope_paths.len() {
+                out.push(shape(
+                    "duplicate scope paths cannot define a source denominator",
+                ));
+            }
+            if m.status.has_valid_reply() && !m.has_effective_review() {
+                out.push(shape("reviewed status requires selected, nonempty source scope and a valid attempt with effective content"));
+            }
+            if m.status == ModuleCoverageStatus::Covered && !m.has_full_review() {
+                out.push(shape(
+                    "covered status requires every finder to review its full nonempty source scope",
+                ));
+            }
+
+            let mut reviewed = HashSet::new();
+            for attempt in &m.attempts {
+                let valid_reply = matches!(
+                    attempt.status,
+                    ModuleCoverageStatus::Covered
+                        | ModuleCoverageStatus::Candidate
+                        | ModuleCoverageStatus::PartiallyReviewed
+                );
+                if valid_reply {
+                    if !attempt.files.iter().any(|file| {
+                        file.read_status == FileReadStatus::Included && file.submitted_bytes > 0
+                    }) {
+                        out.push(shape("valid reply attempt has no effective content"));
+                    }
+                    let accounted: HashSet<&str> =
+                        attempt.files.iter().map(|f| f.path.as_str()).collect();
+                    if accounted != scope || attempt.files.len() != scope.len() {
+                        out.push(shape(
+                            "reviewed attempt does not account for every scope path exactly once",
+                        ));
+                    }
+                }
+                for file in &attempt.files {
+                    if !scope.contains(file.path.as_str()) {
+                        out.push(shape("attempt file is outside scope_paths"));
+                    }
+                    let included = file.read_status == FileReadStatus::Included;
+                    if included && file.submitted_bytes == 0 {
+                        out.push(shape("included file has no submitted content"));
+                    }
+                    if !included
+                        && (file.submitted_bytes > 0
+                            || file.start_line.is_some()
+                            || file.end_line.is_some())
+                    {
+                        out.push(shape("excluded file claims submitted content"));
+                    }
+                    if file.submitted_bytes > 0
+                        && (file.start_line != Some(1) || file.end_line.is_none_or(|n| n == 0))
+                    {
+                        out.push(shape("submitted file has no valid line range"));
+                    }
+                    if file.source_bytes.is_some_and(|n| file.submitted_bytes > n) {
+                        out.push(shape("submitted bytes exceed source bytes"));
+                    }
+                    if included {
+                        match (file.source_bytes, file.source_lines, file.end_line) {
+                            (Some(bytes), Some(lines), Some(end)) if bytes > 0 && lines > 0 => {
+                                if file.truncated != (file.submitted_bytes < bytes) {
+                                    out.push(shape(
+                                        "truncation does not match submitted/source byte counts",
+                                    ));
+                                }
+                                if end > lines || (!file.truncated && end != lines) {
+                                    out.push(shape(
+                                        "submitted line range exceeds or contradicts source lines",
+                                    ));
+                                }
+                            }
+                            _ => out.push(shape("included file is missing valid source metadata")),
+                        }
+                    }
+                    if valid_reply && included {
+                        reviewed.insert(file.path.as_str());
+                    }
+                }
+            }
+            let truncated: HashSet<&str> = m
+                .attempts
+                .iter()
+                .flat_map(|a| a.files.iter())
+                .filter(|f| f.truncated)
+                .map(|f| f.path.as_str())
+                .collect();
+            let reported_truncated: HashSet<&str> =
+                m.truncated_paths.iter().map(String::as_str).collect();
+            if truncated != reported_truncated {
+                out.push(shape("truncated_paths do not match finder file evidence"));
+            }
+            let aggregate: HashSet<&str> = m.reviewed_paths.iter().map(String::as_str).collect();
+            if reviewed != aggregate {
+                out.push(shape("reviewed_paths do not match valid finder replies"));
+            }
+        }
         match m.status {
             ModuleCoverageStatus::Candidate if m.candidate_ids.is_empty() => {
                 out.push(shape("candidate status with no candidate_ids"))
@@ -677,6 +821,9 @@ mod tests {
             reviewed_paths: vec!["src/a.rs".into()],
             truncated_paths: vec![],
             candidate_ids: vec![refuted.id.clone()],
+            scope_paths: vec![],
+            selected: false,
+            attempts: vec![],
         }];
         let r = report(
             vec![scanner("src/a.rs"), needs_human("src/c.rs"), refuted],
@@ -932,6 +1079,9 @@ mod tests {
             reviewed_paths: vec![],
             truncated_paths: vec![],
             candidate_ids: ids,
+            scope_paths: vec![],
+            selected: false,
+            attempts: vec![],
         };
         let cov = vec![
             m("a", ModuleCoverageStatus::Covered, vec![]),
@@ -954,6 +1104,178 @@ mod tests {
             .filter(|x| matches!(x, ReportViolation::CoverageStatusShape { .. }))
             .count();
         assert_eq!(shapes, 3, "{v:?}");
+    }
+
+    fn complete_coverage_fixture() -> ModuleCoverage {
+        serde_json::from_value(serde_json::json!({
+            "module_path": "src", "status": "covered", "reason": null,
+            "selected": true, "scope_paths": ["src/a.rs"],
+            "reviewed_paths": ["src/a.rs"], "truncated_paths": [], "candidate_ids": [],
+            "attempts": [{"model": "mock", "family": "fixture", "status": "covered", "reason": null,
+                "duration_ms": 1, "timed_out": false,
+                "files": [{"path": "src/a.rs", "read_status": "included", "source_bytes": 1,
+                    "source_lines": 1, "submitted_bytes": 1, "start_line": 1, "end_line": 1,
+                    "truncated": false, "reason": null}]}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn modern_covered_without_content_is_partial_and_rejected() {
+        let valid = complete_coverage_fixture();
+        assert!(only(&report(vec![], vec![valid.clone()])).is_empty());
+        for scenario in [
+            "no_attempts",
+            "empty_scope",
+            "only_empty_files",
+            "failed_attempt",
+            "duplicate_scope",
+            "candidate_without_attempt",
+        ] {
+            let mut module = valid.clone();
+            match scenario {
+                "no_attempts" => {
+                    module.attempts.clear();
+                    module.reviewed_paths.clear();
+                }
+                "empty_scope" => {
+                    module.scope_paths.clear();
+                    module.attempts[0].files.clear();
+                    module.reviewed_paths.clear();
+                }
+                "only_empty_files" => {
+                    let file = &mut module.attempts[0].files[0];
+                    file.read_status = super::super::schema::FileReadStatus::Empty;
+                    file.source_bytes = Some(0);
+                    file.source_lines = Some(0);
+                    file.submitted_bytes = 0;
+                    file.start_line = None;
+                    file.end_line = None;
+                    module.reviewed_paths.clear();
+                }
+                "failed_attempt" => {
+                    module.attempts[0].status = ModuleCoverageStatus::LlmFailed;
+                    module.reviewed_paths.clear();
+                }
+                "duplicate_scope" => module.scope_paths.push("src/a.rs".into()),
+                "candidate_without_attempt" => {
+                    module.status = ModuleCoverageStatus::Candidate;
+                    module.attempts.clear();
+                    module.reviewed_paths.clear();
+                }
+                _ => unreachable!(),
+            }
+            let summary =
+                super::super::schema::CoverageSummary::from_coverage(std::slice::from_ref(&module));
+            assert!(
+                summary.partial,
+                "{scenario}: missing content must count as partial"
+            );
+            assert_eq!(
+                summary.scanned, 0,
+                "{scenario}: malformed evidence must not count as scanned"
+            );
+            assert!(only(&report(vec![], vec![module])).iter().any(|v| matches!(v,
+                ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("effective content") || detail.contains("source scope") || detail.contains("duplicate scope"))), "{scenario}");
+        }
+    }
+
+    #[test]
+    fn modern_ledger_cannot_mix_in_legacy_covered_as_verified() {
+        let mut legacy = complete_coverage_fixture();
+        legacy.module_path = "legacy".into();
+        legacy.selected = false;
+        legacy.scope_paths.clear();
+        legacy.attempts.clear();
+        let legacy_only = report(vec![], vec![legacy.clone()]);
+        assert!(
+            only(&legacy_only).is_empty(),
+            "wholly legacy JSON remains readable and unknown"
+        );
+        let mixed = vec![complete_coverage_fixture(), legacy];
+        let summary = super::super::schema::CoverageSummary::from_coverage(&mixed);
+        assert!(summary.partial);
+        assert_eq!((summary.scanned, summary.skipped), (1, 1));
+        assert!(only(&report(vec![], mixed)).iter().any(|v| matches!(v,
+            ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("effective content"))));
+    }
+
+    #[test]
+    fn new_deferred_scope_without_attempts_cannot_claim_complete() {
+        let module = ModuleCoverage {
+            module_path: "src".into(),
+            status: ModuleCoverageStatus::Deferred,
+            reason: Some("max_modules".into()),
+            scope_paths: vec!["src/a.rs".into()],
+            selected: false,
+            reviewed_paths: vec![],
+            truncated_paths: vec![],
+            candidate_ids: vec![],
+            attempts: vec![],
+        };
+        let mut report = report(vec![], vec![module]);
+        assert!(only(&report).iter().any(|v| matches!(v, ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("run_status is complete"))));
+        report.run_status = RunStatus::Incomplete;
+        report.incomplete_reason = Some(IncompleteReason::ScopeNotFullyReviewed);
+        assert!(only(&report).is_empty());
+    }
+
+    #[test]
+    fn new_partial_coverage_cannot_claim_complete_or_full_coverage() {
+        use super::super::schema::{FileCoverage, FileReadStatus, ModuleAttempt};
+        let file = FileCoverage {
+            path: "src/a.rs".into(),
+            read_status: FileReadStatus::Included,
+            source_bytes: Some(10),
+            source_lines: Some(2),
+            submitted_bytes: 5,
+            start_line: Some(1),
+            end_line: Some(1),
+            truncated: true,
+            reason: None,
+        };
+        let attempt = ModuleAttempt {
+            model: "mock".into(),
+            family: "mock".into(),
+            status: ModuleCoverageStatus::PartiallyReviewed,
+            reason: None,
+            files: vec![file],
+            duration_ms: 1,
+            timed_out: false,
+        };
+        let module = ModuleCoverage {
+            module_path: "src".into(),
+            status: ModuleCoverageStatus::PartiallyReviewed,
+            reason: None,
+            scope_paths: vec!["src/a.rs".into()],
+            selected: true,
+            reviewed_paths: vec!["src/a.rs".into()],
+            truncated_paths: vec!["src/a.rs".into()],
+            candidate_ids: vec![],
+            attempts: vec![attempt],
+        };
+        let mut report = report(vec![], vec![module]);
+        assert!(only(&report).iter().any(|v| matches!(v, ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("run_status is complete"))));
+        report.run_status = RunStatus::Incomplete;
+        report.incomplete_reason = Some(IncompleteReason::ScopeNotFullyReviewed);
+        assert!(only(&report).is_empty());
+        report.coverage[0].status = ModuleCoverageStatus::Covered;
+        assert!(only(&report).iter().any(|v| matches!(v, ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("covered status with incomplete"))));
+        report.coverage[0].status = ModuleCoverageStatus::PartiallyReviewed;
+        report.coverage[0].attempts[0].files[0].source_bytes = Some(1000);
+        report.coverage[0].attempts[0].files[0].source_lines = Some(1000);
+        report.coverage[0].attempts[0].files[0].end_line = Some(9999);
+        report.coverage[0].attempts[0].files[0].truncated = false;
+        let violations = only(&report);
+        for detail in [
+            "truncation does not match",
+            "line range exceeds",
+            "truncated_paths do not match",
+        ] {
+            assert!(violations.iter().any(|v| matches!(v, ReportViolation::CoverageStatusShape { detail: actual, .. } if actual.contains(detail))), "{detail}: {violations:?}");
+        }
+        report.coverage[0].scope_paths.push("src/missing.rs".into());
+        assert!(only(&report).iter().any(|v| matches!(v, ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("every scope path"))));
     }
 
     #[test]

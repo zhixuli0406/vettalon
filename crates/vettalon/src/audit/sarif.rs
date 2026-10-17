@@ -81,6 +81,9 @@ fn result(f: &Finding) -> Value {
             "vettalon.found_by": f.found_by,
             "vettalon.verification": f.verification,
             "vettalon.blockers": f.blockers,
+            "vettalon.proof_level": f.proof_evidence.last().map(|proof| proof.level.key()).unwrap_or("unknown"),
+            "vettalon.proof_evidence": f.proof_evidence,
+            "vettalon.proof_limits": f.proof_summary(),
         }
     });
     if let Some(cwe) = &f.cwe {
@@ -179,6 +182,9 @@ pub fn to_sarif(report: &AuditReport) -> Value {
             "results": report.findings.iter().map(result).collect::<Vec<_>>(),
             "properties": {
                 "vettalon.run_status": report.run_status,
+                "vettalon.incomplete_reason": report.incomplete_reason,
+                "vettalon.coverage": report.coverage,
+                "vettalon.coverage_summary": report.summary.coverage,
                 "vettalon.verifier_independence": report.verifier.independence,
                 "vettalon.refusals": report.ensemble.refusals,
             }
@@ -234,6 +240,33 @@ mod tests {
             verifier: VerifierInfo::default(),
             ensemble: Default::default(),
         }
+    }
+
+    #[test]
+    fn incomplete_scope_and_unknown_proof_survive_sarif_export() {
+        let mut report = report(vec![finding(
+            Severity::High,
+            FindingStatus::Candidate,
+            Some(1),
+        )]);
+        report.run_status = vettalon_contract::coverage::RunStatus::Incomplete;
+        report.incomplete_reason =
+            Some(vettalon_contract::coverage::IncompleteReason::ScopeNotFullyReviewed);
+        let sarif = to_sarif(&report);
+        let props = &sarif["runs"][0]["properties"];
+        assert_eq!(
+            props["vettalon.incomplete_reason"],
+            "scope_not_fully_reviewed"
+        );
+        assert_eq!(props["vettalon.coverage"], serde_json::json!([]));
+        assert_eq!(
+            sarif["runs"][0]["results"][0]["properties"]["vettalon.proof_level"],
+            "unknown"
+        );
+        assert_eq!(
+            sarif["runs"][0]["results"][0]["properties"]["vettalon.status"],
+            "candidate"
+        );
     }
 
     #[test]

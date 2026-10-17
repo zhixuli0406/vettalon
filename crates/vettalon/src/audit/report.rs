@@ -273,6 +273,13 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
         }
         out.push('\n');
     }
+    for finding in &report.findings {
+        out.push_str(&format!(
+            "  Proof {}:\n{}\n",
+            finding.id,
+            finding.proof_summary()
+        ));
+    }
     let policy_failed = crate::audit::gate::any_failed(&report.summary.policy);
     let severity_hits = fail_on.map(|s| (s, report.summary.gate_counts().count_at_or_above(s)));
     match severity_hits {
@@ -337,6 +344,10 @@ fn severity_row(c: &SeverityCounts) -> String {
 fn incomplete_reason(r: vettalon_contract::coverage::IncompleteReason) -> &'static str {
     use vettalon_contract::coverage::IncompleteReason as R;
     match r {
+        R::ScopeNotFullyReviewed => pick(
+            "部分模組或原始碼未完整審查（模組／提示內容上限）",
+            "some ranked modules or source bytes were excluded by module or prompt limits",
+        ),
         R::EngineUnavailable => pick("AI 引擎無法使用", "the AI engine was unavailable"),
         R::ValidationBudgetExhausted => pick(
             "候選數已達全程上限（多模型時由各 finder 分攤），部分候選或模組未處理",
@@ -357,8 +368,8 @@ fn incomplete_reason(r: vettalon_contract::coverage::IncompleteReason) -> &'stat
             "a model refused, so the affected modules or findings were not reviewed",
         ),
         R::UnitsFailed => pick(
-            "部分模組或候選沒有得到可用結果（呼叫失敗、回覆不合格式或未覆核）",
-            "some modules or candidates got no usable result (call failed, malformed reply, or not verified)",
+            "部分掃描引擎、模組或候選沒有得到可用結果（執行失敗、輸出格式錯誤或未覆核）",
+            "some scan engines, modules, or candidates got no usable result (execution failed, malformed output, or not verified)",
         ),
         R::InjectionUncrosschecked => pick(
             "偵測到疑似 prompt injection 的模組，因本次只有單一模型家族，無法交叉覆審（建議加入不同家族的模型）",
@@ -370,10 +381,10 @@ fn incomplete_reason(r: vettalon_contract::coverage::IncompleteReason) -> &'stat
 fn render_coverage(report: &AuditReport, out: &mut String) {
     let c = &report.summary.coverage;
     out.push_str(&tr!(
-        "  模組覆蓋：共 {}　已審 {}（無候選 {}、有候選 {}）　延後 {}　失敗 {}\n",
-        "  Module coverage: {} total, {} reviewed ({} clean, {} with candidates), {} deferred, {} failed\n",
+        "  模組覆蓋：共 {}　取得有效回覆 {}（完整無候選 {}、有候選 {}）　延後 {}　失敗 {}\n",
+        "  Module coverage: {} total, {} with valid replies ({} fully reviewed without candidates, {} with candidates), {} deferred, {} failed\n",
         c.modules_total,
-        c.covered + c.candidate,
+        c.covered + c.candidate + c.partially_reviewed,
         c.covered,
         c.candidate,
         c.deferred,
@@ -381,9 +392,9 @@ fn render_coverage(report: &AuditReport, out: &mut String) {
     ));
     if c.partial {
         out.push_str(&tr!(
-            "  部分覆蓋：{} 模組未審\n",
-            "  Partial coverage: {} modules not reviewed\n",
-            c.deferred + c.failed
+            "  部分覆蓋：{} 模組未審，{} 模組僅部分完成；請查 JSON coverage 的檔案範圍與各次審查結果\n",
+            "  Partial coverage: {} modules not reviewed, {} partially reviewed; inspect JSON coverage for file scope and finder attempts\n",
+            c.deferred + c.failed, c.partially_reviewed
         ));
     }
 }
@@ -982,6 +993,7 @@ mod tests {
             deferred: 3,
             failed: 1,
             partial: true,
+            ..Default::default()
         };
         report.verifier = VerifierInfo {
             independence: VerifierIndependence::DifferentAgent,

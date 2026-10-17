@@ -1,0 +1,634 @@
+{
+  "schema_version": 2,
+  "repo": "synthetic-coverage-candidate-cap",
+  "started_at": "2026-10-16T11:08:03.694439+00:00",
+  "profile": {
+    "mode": "deep",
+    "intake": {
+      "language_census": [
+        {
+          "extension": "py",
+          "file_count": 1
+        }
+      ],
+      "entry_points": [],
+      "git_history": {
+        "status": "unavailable",
+        "reason": "not a git repository (no .git found at repo root)"
+      }
+    }
+  },
+  "engines_run": [
+    {
+      "engine": "gitleaks",
+      "findings_count": 0,
+      "duration_ms": 22,
+      "parse_error": null,
+      "timed_out": false
+    },
+    {
+      "engine": "ai_audit[public-mock]:a",
+      "findings_count": 8,
+      "duration_ms": 3,
+      "parse_error": null,
+      "timed_out": false
+    }
+  ],
+  "engines_missing": [
+    {
+      "engine": "semgrep",
+      "reason": "not installed: fixture environment; raw diagnostics not published."
+    },
+    {
+      "engine": "osv-scanner",
+      "reason": "not installed: fixture environment; raw diagnostics not published."
+    },
+    {
+      "engine": "cargo-audit",
+      "reason": "not applicable: fixture environment; raw diagnostics not published."
+    }
+  ],
+  "findings": [
+    {
+      "id": "ai_audit-0f45f5ee5f5569ee",
+      "source_engine": "ai_audit",
+      "kind": "other",
+      "severity": "high",
+      "title": "Synthetic candidate",
+      "file": "a/util.py",
+      "line": 1,
+      "snippet": "def demo(value):\n    return value",
+      "rule_id": "ai-audit/synthetic-0",
+      "evidence": [
+        {
+          "kind": "ai_analysis",
+          "source": "ai_audit",
+          "detail": "reasoning: Self-built fixture, not a vulnerability claim",
+          "recorded_at": "2026-10-16T11:08:03.768032+00:00"
+        }
+      ],
+      "proof_evidence": [],
+      "status": "candidate",
+      "root_fingerprint": "ai_audit/ai-audit/synthetic-0/a/util.py/demo@62ad5fe2e7a393af",
+      "file_hash": "825914339ac612144888cf476c721c026a96b6d141d8c923c4cab69937562eb0",
+      "severity_basis": "model_self_reported",
+      "threat_model": {
+        "principal": "fixture",
+        "input": "fixture",
+        "control": "fixture",
+        "boundary": "fixture",
+        "affected": "fixture",
+        "result": "fixture"
+      },
+      "trace": [
+        {
+          "kind": "entrypoint",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        },
+        {
+          "kind": "sink",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        }
+      ],
+      "conditions": [],
+      "blockers": [],
+      "validation_plan": null,
+      "precheck": {
+        "passed": true,
+        "violations": []
+      },
+      "found_by": [
+        "public-mock"
+      ],
+      "verification": []
+    },
+    {
+      "id": "ai_audit-f19c4546644959a3",
+      "source_engine": "ai_audit",
+      "kind": "other",
+      "severity": "high",
+      "title": "Synthetic candidate",
+      "file": "a/util.py",
+      "line": 1,
+      "snippet": "def demo(value):\n    return value",
+      "rule_id": "ai-audit/synthetic-1",
+      "evidence": [
+        {
+          "kind": "ai_analysis",
+          "source": "ai_audit",
+          "detail": "reasoning: Self-built fixture, not a vulnerability claim",
+          "recorded_at": "2026-10-16T11:08:03.768231+00:00"
+        }
+      ],
+      "proof_evidence": [],
+      "status": "candidate",
+      "root_fingerprint": "ai_audit/ai-audit/synthetic-1/a/util.py/demo@68d26dfae0e4cc5f",
+      "file_hash": "825914339ac612144888cf476c721c026a96b6d141d8c923c4cab69937562eb0",
+      "severity_basis": "model_self_reported",
+      "threat_model": {
+        "principal": "fixture",
+        "input": "fixture",
+        "control": "fixture",
+        "boundary": "fixture",
+        "affected": "fixture",
+        "result": "fixture"
+      },
+      "trace": [
+        {
+          "kind": "entrypoint",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        },
+        {
+          "kind": "sink",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        }
+      ],
+      "conditions": [],
+      "blockers": [],
+      "validation_plan": null,
+      "precheck": {
+        "passed": true,
+        "violations": []
+      },
+      "found_by": [
+        "public-mock"
+      ],
+      "verification": []
+    },
+    {
+      "id": "ai_audit-1e1aefdf5ce9963f",
+      "source_engine": "ai_audit",
+      "kind": "other",
+      "severity": "high",
+      "title": "Synthetic candidate",
+      "file": "a/util.py",
+      "line": 1,
+      "snippet": "def demo(value):\n    return value",
+      "rule_id": "ai-audit/synthetic-2",
+      "evidence": [
+        {
+          "kind": "ai_analysis",
+          "source": "ai_audit",
+          "detail": "reasoning: Self-built fixture, not a vulnerability claim",
+          "recorded_at": "2026-10-16T11:08:03.768281+00:00"
+        }
+      ],
+      "proof_evidence": [],
+      "status": "candidate",
+      "root_fingerprint": "ai_audit/ai-audit/synthetic-2/a/util.py/demo@6ab538fae84b37d0",
+      "file_hash": "825914339ac612144888cf476c721c026a96b6d141d8c923c4cab69937562eb0",
+      "severity_basis": "model_self_reported",
+      "threat_model": {
+        "principal": "fixture",
+        "input": "fixture",
+        "control": "fixture",
+        "boundary": "fixture",
+        "affected": "fixture",
+        "result": "fixture"
+      },
+      "trace": [
+        {
+          "kind": "entrypoint",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        },
+        {
+          "kind": "sink",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        }
+      ],
+      "conditions": [],
+      "blockers": [],
+      "validation_plan": null,
+      "precheck": {
+        "passed": true,
+        "violations": []
+      },
+      "found_by": [
+        "public-mock"
+      ],
+      "verification": []
+    },
+    {
+      "id": "ai_audit-925ed89e983ec8ee",
+      "source_engine": "ai_audit",
+      "kind": "other",
+      "severity": "high",
+      "title": "Synthetic candidate",
+      "file": "a/util.py",
+      "line": 1,
+      "snippet": "def demo(value):\n    return value",
+      "rule_id": "ai-audit/synthetic-3",
+      "evidence": [
+        {
+          "kind": "ai_analysis",
+          "source": "ai_audit",
+          "detail": "reasoning: Self-built fixture, not a vulnerability claim",
+          "recorded_at": "2026-10-16T11:08:03.768328+00:00"
+        }
+      ],
+      "proof_evidence": [],
+      "status": "candidate",
+      "root_fingerprint": "ai_audit/ai-audit/synthetic-3/a/util.py/demo@44f2358176ddb0bd",
+      "file_hash": "825914339ac612144888cf476c721c026a96b6d141d8c923c4cab69937562eb0",
+      "severity_basis": "model_self_reported",
+      "threat_model": {
+        "principal": "fixture",
+        "input": "fixture",
+        "control": "fixture",
+        "boundary": "fixture",
+        "affected": "fixture",
+        "result": "fixture"
+      },
+      "trace": [
+        {
+          "kind": "entrypoint",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        },
+        {
+          "kind": "sink",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        }
+      ],
+      "conditions": [],
+      "blockers": [],
+      "validation_plan": null,
+      "precheck": {
+        "passed": true,
+        "violations": []
+      },
+      "found_by": [
+        "public-mock"
+      ],
+      "verification": []
+    },
+    {
+      "id": "ai_audit-47c5ac9150161be6",
+      "source_engine": "ai_audit",
+      "kind": "other",
+      "severity": "high",
+      "title": "Synthetic candidate",
+      "file": "a/util.py",
+      "line": 1,
+      "snippet": "def demo(value):\n    return value",
+      "rule_id": "ai-audit/synthetic-4",
+      "evidence": [
+        {
+          "kind": "ai_analysis",
+          "source": "ai_audit",
+          "detail": "reasoning: Self-built fixture, not a vulnerability claim",
+          "recorded_at": "2026-10-16T11:08:03.768374+00:00"
+        }
+      ],
+      "proof_evidence": [],
+      "status": "candidate",
+      "root_fingerprint": "ai_audit/ai-audit/synthetic-4/a/util.py/demo@35dd068ecb20ef65",
+      "file_hash": "825914339ac612144888cf476c721c026a96b6d141d8c923c4cab69937562eb0",
+      "severity_basis": "model_self_reported",
+      "threat_model": {
+        "principal": "fixture",
+        "input": "fixture",
+        "control": "fixture",
+        "boundary": "fixture",
+        "affected": "fixture",
+        "result": "fixture"
+      },
+      "trace": [
+        {
+          "kind": "entrypoint",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        },
+        {
+          "kind": "sink",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        }
+      ],
+      "conditions": [],
+      "blockers": [],
+      "validation_plan": null,
+      "precheck": {
+        "passed": true,
+        "violations": []
+      },
+      "found_by": [
+        "public-mock"
+      ],
+      "verification": []
+    },
+    {
+      "id": "ai_audit-87ba3eb7f7c29d43",
+      "source_engine": "ai_audit",
+      "kind": "other",
+      "severity": "high",
+      "title": "Synthetic candidate",
+      "file": "a/util.py",
+      "line": 1,
+      "snippet": "def demo(value):\n    return value",
+      "rule_id": "ai-audit/synthetic-5",
+      "evidence": [
+        {
+          "kind": "ai_analysis",
+          "source": "ai_audit",
+          "detail": "reasoning: Self-built fixture, not a vulnerability claim",
+          "recorded_at": "2026-10-16T11:08:03.768421+00:00"
+        }
+      ],
+      "proof_evidence": [],
+      "status": "candidate",
+      "root_fingerprint": "ai_audit/ai-audit/synthetic-5/a/util.py/demo@5cbbe9af2e7e9279",
+      "file_hash": "825914339ac612144888cf476c721c026a96b6d141d8c923c4cab69937562eb0",
+      "severity_basis": "model_self_reported",
+      "threat_model": {
+        "principal": "fixture",
+        "input": "fixture",
+        "control": "fixture",
+        "boundary": "fixture",
+        "affected": "fixture",
+        "result": "fixture"
+      },
+      "trace": [
+        {
+          "kind": "entrypoint",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        },
+        {
+          "kind": "sink",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        }
+      ],
+      "conditions": [],
+      "blockers": [],
+      "validation_plan": null,
+      "precheck": {
+        "passed": true,
+        "violations": []
+      },
+      "found_by": [
+        "public-mock"
+      ],
+      "verification": []
+    },
+    {
+      "id": "ai_audit-47b10311d8a5e963",
+      "source_engine": "ai_audit",
+      "kind": "other",
+      "severity": "high",
+      "title": "Synthetic candidate",
+      "file": "a/util.py",
+      "line": 1,
+      "snippet": "def demo(value):\n    return value",
+      "rule_id": "ai-audit/synthetic-6",
+      "evidence": [
+        {
+          "kind": "ai_analysis",
+          "source": "ai_audit",
+          "detail": "reasoning: Self-built fixture, not a vulnerability claim",
+          "recorded_at": "2026-10-16T11:08:03.768468+00:00"
+        }
+      ],
+      "proof_evidence": [],
+      "status": "candidate",
+      "root_fingerprint": "ai_audit/ai-audit/synthetic-6/a/util.py/demo@30e38feb30d55d2f",
+      "file_hash": "825914339ac612144888cf476c721c026a96b6d141d8c923c4cab69937562eb0",
+      "severity_basis": "model_self_reported",
+      "threat_model": {
+        "principal": "fixture",
+        "input": "fixture",
+        "control": "fixture",
+        "boundary": "fixture",
+        "affected": "fixture",
+        "result": "fixture"
+      },
+      "trace": [
+        {
+          "kind": "entrypoint",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        },
+        {
+          "kind": "sink",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        }
+      ],
+      "conditions": [],
+      "blockers": [],
+      "validation_plan": null,
+      "precheck": {
+        "passed": true,
+        "violations": []
+      },
+      "found_by": [
+        "public-mock"
+      ],
+      "verification": []
+    },
+    {
+      "id": "ai_audit-e4f963a522b09b7f",
+      "source_engine": "ai_audit",
+      "kind": "other",
+      "severity": "high",
+      "title": "Synthetic candidate",
+      "file": "a/util.py",
+      "line": 1,
+      "snippet": "def demo(value):\n    return value",
+      "rule_id": "ai-audit/synthetic-7",
+      "evidence": [
+        {
+          "kind": "ai_analysis",
+          "source": "ai_audit",
+          "detail": "reasoning: Self-built fixture, not a vulnerability claim",
+          "recorded_at": "2026-10-16T11:08:03.768514+00:00"
+        }
+      ],
+      "proof_evidence": [],
+      "status": "candidate",
+      "root_fingerprint": "ai_audit/ai-audit/synthetic-7/a/util.py/demo@5b85cf2795b1a83f",
+      "file_hash": "825914339ac612144888cf476c721c026a96b6d141d8c923c4cab69937562eb0",
+      "severity_basis": "model_self_reported",
+      "threat_model": {
+        "principal": "fixture",
+        "input": "fixture",
+        "control": "fixture",
+        "boundary": "fixture",
+        "affected": "fixture",
+        "result": "fixture"
+      },
+      "trace": [
+        {
+          "kind": "entrypoint",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        },
+        {
+          "kind": "sink",
+          "file": "a/util.py",
+          "line": 1,
+          "scope": "demo",
+          "description": "fixture"
+        }
+      ],
+      "conditions": [],
+      "blockers": [],
+      "validation_plan": null,
+      "precheck": {
+        "passed": true,
+        "violations": []
+      },
+      "found_by": [
+        "public-mock"
+      ],
+      "verification": []
+    }
+  ],
+  "summary": {
+    "total_findings": 8,
+    "by_severity": {
+      "critical": 0,
+      "high": 8,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    },
+    "engines_run_count": 2,
+    "engines_missing_count": 3,
+    "ai_audit_candidates": 8,
+    "ai_audit_refuted": 0,
+    "ai_audit_needs_human": 0,
+    "poc_ran": 0,
+    "needs_human_by_severity": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    },
+    "gate_includes_needs_human": false,
+    "coverage": {
+      "modules_total": 1,
+      "selected": 1,
+      "scanned": 1,
+      "skipped": 0,
+      "partially_reviewed": 0,
+      "covered": 0,
+      "candidate": 1,
+      "deferred": 0,
+      "failed": 0,
+      "partial": false
+    },
+    "precheck_refuted": 0,
+    "carried_from_prior": 0
+  },
+  "run_status": "incomplete",
+  "incomplete_reason": "validation_budget_exhausted",
+  "coverage": [
+    {
+      "module_path": "a",
+      "status": "candidate",
+      "reason": "2 candidate(s) dropped by the per-module (8) or run-wide (60) cap",
+      "scope_paths": [
+        "a/util.py"
+      ],
+      "selected": true,
+      "attempts": [
+        {
+          "model": "public-mock",
+          "family": "fixture",
+          "status": "candidate",
+          "reason": "2 candidate(s) dropped by the per-module (8) or run-wide (60) cap",
+          "files": [
+            {
+              "path": "a/util.py",
+              "read_status": "included",
+              "source_bytes": 34,
+              "source_lines": 2,
+              "submitted_bytes": 34,
+              "start_line": 1,
+              "end_line": 2,
+              "truncated": false,
+              "reason": null
+            }
+          ],
+          "duration_ms": 3,
+          "timed_out": false
+        }
+      ],
+      "reviewed_paths": [
+        "a/util.py"
+      ],
+      "truncated_paths": [],
+      "candidate_ids": [
+        "ai_audit-0f45f5ee5f5569ee",
+        "ai_audit-1e1aefdf5ce9963f",
+        "ai_audit-47b10311d8a5e963",
+        "ai_audit-47c5ac9150161be6",
+        "ai_audit-87ba3eb7f7c29d43",
+        "ai_audit-925ed89e983ec8ee",
+        "ai_audit-e4f963a522b09b7f",
+        "ai_audit-f19c4546644959a3"
+      ]
+    }
+  ],
+  "prior_run": null,
+  "verifier": {
+    "independence": "not_run",
+    "audit_agent": "public-mock",
+    "verifier_agent": null
+  },
+  "ensemble": {
+    "models": [
+      {
+        "id": "public-mock",
+        "family": "fixture",
+        "roles": [
+          "finder"
+        ]
+      }
+    ],
+    "refusals": [],
+    "suspected_injection": [],
+    "cross_checked": 0,
+    "ranker": "heuristic"
+  }
+}

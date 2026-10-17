@@ -4,6 +4,44 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
+此版本在 1.0 前以次版號承載 Rust API 的破壞性變更；從 0.1.x 升級須依下列 migration 調整。既有實驗預覽及尚未驗證項目保留各自限制，版本發布不代表完成產品或模型驗收。
+
+### Added
+- 0.2.0 formal 報告預覽：加入逐階段worksheet／獨立overlay與成本附件，核對raw／attempt artifact／model／版價來源；人工註記不改metrics，operator價目與分配人時只產明示範圍的估算。缺完整observed tokens或附件資料保留unknown total與known subtotal；無真模型、帳單或人類身分認證。本輪87個離線方法通過（原31＋新增56），另以root自建fixture驗三個CLI入口：0／0／1預期拒收，註記不改metrics。新來源的stage交付依對應manifest與測試收據核對；先前251-source包為歷史版本，不代表本次來源已發行。Worksheet／review-overlay僅支援twins；context／RAG可用預設derived重播與cost，不支援worksheet。
+- 0.2.0 實驗預覽：新增 self-authored synthetic identity views、legacy observation readers 與 formal transport 的功能導航及逐檔匯出清單，並附差分程序契約。Identity 僅是合成來源歸屬；legacy 保留固定 registry 分母、missing／failed 與 unknown 成本，不轉成人工判讀指標。2026-10-17 本機檢查點：差分記錄 27 個 unique methods 與 1 個 socket case 環境阻擋，整套非綠；legacy 32 個自包含合成測試通過，另將 9 份既有固定輸入轉成 7 個 cohort／739 個 observation slots，9 檔來源 SHA 不變，僅驗純 reader、不代表新掃描或歷史成效重新認證；formal 先前31個離線測試通過，其中三 arm 的 50 次 fake 扣額／51,200 reservation 僅驗帳本與編排，非真 provider 呼叫或帳單；production provider readiness 維持 unknown-disabled，真 provider 呼叫與正式三 arm 效益執行均為 0，公開stage交付須按各自manifest與測試收據核對。不匯出未覆核 raw、phase 輸出或 denominator manifests，不代表已發行或正式模型比較通過。
+- 0.2.0 實驗預覽：新增 query refinement public V2 的顯式 runtime profile／approved lock 與 raw SHA-256 綁定、獨立公開指南及逐檔匯出清單；既有工具須預先覆核，無下載或版本 fallback。離線 parser／自寫 fake CLI 與乾淨公開樹檢查僅驗來源綁定及交付契約；本階段不跑真 scanner 或模型。R27 保持 PARTIAL、budget-control-incomplete、adoption_eligible=false，歷史 8-call batch 保留原來源範圍。
+- 新增 opt-in 自建合成 twin 的 fresh runner→finding 連結：核對 file hash、當次 nonce、Docker raw／control／cleanup，自動產可 attach 的五角色附件；仍是 unsigned operator-supplied 資料，不自動 confirmed。
+- 實驗工具新增 runner-process CPU／lifetime RSS 觀測，以及同 snapshot 三種選段的 dry-run／mock 比較；不代表真模型成本或召回提升。
+- 新增明確 opt-in 的 macOS 本機離線診斷預覽：先驗 supervisor／child 的外網 EPERM 與 loopback／唯讀政策，再以獨立 Ollama daemon、單次 upstream 上限與完整失敗紀錄檢查自建樣本；加入工具與 mock 測試不代表真模型診斷已通過。
+
+- 0.2.0: structured proof artifact records and bounded local `evidence attach`; no command execution or automatic finding confirmation.
+- Public self-built coverage examples and loopback CLI generator; SARIF carries incomplete reason, module scope and proof limits.
+- 信任包工具：Syft CycloneDX 1.6 adapter、官方 schema 驗證、asset 完整性／digest gate、unsigned build record、具 exact workflow／issuer／source 條件的 release verifier，以及最小憑證 Scorecard 介面。新增資料流矩陣與 Best Practices 自評；新 release provenance workflow 尚待正式執行驗證。
+
+### Changed
+- 本機 Claude Code plugin lifecycle 驗證改為核對安裝與更新後的 inventory、版本及固定檔案雜湊；命令成功但觀察仍舊版時保留 partial。使用拋棄式 HOME／設定與精簡環境，不再讀取真實使用者設定計算 fingerprint；此工具不證明 hosted marketplace 更新或模型 session 已載入新版。
+- **Breaking change — Rust API migration**（Rust 原始碼不相容）：`HuntReport`／`HuntPlan` 的 struct literal 須補 `intake`，對 `SkipReason` 的窮盡 match 須處理 `DirectnessUnknown`。`targets_from_dir` 簽名不變，但部分 intake 現回傳 `Err`；需保留有效目標與缺口請改用 `intake_from_dir`。新版仍可讀缺 `intake` 的舊 JSON，維持 `None`／unknown，不補造 complete；此 Rust 原始碼相容性變更由 0.2.0 承載。
+- 0.2.0：hunt 新增離線 intake ledger，保留混合來源的有效目標並明示解析缺口、未知直接性與已解析分母；舊報告缺證據維持 unknown。指定報告／揭露草稿寫入失敗回傳非零，保留已完成草稿。
+- 文件明確區分本機編排、雲模型接收程式碼、Jev metadata opt-in 與 hunt registry／OSV 流量；deep／PoC／hunt 均在免費 CLI，AI 與 pattern PoC 不會自動 confirmed。
+
+### Fixed
+- Formal-v1 報表的 twins／context／RAG 統一保留已記錄的 runner CPU、lifetime RSS 與 wall time；異常值拒收、缺值維持 unknown。這些觀察不含模型伺服器或實際費用，RSS 不代表每次執行峰值；舊版 reader 契約不變。
+- Formal只讀報告預設從immutable attempt回覆重算parsed／finder／surfaced／detected／root cause／parent lineage，拒絕手改衍生欄位或無proof的human／differential結果；缺stage與producer例外保incomplete。Formal輸入改用POSIX不跟隨symlink的regular bounded讀取與前後核對，legacy不接受新worksheet／review／cost附件。
+- 0.2.0: the Claude Code thin plugin now bundles a versioned POSIX capture helper for every metadata, Docker-presence and scan command, with stream caps, preserved raw receipts and bounded shared process-group cleanup. Existing 180-second default / 600-second maximum execution limits and findings exit 1 remain; metadata has separate 15-second limits. Invalid UTF-8, truncation and incomplete cleanup/control cannot become success. Installed plugins need no repository runtime; frozen reachability/research source remains unchanged. Doctor/scan are explicitly POSIX-only, while report-only reading remains available. Native Windows, hosted upgrade and real model-session acceptance are not claimed.
+- 0.2.0 實驗預覽：loopback 資料流 probe 限制 subprocess capture、HTTP 讀取與 shutdown，保留部分 raw 與清理狀態；child 使用獨立 HOME 與環境變數允許清單。接收執行緒啟動失敗保留 incomplete／零 CLI attempts，清理證據不足也維持 incomplete。本機 fixture 傳輸的完整記錄不代表完整掃描涵蓋率、雲端留存或硬 OS 資源保證；本機真實 CLI 對 loopback 假模型端點的原始碼傳輸與清理已驗證；固定空回覆不代表模型判斷能力，發行另行驗收。
+- Python native graph 的 marker 判斷改為完整輸入環境快照；缺值或錯值明確失敗，條件排除留下紀錄，不再由分析主機補值。
+- 揭露草稿明列人工覆核、對應目標沙盒紀錄與送出核准；移除預先同意公開及到期自動公開敘述，日期僅為協調建議，公開另須核准。
+- Scanner 程序清理：修正逾時、取消或正常 leader 退出後背景 child 仍存活的問題，保留部分輸出，清理錯誤另記 incomplete。Unix 私有 process group 已有 macOS 活驗；Windows Job Object runner 已在原生 Windows CI 取得限定 scanner 測試結果（12 passed、0 failed、1 ignored、545 filtered）。這不代表完整 Desktop、所有平台安裝或真模型流程已驗收。
+- Hunt 的 OSV／registry 傳輸限定 HTTPS／443 與各自允許目的地，最多三次 redirect、30 秒 request timeout、零自動 retry；測試 CA／觀察器僅限測試。
+- Scanner 失敗不再被記為成功空結果：缺 RustSec DB、空白／錯誤 JSON、Semgrep 部分錯誤及 Gitleaks 缺報告會顯式標記 incomplete；有效的部分候選保留。
+- **只含二進位檔的模組被算成審查失敗**：macOS 的 `.DS_Store` 這類沒有已知副檔名的二進位檔會被收進模組，讀不出文字就記為失敗，掃描因此顯示「部分覆蓋」並少算覆蓋率。現在走訪時略過作業系統產生的中繼檔（`.DS_Store`、`Thumbs.db`、`desktop.ini`、`._*`），排序前也會檢查檔頭，前 8 KB 含 NUL（且不是帶 BOM 的 UTF-16）的檔案不會成為審查對象。Big5、Latin-1 等非 UTF-8 文字檔照舊列為審查對象，讀不出來時在覆蓋率裡顯示為失敗，不會悄悄消失；真正讀取失敗（例如沒有權限）也照舊記為失敗。
+- **`.gitignore`、`LICENSE`、`CODEOWNERS` 這類 repo 中繼檔被送審**：沒有程式邏輯，卻各花一次模型呼叫，現在排除。
+
+### Security
+- **深度掃描會把 `.env` 等密鑰檔送給模型**：模組選檔只看副檔名，`.env`（被當成副檔名 `env`）、`.env.local`、私鑰（`*.pem`、`*.key`、`id_rsa` 等）、`.npmrc`、`.netrc` 這類檔案都被當成程式碼，內容原封不動放進審查 prompt；用雲端模型時就離開本機。即使檔案已列在 `.gitignore` 也一樣，因為檔案層級的 gitignore 規則不會套用。現在這些檔案不會成為審查對象；覆核與 PoC 階段若模型指名這類檔案，或指名一個指向它的 symlink，讀檔入口也會拒絕。清單另外涵蓋 `*.tfvars`、`terraform.tfstate`、`credentials.json`、`service-account*.json`、`*.p8`、`*.ppk`、`.htpasswd`、`secrets.yaml` 等常見慣例，但不是完整保證：寫死在原始碼裡的密鑰仍會隨原始碼送出。密鑰偵測仍由 gitleaks 在本機處理。影響 0.1.0、0.1.1 的 `--profile deep` 與 `vettalon hunt`。
+
 ## [0.1.1] - 2026-10-16
 
 ### Added
@@ -24,9 +62,9 @@
 
 ### Added
 - **`vettalon hunt --dep-concurrency N`：相依套件平行審查**（1–4，預設 2）。原本相依一個接一個審，每個最長 `--dep-timeout`，20 個相依可以跑上一兩個小時。總 token 用量與串行相同，增加的是每個模型同時收到的呼叫數（每個進行中的相依各一個），CLI 帳號遇到限流時調低即可。報告裡相依的順序維持計畫順序，不受誰先審完影響；逐相依進度訊息會交錯：開始行標的是計畫中的位置，完成行改標「完成 N/總數」並帶套件名稱。解壓縮改在 blocking 執行緒跑，不會卡住同時進行的其他相依與它們的逾時計時。函式庫 API：`HuntOptions::dep_concurrency`、`hunt::run::MAX_DEP_CONCURRENCY`。
-- **選配的 metadata-only 模組排序 `scan --rank jev`**（TypeSafe Jev）：把模組的 metadata（路徑、副檔名、位元組大小、是否進入點、git 熱點數，**不含程式碼內容**）送 Jev 排序，把高風險檔排進審查名額內。基準上深掃 hit@40 從啟發式 6/9 提到 8/9。**預設關閉**：不給 `--rank jev`，scan 維持零網路、用內建啟發式排序。送出前由 `assert_metadata_only` 逐檔比對原始碼 fail-closed，確保碼不離機；Jev 不可用時自動退回啟發式並出一行提示（報告記 `ensemble.rank_degraded`），不取代 finder／verifier。金鑰兩種存法：`[jev].api_key_env`（環境變數名，優先）或 `[jev].api_key_file`（0600 金鑰檔），config 一律不存 key 本身，key 不進 log／報告。CLI `--rank <heuristic|jev>`、`vettalon.example.toml` 範例。BYOK（自備 TypeSafe 金鑰），CLI 每次執行印出 metadata 送出目的地。
+- **選配的 metadata-only 模組排序 `scan --rank jev`**（TypeSafe Jev）：把模組的 metadata（路徑、副檔名、位元組大小、是否進入點、git 熱點數，**不含程式碼內容**）送 Jev 排序，把高風險檔排進審查名額內。基準上深掃 hit@40 從啟發式 6/9 提到 8/9。**預設關閉**：不給 `--rank jev` 時不傳送 Jev metadata、用內建啟發式排序；雲模型仍接收程式碼。送出前由 `assert_metadata_only` 逐檔比對原始碼 fail-closed，確保碼不離機；Jev 不可用時自動退回啟發式並出一行提示（報告記 `ensemble.rank_degraded`），不取代 finder／verifier。金鑰兩種存法：`[jev].api_key_env`（環境變數名，優先）或 `[jev].api_key_file`（0600 金鑰檔），config 一律不存 key 本身，key 不進 log／報告。CLI `--rank <heuristic|jev>`、`vettalon.example.toml` 範例。BYOK（自備 TypeSafe 金鑰），CLI 每次執行印出 metadata 送出目的地。
 - **`vettalon hunt` 逐相依進度**：每個相依開始審查與結束時回報一行（位置、結果：新漏洞候選數／未發現／未完成），走 stderr（JSON 報告仍走 stdout）。相依是串行審查、每個可達 `--dep-timeout`，原本整段看起來像卡住。函式庫 API：`hunt::run::run_hunt_with_progress` 與 `HuntProgress` trait。
-- **供應鏈獵捕 `vettalon hunt <project>`**：稽核專案相依的 OSS 套件**原始碼**，找尚未登錄成 CVE 的新漏洞，用既有跨家族對抗覆核＋PoC 驗證後，標出可向上游負責任揭露的候選。流程：解 lockfile（Cargo.lock、npm `package-lock.json` v1/v2-3、pip `requirements.txt`、Go `go.sum`+`go.mod`）→ 查 OSV 分「已知／可能新」→ 抓官方發佈檔並安全解壓（純 Rust flate2/tar/zip，擋 zip-slip/tar-slip、解壓炸彈、symlink）→ 對每個相依跑 deep audit。成本預設：只審直接依賴、`--max-deps`（預設 20）上限、預設跳過 OSV 已知 CVE 的版本（把 AI 預算集中在未登錄的）；`--include-transitive`、`--reaudit-known` 可放寬，`--dry-run` 只預覽選取不花 token。`--report <檔>` 寫出完整 JSON；`--disclose-dir <目錄>` 對「確認／needs_human 且 OSV 查無」的新候選產上游負責任揭露草稿（接 `disclose`，附送出前檢查清單，只草稿、永不自動送出），上游座標從抓回的套件 manifest `repository` 推得。`--dep-timeout`（預設 300 秒）給每個相依的 fetch+audit 一個時限，逾時就記為錯誤並繼續下一個，一個卡住的相依不會拖垮整個 run；OSV 用 `/v1/querybatch` 批次查詢，`--include-transitive` 大型 repo 也只打少數幾次而非上百次。網路只在獵捕模式、只連 allowlist（套件登錄處＋`api.osv.dev`），逐跳檢查 redirect，`scan` 的零網路行為不變。
+- **供應鏈獵捕 `vettalon hunt <project>`**：稽核專案相依的 OSS 套件**原始碼**，找尚未登錄成 CVE 的新漏洞，用既有跨家族對抗覆核＋PoC 驗證後，標出可向上游負責任揭露的候選。流程：解 lockfile（Cargo.lock、npm `package-lock.json` v1/v2-3、pip `requirements.txt`、Go `go.sum`+`go.mod`）→ 查 OSV 分「已知／可能新」→ 抓官方發佈檔並安全解壓（純 Rust flate2/tar/zip，擋 zip-slip/tar-slip、解壓炸彈、symlink）→ 對每個相依跑 deep audit。成本預設：只審直接依賴、`--max-deps`（預設 20）上限、預設跳過 OSV 已知 CVE 的版本（把 AI 預算集中在未登錄的）；`--include-transitive`、`--reaudit-known` 可放寬，`--dry-run` 只預覽選取不花 token。`--report <檔>` 寫出完整 JSON；`--disclose-dir <目錄>` 對「確認／needs_human 且 OSV 查無」的新候選產上游負責任揭露草稿（接 `disclose`，附送出前檢查清單，只草稿、永不自動送出），上游座標從抓回的套件 manifest `repository` 推得。`--dep-timeout`（預設 300 秒）給每個相依的 fetch+audit 一個時限，逾時就記為錯誤並繼續下一個，一個卡住的相依不會拖垮整個 run；OSV 用 `/v1/querybatch` 批次查詢，`--include-transitive` 大型 repo 也只打少數幾次而非上百次。獵捕的來源抓取／OSV 查詢只連 allowlist（套件登錄處＋`api.osv.dev`），逐跳檢查 redirect；deep 模型請求另依 provider 設定傳送相依原始碼。
 - **攻擊模式知識層（CAPEC）＋攻擊情境**（借鑑 PentaGI）：CWE 知識庫為 14 個 OWASP Top 10 類別補上 MITRE CAPEC 對應與一段 zh-TW 攻擊情境（攻擊者進入點、前置條件、可串接後果）。SARIF result 帶 `vettalon.capec`。屬知識庫層，非可直接外用的攻擊步驟。函式庫 API：`vettalon::kb`（`CapecPattern`、`attack_scenario_zh`、`capec_url`）。
 - **可利用性分級（exploitability）**：依發現既有的 `conditions` 前置條件零 LLM 推導「直接可達／條件可達／難以觸及」三級，作為 SARIF `vettalon.exploitability`，以及嚴重度帶內的次序鍵（越可達越前）。不覆寫 CVSS 標準分數。函式庫 API：`vettalon::audit::exploitability`。
 - **`vettalon scan --trace <檔>`**：逐次模型呼叫的 JSON Lines 追蹤（步驟、模型、家族、prompt／reply 位元組數、延遲、結果），不含任何 prompt／回覆內文，可安全保存。供成本／延遲檢視與基準回歸分析。未給旗標時完全不記錄、零成本。

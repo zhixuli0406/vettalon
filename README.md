@@ -23,7 +23,7 @@ Open-source scanners (semgrep, gitleaks, cargo-audit) run a deterministic pass f
 
 ```bash
 npm install -g vettalon                # macOS / Linux; or build from source, see "Install"
-vettalon scan .                        # open-source scanners only (free, offline)
+vettalon scan .                        # open-source scanners only (free; local scanners, see network prerequisites)
 vettalon scan . --profile deep --report report.json --sarif report.sarif   # add the AI audit
 ```
 
@@ -84,7 +84,7 @@ steps:
 ## Usage
 
 ```bash
-# Open-source scanners only (free, offline)
+# Open-source scanners only (free; local scanners, see network prerequisites)
 vettalon scan .
 
 # AI deep audit: the top 5 highest-risk modules, split across the models
@@ -137,15 +137,15 @@ vettalon hunt . --report hunt.json --disclose-dir drafts/
 
 ### Supply-chain hunt (`vettalon hunt`)
 
-`vettalon hunt <project>` reads the dependencies from the project's lockfile (Cargo.lock, npm `package-lock.json`, pip `requirements.txt`, Go `go.sum`), fetches their official released source code and audits it, looking for new vulnerabilities **that haven't been assigned a CVE yet**. This complements existing SCA tools, which match against known CVEs. It first queries OSV to sort versions into "known" and "possibly new". By default it audits **direct dependencies only** and skips versions that already have a CVE in OSV (SCA tools already track those), so the AI budget goes to what isn't on record. Each dependency gets the same cross-family adversarial verification as `scan --profile deep`. Only new findings that are confirmed and whose PoC runs successfully are listed as disclosure candidates.
+`vettalon hunt <project>` reads the dependencies from the project's lockfile (Cargo.lock, npm `package-lock.json`, pip `requirements.txt`, Go `go.sum`), fetches their official released source code and audits it, looking for new vulnerabilities **that haven't been assigned a CVE yet**. This complements existing SCA tools, which match against known CVEs. It first queries OSV to sort versions into "known" and "possibly new". By default it audits **direct dependencies only** and skips versions that already have a CVE in OSV (SCA tools already track those), so the AI budget goes to what isn't on record. Each dependency gets the same cross-family adversarial verification as `scan --profile deep`. OSV-unlisted findings retained after review are candidates requiring human judgment (`needs_human`); an OSV miss is not proof of novelty, and a successful pattern PoC is not confirmation.
 
-Flags: `--max-deps N` (cap, default 20), `--include-transitive` (include indirect dependencies too), `--reaudit-known` (also audit versions with known CVEs), `--dry-run` (preview the selection only; nothing is fetched and no tokens are spent), `--report <file>` (write the full JSON), `--disclose-dir <dir>` (write upstream responsible-disclosure drafts for new candidates, with a pre-submission checklist; drafts only, never sent), `--dep-timeout <seconds>` (time limit for each dependency's fetch + audit, default 300; on timeout it records an error and carries on), `--dep-concurrency N` (how many dependencies to audit at the same time, 1–4, default 2; total token use stays the same, but each model receives N calls at once, so lower it if a CLI account hits rate limits), `--poc`, `--finders`/`--verifiers`. OSV is queried in batches, so even a large dependency tree takes only a few requests. Hunt mode goes online to fetch source code and query OSV, with egress limited to the package registries and `api.osv.dev`. The audited project's own private code never leaves the machine; the only thing sent out is each dependency's `name@version`. The zero-network behavior of `scan` is not affected.
+Flags: `--max-deps N` (cap, default 20), `--include-transitive` (include indirect dependencies too), `--reaudit-known` (also audit versions with known CVEs), `--dry-run` (preview the selection only; nothing is fetched and no tokens are spent), `--report <file>` (write the full JSON), `--disclose-dir <dir>` (write upstream responsible-disclosure drafts for new candidates, with a pre-submission checklist; drafts only, never sent), `--dep-timeout <seconds>` (time limit for each dependency's fetch + audit, default 300; on timeout it records an error and carries on), `--dep-concurrency N` (how many dependencies to audit at the same time, 1–4, default 2; total token use stays the same, but each model receives N calls at once, so lower it if a CLI account hits rate limits), `--poc`, `--finders`/`--verifiers`. OSV is queried in batches, so even a large dependency tree takes only a few requests. Hunt mode goes online to fetch source code and query OSV, with egress limited to the package registries and `api.osv.dev`. Registry/OSV requests carry dependency identities; deep-review prompts also send dependency source to the configured model provider. These fetching allowlists do not restrict model-provider traffic. See [data flow](docs/DATA-FLOW.md).
 
 The paid Vettalon Pro can also turn a hunt report into an enterprise supply-chain report (Word/PDF/HTML).
 
 ### Disclosure drafts
 
-`vettalon disclose` works out the reporting channel from the repo itself (git remote, SECURITY.md, package metadata; no network access) and generates a draft, with a suggested public disclosure date, in one of these formats: a GitHub private vulnerability report, the project's security email address, Taiwan's TWCERT/CC (90 days to public disclosure suggested) or HITCON ZeroDay (60 days). You have to fill in the "reproduced by a human / not yet reproduced" field in the draft yourself. Only findings that verification left as `needs_human`, or that a human confirmed, can get a draft; findings that were never verified or were refuted are rejected. vettalon never submits anything for you.
+`vettalon disclose` uses local repository metadata (git remote, SECURITY.md and package metadata; no network access) to suggest a reporting channel and generate an unapproved local draft for GitHub, vendor email, TWCERT/CC or HITCON ZeroDay. Before sending, document independent human review and sandbox reproduction tied to the target and source identity, check the current maintainer/channel policy, and obtain explicit approval. Draft eligibility (`needs_human` or human-confirmed) does not prove those requirements have been met. Dates are suggested coordination checkpoints; the legacy 90/60-day calculation is neither a verified platform policy nor permission to publish. Publication requires separate approval. vettalon never submits anything for you.
 
 ### Policy gates (`--gate`)
 
@@ -164,7 +164,7 @@ Exit codes: `0` the `--fail-on` threshold wasn't reached and every `--gate` cond
 
 ### Module ranking (`--rank`)
 
-By default the deep scan uses a built-in heuristic ranker to decide the order in which modules are audited (git hotspots, entry points, risk score), with **zero network access**. There is also an optional `--rank jev`: it sends the modules' **metadata** (path, file extension, size in bytes, whether it's an entry point, git hotspot count; **no code content of any kind**) to TypeSafe Jev, which ranks them so the high-risk files land inside the audit quota. In benchmarks, Jev raised the deep scan's hit@40 from 6/9 to 8/9 (see the [benchmarks on the website](https://vettalon.dudustudio.monster/#benchmarks)).
+By default the deep scan uses a built-in heuristic ranker to decide the order in which modules are audited (git hotspots, entry points, risk score), without network requests **by the ranker itself**; remote model calls still send source. There is also an optional `--rank jev`: it sends the modules' **metadata** (path, file extension, size in bytes, whether it's an entry point, git hotspot count; **no code content of any kind**) to TypeSafe Jev, which ranks them so the high-risk files land inside the audit quota. In benchmarks, Jev raised the deep scan's hit@40 from 6/9 to 8/9 (see the [benchmarks on the website](https://vettalon.dudustudio.monster/#benchmarks)).
 
 ```bash
 # Default heuristic (zero network)
@@ -174,7 +174,7 @@ vettalon scan . --profile deep
 vettalon scan . --profile deep --rank jev
 ```
 
-- **Only `--rank jev` goes online**; without this flag, scan stays zero-network.
+- **Only `--rank jev` enables Jev metadata requests**. Heuristic ranking is local; deep scans using cloud HTTP or subscription CLIs still send source to their configured providers.
 - Before anything is sent, `assert_metadata_only` checks the payload against the source code file by file, and fails closed if any code content would leak.
 - When Jev is unavailable (offline, timeout, error response), it falls back to the heuristic with a one-line notice and the scan isn't interrupted.
 - Jev only ranks; it **does not replace** the finders or verifiers.
@@ -187,7 +187,9 @@ api_key_env = "TYPESAFE_API_KEY"                            # option 1: name of 
 ```
 Resolution order: the environment variable wins if it has a value, otherwise the key file is read. The key exists only for the duration of the call; it is never written to disk, to the report or to logs.
 
-**For end customers**: Jev is off by default, and customers decide for themselves whether to turn it on. Every time `--rank jev` is used, the CLI prints a line saying it is sending metadata to <host>. Customers use **their own TypeSafe key** (BYOK), and billing and data processing are between the customer and TypeSafe. File paths alone can reveal internal project names; if nothing at all should leave the machine, use the heuristic ranker (the default). TypeSafe's data retention period depends on its terms (no fixed number of days on non-enterprise plans; zero data retention (ZDR) is available on enterprise plans only).
+**For end customers**: Jev is off by default, and customers decide for themselves whether to turn it on. Every time `--rank jev` is used, the CLI prints a line saying it is sending metadata to <host>. Customers use **their own TypeSafe key** (BYOK), and billing and data processing are between the customer and TypeSafe. File paths alone can reveal internal project names; to avoid Jev traffic, use the heuristic ranker (the default). To keep the entire scan offline, configure all model roles locally, preload scanners/rules/DB/images and deny external egress. TypeSafe's data retention period depends on its terms (no fixed number of days on non-enterprise plans; zero data retention (ZDR) is available on enterprise plans only).
+
+See [data flow and offline prerequisites](docs/DATA-FLOW.md), [release verification](docs/TRUST.md), and [trust tools](scripts/trust/README.md).
 
 ### Model configuration
 
@@ -226,6 +228,7 @@ The code under review is untrusted data and may hide instructions written for th
 
 - Every CLI call runs in a fresh, empty temporary directory, and only allowlisted environment variables are passed through, such as `HOME`, `PATH` and the variables that CLI needs for authentication.
 - Any path a model mentions is canonicalized first and read only if it is still inside the repo; symlinks pointing outside the repo are not read.
+- Deep mode never sends secret-bearing files to a model: `.env` and `.env.*`, private keys and certificates (`*.pem`, `*.key`, `id_rsa`, ...), credential and state files (`.npmrc`, `.netrc`, `credentials.json`, `*.tfvars`, `terraform.tfstate`, ...), including through a symlink. gitleaks still scans them locally. The list follows common conventions and is not a guarantee: every other file in an audited module is sent as it is, so a secret hard-coded in source code goes with it.
 - Before reports and SARIF are written, secrets are masked in every free-text field, and the files have 0600 permissions from the moment they are created. SARIF contains no local absolute paths.
 - Before the audit, the code is scanned for hidden instructions aimed at the model (see item 6 of "How it works"), so an injection telling the model to report the code as clean can't slip through unnoticed.
 
@@ -306,6 +309,12 @@ This repo is the open-source core of Vettalon. Everything listed above (scanning
 There is also a paid Vettalon Pro. It provides a desktop app, a local dashboard (set a time budget, cancel a scan at any time, plus a "Supply chain" tab for viewing hunt results and generating upstream disclosure drafts), and an enterprise report generator that follows the conventions of Taiwanese security assessment reports (PDF/Word/HTML). Pro reads the same `scan --report` JSON, and the core does not depend on Pro.
 
 Pro needs a license key; see the [website](https://vettalon.dudustudio.monster/#editions). The open-source core needs no license and never checks for one.
+
+## Coverage and proof records (next-release preview)
+
+See [coverage and proof contracts](docs/COVERAGE.md) and [public synthetic fixtures](fixtures/coverage/README.md). `vettalon evidence attach` checks local artifact hashes and preserves operator-supplied run/pair/control records; it executes nothing and never changes a finding to confirmed. Missing historical proof remains unknown. Existing sandbox PoCs are standalone pattern demonstrations.
+
+[Experimental tools (preview)](docs/EXPERIMENTAL-TOOLS.md): self-built fixtures, bounded offline prototypes, source data and limitations; no measured model advantage.
 
 ## License
 

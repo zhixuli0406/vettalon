@@ -41,6 +41,15 @@ const SKIP_DIR_NAMES: &[&str] = &[
     ".terraform",
 ];
 
+/// Files the operating system drops into folders (Finder, Explorer). Never
+/// project content, usually binary, and usually gitignored. Matched by exact
+/// basename; macOS AppleDouble files (`._name`) are matched by prefix.
+const SKIP_FILE_NAMES: &[&str] = &[".DS_Store", "Thumbs.db", "ehthumbs.db", "desktop.ini"];
+
+fn is_os_metadata_file(name: &str) -> bool {
+    SKIP_FILE_NAMES.contains(&name) || name.starts_with("._")
+}
+
 /// Safety valve against pathological trees (not a normal-repo limit — a
 /// healthy repo is nowhere near this).
 const MAX_WALK_FILES: usize = 200_000;
@@ -53,6 +62,7 @@ const MAX_WALK_DEPTH: usize = 16;
 /// can be unit-tested with literal fixture data.
 ///
 /// Also skipped, so audit slots go to the project's own code:
+/// - operating-system metadata files ([`SKIP_FILE_NAMES`], `._*`);
 /// - nested independent clones (a subdirectory whose `.git` is a directory —
 ///   another project checked out inside this one; a submodule's `.git` is a
 ///   file and is kept, it is part of the product);
@@ -163,6 +173,7 @@ fn walk_dir(
             }
             walk_dir(root, &path, depth + 1, ignored, out);
         } else if file_type.is_file()
+            && !is_os_metadata_file(&entry.file_name().to_string_lossy())
             && let Ok(rel) = path.strip_prefix(root)
         {
             out.push(rel.to_string_lossy().replace('\\', "/"));
@@ -480,6 +491,20 @@ mod tests {
     use super::*;
 
     // ── walk_repo_files ──────────────────────────────────────────────
+
+    #[test]
+    fn walk_skips_os_metadata_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "print(1)").unwrap();
+        for junk in [".DS_Store", "src/._app.py", "Thumbs.db", "src/desktop.ini"] {
+            std::fs::write(root.join(junk), [0u8, 1, 2, 3]).unwrap();
+        }
+        let mut files = walk_repo_files(root);
+        files.sort();
+        assert_eq!(files, vec!["src/app.py".to_string()]);
+    }
 
     #[test]
     fn walk_skips_nested_clones_and_root_gitignored_dirs_but_keeps_submodules() {

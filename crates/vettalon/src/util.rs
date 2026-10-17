@@ -156,10 +156,75 @@ pub fn resolve_in_repo(repo_root: &Path, path: &str) -> Result<std::path::PathBu
     Ok(real)
 }
 
-/// Read a repo file through [`resolve_in_repo`].
+/// Read a repo file through [`resolve_in_repo`]. No secret-file check: for
+/// text that goes into a model prompt, or a path a model named, resolve with
+/// [`resolve_for_model`] instead.
 pub fn read_repo_file(repo_root: &Path, path: &str) -> Result<String, String> {
     let real = resolve_in_repo(repo_root, path)?;
     std::fs::read_to_string(real).map_err(|e| format!("could not read {path:?}: {e}"))
+}
+
+/// Files whose job is to hold secrets: dotenv files, private keys and
+/// certificates, credential and state files of common tools. Their text must
+/// never reach a model (a cloud one would take it off the machine); gitleaks
+/// still scans them locally. `name` is a basename. The list covers common
+/// conventions, it is not a guarantee: a secret hard-coded in source code is
+/// sent with that source.
+pub fn is_secret_file(name: &str) -> bool {
+    const SECRET_NAMES: &[&str] = &[
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".git-credentials",
+        ".htpasswd",
+        ".dockercfg",
+        "credentials",
+        "credentials.json",
+        "secrets.yaml",
+        "secrets.yml",
+        "terraform.tfstate",
+        "terraform.tfstate.backup",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_ecdsa_sk",
+        "id_ed25519_sk",
+    ];
+    const SECRET_EXT: &[&str] = &[
+        "pem", "key", "p12", "pfx", "jks", "keystore", "p8", "ppk", "tfvars", "tfstate",
+    ];
+    let lower = name.to_ascii_lowercase();
+    if lower == ".env"
+        || lower.starts_with(".env.")
+        || SECRET_NAMES.contains(&lower.as_str())
+        || (lower.starts_with("service-account") && lower.ends_with(".json"))
+    {
+        return true;
+    }
+    lower
+        .rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && SECRET_EXT.contains(&ext))
+}
+
+/// Why a resolved repo file must not be shown to a model, if it must not:
+/// either the name the model gave or the real file it resolves to (a symlink
+/// such as `app.conf -> .env`) is a secret file.
+pub fn secret_file_reason(path: &str, real: &Path) -> Option<String> {
+    let given = path.rsplit('/').next().unwrap_or(path);
+    let target = real.file_name().map(|n| n.to_string_lossy().into_owned());
+    (is_secret_file(given) || target.as_deref().is_some_and(is_secret_file))
+        .then(|| format!("{path:?} holds secrets and is never sent to a model"))
+}
+
+/// [`resolve_in_repo`] for a path whose text is about to go into a model
+/// prompt: also refuses secret files ([`secret_file_reason`]).
+pub fn resolve_for_model(repo_root: &Path, path: &str) -> Result<std::path::PathBuf, String> {
+    let real = resolve_in_repo(repo_root, path)?;
+    match secret_file_reason(path, &real) {
+        Some(reason) => Err(reason),
+        None => Ok(real),
+    }
 }
 
 /// Write `contents` to a file created owner-only (0600) from the start, so
@@ -333,6 +398,43 @@ pub fn mask_sensitive_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secret_files_cover_cloud_and_infra_credentials() {
+        for s in [
+            ".env",
+            ".env.local",
+            "terraform.tfvars",
+            "prod.auto.tfvars",
+            "terraform.tfstate",
+            "terraform.tfstate.backup",
+            "AuthKey_ABC.p8",
+            "deploy.ppk",
+            "credentials.json",
+            "service-account-prod.json",
+            ".htpasswd",
+            ".dockercfg",
+            "secrets.yaml",
+            "secrets.yml",
+            "credentials",
+            "id_ed25519_sk",
+            "server.pem",
+            ".npmrc",
+        ] {
+            assert!(super::is_secret_file(s), "{s}");
+        }
+        for ok in [
+            "main.tf",
+            "variables.tf",
+            "package.json",
+            "secrets.py",
+            "credentials.rs",
+            "id.rs",
+            "key.go",
+        ] {
+            assert!(!super::is_secret_file(ok), "{ok}");
+        }
+    }
+
     use super::*;
 
     #[test]

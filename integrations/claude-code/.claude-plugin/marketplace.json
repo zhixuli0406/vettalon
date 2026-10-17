@@ -1,0 +1,14 @@
+{
+  "name": "vettalon-local",
+  "owner": {
+    "name": "Dudu Technology Ltd."
+  },
+  "plugins": [
+    {
+      "name": "vettalon",
+      "source": "./plugins/vettalon",
+      "description": "Bounded, explicit Vettalon CLI scans and local SARIF reports (preview)."
+    }
+  ],
+  "description": "Local preview of explicit, bounded Vettalon CLI integration."
+}

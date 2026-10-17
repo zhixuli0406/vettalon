@@ -120,7 +120,15 @@ pub fn url_host(url: &str) -> Option<String> {
 }
 
 pub fn host_allowed(url: &str) -> bool {
-    url_host(url).is_some_and(|h| ALLOWED_HOSTS.contains(&h.as_str()))
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url
+                .host_str()
+                .is_some_and(|host| ALLOWED_HOSTS.contains(&host))
+    })
 }
 
 // ── safe extraction (pure over bytes) ────────────────────────────────────
@@ -246,6 +254,37 @@ pub trait SourceFetcher: Send + Sync {
 /// refused by the client's redirect policy.
 pub struct HttpSourceFetcher {
     http: reqwest::Client,
+    max_download_bytes: u64,
+    #[cfg(test)]
+    observer: Option<ArchiveObserver>,
+}
+
+#[cfg(test)]
+pub(super) type ArchiveObserver =
+    std::sync::Arc<dyn Fn(&str, &str, &[u8]) -> Result<(), String> + Send + Sync>;
+
+const MAX_REGISTRY_REDIRECTS: usize = 3;
+
+fn fetch_redirect_allowed(url: &reqwest::Url, previous: usize) -> bool {
+    previous <= MAX_REGISTRY_REDIRECTS && host_allowed(url.as_str())
+}
+
+pub(super) fn fetch_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if fetch_redirect_allowed(attempt.url(), attempt.previous().len()) {
+            attempt.follow()
+        } else {
+            attempt.error("registry redirect outside HTTPS allowlist/port or hop limit")
+        }
+    })
+}
+
+pub(super) fn fetch_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(fetch_redirect_policy())
+        .timeout(std::time::Duration::from_secs(30))
+        .retry(reqwest::retry::never())
 }
 
 impl Default for HttpSourceFetcher {
@@ -256,15 +295,28 @@ impl Default for HttpSourceFetcher {
 
 impl HttpSourceFetcher {
     pub fn new() -> Self {
-        let policy = reqwest::redirect::Policy::custom(|attempt| match attempt.url().host_str() {
-            Some(h) if ALLOWED_HOSTS.contains(&h) => attempt.follow(),
-            _ => attempt.stop(),
-        });
-        let http = reqwest::Client::builder()
-            .redirect(policy)
+        let http = fetch_client_builder()
             .build()
-            .unwrap_or_default();
-        HttpSourceFetcher { http }
+            .expect("static registry HTTP client configuration");
+        HttpSourceFetcher {
+            http,
+            max_download_bytes: MAX_DOWNLOAD_BYTES,
+            #[cfg(test)]
+            observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_transport_test(
+        http: reqwest::Client,
+        max_download_bytes: u64,
+        observer: Option<ArchiveObserver>,
+    ) -> Self {
+        Self {
+            http,
+            max_download_bytes,
+            observer,
+        }
     }
 
     async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -280,6 +332,8 @@ impl HttpSourceFetcher {
         if !resp.status().is_success() {
             return Err(format!("fetch {url} returned {}", resp.status()));
         }
+        #[cfg(test)]
+        let final_url = resp.url().to_string();
         // Stream with a hard cap so a huge body cannot exhaust memory.
         let mut resp = resp;
         let mut buf: Vec<u8> = Vec::new();
@@ -289,9 +343,13 @@ impl HttpSourceFetcher {
             .map_err(|e| format!("read failed: {e}"))?
         {
             buf.extend_from_slice(&chunk);
-            if buf.len() as u64 > MAX_DOWNLOAD_BYTES {
+            if buf.len() as u64 > self.max_download_bytes {
                 return Err("download exceeds the size cap".into());
             }
+        }
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer(url, &final_url, &buf)?;
         }
         Ok(buf)
     }
@@ -377,6 +435,37 @@ mod tests {
             url_host("https://crates.io:443/x"),
             Some("crates.io".into())
         );
+    }
+
+    #[test]
+    fn registry_transport_rejects_downgrade_ports_and_redirect_escape() {
+        for url in [
+            "https://crates.io/x",
+            "https://static.crates.io:443/x",
+            "https://registry.npmjs.org/x",
+        ] {
+            assert!(host_allowed(url), "{url}");
+            assert!(fetch_redirect_allowed(
+                &reqwest::Url::parse(url).unwrap(),
+                1
+            ));
+        }
+        for url in [
+            "http://crates.io/x",
+            "https://crates.io:444/x",
+            "https://evil.invalid/x",
+            "https://user@crates.io/x",
+        ] {
+            assert!(!host_allowed(url), "{url}");
+            assert!(!fetch_redirect_allowed(
+                &reqwest::Url::parse(url).unwrap(),
+                1
+            ));
+        }
+        assert!(!fetch_redirect_allowed(
+            &reqwest::Url::parse("https://static.crates.io/x").unwrap(),
+            4
+        ));
     }
 
     #[test]

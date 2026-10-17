@@ -21,21 +21,21 @@ pub const ENGINE_NAME: &str = "cargo-audit";
 #[derive(Debug, Deserialize)]
 struct CargoAuditReport {
     #[serde(default)]
-    vulnerabilities: Option<VulnerabilitiesBlock>,
+    error: Option<serde_json::Value>,
+    vulnerabilities: VulnerabilitiesBlock,
 }
 
 #[derive(Debug, Deserialize)]
 struct VulnerabilitiesBlock {
-    #[serde(default)]
+    found: bool,
+    count: usize,
     list: Vec<VulnEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 struct VulnEntry {
-    #[serde(default)]
-    advisory: Option<Advisory>,
-    #[serde(default)]
-    package: Option<Package>,
+    advisory: Advisory,
+    package: Package,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,30 +89,36 @@ fn map_severity(advisory: &Advisory) -> Severity {
 }
 
 /// Parse `cargo audit --json` output. Malformed top-level JSON is an `Err`;
-/// an absent `vulnerabilities` block (schema drift, or a `cargo audit`
-/// version that shapes things differently) degrades to zero findings rather
-/// than failing the whole parse.
+/// missing/inconsistent vulnerability fields are errors, never a clean scan.
 pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Err("cargo-audit returned empty stdout".to_string());
     }
     let report: CargoAuditReport =
         serde_json::from_str(trimmed).map_err(|e| format!("cargo-audit JSON parse failed: {e}"))?;
 
-    let list = match report.vulnerabilities {
-        Some(v) => v.list,
-        None => Vec::new(),
-    };
+    if report.error.is_some() {
+        return Err("cargo-audit reported an execution error".to_string());
+    }
+    let block = report.vulnerabilities;
+    if block.count != block.list.len() || block.found != !block.list.is_empty() {
+        return Err("cargo-audit vulnerabilities found/count/list disagree".to_string());
+    }
+    if block.list.iter().any(|entry| {
+        entry.advisory.id.trim().is_empty()
+            || entry.package.name.trim().is_empty()
+            || entry.package.version.trim().is_empty()
+    }) {
+        return Err("cargo-audit vulnerability entry lacks advisory/package identity".to_string());
+    }
+    let list = block.list;
 
     Ok(list
         .into_iter()
-        .filter_map(|entry| {
-            let advisory = entry.advisory?;
-            let package = entry.package.unwrap_or(Package {
-                name: String::new(),
-                version: String::new(),
-            });
+        .map(|entry| {
+            let advisory = entry.advisory;
+            let package = entry.package;
             let severity = map_severity(&advisory);
             let title = if advisory.title.is_empty() {
                 format!("{} (unscored advisory)", advisory.id)
@@ -168,7 +174,7 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
             );
             f.cve = cve;
             f.cvss = cvss;
-            Some(f)
+            f
         })
         .collect())
 }
@@ -279,14 +285,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_vulnerabilities_block_degrades_to_zero_findings() {
+    fn missing_vulnerabilities_block_is_an_error() {
         let raw = r#"{"database": {}}"#;
-        assert!(parse(raw).unwrap().is_empty());
+        assert!(parse(raw).is_err());
     }
 
     #[test]
-    fn empty_stdout_is_zero_findings_not_error() {
-        assert!(parse("").unwrap().is_empty());
+    fn empty_stdout_is_an_error() {
+        assert!(parse("").is_err());
     }
 
     #[test]
@@ -295,8 +301,21 @@ mod tests {
     }
 
     #[test]
-    fn entry_without_advisory_is_skipped_not_panicking() {
+    fn entry_without_advisory_is_an_error() {
         let raw = r#"{"vulnerabilities": {"found": true, "count": 1, "list": [{"package": {"name": "x", "version": "1"}}]}}"#;
-        assert!(parse(raw).unwrap().is_empty());
+        assert!(parse(raw).is_err());
+    }
+
+    #[test]
+    fn error_json_and_incomplete_or_inconsistent_blocks_are_not_clean() {
+        for raw in [
+            r#"{"error":"database unavailable"}"#,
+            r#"{"vulnerabilities":{}}"#,
+            r#"{"vulnerabilities":{"list":[]}}"#,
+            r#"{"vulnerabilities":{"found":true,"count":0,"list":[]}}"#,
+            r#"{"vulnerabilities":{"found":false,"count":1,"list":[]}}"#,
+        ] {
+            assert!(parse(raw).is_err(), "{raw}");
+        }
     }
 }

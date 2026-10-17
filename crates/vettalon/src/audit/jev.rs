@@ -6,11 +6,12 @@
 //! dispatch order so a high-value file lands inside the `--max-modules`
 //! budget. The benchmark that justified this lives in `benchmarks/ranking/`.
 //!
-//! Safety: this is the only place a scan can send anything to a cloud API,
-//! and only when the operator passed `--rank jev`. Before every request,
-//! [`assert_metadata_only`] fails closed if any payload field could carry
-//! source text, so "code never leaves the machine" holds. On any error the
-//! caller keeps the heuristic order (see [`rerank`] returning `Err`).
+//! Safety: this ranker sends metadata only when the operator passes `--rank jev`.
+//! Before every ranking request, [`assert_metadata_only`] fails closed on
+//! source-like payload fields. This boundary does not cover model providers:
+//! deep finder/verifier/PoC prompts can send source to configured HTTP or CLI
+//! providers. On ranking error the caller keeps the heuristic order
+//! (see [`rerank`] returning `Err`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -208,6 +209,38 @@ pub async fn rerank(
     ranked: Vec<ModuleTarget>,
     cfg: &JevSettings,
 ) -> Result<Vec<ModuleTarget>, String> {
+    let http = client_builder(cfg.base_url())?
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    rerank_with_client(repo_root, profile, ranked, cfg, &http).await
+}
+
+/// Client policy is shared with local tests; production never adds test CAs.
+fn client_builder(base: &str) -> Result<reqwest::ClientBuilder, String> {
+    if !base.starts_with("https://") {
+        return Err(format!("Jev base_url must be https://: {base}"));
+    }
+    // Pin the client to the configured host; refuse any redirect off it.
+    let host = host_of(base).ok_or_else(|| format!("bad Jev base_url: {base}"))?;
+    let host_for_policy = host.clone();
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(move |a| {
+            match a.url().host_str() {
+                Some(h) if h == host_for_policy => a.follow(),
+                _ => a.stop(),
+            }
+        }))
+        .timeout(std::time::Duration::from_secs(30)))
+}
+
+/// Private transport seam; only in-module tests inject a CA-restricted client.
+async fn rerank_with_client(
+    repo_root: &Path,
+    profile: &RepoProfile,
+    ranked: Vec<ModuleTarget>,
+    cfg: &JevSettings,
+    http: &reqwest::Client,
+) -> Result<Vec<ModuleTarget>, String> {
     let key = cfg.resolve_key()?;
     let base = cfg.base_url();
     if !base.starts_with("https://") {
@@ -219,20 +252,6 @@ pub async fn rerank(
         return Ok(ranked);
     }
     let paths: Vec<String> = rows.iter().map(|r| r.path.clone()).collect();
-
-    // Pin the client to the configured host; refuse any redirect off it.
-    let host = host_of(base).ok_or_else(|| format!("bad Jev base_url: {base}"))?;
-    let host_for_policy = host.clone();
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(move |a| {
-            match a.url().host_str() {
-                Some(h) if h == host_for_policy => a.follow(),
-                _ => a.stop(),
-            }
-        }))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
 
     let mut scores: HashMap<String, f64> = HashMap::new();
     for body in request_bodies(profile, &rows, cfg.model()) {
@@ -410,3 +429,7 @@ mod tests {
         assert_eq!(host_of("http://api.typesafe.ai"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "jev_transport_tests.rs"]
+mod transport_tests;

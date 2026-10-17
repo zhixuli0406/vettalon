@@ -6,10 +6,10 @@
 //! unit-tested offline; the live HTTP path is an `#[ignore]`d test (run with
 //! `--ignored`), matching the sandbox live-test convention.
 //!
-//! Network boundary: this is
-//! the hunt-mode egress exception. The client talks ONLY to `api.osv.dev`; the
-//! project's own code never leaves the machine — only the public `name@version`
-//! coordinate is sent.
+//! Network boundary of this lookup client: only dependency `name@version`
+//! coordinates are sent to `api.osv.dev`. Other hunt stages fetch registry
+//! archives and send dependency source/context to configured model providers;
+//! this lookup policy is not a global egress allowlist.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -115,7 +115,7 @@ pub trait OsvClient: Send + Sync {
     ) -> Result<Vec<Vec<KnownVuln>>, String> {
         let mut out = Vec::with_capacity(targets.len());
         for t in targets {
-            out.push(self.known_vulns(t).await.unwrap_or_default());
+            out.push(self.known_vulns(t).await?);
         }
         Ok(out)
     }
@@ -127,6 +127,35 @@ pub struct HttpOsvClient {
     http: reqwest::Client,
 }
 
+const MAX_OSV_REDIRECTS: usize = 3;
+
+fn osv_redirect_allowed(url: &reqwest::Url, previous: usize) -> bool {
+    previous <= MAX_OSV_REDIRECTS
+        && url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.host_str() == Some("api.osv.dev")
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+pub(super) fn osv_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if osv_redirect_allowed(attempt.url(), attempt.previous().len()) {
+            attempt.follow()
+        } else {
+            attempt.error("OSV redirect outside HTTPS origin/port or hop limit")
+        }
+    })
+}
+
+pub(super) fn osv_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(osv_redirect_policy())
+        .timeout(std::time::Duration::from_secs(30))
+        .retry(reqwest::retry::never())
+}
+
 impl Default for HttpOsvClient {
     fn default() -> Self {
         Self::new()
@@ -134,10 +163,20 @@ impl Default for HttpOsvClient {
 }
 
 impl HttpOsvClient {
+    #[cfg(test)]
+    pub(super) fn for_transport_test(http: reqwest::Client) -> Self {
+        Self {
+            base: OSV_API_BASE.to_string(),
+            http,
+        }
+    }
+
     pub fn new() -> Self {
         HttpOsvClient {
             base: OSV_API_BASE.to_string(),
-            http: reqwest::Client::new(),
+            http: osv_client_builder()
+                .build()
+                .expect("static OSV HTTP client configuration"),
         }
     }
 }
@@ -174,9 +213,8 @@ impl OsvClient for HttpOsvClient {
         &self,
         targets: &[DependencyTarget],
     ) -> Result<Vec<Vec<KnownVuln>>, String> {
-        // OSV caps batch size; chunk well under it. A failed chunk degrades to
-        // empties for that chunk (honest: never silently hide a dependency),
-        // so one bad request does not sink the whole classification.
+        // OSV caps batch size. A failed or malformed chunk fails the batch;
+        // scan_known keeps every dependency with explicit failed query evidence.
         const CHUNK: usize = 256;
         let mut out: Vec<Vec<KnownVuln>> = Vec::with_capacity(targets.len());
         for chunk in targets.chunks(CHUNK) {
@@ -209,75 +247,93 @@ impl OsvClient for HttpOsvClient {
                 parse_osv_batch_response(&text)
             }
             .await;
-            match parsed {
-                Ok(mut rows) if rows.len() == chunk.len() => out.append(&mut rows),
-                Ok(_) => {
-                    eprintln!(
-                        "[vettalon] {}",
-                        crate::lang::pick(
-                            "OSV 批次回應筆數不符，該批視為查無",
-                            "OSV batch reply has the wrong row count; treating the batch as no known vulnerabilities",
-                        )
-                    );
-                    out.extend(chunk.iter().map(|_| Vec::new()));
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[vettalon] {}",
-                        crate::tr!(
-                            "OSV 批次查詢失敗（該批視為查無）：{e}",
-                            "OSV batch query failed (treating the batch as no known vulnerabilities): {e}"
-                        )
-                    );
-                    out.extend(chunk.iter().map(|_| Vec::new()));
-                }
+            let mut rows = parsed?;
+            if rows.len() != chunk.len() {
+                return Err("OSV batch reply has the wrong row count".into());
             }
+            out.append(&mut rows);
         }
         Ok(out)
     }
 }
 
-/// A dependency paired with its known advisories (empty = clean per OSV).
+/// Result of the advisory query, independent of the code audit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OsvStatus {
+    #[default]
+    Unknown,
+    Matched,
+    Unmatched,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsvEvidence {
+    pub status: OsvStatus,
+    pub error: Option<String>,
+    /// Elapsed batch classification time, shared by its dependency rows.
+    pub duration_ms: u64,
+}
+
+/// A dependency paired with its advisory-query evidence. An empty advisory
+/// array is not evidence of a successful query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyAdvisories {
     pub target: DependencyTarget,
     pub known: Vec<KnownVuln>,
+    #[serde(default)]
+    pub osv: OsvEvidence,
 }
 
 impl DependencyAdvisories {
-    /// No OSV advisory for this version: a finding here is a novelty candidate.
+    /// Compatibility name: true only for a successful query with no matches.
+    /// It is not a claim that the dependency is safe or the finding is novel.
     pub fn is_clean(&self) -> bool {
-        self.known.is_empty()
+        self.osv.status == OsvStatus::Unmatched && self.known.is_empty()
     }
 }
 
-/// Look up known advisories for every target. A per-target failure is recorded
-/// as `known: []` with the error on stderr (honest degradation: a transient
-/// OSV failure must not silently hide a dependency), so the caller still gets a
-/// row for every target. Sequential by design — OSV rate-limits and a hunt's
-/// target list is already capped.
+/// Keep every target on a failed or malformed batch. Do not retry queries or
+/// turn unknown advisory state into a novelty candidate.
 pub async fn scan_known<C: OsvClient>(
     targets: &[DependencyTarget],
     client: &C,
 ) -> Vec<DependencyAdvisories> {
-    // One batch request where the client supports it; a whole-batch failure
-    // degrades every row to "none known" rather than dropping dependencies.
-    let batch = client.known_vulns_batch(targets).await.unwrap_or_else(|e| {
-        eprintln!(
-            "[vettalon] {}",
-            crate::tr!(
-                "OSV 批次查詢失敗，全部視為查無：{e}",
-                "OSV batch query failed; treating everything as no known vulnerabilities: {e}"
-            )
-        );
-        Vec::new()
-    });
+    let started = std::time::Instant::now();
+    let batch = match client.known_vulns_batch(targets).await {
+        Ok(rows) if rows.len() == targets.len() => Ok(rows),
+        Ok(_) => Err("OSV batch reply has the wrong row count".to_string()),
+        Err(error) => Err(crate::util::mask_sensitive_text(
+            crate::util::truncate_bytes(&error, 300),
+        )),
+    };
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     targets
         .iter()
         .enumerate()
-        .map(|(i, t)| DependencyAdvisories {
-            target: t.clone(),
-            known: batch.get(i).cloned().unwrap_or_default(),
+        .map(|(i, target)| {
+            let (known, status, error) = match &batch {
+                Ok(rows) => {
+                    let known = rows[i].clone();
+                    let status = if known.is_empty() {
+                        OsvStatus::Unmatched
+                    } else {
+                        OsvStatus::Matched
+                    };
+                    (known, status, None)
+                }
+                Err(error) => (Vec::new(), OsvStatus::Failed, Some(error.clone())),
+            };
+            DependencyAdvisories {
+                target: target.clone(),
+                known,
+                osv: OsvEvidence {
+                    status,
+                    error,
+                    duration_ms,
+                },
+            }
         })
         .collect()
 }
@@ -374,11 +430,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_known_degrades_a_failed_lookup_to_empty_not_dropped() {
+    async fn scan_known_keeps_failed_lookup_unknown_not_unmatched() {
         let targets = vec![target("a", "1.0.0")];
         let rows = scan_known(&targets, &FailingClient).await;
         assert_eq!(rows.len(), 1, "a failed lookup still yields a row");
-        assert!(rows[0].is_clean());
+        assert!(
+            !rows[0].is_clean(),
+            "failed OSV query must not be classified as unmatched"
+        );
+    }
+
+    struct WrongCountClient;
+    #[async_trait]
+    impl OsvClient for WrongCountClient {
+        async fn known_vulns(&self, _: &DependencyTarget) -> Result<Vec<KnownVuln>, String> {
+            panic!("batch only")
+        }
+        async fn known_vulns_batch(
+            &self,
+            _: &[DependencyTarget],
+        ) -> Result<Vec<Vec<KnownVuln>>, String> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_batch_count_is_failed_not_an_unmatched_default() {
+        let rows = scan_known(&[target("a", "1")], &WrongCountClient).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].osv.status, OsvStatus::Failed);
+        assert!(!rows[0].is_clean());
+        assert!(rows[0].osv.error.as_deref().unwrap().contains("row count"));
+    }
+
+    #[test]
+    fn legacy_advisory_row_stays_unknown() {
+        let row: DependencyAdvisories = serde_json::from_str(
+            r#"{"target":{"ecosystem":"npm","name":"x","version":"1","direct":true},"known":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(row.osv.status, OsvStatus::Unknown);
+        assert!(!row.is_clean());
+    }
+
+    #[test]
+    fn osv_transport_redirects_stay_on_https_standard_origin_and_are_bounded() {
+        assert!(osv_redirect_allowed(
+            &reqwest::Url::parse("https://api.osv.dev/v1/final").unwrap(),
+            1
+        ));
+        assert!(osv_redirect_allowed(
+            &reqwest::Url::parse("https://api.osv.dev:443/v1/final").unwrap(),
+            3
+        ));
+        for url in [
+            "http://api.osv.dev/x",
+            "https://api.osv.dev:444/x",
+            "https://evil.invalid/x",
+            "https://user@api.osv.dev/x",
+        ] {
+            assert!(
+                !osv_redirect_allowed(&reqwest::Url::parse(url).unwrap(), 1),
+                "{url}"
+            );
+        }
+        assert!(!osv_redirect_allowed(
+            &reqwest::Url::parse("https://api.osv.dev/x").unwrap(),
+            4
+        ));
     }
 
     /// Live OSV check. Ignored by default (needs the network); run with

@@ -73,8 +73,9 @@ timeout_secs = 1200
 # ── Metadata-only module ranker (optional) ─────────────────────────
 # TypeSafe Jev reorders which modules a deep scan audits first, using ONLY
 # metadata (paths, byte sizes, entry-point flag, git touch counts) — never
-# file contents. Opt in per scan with `scan --rank jev`; without that flag a
-# scan stays zero-network and uses the built-in heuristic ranker. If Jev is
+# file contents. Opt in per scan with `scan --profile deep --rank jev`.
+# Without it only the ranker is offline; cloud models/CLIs still receive code.
+# Fully offline scans need local providers, cached tools/DB/images and egress denial. If Jev is
 # unreachable the scan falls back to the heuristic order. The key is never
 # written here — give an env var name (preferred) or a 0600 key file.
 # [jev]

@@ -93,11 +93,28 @@ struct ScanArgs {
     /// instead of grinding on. Unset = no budget.
     #[arg(long)]
     time_budget: Option<u64>,
-    /// Module ranker for the deep audit: `heuristic` (default, zero-network)
+    /// Module ranker for the deep audit: `heuristic` (default, local ranking)
     /// or `jev` (TypeSafe Jev, metadata-only; requires a `[jev]` config
-    /// block). `jev` is the only way a scan reaches the network.
+    /// block). Cloud models and scanner database updates may also use the network.
     #[arg(long, default_value = "heuristic")]
     rank: String,
+}
+
+#[derive(Subcommand)]
+enum EvidenceAction {
+    /// Check local artifact hashes and attach operator-supplied evidence to a new report.
+    Attach {
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(long)]
+        finding: String,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        artifact_root: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 // Parsed once at startup; boxing the big variant buys nothing.
@@ -108,6 +125,11 @@ enum Command {
     Scan(ScanArgs),
     /// Validate a saved JSON report.
     Validate { report: PathBuf },
+    /// Attach local proof artifact references; no commands run and no verdict changes.
+    Evidence {
+        #[command(subcommand)]
+        action: EvidenceAction,
+    },
     /// Show the model roster; --probe sends each model a one-line check.
     Models {
         #[arg(long)]
@@ -624,8 +646,8 @@ fn cmd_disclose(
     eprintln!(
         "{}\n",
         vettalon::tr!(
-            "建議公開日期：{}",
-            "Suggested disclosure date: {}",
+            "建議協調檢查日期：{}；公開另須核准",
+            "Suggested coordination checkpoint: {}; publication requires separate approval",
             pkg.draft.disclose_by
         )
     );
@@ -792,9 +814,16 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
                     })
                     .count();
                 if novel > 0 {
-                    vettalon::tr!("新漏洞候選 {novel}", "{novel} novelty candidate(s)")
+                    vettalon::tr!(
+                        "待人工候選 {novel}（OSV 狀態另列）",
+                        "{novel} candidates for human review (see OSV status separately)"
+                    )
                 } else {
-                    vettalon::lang::pick("未發現", "nothing found").to_string()
+                    vettalon::lang::pick(
+                        "已審範圍未提出候選（OSV 狀態另列）",
+                        "no candidates in reviewed scope (see OSV status separately)",
+                    )
+                    .to_string()
                 }
             };
             // The index is the plan position; with parallel audits they finish
@@ -835,26 +864,38 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
                             "[vettalon] {}",
                             vettalon::tr!("報告已寫入 {}", "report written: {}", path.display())
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => {
+                            eprintln!(
+                                "[vettalon] {}",
+                                vettalon::tr!(
+                                    "無法寫入報告 {}：{e}",
+                                    "cannot write the report {}: {e}",
+                                    path.display()
+                                )
+                            );
+                            return 2;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!(
                             "[vettalon] {}",
                             vettalon::tr!(
-                                "無法寫入報告 {}：{e}",
-                                "cannot write the report {}: {e}",
-                                path.display()
+                                "報告序列化失敗：{e}",
+                                "cannot serialise the report: {e}"
                             )
-                        ),
-                    },
-                    Err(e) => eprintln!(
-                        "[vettalon] {}",
-                        vettalon::tr!("報告序列化失敗：{e}", "cannot serialise the report: {e}")
-                    ),
+                        );
+                        return 2;
+                    }
                 }
             }
-            if let Some(dir) = &args.disclose_dir {
-                write_disclosure_drafts(
+            if let Some(dir) = &args.disclose_dir
+                && let Err(error) = write_disclosure_drafts(
                     dir,
                     &disclosure_drafts(&report, chrono::Utc::now().date_naive()),
-                );
+                )
+            {
+                eprintln!("[vettalon] {error}");
+                return 2;
             }
             0
         }
@@ -867,7 +908,10 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
 
 /// Write each upstream disclosure draft to `<dir>/<dep>-<finding>.md` with the
 /// pre-send checklist. Drafts only — nothing is sent.
-fn write_disclosure_drafts(dir: &std::path::Path, drafts: &[vettalon::hunt::run::HuntDisclosure]) {
+fn write_disclosure_drafts(
+    dir: &std::path::Path,
+    drafts: &[vettalon::hunt::run::HuntDisclosure],
+) -> Result<usize, String> {
     if drafts.is_empty() {
         eprintln!(
             "[vettalon] {}",
@@ -876,19 +920,15 @@ fn write_disclosure_drafts(dir: &std::path::Path, drafts: &[vettalon::hunt::run:
                 "no novelty candidates to disclose (they must be confirmed or needs_human and unknown to OSV)."
             )
         );
-        return;
+        return Ok(0);
     }
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        eprintln!(
-            "[vettalon] {}",
-            vettalon::tr!(
-                "無法建立草稿目錄 {}：{e}",
-                "cannot create the draft directory {}: {e}",
-                dir.display()
-            )
-        );
-        return;
-    }
+    std::fs::create_dir_all(dir).map_err(|e| {
+        vettalon::tr!(
+            "無法建立草稿目錄 {}：{e}",
+            "cannot create the draft directory {}: {e}",
+            dir.display()
+        )
+    })?;
     let safe = |s: &str| -> String {
         s.chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -903,7 +943,7 @@ fn write_disclosure_drafts(dir: &std::path::Path, drafts: &[vettalon::hunt::run:
             .collect::<Vec<_>>()
             .join("\n");
         let content = format!(
-            "# {}\n\n> 上游負責任揭露草稿（{}）。只是草稿，送出前請逐項確認下方清單。\n> 建議公開時程：{}{}\n\n{}\n\n---\n\n## 送出前檢查清單\n\n{checklist}\n",
+            "# {}\n\n> 上游負責任揭露草稿（{}）。只是草稿，送出前請逐項確認下方清單。\n> 建議協調檢查日期：{}；公開另須核准{}\n\n{}\n\n---\n\n## 送出前檢查清單\n\n{checklist}\n",
             d.draft.subject,
             d.dependency,
             d.draft.disclose_by,
@@ -917,14 +957,13 @@ fn write_disclosure_drafts(dir: &std::path::Path, drafts: &[vettalon::hunt::run:
         let path = dir.join(&name);
         match vettalon::util::write_private(&path, content.as_bytes()) {
             Ok(()) => written += 1,
-            Err(e) => eprintln!(
-                "[vettalon] {}",
-                vettalon::tr!(
-                    "無法寫入草稿 {}：{e}",
-                    "cannot write the draft {}: {e}",
+            Err(e) => {
+                return Err(vettalon::tr!(
+                    "無法寫入草稿 {}：{e}（已保留 {written} 份成功草稿）",
+                    "cannot write the draft {}: {e} ({written} completed drafts retained)",
                     path.display()
-                )
-            ),
+                ));
+            }
         }
     }
     eprintln!(
@@ -935,6 +974,7 @@ fn write_disclosure_drafts(dir: &std::path::Path, drafts: &[vettalon::hunt::run:
             dir.display()
         )
     );
+    Ok(written)
 }
 
 #[tokio::main]
@@ -950,6 +990,43 @@ async fn main() -> ExitCode {
     let code = match cli.command {
         Command::Scan(args) => cmd_scan(args).await,
         Command::Validate { report } => audit::cmd_validate(&report).await,
+        Command::Evidence {
+            action:
+                EvidenceAction::Attach {
+                    report,
+                    finding,
+                    manifest,
+                    artifact_root,
+                    output,
+                },
+        } => match audit::attach_proof_evidence(
+            &report,
+            &finding,
+            &manifest,
+            &artifact_root,
+            &output,
+        ) {
+            Ok(()) => {
+                println!(
+                    "Attached operator-supplied artifact references; finding status unchanged: {}",
+                    output.display()
+                );
+                if let Ok(attached) = audit::load_report_for_delivery(&output) {
+                    println!(
+                        "run_status={} incomplete_reason={:?}",
+                        attached.run_status, attached.incomplete_reason
+                    );
+                    if let Some(record) = attached.findings.iter().find(|f| f.id == finding) {
+                        println!("{}", record.proof_summary());
+                    }
+                }
+                0
+            }
+            Err(error) => {
+                eprintln!("proof attachment refused: {error}");
+                2
+            }
+        },
         Command::Disclose {
             report,
             finding,
@@ -976,4 +1053,94 @@ async fn main() -> ExitCode {
         }
     };
     ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+#[cfg(test)]
+mod hunt_intake_cli_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn requested_hunt_report_write_failure_returns_error_for_valid_empty_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let config = dir.path().join("roster.toml");
+        std::fs::write(&config, "model = []\n").unwrap();
+        std::fs::write(
+            project.join("Cargo.lock"),
+            "version=3\n[[package]]\nname='own'\nversion='0.0.0'\n",
+        )
+        .unwrap();
+        let report = dir.path().join("report-is-directory");
+        std::fs::create_dir(&report).unwrap();
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "hunt",
+            project.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Hunt(args) = cli.command else {
+            panic!("hunt parser");
+        };
+        assert_eq!(cmd_hunt(args).await, 2);
+    }
+    fn draft_fixture(id: &str) -> vettalon::hunt::run::HuntDisclosure {
+        vettalon::hunt::run::HuntDisclosure {
+            dependency: "fixture@1.0.0".into(),
+            finding_id: id.into(),
+            finding_title: "synthetic".into(),
+            draft: vettalon::disclose::Draft {
+                channel: vettalon::disclose::Channel::GithubAdvisory,
+                subject: "Synthetic draft".into(),
+                body: "Self-authored test only".into(),
+                submit: None,
+                disclose_by: "2026-12-01".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn written_disclosure_date_is_a_coordination_checkpoint_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            write_disclosure_drafts(dir.path(), &[draft_fixture("one")]).unwrap(),
+            1
+        );
+        let text = std::fs::read_to_string(dir.path().join("fixture_1_0_0-one.md")).unwrap();
+        assert!(text.contains("建議協調檢查日期：2026-12-01"));
+        assert!(text.contains("公開另須核准"));
+        assert!(!text.contains("建議公開時程"));
+    }
+
+    #[test]
+    fn requested_disclosure_mkdir_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("file-not-directory");
+        std::fs::write(&blocked, "preserve").unwrap();
+        assert!(write_disclosure_drafts(&blocked, &[draft_fixture("one")]).is_err());
+        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "preserve");
+    }
+
+    #[test]
+    fn requested_disclosure_write_failure_preserves_already_written_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("fixture_1_0_0-two.md")).unwrap();
+        assert!(
+            write_disclosure_drafts(dir.path(), &[draft_fixture("one"), draft_fixture("two")])
+                .is_err()
+        );
+        assert!(dir.path().join("fixture_1_0_0-one.md").is_file());
+    }
+
+    #[test]
+    fn no_disclosure_candidates_is_success_without_creating_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("not-needed");
+        assert_eq!(write_disclosure_drafts(&output, &[]).unwrap(), 0);
+        assert!(!output.exists());
+    }
 }

@@ -206,6 +206,8 @@ pub enum IncompleteReason {
     /// pending were not audited.
     TimeBudgetExhausted,
     EngineUnavailable,
+    /// Ranked modules or scoped source bytes were excluded by a safety or prompt cap.
+    ScopeNotFullyReviewed,
     Interrupted,
     /// A model refused part of the work; those units were not reviewed.
     ModelRefused,
@@ -227,6 +229,7 @@ impl fmt::Display for IncompleteReason {
                 "the scan time budget ran out before every module was audited"
             }
             Self::EngineUnavailable => "an analysis engine was unavailable",
+            Self::ScopeNotFullyReviewed => "the ranked source scope was not fully reviewed",
             Self::Interrupted => "the run was interrupted",
             Self::ModelRefused => "a model refused part of the work",
             Self::UnitsFailed => "some units got no usable result",

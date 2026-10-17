@@ -1,0 +1,173 @@
+{
+  "schema_version": 2,
+  "repo": "synthetic-coverage-time-budget",
+  "started_at": "2026-10-16T11:08:01.318302+00:00",
+  "profile": {
+    "mode": "deep",
+    "intake": {
+      "language_census": [
+        {
+          "extension": "py",
+          "file_count": 2
+        }
+      ],
+      "entry_points": [],
+      "git_history": {
+        "status": "unavailable",
+        "reason": "not a git repository (no .git found at repo root)"
+      }
+    }
+  },
+  "engines_run": [
+    {
+      "engine": "gitleaks",
+      "findings_count": 0,
+      "duration_ms": 17,
+      "parse_error": null,
+      "timed_out": false
+    },
+    {
+      "engine": "ai_audit[public-mock]:a",
+      "findings_count": 0,
+      "duration_ms": 1002,
+      "parse_error": "Fixture environment engine error; raw diagnostics not published.",
+      "timed_out": true
+    }
+  ],
+  "engines_missing": [
+    {
+      "engine": "semgrep",
+      "reason": "not installed: fixture environment; raw diagnostics not published."
+    },
+    {
+      "engine": "osv-scanner",
+      "reason": "not installed: fixture environment; raw diagnostics not published."
+    },
+    {
+      "engine": "cargo-audit",
+      "reason": "not applicable: fixture environment; raw diagnostics not published."
+    }
+  ],
+  "findings": [],
+  "summary": {
+    "total_findings": 0,
+    "by_severity": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    },
+    "engines_run_count": 2,
+    "engines_missing_count": 3,
+    "ai_audit_candidates": 0,
+    "ai_audit_refuted": 0,
+    "ai_audit_needs_human": 0,
+    "poc_ran": 0,
+    "needs_human_by_severity": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    },
+    "gate_includes_needs_human": false,
+    "coverage": {
+      "modules_total": 2,
+      "selected": 2,
+      "scanned": 0,
+      "skipped": 2,
+      "partially_reviewed": 0,
+      "covered": 0,
+      "candidate": 0,
+      "deferred": 1,
+      "failed": 1,
+      "partial": true
+    },
+    "precheck_refuted": 0,
+    "carried_from_prior": 0
+  },
+  "run_status": "incomplete",
+  "incomplete_reason": "time_budget_exhausted",
+  "coverage": [
+    {
+      "module_path": "a",
+      "status": "llm_failed",
+      "reason": "llm call failed: scan time budget exhausted during model call",
+      "scope_paths": [
+        "a/util.py"
+      ],
+      "selected": true,
+      "attempts": [
+        {
+          "model": "public-mock",
+          "family": "fixture",
+          "status": "llm_failed",
+          "reason": "llm call failed: scan time budget exhausted during model call",
+          "files": [
+            {
+              "path": "a/util.py",
+              "read_status": "included",
+              "source_bytes": 34,
+              "source_lines": 2,
+              "submitted_bytes": 34,
+              "start_line": 1,
+              "end_line": 2,
+              "truncated": false,
+              "reason": null
+            }
+          ],
+          "duration_ms": 1002,
+          "timed_out": true
+        }
+      ],
+      "reviewed_paths": [],
+      "truncated_paths": [],
+      "candidate_ids": []
+    },
+    {
+      "module_path": "b",
+      "status": "deferred",
+      "reason": "time_budget",
+      "scope_paths": [
+        "b/util.py"
+      ],
+      "selected": true,
+      "attempts": [
+        {
+          "model": "public-mock",
+          "family": "fixture",
+          "status": "deferred",
+          "reason": "time_budget",
+          "files": [],
+          "duration_ms": 0,
+          "timed_out": false
+        }
+      ],
+      "reviewed_paths": [],
+      "truncated_paths": [],
+      "candidate_ids": []
+    }
+  ],
+  "prior_run": null,
+  "verifier": {
+    "independence": "not_run",
+    "audit_agent": "public-mock",
+    "verifier_agent": null
+  },
+  "ensemble": {
+    "models": [
+      {
+        "id": "public-mock",
+        "family": "fixture",
+        "roles": [
+          "finder"
+        ]
+      }
+    ],
+    "refusals": [],
+    "suspected_injection": [],
+    "cross_checked": 0,
+    "ranker": "heuristic"
+  }
+}

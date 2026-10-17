@@ -21,6 +21,7 @@ jobs:
     permissions:
       contents: read
       id-token: write   # cosign keyless (Sigstore OIDC) signing
+      attestations: write # GitHub build provenance for exact archive/BOM digests
     strategy:
       fail-fast: false
       matrix:
@@ -42,8 +43,13 @@ jobs:
         shell: bash
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: '[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag $TAG"; exit 1; }'
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag $TAG"; exit 1; }
+          [[ "$WORKFLOW_REF" == "refs/tags/$TAG" ]] || { echo "dispatch the workflow using the release tag ref (not a branch)"; exit 1; }
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -54,12 +60,14 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            cross build --release -p vettalon --target ${{ matrix.target }}
+            cross build --locked --release -p vettalon --target ${{ matrix.target }}
           else
-            cargo build --release -p vettalon --target ${{ matrix.target }}
+            cargo build --locked --release -p vettalon --target ${{ matrix.target }}
           fi
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.5.2
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -68,10 +76,32 @@ jobs:
           cp README.md LICENSE NOTICE _pkg/
           tar czf ${{ matrix.artifact }}.tar.gz -C _pkg .
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
-          cosign sign-blob --yes \
+          cosign sign-blob --yes --new-bundle-format \
             --output-signature ${{ matrix.artifact }}.tar.gz.sig \
             --output-certificate ${{ matrix.artifact }}.tar.gz.pem \
+            --bundle ${{ matrix.artifact }}.tar.gz.sigstore.json \
             ${{ matrix.artifact }}.tar.gz
+
+      - name: Install trust tools (pinned official Syft checksum)
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/trust-venv"
+          "$RUNNER_TEMP/trust-venv/bin/python" -m pip install -r scripts/trust/requirements.txt
+          python3 scripts/trust/install-syft.py "$RUNNER_TEMP/syft"
+      - name: Generate source-lock SBOM and unsigned build record
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/trust-venv/bin/python" scripts/trust/trust.py release-sbom . \
+            ${{ matrix.artifact }}.tar.gz --output ${{ matrix.artifact }}.tar.gz.cdx.json \
+            --source-sha "$(git rev-parse HEAD)" --target ${{ matrix.target }} --syft "$RUNNER_TEMP/syft"
+      - name: Attest archive and SBOM build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.cdx.json
+      - name: Require every release sidecar and matching digest
+        run: '"$RUNNER_TEMP/trust-venv/bin/python" scripts/trust/trust.py verify-assets ${{ matrix.artifact }}.tar.gz'
 
       - uses: actions/upload-artifact@v7
         with:
@@ -88,6 +118,20 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
+      - uses: actions/checkout@v7
+        with:
+          path: trust-source
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Validate merged assets before publication
+        run: |
+          python3 -m venv "$RUNNER_TEMP/trust-venv"
+          "$RUNNER_TEMP/trust-venv/bin/python" -m pip install -r trust-source/scripts/trust/requirements.txt
+          count=0
+          for asset in vettalon-*.tar.gz; do
+            "$RUNNER_TEMP/trust-venv/bin/python" trust-source/scripts/trust/trust.py verify-assets "$asset"
+            count=$((count + 1))
+          done
+          test "$count" -eq 4
       # minisign is optional: sign only if the keypair secret is configured
       # (reuses the DuDuClaw signing setup). cosign signatures ship regardless.
       - name: Sign with minisign (optional)
@@ -113,6 +157,9 @@ jobs:
             vettalon-*.sig
             vettalon-*.pem
             vettalon-*.minisig
+            vettalon-*.cdx.json
+            vettalon-*.build-record.json
+            vettalon-*.sigstore.json
 
   npm-publish:
     needs: release

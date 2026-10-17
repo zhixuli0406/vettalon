@@ -1,0 +1,208 @@
+{
+  "schema": "public-coverage-fixtures-v1",
+  "kind": "self-built-engineering-mock",
+  "observations": [
+    {
+      "case": "complete",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 1,
+      "run_status": "complete",
+      "incomplete_reason": null,
+      "coverage": {
+        "modules_total": 1,
+        "selected": 1,
+        "scanned": 1,
+        "skipped": 0,
+        "partially_reviewed": 0,
+        "covered": 1,
+        "candidate": 0,
+        "deferred": 0,
+        "failed": 0,
+        "partial": false
+      }
+    },
+    {
+      "case": "module-cap",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 1,
+      "run_status": "incomplete",
+      "incomplete_reason": "scope_not_fully_reviewed",
+      "coverage": {
+        "modules_total": 2,
+        "selected": 1,
+        "scanned": 1,
+        "skipped": 1,
+        "partially_reviewed": 0,
+        "covered": 1,
+        "candidate": 0,
+        "deferred": 1,
+        "failed": 0,
+        "partial": true
+      }
+    },
+    {
+      "case": "truncation",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 1,
+      "run_status": "incomplete",
+      "incomplete_reason": "scope_not_fully_reviewed",
+      "coverage": {
+        "modules_total": 1,
+        "selected": 1,
+        "scanned": 1,
+        "skipped": 0,
+        "partially_reviewed": 1,
+        "covered": 0,
+        "candidate": 0,
+        "deferred": 0,
+        "failed": 0,
+        "partial": true
+      }
+    },
+    {
+      "case": "utf8-truncation",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 1,
+      "run_status": "incomplete",
+      "incomplete_reason": "scope_not_fully_reviewed",
+      "coverage": {
+        "modules_total": 1,
+        "selected": 1,
+        "scanned": 1,
+        "skipped": 0,
+        "partially_reviewed": 1,
+        "covered": 0,
+        "candidate": 0,
+        "deferred": 0,
+        "failed": 0,
+        "partial": true
+      }
+    },
+    {
+      "case": "parse-failure",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 2,
+      "run_status": "incomplete",
+      "incomplete_reason": "units_failed",
+      "coverage": {
+        "modules_total": 1,
+        "selected": 1,
+        "scanned": 0,
+        "skipped": 1,
+        "partially_reviewed": 0,
+        "covered": 0,
+        "candidate": 0,
+        "deferred": 0,
+        "failed": 1,
+        "partial": true
+      }
+    },
+    {
+      "case": "read-failure",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 0,
+      "run_status": "incomplete",
+      "incomplete_reason": "units_failed",
+      "coverage": {
+        "modules_total": 1,
+        "selected": 1,
+        "scanned": 0,
+        "skipped": 1,
+        "partially_reviewed": 0,
+        "covered": 0,
+        "candidate": 0,
+        "deferred": 0,
+        "failed": 1,
+        "partial": true
+      }
+    },
+    {
+      "case": "time-budget",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 1,
+      "run_status": "incomplete",
+      "incomplete_reason": "time_budget_exhausted",
+      "coverage": {
+        "modules_total": 2,
+        "selected": 2,
+        "scanned": 0,
+        "skipped": 2,
+        "partially_reviewed": 0,
+        "covered": 0,
+        "candidate": 0,
+        "deferred": 1,
+        "failed": 1,
+        "partial": true
+      }
+    },
+    {
+      "case": "engine-error",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 1,
+      "run_status": "incomplete",
+      "incomplete_reason": "engine_unavailable",
+      "coverage": {
+        "modules_total": 1,
+        "selected": 1,
+        "scanned": 0,
+        "skipped": 1,
+        "partially_reviewed": 0,
+        "covered": 0,
+        "candidate": 0,
+        "deferred": 0,
+        "failed": 1,
+        "partial": true
+      }
+    },
+    {
+      "case": "empty-content",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 0,
+      "run_status": "incomplete",
+      "incomplete_reason": "units_failed",
+      "coverage": {
+        "modules_total": 1,
+        "selected": 1,
+        "scanned": 0,
+        "skipped": 1,
+        "partially_reviewed": 0,
+        "covered": 0,
+        "candidate": 0,
+        "deferred": 0,
+        "failed": 1,
+        "partial": true
+      }
+    },
+    {
+      "case": "candidate-cap",
+      "cli_exit": 0,
+      "validate_exit": 0,
+      "model_requests": 1,
+      "run_status": "incomplete",
+      "incomplete_reason": "validation_budget_exhausted",
+      "coverage": {
+        "modules_total": 1,
+        "selected": 1,
+        "scanned": 1,
+        "skipped": 0,
+        "partially_reviewed": 0,
+        "covered": 0,
+        "candidate": 1,
+        "deferred": 0,
+        "failed": 0,
+        "partial": false
+      }
+    }
+  ],
+  "command": "python3 fixtures/coverage/generate.py --binary <local-vettalon> --output <new-directory>",
+  "limitations": "Loopback fixed mock replies and synthetic source only. External scanners depend on the local installation. Not a detection benchmark, target exploit, production acceptance, or new vulnerability discovery."
+}

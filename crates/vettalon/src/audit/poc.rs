@@ -251,6 +251,12 @@ pub async fn maybe_run_poc<C: LlmCaller>(
             return;
         }
     };
+    // A model can name a secret file, or a symlink to one: its text must not
+    // go into the PoC prompt.
+    if let Some(reason) = crate::util::secret_file_reason(&finding.file, &abs) {
+        push_evidence(finding, EvidenceKind::PocSkipped, "poc_skipped", &reason);
+        return;
+    }
     let excerpt = match std::fs::read_to_string(&abs) {
         Ok(content) => match numbered_context_window(&content, finding.line, CONTEXT_LINES) {
             Some(w) => w,
@@ -344,6 +350,17 @@ pub async fn maybe_run_poc<C: LlmCaller>(
                 crate::util::truncate_bytes(&masked_script, POC_EVIDENCE_MAX_BYTES),
                 crate::util::truncate_bytes(&masked_output, POC_EVIDENCE_MAX_BYTES),
             );
+            let transcript_sha256 = super::schema::sha256_hex(detail.as_bytes());
+            finding.proof_evidence.push(super::schema::ProofEvidence {
+                level: super::schema::ProofLevel::PatternDemo,
+                origin: super::schema::ProofOrigin::GeneratedPattern,
+                run_id: uuid::Uuid::new_v4().to_string(),
+                pair_id: None,
+                manifest_sha256: None,
+                transcript_sha256: Some(transcript_sha256),
+                artifacts: Vec::new(),
+                human_decision: None,
+            });
             finding.evidence.push(EvidenceItem {
                 kind: EvidenceKind::PocTranscript,
                 source: "poc".to_string(),
@@ -384,6 +401,285 @@ async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String
     sandbox.run_script(script, language, POC_TIMEOUT).await
 }
 
+/// Local proof attachment bounds. Importing reads artifacts; it executes nothing.
+pub const PROOF_ARTIFACT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const PROOF_TOTAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const PROOF_MANIFEST_MAX_BYTES: u64 = 128 * 1024;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProofManifest {
+    schema: String,
+    finding_id: String,
+    level: super::schema::ProofLevel,
+    run_id: String,
+    pair_id: Option<String>,
+    artifacts: Vec<super::schema::ProofArtifact>,
+    human_decision: Option<super::schema::ProofHumanDecision>,
+}
+
+fn digest_valid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub(crate) fn proof_violations(finding: &Finding) -> Vec<String> {
+    use super::schema::{ProofLevel as L, ProofOrigin as O, sha256_hex};
+    use std::collections::HashSet;
+    use vettalon_contract::{safe_path::SafeRepoPath, visible_text::is_visible_text};
+    let mut errors = Vec::new();
+    if finding.proof_evidence.len() > 16 {
+        errors.push("more than 16 proof records".into());
+    }
+    let mut run_ids = HashSet::new();
+    for proof in &finding.proof_evidence {
+        if !is_visible_text(&proof.run_id, 128) || !run_ids.insert(&proof.run_id) {
+            errors.push("invalid or duplicate proof run_id".into());
+        }
+        if let Some(human) = &proof.human_decision
+            && (!is_visible_text(&human.actor, 128)
+                || !is_visible_text(&human.decision, 256)
+                || chrono::DateTime::parse_from_rfc3339(&human.recorded_at).is_err())
+        {
+            errors.push("invalid operator-supplied human decision record".into());
+        }
+        match proof.origin {
+            O::GeneratedPattern => {
+                if proof.level != L::PatternDemo
+                    || proof.manifest_sha256.is_some()
+                    || !proof.artifacts.is_empty()
+                    || proof.pair_id.is_some()
+                    || proof.human_decision.is_some()
+                {
+                    errors.push(
+                        "generated pattern cannot claim target or differential evidence".into(),
+                    );
+                }
+                if !proof.transcript_sha256.as_deref().is_some_and(|digest| {
+                    digest_valid(digest)
+                        && finding.evidence.iter().any(|e| {
+                            e.kind == EvidenceKind::PocTranscript
+                                && sha256_hex(e.detail.as_bytes()) == digest
+                        })
+                }) {
+                    errors.push("pattern proof has no matching recorded transcript digest".into());
+                }
+            }
+            O::OperatorSupplied => {
+                if !matches!(proof.level, L::TargetExecution | L::DifferentialOracle)
+                    || proof.transcript_sha256.is_some()
+                    || !proof.manifest_sha256.as_deref().is_some_and(digest_valid)
+                {
+                    errors.push(
+                        "external proof requires a manifest digest and target/differential level"
+                            .into(),
+                    );
+                }
+                if proof.artifacts.is_empty() || proof.artifacts.len() > 16 {
+                    errors.push("external proof artifact count is outside 1..16".into());
+                }
+                let mut paths = HashSet::new();
+                let mut roles = HashSet::new();
+                let mut total = 0u64;
+                for artifact in &proof.artifacts {
+                    if SafeRepoPath::parse(&artifact.path).is_err() || !paths.insert(&artifact.path)
+                    {
+                        errors.push("unsafe or duplicate proof artifact path".into());
+                    }
+                    if !roles.insert(artifact.role.as_str())
+                        || ![
+                            "target_source",
+                            "target_execution",
+                            "vulnerable_source",
+                            "patched_source",
+                            "vulnerable_execution",
+                            "patched_execution",
+                            "normal_control",
+                            "patch",
+                        ]
+                        .contains(&artifact.role.as_str())
+                    {
+                        errors.push("unknown or duplicate proof artifact role".into());
+                    }
+                    if !digest_valid(&artifact.sha256)
+                        || artifact.bytes == 0
+                        || artifact.bytes > PROOF_ARTIFACT_MAX_BYTES
+                    {
+                        errors.push("invalid artifact digest or byte count".into());
+                    }
+                    total = total.saturating_add(artifact.bytes);
+                }
+                if total > PROOF_TOTAL_MAX_BYTES {
+                    errors.push("proof artifact total byte limit exceeded".into());
+                }
+                let required: &[&str] = if proof.level == L::DifferentialOracle {
+                    &[
+                        "vulnerable_source",
+                        "patched_source",
+                        "vulnerable_execution",
+                        "patched_execution",
+                        "normal_control",
+                    ]
+                } else {
+                    &["target_source", "target_execution"]
+                };
+                if required.iter().any(|role| !roles.contains(role)) {
+                    errors.push(
+                        "proof is missing required source/execution/control artifacts".into(),
+                    );
+                }
+                let source_role = if proof.level == L::DifferentialOracle {
+                    "vulnerable_source"
+                } else {
+                    "target_source"
+                };
+                if let Some(expected_source) = &finding.file_hash
+                    && proof
+                        .artifacts
+                        .iter()
+                        .find(|a| a.role == source_role)
+                        .is_some_and(|a| &a.sha256 != expected_source)
+                {
+                    errors.push(
+                        "proof source digest does not match the finding's scanned file hash".into(),
+                    );
+                }
+                if proof.level == L::DifferentialOracle {
+                    if !proof
+                        .pair_id
+                        .as_deref()
+                        .is_some_and(|pair| is_visible_text(pair, 128))
+                    {
+                        errors.push("differential proof needs pair_id".into());
+                    }
+                    let source = |role| {
+                        proof
+                            .artifacts
+                            .iter()
+                            .find(|a| a.role == role)
+                            .map(|a| a.sha256.as_str())
+                    };
+                    if source("vulnerable_source") == source("patched_source") {
+                        errors.push("vulnerable and patched sources must differ".into());
+                    }
+                } else if proof.pair_id.is_some() {
+                    errors.push("target execution cannot claim a differential pair".into());
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| "proof artifact is missing".to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > cap {
+        return Err("proof input must be a regular non-symlink file within the byte limit".into());
+    }
+    let mut data = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| "cannot open proof input")?
+        .take(cap + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| "cannot read proof input")?;
+    if data.len() as u64 > cap {
+        return Err("proof input exceeds byte limit".into());
+    }
+    Ok(data)
+}
+
+/// Attach only operator-supplied local artifact references. Digests are checked,
+/// not the claimed security effect, sandbox isolation, or oracle semantics.
+pub fn attach_proof_evidence(
+    report_path: &Path,
+    finding_id: &str,
+    manifest_path: &Path,
+    artifact_root: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    use super::schema::{ProofEvidence, ProofOrigin, sha256_hex};
+    use std::io::Write;
+    use vettalon_contract::safe_path::SafeRepoPath;
+    let mut report = crate::audit::load_report_for_delivery(report_path)?;
+    let raw = read_regular_capped(manifest_path, PROOF_MANIFEST_MAX_BYTES)?;
+    let manifest: ProofManifest =
+        serde_json::from_slice(&raw).map_err(|_| "invalid proof manifest shape")?;
+    if manifest.schema != "vettalon-evidence-v1" || manifest.finding_id != finding_id {
+        return Err("proof manifest schema/finding does not match".into());
+    }
+    let finding = report
+        .findings
+        .iter_mut()
+        .find(|f| f.id == finding_id)
+        .ok_or("finding id not in report")?;
+    finding.proof_evidence.push(ProofEvidence {
+        level: manifest.level,
+        origin: ProofOrigin::OperatorSupplied,
+        run_id: manifest.run_id,
+        pair_id: manifest.pair_id,
+        manifest_sha256: Some(sha256_hex(&raw)),
+        transcript_sha256: None,
+        artifacts: manifest.artifacts,
+        human_decision: manifest.human_decision,
+    });
+    let violations = proof_violations(finding);
+    if !violations.is_empty() {
+        return Err(violations.join("; "));
+    }
+    let root = artifact_root
+        .canonicalize()
+        .map_err(|_| "artifact root is unavailable")?;
+    if !root.is_dir() {
+        return Err("artifact root must be a directory".into());
+    }
+    for artifact in &finding
+        .proof_evidence
+        .last()
+        .ok_or("missing proof record")?
+        .artifacts
+    {
+        SafeRepoPath::parse(&artifact.path).map_err(|_| "unsafe artifact path")?;
+        let mut path = root.clone();
+        for component in Path::new(&artifact.path).components() {
+            path.push(component);
+            if std::fs::symlink_metadata(&path)
+                .map_err(|_| "artifact path is missing")?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("proof artifact symlink is refused".into());
+            }
+        }
+        let bytes = read_regular_capped(&path, PROOF_ARTIFACT_MAX_BYTES)?;
+        if bytes.len() as u64 != artifact.bytes || sha256_hex(&bytes) != artifact.sha256 {
+            return Err("proof artifact digest/size mismatch".into());
+        }
+    }
+    let violations = crate::audit::validation_errors(&report);
+    if !violations.is_empty() {
+        return Err(violations.join("; "));
+    }
+    let bytes =
+        serde_json::to_vec_pretty(&report).map_err(|_| "cannot serialize attached report")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(output)
+        .map_err(|_| "output must be a new writable file; refusing overwrite")?;
+    file.write_all(&bytes)
+        .map_err(|_| "cannot write attached report")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +699,260 @@ mod tests {
         );
         f.status = FindingStatus::NeedsHuman;
         f
+    }
+
+    fn external_proof_fixture() -> tempfile::TempDir {
+        use super::super::schema::{FindingKind, GatePolicy, Summary};
+        let dir = tempfile::tempdir().unwrap();
+        let f = Finding::candidate(
+            "semgrep",
+            FindingKind::StaticAnalysis,
+            Severity::High,
+            "Synthetic evidence fixture",
+            "src/a.py",
+            Some(1),
+            "demo",
+            "fixture/rule",
+            vec![],
+        );
+        let summary =
+            Summary::from_findings(std::slice::from_ref(&f), 0, 0, GatePolicy::default(), &[]);
+        let report = serde_json::json!({ "schema_version": 2, "repo": "synthetic-example", "started_at": "2026-10-16T00:00:00Z",
+            "profile": {"mode": "quick"}, "engines_run": [], "engines_missing": [], "findings": [f], "summary": summary });
+        std::fs::write(
+            dir.path().join("report.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("artifacts")).unwrap();
+        let artifacts: Vec<serde_json::Value> = [("target_source", "source.txt", "synthetic source"), ("target_execution", "execution.txt", "operator supplied execution record")].into_iter().map(|(role,path,contents)| {
+            std::fs::write(dir.path().join("artifacts").join(path), contents).unwrap();
+            serde_json::json!({"role": role, "path": path, "sha256": super::super::schema::sha256_hex(contents.as_bytes()), "bytes": contents.len()})
+        }).collect();
+        let manifest = serde_json::json!({"schema":"vettalon-evidence-v1", "finding_id": report["findings"][0]["id"],
+            "level":"target_execution", "run_id":"synthetic-run-1", "pair_id":null, "artifacts": artifacts, "human_decision":null });
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn fixture_finding_id(dir: &Path) -> String {
+        crate::audit::load_report_for_delivery(&dir.join("report.json"))
+            .unwrap()
+            .findings[0]
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn external_proof_import_checks_local_digests_without_promoting_status() {
+        let dir = external_proof_fixture();
+        let id = fixture_finding_id(dir.path());
+        attach_proof_evidence(
+            &dir.path().join("report.json"),
+            &id,
+            &dir.path().join("manifest.json"),
+            &dir.path().join("artifacts"),
+            &dir.path().join("attached.json"),
+        )
+        .unwrap();
+        let report =
+            crate::audit::load_report_for_delivery(&dir.path().join("attached.json")).unwrap();
+        assert_eq!(report.findings[0].status, FindingStatus::Candidate);
+        let proof = &report.findings[0].proof_evidence[0];
+        assert_eq!(proof.level.key(), "target_execution");
+        assert_eq!(proof.artifacts.len(), 2);
+        assert!(proof.manifest_sha256.is_some());
+        assert!(proof.human_decision.is_none());
+        assert!(
+            attach_proof_evidence(
+                &dir.path().join("report.json"),
+                &id,
+                &dir.path().join("manifest.json"),
+                &dir.path().join("artifacts"),
+                &dir.path().join("attached.json")
+            )
+            .is_err(),
+            "never overwrite"
+        );
+    }
+
+    #[test]
+    fn proof_attachment_binds_source_hash_and_legacy_transcripts_stay_unknown() {
+        let dir = external_proof_fixture();
+        let path = dir.path().join("report.json");
+        let mut report = crate::audit::load_report_for_delivery(&path).unwrap();
+        let id = report.findings[0].id.clone();
+        report.findings[0].file_hash = Some(super::super::schema::sha256_hex(
+            b"different scanned source",
+        ));
+        report.findings[0].evidence.push(EvidenceItem {
+            kind: EvidenceKind::PocTranscript,
+            source: "legacy".into(),
+            detail: "exit_code=0".into(),
+            recorded_at: "2026-10-16T00:00:00Z".into(),
+        });
+        report.summary = super::super::schema::Summary::from_findings(
+            &report.findings,
+            0,
+            0,
+            super::super::schema::GatePolicy::default(),
+            &[],
+        );
+        assert!(
+            report.findings[0]
+                .proof_summary()
+                .contains("proof_level=unknown")
+        );
+        std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(
+            attach_proof_evidence(
+                &path,
+                &id,
+                &dir.path().join("manifest.json"),
+                &dir.path().join("artifacts"),
+                &dir.path().join("attached.json")
+            )
+            .unwrap_err()
+            .contains("scanned file hash")
+        );
+    }
+
+    #[test]
+    fn external_proof_import_rejects_tamper_wrong_finding_and_missing_files() {
+        for failure in [
+            "digest",
+            "finding",
+            "missing",
+            "traversal",
+            "duplicate",
+            "too_large",
+        ] {
+            let dir = external_proof_fixture();
+            let id = fixture_finding_id(dir.path());
+            let path = dir.path().join("manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            match failure {
+                "digest" => {
+                    std::fs::write(dir.path().join("artifacts/source.txt"), "tampered").unwrap();
+                }
+                "finding" => manifest["finding_id"] = serde_json::json!("wrong"),
+                "missing" => {
+                    std::fs::remove_file(dir.path().join("artifacts/source.txt")).unwrap();
+                }
+                "traversal" => {
+                    manifest["artifacts"][0]["path"] = serde_json::json!("../report.json")
+                }
+                "duplicate" => {
+                    let duplicate = manifest["artifacts"][0].clone();
+                    manifest["artifacts"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(duplicate);
+                }
+                "too_large" => {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(dir.path().join("artifacts/source.txt"))
+                        .unwrap()
+                        .set_len(PROOF_ARTIFACT_MAX_BYTES + 1)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(
+                attach_proof_evidence(
+                    &dir.path().join("report.json"),
+                    &id,
+                    &path,
+                    &dir.path().join("artifacts"),
+                    &dir.path().join("attached.json")
+                )
+                .is_err(),
+                "{failure}"
+            );
+            assert!(
+                !dir.path().join("attached.json").exists(),
+                "{failure}: no partial output"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_artifact_roles_and_human_record_do_not_confirm_findings() {
+        let dir = external_proof_fixture();
+        let id = fixture_finding_id(dir.path());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("manifest.json")).unwrap())
+                .unwrap();
+        manifest["level"] = serde_json::json!("differential_oracle");
+        manifest["pair_id"] = serde_json::json!("synthetic-pair-1");
+        manifest["human_decision"] = serde_json::json!({"actor":"fixture-operator","decision":"confirmed","recorded_at":"2026-10-16T00:00:00Z"});
+        manifest["artifacts"] = serde_json::Value::Array(["vulnerable_source", "patched_source", "vulnerable_execution", "patched_execution", "normal_control"].into_iter().map(|role| {
+            std::fs::write(dir.path().join("artifacts").join(role), role).unwrap();
+            serde_json::json!({"role":role,"path":role,"sha256":super::super::schema::sha256_hex(role.as_bytes()),"bytes":role.len()})
+        }).collect());
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        attach_proof_evidence(
+            &dir.path().join("report.json"),
+            &id,
+            &dir.path().join("manifest.json"),
+            &dir.path().join("artifacts"),
+            &dir.path().join("attached.json"),
+        )
+        .unwrap();
+        let report =
+            crate::audit::load_report_for_delivery(&dir.path().join("attached.json")).unwrap();
+        assert_eq!(report.findings[0].status, FindingStatus::Candidate);
+        assert_eq!(
+            report.findings[0].proof_evidence[0].level.key(),
+            "differential_oracle"
+        );
+        manifest["artifacts"].as_array_mut().unwrap().pop();
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            attach_proof_evidence(
+                &dir.path().join("report.json"),
+                &id,
+                &dir.path().join("manifest.json"),
+                &dir.path().join("artifacts"),
+                &dir.path().join("missing-control.json")
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_proof_import_refuses_symlink_artifacts() {
+        let dir = external_proof_fixture();
+        let id = fixture_finding_id(dir.path());
+        let source = dir.path().join("artifacts/source.txt");
+        std::fs::remove_file(&source).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("report.json"), source).unwrap();
+        assert!(
+            attach_proof_evidence(
+                &dir.path().join("report.json"),
+                &id,
+                &dir.path().join("manifest.json"),
+                &dir.path().join("artifacts"),
+                &dir.path().join("attached.json")
+            )
+            .is_err()
+        );
     }
 
     // ── parse_poc_response ────────────────────────────────────────────
@@ -599,6 +1149,45 @@ mod tests {
             assert!(
                 f.evidence[0].detail.contains("unsafe file path"),
                 "{hostile}"
+            );
+        }
+    }
+
+    /// A model can name a secret file (or a symlink to one); its text must not
+    /// reach the PoC prompt.
+    #[tokio::test]
+    async fn maybe_run_poc_refuses_secret_files_and_symlinks_to_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::write(
+            dir.path().join("app/.env"),
+            "A=1\nSTRIPE_SECRET=sk_live_x\nB=2\n",
+        )
+        .unwrap();
+        let mut named = vec!["app/.env".to_string()];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(".env", dir.path().join("app/settings.conf")).unwrap();
+            named.push("app/settings.conf".to_string());
+        }
+        for file in named {
+            let mut f = plausible_high_finding();
+            f.file = file.clone();
+            f.line = Some(2);
+            maybe_run_poc(
+                dir.path(),
+                &mut f,
+                &PanicCaller,
+                true,
+                &PocBudget::new(POC_MAX_RUNS),
+            )
+            .await;
+            assert_eq!(f.evidence.len(), 1, "{file}");
+            assert_eq!(f.evidence[0].kind, EvidenceKind::PocSkipped);
+            assert!(
+                f.evidence[0].detail.contains("holds secrets"),
+                "{file}: {}",
+                f.evidence[0].detail
             );
         }
     }

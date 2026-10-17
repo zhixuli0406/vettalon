@@ -3,18 +3,24 @@
 //! **Known limitation (documented per task instruction, not silently
 //! worked around)**: semgrep's usual `--config auto` / `--config p/<pack>`
 //! shortcuts fetch rules from the semgrep registry over the network (or
-//! require `semgrep login`). `vettalon scan` runs fully offline this
-//! wave, so neither is usable. Instead
+//! require `semgrep login`). This adapter uses a bundled rule file and
+//! disables Semgrep metrics and version checks; other scan engines and configured models have
+//! their own network boundaries. Instead of registry shortcuts,
 //! this module writes a small **bundled, local** rule file
 //! ([`BUNDLED_RULES_YAML`]) to a temp path and invokes
-//! `semgrep scan --json --config <local-path>` — a local filesystem path
-//! never triggers a network fetch. The bundled ruleset is intentionally
-//! minimal (a handful of generic-security patterns, not a registry-grade
-//! ruleset) and has NOT been validated against a live semgrep install in
-//! this sandbox (no network, and semgrep is not guaranteed installed here) —
-//! only its YAML syntax is sanity-checked by a unit test. Treat it as a
-//! starting point; deeper coverage requires running semgrep with the full
-//! registry config online, out of scope for this offline CLI wave.
+//! `semgrep scan --json --metrics=off --disable-version-check --config <local-path>`.
+//! The local config avoids registry rule downloads. These flags are not an OS
+//! network firewall or live proof of all third-party network behavior. We omit
+//! `--error`, so every nonzero exit is a failed invocation even if candidates
+//! are present; those candidates are retained. The bundled ruleset is intentionally
+//! minimal (six generic-security rules, not a registry-grade ruleset).
+//! Local acceptance on 2026-10-16 used Semgrep 1.181.0 under an OS deny-egress
+//! policy: self-authored Python/JavaScript/TypeScript positive fixtures hit all
+//! six rule IDs (eight results), while selected safe fixtures produced zero
+//! results; both had no Semgrep errors. This validates only those rules,
+//! fixtures, version and environment, not arbitrary source or all scanners.
+//! Private raw evidence: reports/evidence-acceptance/root/semgrep-live-20261016/.
+//! Deeper coverage requires a separately selected and validated ruleset.
 
 use std::path::PathBuf;
 
@@ -23,6 +29,21 @@ use serde::Deserialize;
 use crate::audit::schema::{EvidenceItem, EvidenceKind, Finding, FindingKind, Severity};
 
 pub const ENGINE_NAME: &str = "semgrep";
+
+/// Use bundled local rules and disable telemetry and server version checks.
+pub fn args(rules_path: &str) -> Vec<String> {
+    [
+        "scan",
+        "--json",
+        "--metrics=off",
+        "--disable-version-check",
+        "--config",
+        rules_path,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
 
 /// Minimal offline ruleset. Kept intentionally small —
 /// generic cross-language `eval`/shell-injection/unsafe-deserialization
@@ -114,8 +135,8 @@ fn normalize_check_id(raw: &str) -> String {
 /// semgrep `--json` top-level shape (subset — only what we use).
 #[derive(Debug, Deserialize)]
 struct SemgrepReport {
-    #[serde(default)]
     results: Vec<SemgrepResult>,
+    errors: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,17 +185,43 @@ fn map_severity(raw: &str) -> Severity {
 }
 
 /// Parse `semgrep scan --json` output. Malformed top-level JSON is an
-/// `Err`; missing/absent `results` degrades to zero findings (semgrep
-/// always emits `results: []` when clean, but we don't rely on that).
+/// `Err`; missing results/errors or reported scanner errors cannot be clean.
+#[cfg(test)]
 pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
+    let (findings, diagnostic) = parse_with_diagnostics(raw)?;
+    match diagnostic {
+        Some(error) => Err(error),
+        None => Ok(findings),
+    }
+}
+
+/// Keep usable candidates from a partial scan while recording every scanner error.
+pub(super) fn parse_with_diagnostics(raw: &str) -> Result<(Vec<Finding>, Option<String>), String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Err("semgrep returned empty stdout".to_string());
     }
     let report: SemgrepReport =
         serde_json::from_str(trimmed).map_err(|e| format!("semgrep JSON parse failed: {e}"))?;
 
-    Ok(report
+    if report
+        .results
+        .iter()
+        .any(|r| r.check_id.trim().is_empty() || r.path.trim().is_empty())
+    {
+        return Err("semgrep result lacks rule/path identity".to_string());
+    }
+    let diagnostic = (!report.errors.is_empty()).then(|| {
+        format!(
+            "semgrep reported {} scanner error(s): {}",
+            report.errors.len(),
+            crate::util::truncate_bytes(
+                &serde_json::to_string(&report.errors).unwrap_or_default(),
+                300
+            )
+        )
+    });
+    let findings = report
         .results
         .into_iter()
         .map(|r| {
@@ -220,12 +267,29 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
             f.cwe = cwe;
             f
         })
-        .collect())
+        .collect();
+    Ok((findings, diagnostic))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argv_disables_metrics_and_keeps_a_local_rules_path() {
+        let args = args("/tmp/vettalon-local.yml");
+        assert_eq!(
+            args,
+            [
+                "scan",
+                "--json",
+                "--metrics=off",
+                "--disable-version-check",
+                "--config",
+                "/tmp/vettalon-local.yml"
+            ]
+        );
+    }
 
     #[test]
     fn bundled_rule_ids_lose_the_temp_dir_prefix_semgrep_adds() {
@@ -317,8 +381,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_stdout_is_zero_findings_not_error() {
-        assert!(parse("").unwrap().is_empty());
+    fn empty_stdout_is_an_error() {
+        assert!(parse("").is_err());
     }
 
     #[test]
@@ -328,7 +392,7 @@ mod tests {
 
     #[test]
     fn missing_extra_block_degrades_gracefully() {
-        let raw = r#"{"results": [{"check_id": "x", "path": "a.py"}]}"#;
+        let raw = r#"{"results": [{"check_id": "x", "path": "a.py"}], "errors": []}"#;
         let findings = parse(raw).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Info);
@@ -357,5 +421,22 @@ mod tests {
         assert_eq!(contents, BUNDLED_RULES_YAML);
         drop(guard);
         assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    #[test]
+    fn missing_results_or_errors_is_not_clean() {
+        for raw in [
+            "{}",
+            r#"{"results":[]}"#,
+            r#"{"errors":[]}"#,
+            r#"{"results":[],"errors":null}"#,
+            r#"{"results":[{}],"errors":[]}"#,
+        ] {
+            assert!(parse(raw).is_err(), "{raw}");
+        }
     }
 }

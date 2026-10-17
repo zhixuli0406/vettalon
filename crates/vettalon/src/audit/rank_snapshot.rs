@@ -25,10 +25,42 @@ use super::intake::{self, GitHistoryStatus, HotspotFile, RepoProfile};
 pub const RANK_SNAPSHOT_SCHEMA: &str = "vettalon.rank_snapshot/1";
 
 /// Rank every code module of `repo_root` exactly as a deep scan does
-/// (pre-pagination). Pure apart from the directory walk.
+/// (pre-pagination). Reads the directory walk plus the first
+/// [`SNIFF_BYTES`] of each code-looking file: binaries that slipped past the
+/// extension list are dropped here, so a module made only of them never
+/// becomes an audit target (it used to be audited, read as empty and
+/// counted as a failed module).
 pub(crate) fn ranked_modules(repo_root: &Path, profile: &RepoProfile) -> Vec<ModuleTarget> {
-    let all_files = intake::walk_repo_files(repo_root);
+    let all_files: Vec<String> = intake::walk_repo_files(repo_root)
+        .into_iter()
+        .filter(|f| ai_audit::is_non_code_file(f) || !looks_binary(repo_root, f))
+        .collect();
     ai_audit::rank_modules(&all_files, hotspots_of(profile), &profile.entry_points)
+}
+
+/// Bytes read from the head of a file to decide whether it is text.
+const SNIFF_BYTES: usize = 8192;
+
+/// True when the head of `rel` holds a NUL byte and no UTF-16 byte-order
+/// mark. Text that is merely not UTF-8 (Big5, Latin-1, UTF-16 with a BOM) is
+/// kept: the audit cannot read it, and it must show up as unreadable in the
+/// coverage instead of silently vanishing. A file that cannot be opened is
+/// kept for the same reason.
+fn looks_binary(repo_root: &Path, rel: &str) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(repo_root.join(rel)) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(SNIFF_BYTES);
+    if file
+        .take(SNIFF_BYTES as u64)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    let utf16_bom = head.starts_with(&[0xff, 0xfe]) || head.starts_with(&[0xfe, 0xff]);
+    !utf16_bom && head.contains(&0)
 }
 
 fn hotspots_of(profile: &RepoProfile) -> &[HotspotFile] {
@@ -230,6 +262,58 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("docs/guide.md"), format!("# {MARKER}\n")).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn binary_files_never_become_audit_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        std::fs::write(root.join("app/main.py"), "print('hi')\n").unwrap();
+        // A binary with no extension next to code, and a directory of nothing
+        // but binaries (NUL bytes in the head).
+        std::fs::write(root.join("app/payload"), [0x7f, b'E', b'L', b'F', 0, 0, 1]).unwrap();
+        std::fs::write(root.join("blobs/cache"), [0x00, 0xff, 0xfe, 0x41]).unwrap();
+        std::fs::write(root.join("blobs/state"), [0x01, 0x00, 0x02, 0x00]).unwrap();
+        // Not UTF-8 but text: legacy encodings (Big5 here) and UTF-16 with a
+        // BOM stay targets, so they surface as unreadable instead of
+        // vanishing from coverage. A NUL past the sniff window is not seen.
+        std::fs::write(
+            root.join("app/legacy.php"),
+            [b'<', b'?', 0xa4, 0xa4, 0xa4, 0xe5, b';'],
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("app/win.ps1"),
+            [0xff, 0xfe, b'a', 0x00, b'b', 0x00],
+        )
+        .unwrap();
+        let mut late_nul = "y".repeat(SNIFF_BYTES).into_bytes();
+        late_nul.push(0);
+        std::fs::write(root.join("app/late_nul.py"), &late_nul).unwrap();
+        // UTF-8 text cut in the middle of a character is still text.
+        let mut text = "x".repeat(SNIFF_BYTES - 1).into_bytes();
+        text.extend("é".as_bytes());
+        std::fs::write(root.join("app/long_script"), &text).unwrap();
+        let profile = intake::build_profile(root).await;
+        let modules = ranked_modules(root, &profile);
+        let paths: Vec<&str> = modules.iter().map(|m| m.module_path.as_str()).collect();
+        assert_eq!(paths, vec!["app"], "binary-only module must not be ranked");
+        let mut files = modules[0].files.clone();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                "app/late_nul.py",
+                "app/legacy.php",
+                "app/long_script",
+                "app/main.py",
+                "app/win.ps1"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
     }
 
     #[tokio::test]

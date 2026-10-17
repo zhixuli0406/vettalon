@@ -285,8 +285,13 @@ pub fn is_eligible(f: &Finding) -> bool {
 
 /// Read a model-supplied path under `repo_root`, only through
 /// [`SafeRepoPath`] (G1).
+/// Secret-bearing files (dotenv, keys, credential dotfiles) are refused even
+/// when a model names one: their text must never go into a verifier prompt.
 fn read_safe(repo_root: &Path, file: &str) -> Result<String, String> {
-    crate::util::read_repo_file(repo_root, file)
+    // Path safety first (a hostile path is reported as one), then the secret
+    // check on both the given name and the real file a symlink points to.
+    let real = crate::util::resolve_for_model(repo_root, file)?;
+    std::fs::read_to_string(real).map_err(|e| format!("could not read {file:?}: {e}"))
 }
 
 /// Excerpts for every trace step outside the main file (deduplicated).
@@ -592,6 +597,23 @@ pub async fn review_all<C: LlmCaller>(
 pub(crate) mod tests {
     use super::*;
     use crate::audit::schema::{FindingKind, Severity, ThreatModel, TraceKind, TraceStep};
+
+    #[test]
+    fn read_safe_refuses_secret_files_a_model_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::write(dir.path().join("app/.env"), "STRIPE_SECRET=sk_live_x\n").unwrap();
+        std::fs::write(dir.path().join("app/main.py"), "print(1)\n").unwrap();
+        let err = read_safe(dir.path(), "app/.env").unwrap_err();
+        assert!(err.contains("holds secrets"), "{err}");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(".env", dir.path().join("app/app.conf")).unwrap();
+            let err = read_safe(dir.path(), "app/app.conf").unwrap_err();
+            assert!(err.contains("holds secrets"), "symlink to .env: {err}");
+        }
+        assert_eq!(read_safe(dir.path(), "app/main.py").unwrap(), "print(1)\n");
+    }
 
     pub(crate) const REFUTED: &str = r#"{"verdict":"refuted","reason":"not reachable","blockers":[],"validation_plan":{"local":null,"deployment":null}}"#;
     pub(crate) const PLAUSIBLE: &str = r#"{"verdict":"plausible","reason":"raw execute confirmed","blockers":["is the endpoint exposed?"],"validation_plan":{"local":"curl the handler","deployment":null}}"#;
