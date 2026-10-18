@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added
+- Deep scan 加入 opt-in `--source-receipts`，在 JSON／SARIF module coverage 記錄來源快照、實際提交前綴及本機提示 SHA-256；模型回覆與未知傳輸分開標記。這不代表模型已讀、理解或提升召回。
+
 ### Fixed
 - Release verifier 改用單一 exact certificate identity，避免新版 GitHub CLI 拒絕同時指定 `--cert-identity` 與 `--signer-workflow`；workflow／tag、issuer、來源 SHA 與 hosted runner 限制保留。此修正不改已發布的 binary 或版本 tag。
 

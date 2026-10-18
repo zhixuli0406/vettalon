@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::llm::LlmCaller;
 use vettalon_contract::strict_json::{self, Violation};
@@ -35,7 +36,8 @@ use super::prompts::{
 };
 use super::schema::{
     AI_AUDIT_ENGINE_NAME, Condition, EngineRun, EvidenceItem, EvidenceKind, Finding, FindingKind,
-    Severity, ThreatModel, TraceStep, compute_root_fingerprint,
+    Severity, SourceCallKind, SourceCallReceipt, SourceCallResponse, SourceReceipt, ThreatModel,
+    TraceStep, compute_root_fingerprint,
 };
 
 /// `source_engine` value stamped on every ai_audit-originated finding —
@@ -535,7 +537,20 @@ struct ModulePrompt {
     evidence: Vec<super::schema::FileCoverage>,
 }
 
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
 fn build_module_prompt(repo_root: &Path, module: &ModuleTarget) -> ModulePrompt {
+    build_module_prompt_with_receipts(repo_root, module, false)
+}
+
+fn build_module_prompt_with_receipts(
+    repo_root: &Path,
+    module: &ModuleTarget,
+    source_receipts: bool,
+) -> ModulePrompt {
     use super::schema::{FileCoverage, FileReadStatus};
     let mut files = Vec::new();
     let mut truncated = Vec::new();
@@ -552,6 +567,8 @@ fn build_module_prompt(repo_root: &Path, module: &ModuleTarget) -> ModulePrompt 
             end_line: None,
             truncated: false,
             reason: Some("prompt_byte_budget".into()),
+            source_sha256: None,
+            submitted_sha256: None,
         };
         if remaining == 0 {
             evidence.push(file);
@@ -561,12 +578,18 @@ fn build_module_prompt(repo_root: &Path, module: &ModuleTarget) -> ModulePrompt 
             Ok(content) => {
                 file.source_bytes = Some(content.len());
                 file.source_lines = Some(content.lines().count());
+                if source_receipts {
+                    file.source_sha256 = Some(sha256(content.as_bytes()));
+                }
                 file.reason = None;
                 if content.is_empty() {
                     file.read_status = FileReadStatus::Empty;
                 } else {
                     let kept = crate::util::truncate_bytes(&content, remaining).to_string();
                     file.submitted_bytes = kept.len();
+                    if source_receipts && !kept.is_empty() {
+                        file.submitted_sha256 = Some(sha256(kept.as_bytes()));
+                    }
                     file.truncated = kept.len() < content.len();
                     if kept.is_empty() {
                         file.read_status = FileReadStatus::BudgetExcluded;
@@ -638,6 +661,7 @@ pub struct ModuleAuditReport {
     pub files: Vec<super::schema::FileCoverage>,
     pub duration_ms: u64,
     pub timed_out: bool,
+    pub source_receipt: Option<SourceReceipt>,
 }
 
 impl ModuleAuditReport {
@@ -653,6 +677,7 @@ impl ModuleAuditReport {
             files: Vec::new(),
             duration_ms: 0,
             timed_out: false,
+            source_receipt: None,
         }
     }
 }
@@ -729,6 +754,7 @@ pub async fn run_ai_audit_capped<C: LlmCaller>(
             total: modules.len() as u32,
             cross_check: &none,
             deadline: None,
+            source_receipts: false,
         },
     )
     .await
@@ -749,6 +775,29 @@ pub struct AuditProgress<'a> {
     /// remaining modules are deferred (`DEFER_TIME_BUDGET`) instead of audited.
     /// Shared by every finder, so they all stop together. `None` = no budget.
     pub deadline: Option<std::time::Instant>,
+    /// Store content-free source and prompt hashes for this run.
+    pub source_receipts: bool,
+}
+
+fn record_source_call(
+    receipt: &mut Option<SourceReceipt>,
+    kind: SourceCallKind,
+    prompt: &str,
+    result: &crate::llm::Result<String>,
+) {
+    let Some(receipt) = receipt else { return };
+    let response = match result {
+        Ok(_) => SourceCallResponse::Returned,
+        Err(crate::llm::LlmError::Refused(_)) => SourceCallResponse::Refused,
+        Err(_) => SourceCallResponse::Unknown,
+    };
+    receipt.calls.push(SourceCallReceipt {
+        kind,
+        prompt_sha256: sha256(prompt.as_bytes()),
+        prompt_bytes: prompt.len(),
+        response,
+        valid_reply: false,
+    });
 }
 
 /// Bound an in-flight finder or reflector call by the shared scan deadline.
@@ -793,6 +842,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         total,
         cross_check,
         deadline,
+        source_receipts,
     } = progress;
     if modules.is_empty() {
         return AiAuditOutcome::Unavailable {
@@ -866,7 +916,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         }
 
         let started = std::time::Instant::now();
-        let mp = build_module_prompt(repo_root, module);
+        let mp = build_module_prompt_with_receipts(repo_root, module, source_receipts);
         if mp.files.is_empty() {
             let reason =
                 "no readable text content in this module (binary files, unreadable, or all budget-excluded)"
@@ -885,8 +935,10 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
             continue;
         }
         let reviewed_paths: Vec<String> = mp.files.iter().map(|(p, _)| p.clone()).collect();
+        let mut receipt = source_receipts.then(|| SourceReceipt { calls: Vec::new() });
 
         let (result, mut timed_out) = complete_before_deadline(caller, &mp.prompt, deadline).await;
+        record_source_call(&mut receipt, SourceCallKind::Primary, &mp.prompt, &result);
         let raw = match result {
             Ok(r) => r,
             Err(e) => {
@@ -912,6 +964,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     module_reports.push(ModuleAuditReport {
                         reviewed_paths: Vec::new(),
                         files: mp.evidence,
+                        source_receipt: receipt,
                         duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                         truncated_paths: mp.truncated,
                         ..ModuleAuditReport::bare(module, ModuleOutcome::LlmFailed { reason })
@@ -942,6 +995,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                 module_reports.push(ModuleAuditReport {
                     reviewed_paths: Vec::new(),
                     files: mp.evidence,
+                    source_receipt: receipt,
                     timed_out,
                     duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     truncated_paths: mp.truncated,
@@ -970,6 +1024,12 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
             let correction = build_reflector_prompt(&mp.prompt, &violation);
             let (correction_result, correction_timeout) =
                 complete_before_deadline(caller, &correction, deadline).await;
+            record_source_call(
+                &mut receipt,
+                SourceCallKind::Reflector,
+                &correction,
+                &correction_result,
+            );
             timed_out |= correction_timeout;
             match correction_result {
                 Ok(r2) => {
@@ -988,6 +1048,11 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
             retry_note = Some(format!(
                 "recovered after {retries_used} reflector retry(ies)"
             ));
+        }
+        if parsed.is_ok()
+            && let Some(last) = receipt.as_mut().and_then(|r| r.calls.last_mut())
+        {
+            last.valid_reply = true;
         }
 
         match parsed {
@@ -1013,6 +1078,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                 module_reports.push(ModuleAuditReport {
                     reviewed_paths: Vec::new(),
                     files: mp.evidence,
+                    source_receipt: receipt,
                     timed_out,
                     duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     truncated_paths: mp.truncated,
@@ -1080,6 +1146,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     truncated_paths: mp.truncated,
                     candidate_ids: ids,
                     files: mp.evidence,
+                    source_receipt: receipt,
                     duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     timed_out,
                     model: String::new(),
@@ -1494,6 +1561,103 @@ pub(crate) mod tests {
         }
     }
 
+    async fn run_with_receipts(
+        repo: &Path,
+        modules: &[ModuleTarget],
+        caller: &StubCaller,
+    ) -> AiAuditOutcome {
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let none = HashSet::new();
+        run_ai_audit_progress(
+            repo,
+            modules,
+            caller,
+            MAX_TOTAL_AI_CANDIDATES,
+            AuditProgress {
+                sink: &crate::audit::NoProgress,
+                label: "fixture",
+                audited: &counter,
+                total: modules.len() as u32,
+                cross_check: &none,
+                deadline: None,
+                source_receipts: true,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn opt_in_source_receipt_binds_snapshot_submitted_prefix_and_prompt() {
+        let content = "fn main() { /* 界 */ }\n";
+        let dir = tmp_repo_with_files(&[("a.rs", content)]);
+        let modules = vec![evidence_target(&["a.rs"])];
+        let prompt = build_module_prompt_with_receipts(dir.path(), &modules[0], true);
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Ok("[]".into())]),
+        };
+        let AiAuditOutcome::Ran { module_reports, .. } =
+            run_with_receipts(dir.path(), &modules, &caller).await
+        else {
+            panic!("expected reply");
+        };
+        let file = &module_reports[0].files[0];
+        assert_eq!(
+            file.source_sha256.as_deref(),
+            Some(sha256(content.as_bytes()).as_str())
+        );
+        assert_eq!(file.submitted_sha256, file.source_sha256);
+        let calls = &module_reports[0].source_receipt.as_ref().unwrap().calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].kind, SourceCallKind::Primary);
+        assert_eq!(calls[0].prompt_sha256, sha256(prompt.prompt.as_bytes()));
+        assert_eq!(calls[0].prompt_bytes, prompt.prompt.len());
+        assert_eq!(calls[0].response, SourceCallResponse::Returned);
+        assert!(calls[0].valid_reply);
+        let without = build_module_prompt(dir.path(), &modules[0]);
+        assert!(without.evidence[0].source_sha256.is_none());
+        assert!(without.evidence[0].submitted_sha256.is_none());
+    }
+
+    #[tokio::test]
+    async fn reflector_receipt_keeps_both_calls_and_only_final_valid_reply() {
+        let dir = tmp_repo_with_files(&[("a.rs", "fn main() {}")]);
+        let modules = vec![evidence_target(&["a.rs"])];
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Ok("invalid".into()), Ok("[]".into())]),
+        };
+        let AiAuditOutcome::Ran { module_reports, .. } =
+            run_with_receipts(dir.path(), &modules, &caller).await
+        else {
+            panic!("expected reply");
+        };
+        let calls = &module_reports[0].source_receipt.as_ref().unwrap().calls;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].kind, SourceCallKind::Primary);
+        assert_eq!(calls[1].kind, SourceCallKind::Reflector);
+        assert_ne!(calls[0].prompt_sha256, calls[1].prompt_sha256);
+        assert!(!calls[0].valid_reply);
+        assert!(calls[1].valid_reply);
+    }
+
+    #[tokio::test]
+    async fn failed_transport_receipt_does_not_claim_provider_received_or_reviewed() {
+        let dir = tmp_repo_with_files(&[("a.rs", "fn main() {}")]);
+        let modules = vec![evidence_target(&["a.rs"])];
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Err("transport down".into())]),
+        };
+        let AiAuditOutcome::Unavailable { module_reports, .. } =
+            run_with_receipts(dir.path(), &modules, &caller).await
+        else {
+            panic!("expected unavailable");
+        };
+        let report = &module_reports[0];
+        assert!(report.reviewed_paths.is_empty());
+        let calls = &report.source_receipt.as_ref().unwrap().calls;
+        assert_eq!(calls[0].response, SourceCallResponse::Unknown);
+        assert!(!calls[0].valid_reply);
+    }
+
     #[test]
     fn coverage_records_missing_empty_binary_and_included_files() {
         use super::super::schema::FileReadStatus as S;
@@ -1634,6 +1798,7 @@ pub(crate) mod tests {
                 total: 2,
                 cross_check: &none,
                 deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(20)),
+                source_receipts: false,
             },
         )
         .await;
@@ -1947,6 +2112,7 @@ pub(crate) mod tests {
                 total: 2,
                 cross_check: &none,
                 deadline: Some(std::time::Instant::now()),
+                source_receipts: false,
             },
         )
         .await;

@@ -460,12 +460,48 @@ fn check_coverage(r: &AuditReport, ids: &HashSet<&str>, out: &mut Vec<ReportViol
 
             let mut reviewed = HashSet::new();
             for attempt in &m.attempts {
+                use super::schema::{SourceCallKind, SourceCallResponse};
                 let valid_reply = matches!(
                     attempt.status,
                     ModuleCoverageStatus::Covered
                         | ModuleCoverageStatus::Candidate
                         | ModuleCoverageStatus::PartiallyReviewed
                 );
+                let digest_ok = |v: &str| {
+                    v.len() == 64
+                        && v.bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                };
+                if let Some(receipt) = &attempt.source_receipt {
+                    if receipt.calls.is_empty()
+                        || receipt.calls[0].kind != SourceCallKind::Primary
+                        || receipt.calls[1..]
+                            .iter()
+                            .any(|call| call.kind != SourceCallKind::Reflector)
+                    {
+                        out.push(shape(
+                            "source receipt has no primary call or invalid call order",
+                        ));
+                    }
+                    let valid_calls = receipt.calls.iter().filter(|c| c.valid_reply).count();
+                    if valid_calls != usize::from(valid_reply) {
+                        out.push(shape(
+                            "source receipt valid reply does not match attempt status",
+                        ));
+                    }
+                    for call in &receipt.calls {
+                        if call.prompt_bytes == 0 || !digest_ok(&call.prompt_sha256) {
+                            out.push(shape(
+                                "source receipt has invalid prompt hash or byte count",
+                            ));
+                        }
+                        if call.valid_reply && call.response != SourceCallResponse::Returned {
+                            out.push(shape(
+                                "source receipt claims valid reply without observed response",
+                            ));
+                        }
+                    }
+                }
                 if valid_reply {
                     if !attempt.files.iter().any(|file| {
                         file.read_status == FileReadStatus::Included && file.submitted_bytes > 0
@@ -481,6 +517,43 @@ fn check_coverage(r: &AuditReport, ids: &HashSet<&str>, out: &mut Vec<ReportViol
                     }
                 }
                 for file in &attempt.files {
+                    if let Some(hash) = &file.source_sha256
+                        && (!digest_ok(hash) || file.source_bytes.is_none())
+                    {
+                        out.push(shape(
+                            "source snapshot hash is invalid or has no source bytes",
+                        ));
+                    }
+                    if let Some(hash) = &file.submitted_sha256
+                        && (!digest_ok(hash) || file.submitted_bytes == 0)
+                    {
+                        out.push(shape(
+                            "submitted source hash is invalid or has no submitted bytes",
+                        ));
+                    }
+                    if file.submitted_sha256.is_some() && attempt.source_receipt.is_none() {
+                        out.push(shape("submitted source hash has no call receipt"));
+                    }
+                    if attempt.source_receipt.is_some()
+                        && file.source_bytes.is_some()
+                        && file.source_sha256.is_none()
+                    {
+                        out.push(shape("source receipt is missing source snapshot hash"));
+                    }
+                    if attempt.source_receipt.is_some()
+                        && file.submitted_bytes > 0
+                        && file.submitted_sha256.is_none()
+                    {
+                        out.push(shape("source receipt is missing submitted source hash"));
+                    }
+                    if !file.truncated
+                        && file.submitted_bytes > 0
+                        && file.source_sha256 != file.submitted_sha256
+                    {
+                        out.push(shape(
+                            "full submitted source hash differs from source snapshot",
+                        ));
+                    }
                     if !scope.contains(file.path.as_str()) {
                         out.push(shape("attempt file is outside scope_paths"));
                     }
@@ -1233,6 +1306,8 @@ mod tests {
             end_line: Some(1),
             truncated: true,
             reason: None,
+            source_sha256: None,
+            submitted_sha256: None,
         };
         let attempt = ModuleAttempt {
             model: "mock".into(),
@@ -1242,6 +1317,7 @@ mod tests {
             files: vec![file],
             duration_ms: 1,
             timed_out: false,
+            source_receipt: None,
         };
         let module = ModuleCoverage {
             module_path: "src".into(),
@@ -1259,6 +1335,36 @@ mod tests {
         report.run_status = RunStatus::Incomplete;
         report.incomplete_reason = Some(IncompleteReason::ScopeNotFullyReviewed);
         assert!(only(&report).is_empty());
+        use super::super::schema::{
+            SourceCallKind, SourceCallReceipt, SourceCallResponse, SourceReceipt,
+        };
+        report.coverage[0].attempts[0].files[0].source_sha256 = Some("a".repeat(64));
+        report.coverage[0].attempts[0].files[0].submitted_sha256 = Some("b".repeat(64));
+        report.coverage[0].attempts[0].source_receipt = Some(SourceReceipt {
+            calls: vec![SourceCallReceipt {
+                kind: SourceCallKind::Primary,
+                prompt_sha256: "c".repeat(64),
+                prompt_bytes: 100,
+                response: SourceCallResponse::Returned,
+                valid_reply: true,
+            }],
+        });
+        assert!(only(&report).is_empty());
+        report.coverage[0].attempts[0]
+            .source_receipt
+            .as_mut()
+            .unwrap()
+            .calls[0]
+            .response = SourceCallResponse::Unknown;
+        assert!(only(&report).iter().any(|v| matches!(v, ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("without observed response"))));
+        report.coverage[0].attempts[0]
+            .source_receipt
+            .as_mut()
+            .unwrap()
+            .calls[0]
+            .response = SourceCallResponse::Returned;
+        report.coverage[0].attempts[0].files[0].submitted_sha256 = None;
+        assert!(only(&report).iter().any(|v| matches!(v, ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("missing submitted source hash"))));
         report.coverage[0].status = ModuleCoverageStatus::Covered;
         assert!(only(&report).iter().any(|v| matches!(v, ReportViolation::CoverageStatusShape { detail, .. } if detail.contains("covered status with incomplete"))));
         report.coverage[0].status = ModuleCoverageStatus::PartiallyReviewed;

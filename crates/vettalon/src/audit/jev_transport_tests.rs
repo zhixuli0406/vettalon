@@ -135,6 +135,7 @@ fn opts(repo: &Path, rank: crate::audit::RankStrategy) -> crate::audit::ScanOpti
         no_prior: true,
         rank,
         trace: None,
+        source_receipts: false,
         time_budget: Some(Duration::from_secs(5)),
         finders: vec![],
         verifiers: vec![],

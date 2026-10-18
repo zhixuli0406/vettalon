@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,11 @@ import tomllib
 from datetime import datetime, timezone
 
 SCHEMAS = Path(__file__).with_name("schemas")
+_CARGO_SPEC = importlib.util.spec_from_file_location(
+    "vettalon_cargo_graph", Path(__file__).with_name("cargo_graph.py")
+)
+cargo_graph = importlib.util.module_from_spec(_CARGO_SPEC)
+_CARGO_SPEC.loader.exec_module(cargo_graph)
 
 
 def sha256(path):
@@ -147,7 +153,9 @@ def verify_assets(asset):
 
 
 def assert_public_workspace(source):
-    manifest = tomllib.loads((Path(source) / "Cargo.toml").read_text())
+    manifest = tomllib.loads(
+        cargo_graph.read_source_bytes(source, "Cargo.toml", 1024 * 1024).decode("utf-8")
+    )
     members = manifest.get("workspace", {}).get("members")
     if set(members or []) != {"crates/vettalon", "crates/vettalon-contract"}:
         raise ValueError(
@@ -267,44 +275,50 @@ def enrich_cargo_licenses(bom, source=None):
 
 
 def annotate_cargo_roles(bom, source):
-    manifest_path = Path(source) / "Cargo.toml"
-    if not manifest_path.is_file():
+    verified = cargo_graph.verify_cargo_graph(bom, source)
+    if verified is None:
         return
-    manifest = tomllib.loads(manifest_path.read_text())
-    manifests = [manifest]
-    for member in manifest.get("workspace", {}).get("members", []):
-        for path in Path(source).glob(member + "/Cargo.toml"):
-            if not path.resolve().is_relative_to(Path(source).resolve()):
-                raise ValueError("Cargo workspace member escapes inventory source")
-            manifests.append(tomllib.loads(path.read_text()))
-    roots = {
-        item["package"]["name"]
-        for item in manifests
-        if isinstance(item.get("package", {}).get("name"), str)
-    }
-    components = bom.get("components", [])
-    root_refs = {
-        item["bom-ref"]
-        for item in components
-        if item.get("name") in roots and item.get("purl", "").startswith("pkg:cargo/")
-    }
-    direct = {
-        ref
-        for edge in bom.get("dependencies", [])
-        if edge["ref"] in root_refs
-        for ref in edge.get("dependsOn", [])
-    }
+    components = list(bom.get("components", []))
+    root = bom.get("metadata", {}).get("component")
+    if root:
+        components.append(root)
     for item in components:
-        if not item.get("purl", "").startswith("pkg:cargo/"):
+        role = verified["roles"].get(item.get("bom-ref"))
+        if role is None:
             continue
-        role = (
-            "root"
-            if item["bom-ref"] in root_refs
-            else ("direct" if item["bom-ref"] in direct else "transitive")
-        )
-        item.setdefault("properties", []).append(
+        properties = item.setdefault("properties", [])
+        # Repeated annotation is idempotent; never retain an unverified role.
+        properties[:] = [prop for prop in properties if prop.get("name") != "vettalon:dependency:role"]
+        properties.append(
             {"name": "vettalon:dependency:role", "value": role}
         )
+
+
+def validate_cargo_graph(source, bom_path):
+    """Reconcile an existing BOM without cataloging, repair or external execution."""
+    bom_path = Path(bom_path)
+    if not bom_path.is_file() or bom_path.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError("missing or oversized Cargo BOM")
+    data = bom_path.read_bytes()
+    if len(data) > 64 * 1024 * 1024:
+        raise ValueError("Cargo BOM exceeds 64 MiB adapter limit")
+    bom = json.loads(data)
+    validate_bom(bom)
+    verified = cargo_graph.verify_cargo_graph(bom, source)
+    if verified is None:
+        raise ValueError("Cargo source-lock inventory required")
+    digest = hashlib.sha256(data).hexdigest()
+    if sha256(bom_path) != digest:
+        raise ValueError("Cargo BOM changed during verification")
+    return {
+        "status": "verified",
+        "scope": "Cargo source-lock graph; all locked optional/platform dependencies; not linked binary inventory",
+        "lockfile_sha256": verified["lockfile_sha256"],
+        "bom_sha256": digest,
+        "manifest_sha256": verified["manifest_sha256"],
+        "package_count": verified["package_count"],
+        "edge_count": verified["edge_count"],
+    }
 
 
 def run_syft(source, output, executable="syft"):
@@ -343,6 +357,9 @@ def run_syft(source, output, executable="syft"):
         if staged.stat().st_size > 64 * 1024 * 1024:
             raise ValueError("SBOM exceeds 64 MiB adapter limit; inventory incomplete")
         bom = json.loads(staged.read_text())
+        # Validate the unmodified catalog before enrichment or role annotation.
+        validate_bom(bom)
+        cargo_graph.verify_cargo_graph(bom, source)
         enrich_cargo_licenses(bom, source)
         annotate_cargo_roles(bom, source)
         validate_bom(bom)
@@ -356,26 +373,48 @@ def run_syft(source, output, executable="syft"):
 
 
 def release_sbom(source, asset, output, source_sha, target, dirty, executable):
-    source = Path(source).resolve()
-    if Path(str(asset) + ".build-record.json").exists():
+    source = cargo_graph._source_root(source)
+    output = Path(output).absolute()
+    if output.exists() or output.is_symlink():
+        raise ValueError("SBOM output already exists; refusing overwrite")
+    record_path = Path(str(asset) + ".build-record.json")
+    if record_path.exists() or record_path.is_symlink():
         raise ValueError("build-record already exists; refusing overwrite")
     assert_public_workspace(source)
     # Inventory only reviewed manifests/lock: never scan target/, customer reports
     # or a sibling application's assets through a broad directory scan.
     with tempfile.TemporaryDirectory(prefix="vettalon-public-lock-") as temp:
-        lock_source = Path(temp)
-        for relative in (
-            "Cargo.toml",
-            "Cargo.lock",
-            "crates/vettalon/Cargo.toml",
-            "crates/vettalon-contract/Cargo.toml",
-        ):
+        lock_source = Path(temp) / "source"
+        source_files = {
+            "Cargo.toml": 1024 * 1024,
+            "Cargo.lock": 16 * 1024 * 1024,
+            "crates/vettalon/Cargo.toml": 1024 * 1024,
+            "crates/vettalon-contract/Cargo.toml": 1024 * 1024,
+        }
+        source_digests = {}
+        for relative, limit in source_files.items():
+            data = cargo_graph.read_source_bytes(source, relative, limit)
+            source_digests[relative] = hashlib.sha256(data).hexdigest()
             destination = lock_source / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source / relative, destination)
-        bom = run_syft(lock_source, output, executable)
+            with destination.open("xb") as stream:
+                stream.write(data)
+        bom = run_syft(lock_source, Path(temp) / "catalog.cdx.json", executable)
+        # The release caller independently checks even an injected cataloger.
+        verified = cargo_graph.verify_cargo_graph(bom, lock_source)
+        if verified is None:
+            raise ValueError("release requires a verified Cargo source-lock graph")
+        annotate_cargo_roles(bom, lock_source)
+        for relative, digest in verified["manifest_sha256"].items():
+            if hashlib.sha256(cargo_graph.read_source_bytes(source, relative, source_files[relative])).hexdigest() != digest:
+                raise ValueError("Cargo release manifest changed during inventory")
+        if hashlib.sha256(cargo_graph.read_source_bytes(source, "Cargo.lock", source_files["Cargo.lock"])).hexdigest() != verified["lockfile_sha256"]:
+            raise ValueError("Cargo release lock changed during inventory")
+        if (source_digests != {"Cargo.lock": verified["lockfile_sha256"],
+                               **verified["manifest_sha256"]}):
+            raise ValueError("Cargo release source changed during inventory")
     record = build_record(
-        asset, source_sha, sha256(source / "Cargo.lock"), target, dirty
+        asset, source_sha, verified["lockfile_sha256"], target, dirty
     )
     props = bom.setdefault("metadata", {}).setdefault("properties", [])
     props.extend(
@@ -395,10 +434,26 @@ def release_sbom(source, asset, output, source_sha, target, dirty, executable):
         ]
     )
     validate_bom(bom)
-    Path(output).write_text(json.dumps(bom, indent=2) + "\n")
-    Path(str(asset) + ".build-record.json").write_text(
-        json.dumps(record, indent=2) + "\n"
-    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    created = []
+    try:
+        for path, payload in (
+            (output, json.dumps(bom, indent=2) + "\n"),
+            (record_path, json.dumps(record, indent=2) + "\n"),
+        ):
+            with path.open("x") as stream:
+                opened = os.fstat(stream.fileno())
+                created.append((path, opened.st_dev, opened.st_ino))
+                stream.write(payload)
+    except OSError:
+        for path, device, inode in reversed(created):
+            try:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) == (device, inode):
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
     return record
 
 
@@ -409,6 +464,9 @@ def main():
     verify.add_argument("asset", type=Path)
     validate = commands.add_parser("validate-sbom")
     validate.add_argument("bom", type=Path)
+    cargo = commands.add_parser("validate-cargo-graph")
+    cargo.add_argument("source", type=Path)
+    cargo.add_argument("bom", type=Path)
     customer = commands.add_parser("customer-sbom")
     customer.add_argument("source", type=Path)
     customer.add_argument("--output", type=Path, required=True)
@@ -428,6 +486,8 @@ def main():
         elif args.command == "validate-sbom":
             validate_bom(json.loads(args.bom.read_text()))
             print("official CycloneDX 1.6 schema and dependency references: valid")
+        elif args.command == "validate-cargo-graph":
+            print(json.dumps(validate_cargo_graph(args.source, args.bom)))
         elif args.command == "customer-sbom":
             run_syft(args.source, args.output, args.syft)
         else:

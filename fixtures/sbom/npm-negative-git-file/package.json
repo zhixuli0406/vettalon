@@ -1,0 +1,8 @@
+{
+  "name": "r14-git-file-negative",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "localgit": "git+file:///tmp/vettalon-r14-git-file-fixture-20261018"
+  }
+}

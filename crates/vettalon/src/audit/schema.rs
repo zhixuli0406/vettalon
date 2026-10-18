@@ -873,6 +873,49 @@ pub struct FileCoverage {
     pub end_line: Option<usize>,
     pub truncated: bool,
     pub reason: Option<String>,
+    /// SHA-256 of the UTF-8 source bytes read for this attempt. Present only
+    /// with opt-in source receipts; no source body is stored in the report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    /// SHA-256 of the exact source prefix inserted before prompt escaping and
+    /// line numbering. Absent for an excluded or empty file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_sha256: Option<String>,
+}
+
+/// What the local audit process observed for a finder call. `unknown` includes
+/// transport failures and timeouts: neither proves nor disproves delivery to
+/// a provider. A returned reply does not prove model attention or recall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCallResponse {
+    Unknown,
+    Returned,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCallKind {
+    Primary,
+    Reflector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCallReceipt {
+    pub kind: SourceCallKind,
+    /// SHA-256 of the full locally assembled prompt, including wrappers,
+    /// numbered source lines and any reflector correction.
+    pub prompt_sha256: String,
+    pub prompt_bytes: usize,
+    pub response: SourceCallResponse,
+    /// Only true for the reply whose JSON passed the finder contract.
+    pub valid_reply: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceReceipt {
+    pub calls: Vec<SourceCallReceipt>,
 }
 
 /// One required finder attempt. Every attempt survives aggregation, including
@@ -886,6 +929,9 @@ pub struct ModuleAttempt {
     pub files: Vec<FileCoverage>,
     pub duration_ms: u64,
     pub timed_out: bool,
+    /// Optional local source/prompt receipt for this finder attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_receipt: Option<SourceReceipt>,
 }
 
 /// One entry per ranked module, including the ones never sent to the model.

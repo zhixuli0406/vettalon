@@ -1,0 +1,8 @@
+{
+  "name": "r14-local-file-negative",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "local": "file:packages/local"
+  }
+}

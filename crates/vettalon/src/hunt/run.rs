@@ -263,6 +263,7 @@ impl DirAuditor for EngineAuditor {
             no_prior: true,
             rank: crate::audit::RankStrategy::Heuristic,
             trace: None,
+            source_receipts: false,
             time_budget: None,
             finders: self.finders.clone(),
             verifiers: self.verifiers.clone(),

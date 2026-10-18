@@ -70,10 +70,8 @@ def prepare_twins(arm='finder-only', repeat=0, identity='anonymous'):
     for payload in payloads:
         if transport.read_json(TWINS_DATA_ROOT / 'anonymous' / (payload['id'] + '.json')) != payload:
             raise ValueError('Actual materialized source mismatch')
-    frozen = transport.read_json(protocol.ARTIFACTS / 'denominator.json')
-    if (frozen['canonical_sha256'] != protocol.digest((protocol.ARTIFACTS / 'canonical-oracle.json').read_text())
-            or frozen['manifest_sha256'] != protocol.digest(labels)):
-        raise ValueError('Frozen canonical or denominator mismatch')
+    frozen = json.loads(twins.read_regular((protocol.ARTIFACTS / 'denominator.json').absolute(), 2 * 1024 * 1024))
+    protocol.validate_frozen_canonical(frozen, twins.read_regular((protocol.ARTIFACTS / 'canonical-oracle.json').absolute(), 2 * 1024 * 1024))
     scope = transport.read_json(TWINS_DATA_ROOT / 'fixed-five-pair-subset.json')
     payloads, selected_labels = protocol.select_scope(payloads, labels, scope)
     manifest_sha = transport.digest((TWINS_DATA_ROOT / 'manifest.json').read_bytes())
@@ -104,6 +102,19 @@ def _select_context(root, mode):
         return json.loads(receipt['stdout'])
 
 
+def _validate_context_range_budget(modules):
+    """Check actual selected ranges independently of the selector's claimed byte total."""
+    total = 0
+    for module in modules:
+        for segment in module['ranges']:
+            low = segment.get('start_byte'); high = segment.get('end_byte')
+            if type(low) is not int or type(high) is not int or not 0 <= low < high:
+                raise ValueError('Invalid context byte range')
+            total += high - low
+            if total > 16384: raise ValueError('Context selected-byte cap exceeded')
+    return total
+
+
 def prepare_context(root):
     root = Path(root)
     if root.is_symlink() or not root.is_dir(): raise ValueError('Real source directory required')
@@ -122,17 +133,24 @@ def prepare_context(root):
             rows.append(row)
             try:
                 selected = _select_context(frozen, mode)
+                compare.validate_selection_result(selected, mode, 40, 16384, 2, 3)
+                compare.validate_selection_scope(selected, frozen_before['snapshot'], 2)
                 by_path = {item['path']: item for item in selected['files']}
+                if len(by_path) != len(selected['files']) or any(path not in snapshot for path in by_path):
+                    raise ValueError('Selected paths differ from frozen scope')
                 modules = []
                 for index, (path, source) in enumerate(snapshot.items()):
                     module = by_path.get(path, {'path': path, 'status': source['status'], 'ranges': []})
                     if index >= 40: module = {'path': path, 'status': 'module_cap', 'ranges': []}
-                    for segment in module['ranges']:
-                        restored = ''.join(source['source'].splitlines(keepends=True)[segment['start_line'] - 1:segment['end_line']])
-                        if not restored.startswith(segment['text']) or transport.digest(segment['text']) != segment['sha256']:
-                            raise ValueError('Range is not restorable to frozen source')
+                    if source['status'] == 'captured' and index < 40 and path not in by_path:
+                        raise ValueError('Captured source omitted by selector')
+                    if module['status'] in ('selected', 'truncated') and not module['ranges']:
+                        raise ValueError('Selected status has no source range')
+                    if source['status'] == 'captured' and index < 40:
+                        compare.verify_selected_ranges(module, source)
                     modules.append({'path': path, 'source_sha256': source['source_sha256'],
                                     'status': module['status'], 'ranges': module['ranges']})
+                _validate_context_range_budget(modules)
                 row.update(payload={'modules': modules}, selection=selected, selection_status='ready',
                            selection_incomplete=selected['incomplete'])
                 if len((CONTEXT_TASK + json.dumps(row['payload'])).encode()) > 32768:
@@ -144,7 +162,9 @@ def prepare_context(root):
         unchanged = compare.capture(root) == initial and compare.capture(frozen) == frozen_before
     return _finish({'experiment': 'context', 'identity_view': 'anonymous', 'execution_status': 'prepared-not-dispatched',
         'task': CONTEXT_TASK, 'scope_sha256': transport.digest(sorted(snapshot)), 'snapshot_sha256': transport.digest(initial),
-        'snapshot': snapshot, 'source_root': str(root), 'comparable': unchanged and initial['inventory_complete'],
+        'snapshot': snapshot, 'source_root': str(root),
+        'comparable': unchanged and initial['inventory_complete'] and initial['source_capture_complete']
+                      and all(row['selection_status'] == 'ready' for row in rows),
         'initial_capture': initial,
         'inventory_complete': initial['inventory_complete'], 'module_denominator': len(snapshot) if initial['inventory_complete'] else None,
         'inventoried_module_lower_bound': len(snapshot), 'rows': rows,
@@ -184,6 +204,11 @@ def validate_prepared(prepared):
                 or prepared['snapshot'] != prepared['initial_capture']['snapshot']
                 or prepared['scope_sha256'] != transport.digest(sorted(prepared['snapshot']))):
             raise ValueError('Context snapshot, mode or task mismatch')
+        if (prepared['comparable'] and
+                (not prepared['initial_capture']['inventory_complete']
+                 or not prepared['initial_capture']['source_capture_complete']
+                 or any(row['selection_status'] != 'ready' for row in prepared['rows']))):
+            raise ValueError('Incomplete context source or selection cannot be comparable')
     else:
         corpus, queries = rag.build()
         query_ids = {query['id'] for query in queries}
@@ -217,19 +242,45 @@ def validate_prepared(prepared):
                         or any(reference[k] != documents[reference['id']][k] for k in reference)):
                     raise ValueError('RAG citation or dev source binding changed')
         else:
-            if set(payload) != {'modules'} or len(payload['modules']) != len(prepared['snapshot']):
+            snapshot = prepared['snapshot']
+            if (set(payload) != {'modules'} or len(payload['modules']) != len(snapshot)
+                    or [module['path'] for module in payload['modules']] != list(snapshot)
+                    or row['source_sha256'] != transport.digest(prepared['initial_capture'])):
                 raise ValueError('Context module denominator changed')
             if len((CONTEXT_TASK + json.dumps(payload)).encode()) > 32768 and row['selection_status'] != 'prompt_budget':
                 raise ValueError('Context prompt exceeds its byte cap')
-            for module in payload['modules']:
-                original = prepared['snapshot'].get(module['path'])
-                if original is None or module['source_sha256'] != original['source_sha256']:
+            selected = row.get('selection')
+            if row['selection_status'] in ('ready', 'prompt_budget'):
+                compare.validate_selection_result(selected, row['id'], 40, 16384, 2, 3)
+                frozen_paths = [path for index, (path, source) in enumerate(snapshot.items())
+                                if index < 40 and 'raw_base64' in source]
+                compare.validate_selection_scope(selected, frozen_paths, 2)
+                selected_by_path = {item['path']: item for item in selected['files']}
+                if len(selected_by_path) != len(selected['files']) or any(path not in snapshot for path in selected_by_path):
+                    raise ValueError('Context selection scope changed')
+            else:
+                selected_by_path = {}
+                if prepared['comparable']: raise ValueError('Context selection failure cannot dispatch')
+            for index, module in enumerate(payload['modules']):
+                original = snapshot[module['path']]
+                if module['source_sha256'] != original['source_sha256']:
                     raise ValueError('Context source binding changed')
-                for segment in module['ranges']:
-                    source = original.get('source', '')
-                    restored = ''.join(source.splitlines(keepends=True)[segment['start_line'] - 1:segment['end_line']])
-                    if not restored.startswith(segment['text']) or transport.digest(segment['text']) != segment['sha256']:
-                        raise ValueError('Context range binding changed')
+                selected_module = selected_by_path.get(module['path']) if index < 40 else None
+                if row['selection_status'] == 'selection_failure':
+                    expected_status = original['status']; expected_ranges = []
+                elif index >= 40:
+                    expected_status = 'module_cap'; expected_ranges = []
+                elif selected_module is None:
+                    expected_status = original['status']; expected_ranges = []
+                    if original['status'] == 'captured': raise ValueError('Captured context source omitted by selector')
+                else:
+                    expected_status = selected_module['status']; expected_ranges = selected_module['ranges']
+                    if expected_status in ('selected', 'truncated') and not expected_ranges:
+                        raise ValueError('Selected status has no source range')
+                    if original['status'] == 'captured': compare.verify_selected_ranges(selected_module, original)
+                if module['status'] != expected_status or module['ranges'] != expected_ranges:
+                    raise ValueError('Context range binding changed')
+            _validate_context_range_budget(payload['modules'])
     return True
 
 

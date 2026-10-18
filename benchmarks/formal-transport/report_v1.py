@@ -121,10 +121,13 @@ def _legacy_usage(raw):
     return result
 
 
-def _twins_metrics(raw, prepared, denominator_path, frozen=None):
-    frozen = transport.read_json(denominator_path) if frozen is None else frozen
+def _twins_metrics(raw, prepared, denominator_path, frozen=None, canonical_text=None):
+    frozen = review._json(_read_regular(denominator_path, ATTACHMENT_CAP), ATTACHMENT_CAP) if frozen is None else frozen
     if prepared['frozen_denominator_sha256'] != protocol.digest(frozen):
         raise ValueError('Frozen denominator fingerprint mismatch')
+    canonical_text = (_read_regular(protocol.canonical_path_for_denominator(denominator_path), ATTACHMENT_CAP)
+                      if canonical_text is None else canonical_text)
+    protocol.validate_frozen_canonical(frozen, canonical_text)
     payloads, labels = protocol.generate()
     payloads, labels = protocol.select_scope(payloads, labels, prepared['scope_manifest'])
     expected = {p['id']: p['source_sha256'] for p in payloads}
@@ -153,9 +156,10 @@ def _read_report(raw_path, denominator_path=None, *, include_worksheet=False, re
     if raw.get('schema') == protocol.SCHEMA:
         if include_worksheet or review_overlay_path is not None or cost_attachment_path is not None:
             raise ValueError('New review/cost attachments are not supported on legacy raw')
-        frozen = transport.read_json(denominator_path)
+        frozen = review._json(_track(denominator_path, ATTACHMENT_CAP, snapshots), ATTACHMENT_CAP)
         if raw['frozen_denominator_sha256'] != protocol.digest(frozen):
             raise ValueError('Legacy frozen denominator mismatch')
+        protocol.validate_frozen_canonical(frozen, _track(protocol.canonical_path_for_denominator(denominator_path), ATTACHMENT_CAP, snapshots))
         payloads, labels = protocol.generate()
         scope = raw.get('scope_manifest')
         if scope is not None and raw.get('scope_manifest_sha256') != protocol.digest(scope):
@@ -178,8 +182,10 @@ def _read_report(raw_path, denominator_path=None, *, include_worksheet=False, re
         usages = [attempt['usage'] for row in raw['rows'] for attempt in row['attempts']]
         run_debits = sum(attempt['debit'] for row in raw['rows'] for attempt in row['attempts'])
         frozen = None
+        canonical_text = None
         if prepared['experiment'] == 'twins':
             frozen = review._json(_track(denominator_path, ATTACHMENT_CAP, snapshots), ATTACHMENT_CAP)
+            canonical_text = _track(protocol.canonical_path_for_denominator(denominator_path), ATTACHMENT_CAP, snapshots)
         result = {'kind': 'formal-v1-readonly-recomputed', 'raw_sha256': verified['raw_sha256'],
             'usage_summary': transport.summarize_usage(usages), 'run_debits_recorded': run_debits,
             'run_reserved_output_tokens': run_debits * 1024,
@@ -187,7 +193,7 @@ def _read_report(raw_path, denominator_path=None, *, include_worksheet=False, re
             'provider_controls_verified': None,
             'control_evidence_scope': 'Recorded readiness is a version binding, not independent provenance or billing',
             'resource_summary': _resource_summary(raw),
-            'metrics': _twins_metrics(raw, prepared, denominator_path, frozen) if prepared['experiment'] == 'twins' else None,
+            'metrics': _twins_metrics(raw, prepared, denominator_path, frozen, canonical_text) if prepared['experiment'] == 'twins' else None,
             'effectiveness': 'unknown pending accepted ground truth/adjudication' if prepared['experiment'] != 'twins' else 'synthetic bounds; no human verdict inferred'}
         if include_worksheet or review_overlay_path is not None:
             worksheet = review.build_worksheet(before, artifacts, runner_context=runner)

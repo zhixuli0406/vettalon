@@ -113,6 +113,8 @@ pub struct ScanOptions {
     pub rank: RankStrategy,
     /// P2-1: write a per-call LLM trace (JSONL) here. `None` disables tracing.
     pub trace: Option<PathBuf>,
+    /// Opt-in content-free source/prompt hashes for each deep finder call.
+    pub source_receipts: bool,
     /// Wall-clock budget for the whole AI deep-audit. When it runs out, the
     /// modules still pending are deferred and the run is marked incomplete
     /// (`TimeBudgetExhausted`) instead of grinding on. `None` = no budget.
@@ -899,6 +901,7 @@ async fn run_audit_step(
                             total: total_modules,
                             cross_check: second,
                             deadline,
+                            source_receipts: opts.source_receipts,
                         },
                     )
                     .await;
@@ -1033,6 +1036,7 @@ fn deferred_report(m: &ModuleTarget, reason: &str) -> ModuleAuditReport {
         files: Vec::new(),
         duration_ms: 0,
         timed_out: false,
+        source_receipt: None,
     }
 }
 
@@ -1404,6 +1408,7 @@ mod tests {
             no_prior: true,
             rank: RankStrategy::Heuristic,
             trace: None,
+            source_receipts: false,
             time_budget: None,
             finders: Vec::new(),
             verifiers: Vec::new(),
@@ -1655,6 +1660,66 @@ mod tests {
         // NeedsHuman does not gate by default.
         assert_eq!(code, 0);
         assert_eq!(cmd_validate(&report_path).await, 0);
+    }
+
+    /// Run the real intake/ranking/audit/report path with a fixed local caller.
+    #[tokio::test]
+    async fn source_receipt_opt_in_survives_report_and_sarif_without_source_text() {
+        use sha2::{Digest, Sha256};
+        let dir = repo_with_module();
+        let home = tempfile::tempdir().unwrap();
+        let report_path = home.path().join("receipt.json");
+        let sarif_path = home.path().join("receipt.sarif");
+        let (finder, script) = model("fixture", "fixture", vec![Ok("[]".into())]);
+        let mut options = opts(dir.path().to_path_buf());
+        options.profile = "deep".into();
+        options.report = Some(report_path.clone());
+        options.sarif = Some(sarif_path.clone());
+        options.source_receipts = true;
+        options.roster = info(&[&finder]);
+        options.finders = vec![finder];
+        assert_eq!(cmd_scan(home.path(), options).await, 0);
+        assert_eq!(cmd_validate(&report_path).await, 0);
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+        let attempt = &report["coverage"][0]["attempts"][0];
+        let source = std::fs::read(dir.path().join("a/main.rs")).unwrap();
+        let source_hash = format!("{:x}", Sha256::digest(&source));
+        assert_eq!(attempt["files"][0]["source_sha256"], source_hash);
+        assert_eq!(attempt["files"][0]["submitted_sha256"], source_hash);
+        let prompts = script.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            attempt["source_receipt"]["calls"][0]["prompt_sha256"],
+            format!("{:x}", Sha256::digest(prompts[0].as_bytes()))
+        );
+        assert_eq!(attempt["source_receipt"]["calls"][0]["valid_reply"], true);
+        let sarif: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sarif_path).unwrap()).unwrap();
+        assert_eq!(
+            sarif["runs"][0]["properties"]["vettalon.coverage"][0]["attempts"][0]["source_receipt"],
+            attempt["source_receipt"]
+        );
+        assert!(
+            !std::fs::read_to_string(report_path)
+                .unwrap()
+                .contains("db.execute(q)")
+        );
+
+        let off_path = home.path().join("receipt-off.json");
+        let (off_finder, _) = model("fixture", "fixture", vec![Ok("[]".into())]);
+        let mut off = opts(dir.path().to_path_buf());
+        off.profile = "deep".into();
+        off.report = Some(off_path.clone());
+        off.roster = info(&[&off_finder]);
+        off.finders = vec![off_finder];
+        assert_eq!(cmd_scan(home.path(), off).await, 0);
+        let off_report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(off_path).unwrap()).unwrap();
+        let off_attempt = &off_report["coverage"][0]["attempts"][0];
+        assert!(off_attempt.get("source_receipt").is_none());
+        assert!(off_attempt["files"][0].get("source_sha256").is_none());
+        assert!(off_attempt["files"][0].get("submitted_sha256").is_none());
     }
 
     /// Two finders, two modules: each module goes to exactly one finder.

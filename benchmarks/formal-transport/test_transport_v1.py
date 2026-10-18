@@ -118,7 +118,9 @@ def synthetic_baseline(runner):
         (artifacts / 'canonical-oracle.json').write_text(canonical_text)
         frozen = {'schema': runner.protocol.SCHEMA, 'kind': 'unit-denominator-no-container-validation',
                   'manifest_sha256': runner.protocol.digest(labels), 'canonical_sha256': runner.protocol.digest(canonical_text),
-                  'eligible_pairs': []}
+                  'positive_denominator': len(labels)//2,
+                  'canonical_rebuildable_denominator': 0, 'eligible_pairs': [],
+                  'excluded_from_canonical_denominator': sorted({x['pair_id'] for x in labels})}
         (artifacts / 'denominator.json').write_text(json.dumps(frozen))
         legacy = {'schema': runner.protocol.SCHEMA, 'kind': 'self-authored-unit-legacy-schema-no-inference',
                   'frozen_denominator_sha256': runner.protocol.digest(frozen),

@@ -88,6 +88,10 @@ struct ScanArgs {
     /// text). Useful for cost/latency review and benchmark regression checks.
     #[arg(long)]
     trace: Option<PathBuf>,
+    /// Include source snapshot and locally assembled prompt SHA-256 receipts
+    /// for each deep finder call in the report; never stores source text.
+    #[arg(long)]
+    source_receipts: bool,
     /// Overall wall-clock budget for the AI deep-audit, in seconds. When it
     /// runs out, pending modules are deferred and the run is marked incomplete
     /// instead of grinding on. Unset = no budget.
@@ -378,6 +382,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         save,
         no_prior,
         trace,
+        source_receipts,
         time_budget,
         rank,
     } = args;
@@ -514,6 +519,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         no_prior,
         rank: rank_strategy,
         trace,
+        source_receipts,
         time_budget: time_budget.map(std::time::Duration::from_secs),
         finders,
         verifiers,

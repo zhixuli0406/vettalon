@@ -16,3 +16,9 @@ A successful fixture test covers these exact snapshots. It does not claim suppor
 for every lockfile variant, optional feature, workspace, platform, malformed input,
 installed artifact or package ecosystem. Customer BOMs and caches are private until
 reviewed; public export includes only these self-contained fixture sources.
+
+The `npm-negative-*` lock snapshots are negative controls copied byte-for-byte
+from the private R14 workspace, local-file and git-file receipt inputs. They
+exercise explicit unsupported outcomes in both private and public trust tests.
+The git-file snapshot names a fixed disposable `/tmp` path as data; running the
+tests does not fetch or execute that dependency.

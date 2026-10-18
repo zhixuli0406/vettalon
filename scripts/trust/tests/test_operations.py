@@ -124,12 +124,15 @@ class OperationTests(unittest.TestCase):
         (self.root / "Cargo.toml").write_text(
             '[workspace]\nmembers=["crates/vettalon","crates/vettalon-contract"]\n'
         )
-        (self.root / "Cargo.lock").write_text("version=4\n")
+        (self.root / "Cargo.lock").write_text(
+            'version=4\n[[package]]\nname="vettalon"\nversion="1.0.0"\n'
+            '[[package]]\nname="vettalon-contract"\nversion="1.0.0"\n'
+        )
         for name in ("vettalon", "vettalon-contract"):
             folder = self.root / "crates" / name
             folder.mkdir(parents=True)
             (folder / "Cargo.toml").write_text(
-                f'[package]\nname="{name}"\nversion="1"\n'
+                f'[package]\nname="{name}"\nversion="1.0.0"\n'
             )
         (self.root / "private-report.json").write_text("must not be inventoried")
         asset = self.root / "vettalon-darwin-arm64.tar.gz"
@@ -137,7 +140,13 @@ class OperationTests(unittest.TestCase):
 
         def inventory(source, output, executable):
             self.assertFalse((source / "private-report.json").exists())
-            return json.loads(json.dumps(self.bom))
+            return {
+                "bomFormat": "CycloneDX", "specVersion": "1.6", "version": 1,
+                "components": [{"type": "library", "name": name, "version": "1.0.0",
+                                "purl": "pkg:cargo/" + name + "@1.0.0", "bom-ref": name}
+                               for name in ("vettalon", "vettalon-contract")],
+                "dependencies": [],
+            }
 
         with patch.object(trust, "run_syft", side_effect=inventory):
             trust.release_sbom(
@@ -154,13 +163,18 @@ class OperationTests(unittest.TestCase):
         self.assertEqual(record["subject"]["sha256"], trust.sha256(asset))
 
     def test_cargo_metadata_roles_and_license_unknown(self):
-        (self.root / "Cargo.toml").write_text('[package]\nname="root"\nversion="1"\n')
+        (self.root / "Cargo.toml").write_text('[package]\nname="root"\nversion="1.0.0"\n')
+        (self.root / "Cargo.lock").write_text(
+            'version=4\n[[package]]\nname="root"\nversion="1.0.0"\ndependencies=["direct"]\n'
+            '[[package]]\nname="direct"\nversion="1.0.0"\ndependencies=["indirect"]\n'
+            '[[package]]\nname="indirect"\nversion="1.0.0"\n'
+        )
         bom = {
             "components": [
                 {
                     "name": name,
-                    "version": "1",
-                    "purl": "pkg:cargo/" + name + "@1",
+                    "version": "1.0.0",
+                    "purl": "pkg:cargo/" + name + "@1.0.0",
                     "bom-ref": name,
                 }
                 for name in ("root", "direct", "indirect")

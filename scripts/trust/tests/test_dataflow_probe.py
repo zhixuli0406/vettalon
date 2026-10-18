@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -182,6 +183,12 @@ os.write(1,b'partial marker');time.sleep(20)
         self.assertEqual(record["status"], "complete")
         self.assertEqual(record["exit_code"], 1)
         self.assertTrue(record["cleanup_complete"])
+        output = self.root / "output"
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+        self.assertEqual((output / "fixture-source.py").read_bytes(), probe.FIXTURE_SOURCE)
+        for artifact in output.iterdir():
+            if artifact.is_file():
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600, artifact.name)
 
     def test_real_missing_binary_retains_failure_and_denominator(self):
         record = probe.run_probe(self.root / "absent", self.root / "output", timeout_seconds=2.5)

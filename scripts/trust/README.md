@@ -4,6 +4,45 @@ These helpers generate local evidence and verify downloaded CLI release assets.
 They never create a release, sign with an identity, send a disclosure, or claim a
 certification. Python 3.11+, `jsonschema`, and an official Syft binary are required.
 
+Source-code test coverage uses a separate standard-library wrapper,
+[`coverage_receipt.py`](coverage_receipt.py). See the pinned
+[line/branch reproduction and scope](../../docs/COVERAGE.md#source-code-test-coverage-is-a-separate-denominator).
+Its source-tag receipt does not measure the published binary or customer-source
+review coverage. The verifier compares every tracked file's bytes with the tag's
+HEAD blob, then checks arithmetic consistency between LLVM's **summary-only**
+per-file counts and aggregate. It cannot derive hits independently from detailed
+execution counters because those were not saved. The receipt's original checkout
+root maps absolute LLVM filenames when verifying from another path; traversal,
+untracked files and changed scope fail. The runner checks source before and after
+execution but cannot detect a modification restored between those snapshots.
+New v2 runs retain at most 2 MiB of each stdout/stderr stream, hash all observed
+bytes, stop the process group immediately at the limit, drain for at most five
+seconds, and fail closed on truncation or missing EOF. JSON and log readback
+opens each file once with `O_NOFOLLOW`, then uses `fstat`, a bounded read and a
+stream hash to reject symlinks, oversized or changing files. Historical v1 logs have no
+stream ledger. This does not replace release signature or attestation checks.
+It requires the exact `--branch --json --summary-only --output-path ... -p ...
+--locked` command for pinned nightly `2026-10-17` and `cargo-llvm-cov 0.9.1`.
+The output path is bound to the original run directory, allowing a
+byte-identical receipt copy to be verified elsewhere. The preserved v1 receipt
+is accepted only at its pinned whole SHA-256; adding a v2 field to a changed v1
+receipt does not bypass that check. New runner receipts use v2 and record the
+original directory as self-asserted metadata. Changing just the command,
+receipt and artifact digest together still fails this scope check. A wholly
+forged unauthenticated v2 receipt remains possible, and the historical runner
+bytes are unavailable.
+For a release-specific readback, supply `verify` with
+`--expected-receipt-sha256`, `--expected-source-sha` and `--expected-tag`
+together. These caller-supplied values can be forged along with an unsigned
+receipt; a match only checks equality. The verifier reports summary arithmetic
+consistency, caller-anchor match, and `provenance_verified: false`. The
+[anchored v0.2.0 readback](../../reports/evidence-acceptance/trust-coverage-next-20261018/ANCHORED-VERIFIER.json)
+includes relocated-receipt and negative checks. No whole-CLI or Desktop/Pro
+line/branch denominator has been measured by this receipt.
+This readback is local and unsigned. Substitution detection requires expected
+values retained through an independent trusted channel; a digest stored next
+to the receipt cannot authenticate that receipt by itself.
+
 ## Setup
 
 ```bash

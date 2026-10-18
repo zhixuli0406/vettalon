@@ -10,6 +10,17 @@ from unittest.mock import patch
 import measurement
 import protocol
 import run
+from fixture_support import synthetic_denominator
+
+
+def setUpModule():
+    global _unit_denominator
+    _unit_denominator = synthetic_denominator()
+    _unit_denominator.__enter__()
+
+
+def tearDownModule():
+    _unit_denominator.__exit__(None, None, None)
 
 
 class MeasurementTests(unittest.TestCase):
@@ -68,7 +79,7 @@ class MeasurementTests(unittest.TestCase):
     def test_failed_calls_record_cpu_and_keep_denominator(self):
         def failure(*args,**kwargs): raise TimeoutError('controlled failure')
         with tempfile.TemporaryDirectory() as directory, patch.object(measurement,'_usage',return_value=self.usage(2,1,100)):
-            result=run.run(Path(directory)/'failure.json', transport=failure, mock=True,max_calls=1)
+            result=run.run(Path(directory).resolve()/'failure.json', transport=failure, mock=True,max_calls=1)
         self.assertEqual(result['rows'][0]['status'],'timeout')
         self.assertEqual(result['metrics']['incomplete'],20)
         self.assertEqual(result['resource_evidence']['cpu']['status'],'measured')
@@ -79,7 +90,7 @@ class MeasurementTests(unittest.TestCase):
     def test_unexpected_failure_persists_partial_resource_evidence(self):
         def failure(*args,**kwargs): raise RuntimeError('controlled unexpected failure')
         with tempfile.TemporaryDirectory() as directory, patch.object(measurement,'_usage',return_value=self.usage(2,1,100)):
-            output=Path(directory)/'partial.json'
+            output=Path(directory).resolve()/'partial.json'
             with self.assertRaises(RuntimeError):
                 run.run(output,transport=failure,mock=True,max_calls=1)
             result=json.loads(output.read_text())
@@ -103,7 +114,7 @@ class ResourceAggregationTests(unittest.TestCase):
     def test_recompute_binds_recorded_version_and_never_retrofits_legacy(self):
         import aggregate
         with tempfile.TemporaryDirectory() as directory:
-            raw_path=Path(directory)/'raw.json'
+            raw_path=Path(directory).resolve()/'raw.json'
             run.run(raw_path,mock=True,max_calls=1,transport=lambda *args,**kwargs: (_ for _ in ()).throw(TimeoutError('controlled')))
             original=json.loads(raw_path.read_text())
             # A source revision after recording is not a reason to fabricate or reject historical counters.

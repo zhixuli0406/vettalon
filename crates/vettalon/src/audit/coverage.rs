@@ -80,6 +80,7 @@ fn from_report(r: &ModuleAuditReport) -> ModuleCoverage {
             files: r.files.clone(),
             duration_ms: r.duration_ms,
             timed_out: r.timed_out,
+            source_receipt: r.source_receipt.clone(),
         }],
     }
 }
@@ -192,6 +193,7 @@ mod tests {
             files: Vec::new(),
             duration_ms: 0,
             timed_out: false,
+            source_receipt: None,
         }
     }
 

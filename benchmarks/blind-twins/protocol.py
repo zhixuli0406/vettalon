@@ -129,6 +129,87 @@ def evaluate_oracle(raw, vulnerable):
     expected=observed['security_effect'] is vulnerable
     return {'status':'complete' if expected else 'incomplete','oracle_pass':expected,'observed':observed}
 
+
+def canonical_path_for_denominator(path):
+    path=Path(path)
+    if path.name=='denominator.json':
+        return path.with_name('canonical-oracle.json')
+    if path.name.endswith('-denominator.json'):
+        return path.with_name(path.name[:-len('-denominator.json')]+'.json')
+    raise ValueError('Unrecognized canonical denominator name')
+
+
+def validate_frozen_canonical(frozen, canonical_text):
+    """Rebuild pair eligibility from bound canonical rows, never from a declaration alone."""
+    payloads,labels=generate()
+    if isinstance(canonical_text,bytes):
+        canonical_text=canonical_text.decode('utf-8','strict')
+    if type(canonical_text) is not str or type(frozen) is not dict:
+        raise ValueError('Canonical and denominator must be JSON objects')
+    try:
+        canonical=json.loads(canonical_text)
+    except (TypeError,ValueError) as exc:
+        raise ValueError('Malformed canonical record') from exc
+    all_pairs=sorted({label['pair_id'] for label in labels})
+    if (type(canonical) is not dict or frozen.get('schema')!=SCHEMA
+            or frozen.get('canonical_sha256')!=digest(canonical_text)
+            or frozen.get('manifest_sha256')!=digest(labels)
+            or type(frozen.get('positive_denominator')) is not int
+            or frozen['positive_denominator']!=sum(label['vulnerable'] for label in labels)
+            or type(frozen.get('canonical_rebuildable_denominator')) is not int
+            or type(frozen.get('eligible_pairs')) is not list
+            or type(frozen.get('excluded_from_canonical_denominator')) is not list):
+        raise ValueError('Canonical or frozen denominator binding mismatch')
+    eligible=[]
+    if canonical.get('kind')=='canonical-oracle':
+        if (canonical.get('schema')!=SCHEMA or canonical.get('planned_cases')!=len(payloads)
+                or type(canonical.get('rows')) is not list
+                or len(canonical['rows'])!=len(payloads)):
+            raise ValueError('Canonical rows do not cover the complete frozen source set')
+        successes={}
+        expected_isolation={'network':'none','read_only':True,'mounts':[],
+                            'user':'65534:65534','cap_drop':['ALL'],
+                            'memory':134217728,'nano_cpus':500000000,'pids_limit':32,
+                            'security_opt':['no-new-privileges']}
+        for row,payload,label in zip(canonical['rows'],payloads,labels):
+            if (type(row) is not dict or row.get('id')!=payload['id']
+                    or row.get('source_sha256')!=payload['source_sha256']
+                    or row.get('harness_sha256')!=digest(harness(payload,label))):
+                raise ValueError('Canonical row source or harness binding mismatch')
+            if row.get('status')=='complete':
+                evaluated=evaluate_oracle(row,label['vulnerable'])
+                if (row.get('oracle_executed') is False or row.get('oracle_pass') is not True
+                        or evaluated.get('status')!='complete'
+                        or row.get('observed')!=evaluated.get('observed')
+                        or row.get('fresh_container') is not True
+                        or type(row.get('container_create_returncode')) is not int
+                        or row['container_create_returncode']!=0
+                        or type(row.get('client_returncode')) is not int or row['client_returncode']!=0
+                        or type(row.get('returncode')) is not int or row['returncode']!=0
+                        or row.get('cleanup')!='removed' or row.get('phase')!='oracle-parse'
+                        or type(row.get('image_id')) is not str or not row['image_id'].startswith('sha256:')
+                        or type(row.get('container_id')) is not str or not row['container_id']
+                        or row.get('isolation')!=expected_isolation):
+                    raise ValueError('Canonical complete row lacks replayable oracle evidence')
+                successes[label['id']]=True
+        for pair in all_pairs:
+            members=[label for label in labels if label['pair_id']==pair]
+            if len(members)!=2 or {label['vulnerable'] for label in members}!={True,False}:
+                raise ValueError('Canonical pair is not one positive and one safe source')
+            if all(successes.get(label['id']) for label in members):
+                eligible.append(pair)
+    elif not (canonical.get('kind') in {'unit-fixture-only','unit-only','unit-bookkeeping-only'}
+              and (canonical.get('no-oracle-executed') is True
+                   or canonical.get('oracle_executed') is False
+                   or canonical.get('container_execution') is False)
+              and canonical.get('rows',[])==[]):
+        raise ValueError('Unrecognized unexecuted canonical fixture')
+    if (frozen['eligible_pairs']!=eligible
+            or frozen['canonical_rebuildable_denominator']!=len(eligible)
+            or frozen['excluded_from_canonical_denominator']!=[p for p in all_pairs if p not in eligible]):
+        raise ValueError('Frozen eligibility differs from recomputed canonical pairs')
+    return eligible
+
 def error_details(exc):
     def as_text(value):
         if value is None: return ''
