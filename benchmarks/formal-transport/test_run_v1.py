@@ -188,6 +188,114 @@ class RunTests(unittest.TestCase):
             with self.assertRaises(ValueError): r.budget_plan(prepared, {'finder': {'name': 'one', 'digest': 'a' * 64, 'family': 'qwen'}})
         self.assertIsNone(r.parse_context_answer('{"findings":[{"path":"../bad","line":1,"category":"path","evidence":"x"}]}', {'modules': []}))
 
+    def test_context_byte_range_forgery_fails_prepare_and_prepared_readback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / 'entry.py').write_bytes('def route():\r\n    return "中\u2028文"\r\n'.encode())
+            def forged(path, mode):
+                selected = r.selection.select(path, mode)
+                if mode == 'baseline':
+                    selected['files'][0]['ranges'][0]['end_byte'] = 2
+                return selected
+            with patch.object(r, '_select_context', side_effect=forged):
+                rejected = r.prepare_context(root)
+            self.assertFalse(rejected['comparable'])
+            self.assertEqual(rejected['rows'][0]['selection_status'], 'selection_failure')
+            with self.assertRaises(ValueError): r.budget_plan(rejected, {'finder': roster()['finder']}, input_token_cap=4096)
+            with patch.object(r, '_select_context', side_effect=lambda path, mode: r.selection.select(path, mode)):
+                prepared = r.prepare_context(root)
+        self.assertTrue(prepared['comparable'])
+        self.assertTrue(r.validate_prepared(prepared))
+        altered = copy.deepcopy(prepared)
+        altered['rows'][0]['payload']['modules'][0]['ranges'][0]['end_byte'] = 2
+        altered['prepared_sha256'] = r.prepared_digest(altered)
+        with self.assertRaises(ValueError): r.validate_prepared(altered)
+
+    def test_context_selector_mode_mismatch_cannot_be_comparable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / 'entry.py').write_text('def route():\n    return 1\n')
+            def swapped(path, mode):
+                selected = r.selection.select(path, mode)
+                if mode == 'baseline': selected['mode'] = 'functions'
+                return selected
+            with patch.object(r, '_select_context', side_effect=swapped):
+                prepared = r.prepare_context(root)
+        self.assertEqual(prepared['rows'][0]['selection_status'], 'selection_failure')
+        self.assertFalse(prepared['comparable'])
+        with self.assertRaises(ValueError): r.budget_plan(prepared, {'finder': roster()['finder']}, input_token_cap=4096)
+
+    def test_context_selector_inventory_and_incomplete_forgery_cannot_dispatch(self):
+        mutations=(('inventory', lambda selected: selected.update(inventory_complete=False, incomplete=False)),
+                   ('unsupported', lambda selected: selected['unsupported_sources'].append('hidden.rs')),
+                   ('omitted', lambda selected: selected['omitted_modules'].append('entry.py')),
+                   ('unknown-status', lambda selected: (selected['files'][0].update(status='model_verified'),
+                                                        selected.update(incomplete=True))),
+                   ('incomplete', lambda selected: selected.update(incomplete=False, unknown_calls=['unknown'])) )
+        for label, mutate in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); (root/'entry.py').write_text('def route():\n    return 1\n')
+                def forged(path, mode):
+                    selected=r.selection.select(path, mode)
+                    if mode=='baseline': mutate(selected)
+                    return selected
+                with patch.object(r, '_select_context', side_effect=forged):
+                    prepared=r.prepare_context(root)
+                self.assertEqual(prepared['rows'][0]['selection_status'], 'selection_failure')
+                self.assertFalse(prepared['comparable'])
+                with self.assertRaises(ValueError):
+                    r.budget_plan(prepared, {'finder': roster()['finder']}, input_token_cap=4096)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/'entry.py').write_text('def route():\n    return 1\n')
+            with patch.object(r, '_select_context', side_effect=lambda path, mode: r.selection.select(path, mode)):
+                prepared=r.prepare_context(root)
+        altered=copy.deepcopy(prepared)
+        altered['rows'][0]['selection']['inventory_complete']=False
+        altered['prepared_sha256']=r.prepared_digest(altered)
+        with self.assertRaises(ValueError): r.validate_prepared(altered)
+
+    def test_context_source_capture_cap_blocks_budget_even_with_full_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index in range(41):
+                (root / f'file_{index:02d}.py').write_text('def route():\n    return 1\n')
+            with patch.object(r, '_select_context', side_effect=lambda path, mode: r.selection.select(path, mode)):
+                prepared = r.prepare_context(root)
+        self.assertTrue(prepared['inventory_complete'])
+        self.assertFalse(prepared['initial_capture']['source_capture_complete'])
+        self.assertFalse(prepared['comparable'])
+        with self.assertRaises(ValueError): r.budget_plan(prepared, {'finder': roster()['finder']}, input_token_cap=4096)
+
+    def test_context_actual_range_total_above_16k_blocks_prepare_and_readback(self):
+        expanded={}
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ('first.py','second.py'):
+                (root/name).write_bytes(b'#'+b'a'*8998+b'\n')
+            def forged(path, mode):
+                selected=r.selection.select(path, mode, byte_budget=20000)
+                selected['byte_budget']=16384
+                expanded[mode]=copy.deepcopy(selected)
+                return selected
+            with patch.object(r, '_select_context', side_effect=forged):
+                rejected=r.prepare_context(root)
+            self.assertGreater(expanded['baseline']['selected_bytes'], 16384)
+            self.assertEqual(rejected['rows'][0]['selection_status'], 'selection_failure')
+            self.assertFalse(rejected['comparable'])
+            with self.assertRaises(ValueError):
+                r.budget_plan(rejected, {'finder': roster()['finder']}, input_token_cap=4096)
+            with patch.object(r, '_select_context', side_effect=lambda path, mode: r.selection.select(path, mode)):
+                prepared=r.prepare_context(root)
+        self.assertTrue(prepared['comparable'])
+        altered=copy.deepcopy(prepared)
+        baseline=altered['rows'][0]; baseline['selection']=expanded['baseline']
+        baseline['selection_incomplete']=expanded['baseline']['incomplete']
+        selected_by_path={module['path']:module for module in expanded['baseline']['files']}
+        for module in baseline['payload']['modules']:
+            selected=selected_by_path[module['path']]
+            module['status']=selected['status'];module['ranges']=selected['ranges']
+        altered['prepared_sha256']=r.prepared_digest(altered)
+        with self.assertRaises(ValueError): r.validate_prepared(altered)
+        self.assertEqual(len([call for call in Connection.calls if call[0]=='request']),0)
+
     def test_rag_payloads_keep_split_and_citations_without_labels(self):
         prepared = r.prepare_rag()
         with tempfile.TemporaryDirectory() as directory:

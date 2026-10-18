@@ -16,8 +16,27 @@ that any finding is correct. No SOC 2 certification or OpenSSF badge is claimed.
 | GitHub artifact attestation | GitHub-signed SLSA build provenance for actual archive/BOM subjects | Requires actual workflow execution and verification. Adding workflow YAML is not an issued attestation or a SLSA certification. |
 | Optional `.minisig` | Signature against a separately trusted minisign key | Optional; do not infer it exists or replace mandatory keyless verification with it. |
 
-These additions apply to future releases after the workflow is merged and run.
-Manual dispatch must run against the actual release tag ref, for example
+The public CLI **[v0.2.0 release](https://github.com/zhixuli0406/vettalon/releases/tag/v0.2.0)**
+has a [2026-10-19 public readback](../reports/evidence-acceptance/cli-v020-public-trust-readback-20261019/README.md):
+four macOS/Linux archives and 24 mandatory sidecars were freshly downloaded and
+matched GitHub release asset digests. Four runs of the current verifier passed
+Cosign identity checks and eight GitHub archive/BOM attestation subject checks
+for source `e3493f620487d23dbbd6a13021c216f415974585`. The
+[sanitized receipt](../reports/evidence-acceptance/cli-v020-public-trust-readback-20261019/receipt.json)
+records the verifier source/schema snapshot and results, but omits raw CLI output
+and has no independent signature; repeat the checks below to verify them independently.
+An older internal readback remains separate from this fresh public run.
+It does not attest this private worktree, a future release, Desktop/Pro assets,
+complete licenses, or a linked/reachable dependency inventory.
+The additional offline Cargo lock-graph comparator in the current tooling was
+not used to produce that historical release and does not reissue its attestations.
+Later source changes are not retroactively part of those signed assets.
+Current Cargo source-lock verification rejects symlinked in-tree source files and
+member parents; it needs a platform with no-follow file opening. A local release
+sidecar write failure cleans up newly created partial output. Neither behavior
+changes historical release assets or establishes binary dependency reachability.
+
+Manual dispatch for another release must run against its actual tag ref, for example
 `gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z`; dispatch from `main`
 fails before building/signing. Checkout resolves the same reviewed tag.
 
@@ -35,10 +54,12 @@ Choose the expected tag and **full source SHA independently** from the reviewed 
 python3 -m venv .venv-trust
 .venv-trust/bin/python -m pip install -r scripts/trust/requirements.txt
 PYTHON=.venv-trust/bin/python scripts/trust/verify-release.sh \
-  vettalon-linux-x64.tar.gz v0.1.2 FULL_40_CHARACTER_SOURCE_SHA
+  vettalon-linux-x64.tar.gz v0.2.0 e3493f620487d23dbbd6a13021c216f415974585
 ```
 
-The example tag is illustrative; use an existing reviewed release. The verifier:
+The example names an existing reviewed CLI release; obtain its assets and sidecars
+from the same GitHub release. For any later tag, substitute its independently
+reviewed full source SHA. The verifier:
 
 1. Requires checksum, signature, certificate, bundle, BOM and unsigned build record;
    checks the archive digest/name and official CycloneDX schema.

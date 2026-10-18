@@ -1,0 +1,225 @@
+{
+  "asset_counts": {
+    "archives": 4,
+    "required_sidecars": 24,
+    "total": 28
+  },
+  "assets": {
+    "vettalon-darwin-arm64.tar.gz": {
+      "metadata_digest_match": true,
+      "sha256": "780b6288adbe31e6cfc37c08e936f1daa38a6a411e6e5491527a890b21529d60",
+      "size": 4489458
+    },
+    "vettalon-darwin-arm64.tar.gz.build-record.json": {
+      "metadata_digest_match": true,
+      "sha256": "e4fe34174269402ba08980d9abfa2bf502a53f84f06fbc1ad85d4fc6f302c6fc",
+      "size": 629
+    },
+    "vettalon-darwin-arm64.tar.gz.cdx.json": {
+      "metadata_digest_match": true,
+      "sha256": "0007dbc3889dea7ed4a34b9eb7f05a28aa6f852053c101eecb0b46d5981fd310",
+      "size": 483741
+    },
+    "vettalon-darwin-arm64.tar.gz.pem": {
+      "metadata_digest_match": true,
+      "sha256": "099dbde8893bd6493f74589fdc02f9a9b78ffc493a35a60ce8df73a9ba198516",
+      "size": 3304
+    },
+    "vettalon-darwin-arm64.tar.gz.sha256": {
+      "metadata_digest_match": true,
+      "sha256": "663714aa4619228b54065110b6b166fe434081d7ba965a4bb23bab62d6652dd7",
+      "size": 95
+    },
+    "vettalon-darwin-arm64.tar.gz.sig": {
+      "metadata_digest_match": true,
+      "sha256": "43812804fcb4ae812706e2c3078b1a759bacbebd2494130415a9662dfa4fb3f7",
+      "size": 96
+    },
+    "vettalon-darwin-arm64.tar.gz.sigstore.json": {
+      "metadata_digest_match": true,
+      "sha256": "ded3e6c5c03ed4be42d432d1cb557e93ab569ea6acc9e285828f701916355ae6",
+      "size": 9431
+    },
+    "vettalon-darwin-x64.tar.gz": {
+      "metadata_digest_match": true,
+      "sha256": "d25da306e2183e02df69cee5debda866d3638b75b668968f2f91942a71ec9f8c",
+      "size": 4697657
+    },
+    "vettalon-darwin-x64.tar.gz.build-record.json": {
+      "metadata_digest_match": true,
+      "sha256": "1bffa5b8b4e227dc25e88152f5a5e27a705f88da57f193ba3109f89897f245d3",
+      "size": 626
+    },
+    "vettalon-darwin-x64.tar.gz.cdx.json": {
+      "metadata_digest_match": true,
+      "sha256": "e262b6f48e17b0564f0c427d1c8aad6391cae6703d1464908a7a1a654b3f3b54",
+      "size": 484002
+    },
+    "vettalon-darwin-x64.tar.gz.pem": {
+      "metadata_digest_match": true,
+      "sha256": "bfe000229badaa7995226001a6fde65e41861217fa18cc8193017b58ccb50db2",
+      "size": 3296
+    },
+    "vettalon-darwin-x64.tar.gz.sha256": {
+      "metadata_digest_match": true,
+      "sha256": "1b564ea3807d23ef6747ddf46be7fd6cacbed180e696b7cdcfa9c47341487cca",
+      "size": 93
+    },
+    "vettalon-darwin-x64.tar.gz.sig": {
+      "metadata_digest_match": true,
+      "sha256": "a0de01af2196ab5196f08ae43fb8e9308e8bebecf2f234322744149793951333",
+      "size": 96
+    },
+    "vettalon-darwin-x64.tar.gz.sigstore.json": {
+      "metadata_digest_match": true,
+      "sha256": "4bccf4627dffb9b656c68974d3455e5ab65c4f3fb8b08d8bf09167d1a3fde7be",
+      "size": 9415
+    },
+    "vettalon-linux-arm64.tar.gz": {
+      "metadata_digest_match": true,
+      "sha256": "93ccc9d3415f12e7d72c4e25931d04ffcd7b4ac12f6fd134dfe858f6cc7f13bb",
+      "size": 4868365
+    },
+    "vettalon-linux-arm64.tar.gz.build-record.json": {
+      "metadata_digest_match": true,
+      "sha256": "79fb3685b57119e979269909814c37a709addb9d22bc4ec3a8cf61bd783782f9",
+      "size": 633
+    },
+    "vettalon-linux-arm64.tar.gz.cdx.json": {
+      "metadata_digest_match": true,
+      "sha256": "dd75ecf2cf3f98c973e56aa79dd5913281890eece602da2f6be0c53205a59f28",
+      "size": 484448
+    },
+    "vettalon-linux-arm64.tar.gz.pem": {
+      "metadata_digest_match": true,
+      "sha256": "fb3fd34602f12ad00282d98a87ce69bb9fdfc5b41dc2946241d2f2c2ebc44785",
+      "size": 3304
+    },
+    "vettalon-linux-arm64.tar.gz.sha256": {
+      "metadata_digest_match": true,
+      "sha256": "0fc5b6b28e3259de9569068fd3398919d108fec89da6a81853b082cdbeda1598",
+      "size": 94
+    },
+    "vettalon-linux-arm64.tar.gz.sig": {
+      "metadata_digest_match": true,
+      "sha256": "5373a417e7228b5b68c00b26fe7858acb18883fbbfe8662c171510ca68620398",
+      "size": 96
+    },
+    "vettalon-linux-arm64.tar.gz.sigstore.json": {
+      "metadata_digest_match": true,
+      "sha256": "5561b52461423b45221219bc700d7c3d030284e288bf904efa4647cfd3d4b7b1",
+      "size": 9483
+    },
+    "vettalon-linux-x64.tar.gz": {
+      "metadata_digest_match": true,
+      "sha256": "d6f858826a0d0c7d82dfe70dfda1a82a4cc6964bf25516f0171d61c341bd9c46",
+      "size": 4959311
+    },
+    "vettalon-linux-x64.tar.gz.build-record.json": {
+      "metadata_digest_match": true,
+      "sha256": "e6dee1a546b9d0d86b96be68b3e685c684a5c0a3a7748bb55ccfb7dc6a622333",
+      "size": 630
+    },
+    "vettalon-linux-x64.tar.gz.cdx.json": {
+      "metadata_digest_match": true,
+      "sha256": "9d866ca610ef1c7d576a02f04d7fd83878036194e6eee0eb5b0a8ad574d00962",
+      "size": 483937
+    },
+    "vettalon-linux-x64.tar.gz.pem": {
+      "metadata_digest_match": true,
+      "sha256": "a85568c9d7e5e2bab8d34ffaa6f4242c05195b1a2b7a8517b2f8f1e3be9d7026",
+      "size": 3296
+    },
+    "vettalon-linux-x64.tar.gz.sha256": {
+      "metadata_digest_match": true,
+      "sha256": "38b3085d85ce96860135dd39b0568137ce0551f67bd852760b4b91815f7ba406",
+      "size": 92
+    },
+    "vettalon-linux-x64.tar.gz.sig": {
+      "metadata_digest_match": true,
+      "sha256": "c3dd887888a75e32ffd9dc6a0125a65d2abe68365333ccd208a72d387f994237",
+      "size": 96
+    },
+    "vettalon-linux-x64.tar.gz.sigstore.json": {
+      "metadata_digest_match": true,
+      "sha256": "dfecf16b6f3e934b3fa2eda1378045cf4141cb298e5c1c39e98a38a5415ae8d8",
+      "size": 9236
+    }
+  },
+  "expected_source_sha": "e3493f620487d23dbbd6a13021c216f415974585",
+  "limits": {
+    "desktop_pro_not_in_scope": true,
+    "maximum_run_seconds": 300,
+    "maximum_single_download_bytes": 8388608,
+    "maximum_single_download_seconds": 45,
+    "maximum_total_download_bytes": 33554432,
+    "public_release_assets_only": true
+  },
+  "metadata_pre_post_match": true,
+  "negative_control": {
+    "local_verify_assets_exit_code": 1,
+    "one_byte_archive_tamper_rejected": true
+  },
+  "observed_at_utc": "2026-10-18T22:31:57.217043+00:00",
+  "observed_tag_sha": "e3493f620487d23dbbd6a13021c216f415974585",
+  "published_at_utc": "2026-10-17T15:08:11Z",
+  "release_url": "https://github.com/zhixuli0406/vettalon/releases/tag/v0.2.0",
+  "repo": "zhixuli0406/vettalon",
+  "schema": "vettalon-cli-public-trust-readback-v1",
+  "status": "public_cli_release_verification_pass",
+  "tag": "v0.2.0",
+  "verification": {
+    "vettalon-darwin-arm64.tar.gz": {
+      "github_attestation_subjects_expected": 2,
+      "status": "pass",
+      "verifier_exit_code": 0
+    },
+    "vettalon-darwin-x64.tar.gz": {
+      "github_attestation_subjects_expected": 2,
+      "status": "pass",
+      "verifier_exit_code": 0
+    },
+    "vettalon-linux-arm64.tar.gz": {
+      "github_attestation_subjects_expected": 2,
+      "status": "pass",
+      "verifier_exit_code": 0
+    },
+    "vettalon-linux-x64.tar.gz": {
+      "github_attestation_subjects_expected": 2,
+      "status": "pass",
+      "verifier_exit_code": 0
+    }
+  },
+  "verifier": {
+    "checks": "local sidecars/SBOM, Cosign exact identity/issuer, GitHub archive and BOM attestations",
+    "command": "PYTHON=<python> verify-release.sh <archive> v0.2.0 <expected-source-sha>",
+    "dependencies": {
+      "cargo_graph.py": {
+        "sha256": "ac36fe21cfdd51788c4666818ebd772153c480d9520785a00e366324fb0d76e6",
+        "size": 16758
+      },
+      "schemas/bom-1.6.schema.json": {
+        "sha256": "3e92dddbc30cf7f6a02b80f0942b1a4cfd4fb1c26f1dfc4310afa9d613cafb93",
+        "size": 252625
+      },
+      "schemas/jsf-0.82.schema.json": {
+        "sha256": "8bae002c25e723db7ee1f26afde680ae1a2b1a8f6b4b4b0fd65dc3becb090aae",
+        "size": 8058
+      },
+      "schemas/spdx.schema.json": {
+        "sha256": "baa9d3bd1ed57b6751b0887edead6b5063ff53ff7429cf85d476c6c94af0166e",
+        "size": 14269
+      },
+      "trust.py": {
+        "sha256": "7710200be8c88943e29b63525ca046cb1025ecbe277fafc9a96b69f228488c9d",
+        "size": 21584
+      },
+      "verify-release.sh": {
+        "sha256": "ff10865118c39a67b7d77a46e02207d6742cf25025c78fc695262ea1dd8922d8",
+        "size": 1997
+      }
+    },
+    "sha256": "ff10865118c39a67b7d77a46e02207d6742cf25025c78fc695262ea1dd8922d8",
+    "snapshot_pre_post_match": true
+  }
+}

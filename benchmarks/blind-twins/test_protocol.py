@@ -1,10 +1,21 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from fixture_support import synthetic_denominator
 
 spec = importlib.util.spec_from_file_location('protocol', Path(__file__).with_name('protocol.py'))
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
+
+
+def setUpModule():
+    global _unit_denominator
+    _unit_denominator = synthetic_denominator()
+    _unit_denominator.__enter__()
+
+
+def tearDownModule():
+    _unit_denominator.__exit__(None, None, None)
 
 class ProtocolTests(unittest.TestCase):
     def test_twenty_anonymous_payloads_and_ten_pairs(self):
@@ -114,7 +125,7 @@ class ExecutionContractTests(unittest.TestCase):
             self.assertLessEqual(timeout,90)
             return {'message':{'content':json.dumps({'vulnerability':False,'category':'none','line':0,'evidence':'controlled stub'})}}
         with tempfile.TemporaryDirectory() as d:
-            r=self.runner.run(Path(d)/'result.json',transport=fake,mock=True)
+            r=self.runner.run(Path(d).resolve()/'result.json',transport=fake,mock=True)
             self.assertEqual(r['calls'],20)
             self.assertEqual(len(r['rows']),20)
             self.assertEqual(r['metrics']['incomplete'],0)
@@ -125,7 +136,7 @@ class ExecutionContractTests(unittest.TestCase):
         import tempfile
         def fake(*args,**kwargs): raise TimeoutError('controlled')
         with tempfile.TemporaryDirectory() as d:
-            r=self.runner.run(Path(d)/'result.json',transport=fake,max_calls=1,mock=True)
+            r=self.runner.run(Path(d).resolve()/'result.json',transport=fake,max_calls=1,mock=True)
             self.assertEqual(r['calls'],1)
             self.assertEqual(r['rows'][0]['status'],'timeout')
             self.assertEqual(r['metrics']['incomplete'],20)
@@ -136,7 +147,7 @@ class ExecutionContractTests(unittest.TestCase):
         def fake(*args,**kwargs):
             return {'message':{'content':json.dumps({'vulnerability':False,'category':'none','line':0,'evidence':'stub'})}}
         with tempfile.TemporaryDirectory() as d:
-            r=self.runner.run(Path(d)/'result.json',arm='samefamily',verifier_model='mock',verifier_family='qwen',transport=fake,max_calls=1,mock=True)
+            r=self.runner.run(Path(d).resolve()/'result.json',arm='samefamily',verifier_model='mock',verifier_family='qwen',transport=fake,max_calls=1,mock=True)
             self.assertEqual(r['rows'][0]['status'],'budget_exhausted')
             self.assertEqual(r['metrics']['incomplete'],20)
 
@@ -157,14 +168,14 @@ class ImmutableArtifactTests(unittest.TestCase):
         sys.path.insert(0,str(Path(__file__).parent))
         import run
         with tempfile.TemporaryDirectory() as d:
-            out=Path(d)/'raw.json'; out.write_text('previous raw')
+            out=Path(d).resolve()/'raw.json'; out.write_text('previous raw')
             with self.assertRaises(FileExistsError): run.run(out,mock=True)
             self.assertEqual(out.read_text(),'previous raw')
 
     def test_existing_canonical_is_preserved_before_docker(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            out=Path(d)/'canonical-oracle.json'; out.write_text('previous raw')
+            out=Path(d).resolve()/'canonical-oracle.json'; out.write_text('previous raw')
             with self.assertRaises(FileExistsError): p.canonical(out)
             self.assertEqual(out.read_text(),'previous raw')
 
@@ -186,9 +197,37 @@ class MockedBoundaryTests(unittest.TestCase):
         def call(args,**kwargs):
             return types.SimpleNamespace(returncode=0,stdout=json.dumps({'security_effect':labels[current['index']]['vulnerable'],'normal_control':True,'uid':65534}),stderr='')
         with tempfile.TemporaryDirectory() as d, patch.object(p.subprocess,'check_output',side_effect=check),patch.object(p.subprocess,'run',side_effect=call):
-            result=p.canonical(Path(d)/'canonical-oracle.json')
+            canonical_path=Path(d).resolve()/'canonical-oracle.json'
+            result=p.canonical(canonical_path)
             self.assertEqual(result['canonical_rebuildable_denominator'],10)
             self.assertEqual(current['index'],19)
+            canonical=canonical_path.read_text()
+            self.assertEqual(len(p.validate_frozen_canonical(result,canonical)),10)
+            declared_empty=dict(result,eligible_pairs=[],canonical_rebuildable_denominator=0,
+                                excluded_from_canonical_denominator=result['eligible_pairs'])
+            with self.assertRaises(ValueError):
+                p.validate_frozen_canonical(declared_empty,canonical)
+            cleanup_failure=json.loads(canonical)
+            cleanup_failure['rows'][0]['status']='incomplete'
+            cleanup_failure['rows'][0]['cleanup']='failed'
+            incomplete_text=json.dumps(cleanup_failure)
+            excluded_pair=labels[0]['pair_id']
+            incomplete_frozen=dict(result,canonical_sha256=p.digest(incomplete_text),
+                                   eligible_pairs=[pair for pair in result['eligible_pairs'] if pair!=excluded_pair],
+                                   canonical_rebuildable_denominator=9,
+                                   excluded_from_canonical_denominator=[excluded_pair])
+            self.assertEqual(len(p.validate_frozen_canonical(incomplete_frozen,incomplete_text)),9)
+            for mutation in ('not_executed','wrong_harness','incomplete_pair','duplicate_case'):
+                forged=json.loads(canonical)
+                if mutation=='not_executed': forged['rows'][0]['oracle_executed']=False
+                elif mutation=='wrong_harness': forged['rows'][0]['harness_sha256']='0'*64
+                elif mutation=='incomplete_pair':
+                    forged['rows'][0]['status']='incomplete';forged['rows'][0]['oracle_pass']=False
+                else: forged['rows'][1]['id']=forged['rows'][0]['id']
+                text=json.dumps(forged)
+                frozen=dict(result,canonical_sha256=p.digest(text))
+                with self.subTest(mutation=mutation),self.assertRaises(ValueError):
+                    p.validate_frozen_canonical(frozen,text)
 
     def test_loopback_transport_metadata_and_hashes_no_real_network(self):
         import tempfile,json,sys
@@ -207,7 +246,7 @@ class MockedBoundaryTests(unittest.TestCase):
             self.assertEqual(data['options']['num_predict'],1024)
             return Response({'message':{'content':json.dumps({'vulnerability':False,'category':'none','line':0,'evidence':'transport mock'})}})
         with tempfile.TemporaryDirectory() as d, patch.object(run.urllib.request,'urlopen',side_effect=open_url):
-            result=run.run(Path(d)/'raw.json')
+            result=run.run(Path(d).resolve()/'raw.json')
             self.assertEqual(result['model_identity']['qwen2.5-coder:7b'],'sha256:mock')
             self.assertTrue(result['implementation']['runner_sha256'])
 
@@ -278,11 +317,11 @@ class FixedSubsetTests(unittest.TestCase):
         import run,tempfile,json
         def fake(*args,**kwargs): return {'message':{'content':json.dumps({'vulnerability':False,'category':'none','line':0,'evidence':'contract mock'})}}
         with tempfile.TemporaryDirectory() as d:
-            subset=Path(d)/'subset.json';subset.write_text(json.dumps(p.fixed_subset()))
+            subset=Path(d).resolve()/'subset.json';subset.write_text(json.dumps(p.fixed_subset()))
             results=[]
             for arm in ['finder-only','samefamily','crossfamily']:
                 kwargs={} if arm=='finder-only' else {'verifier_model':'mock','verifier_family':'qwen' if arm=='samefamily' else 'claude'}
-                results.append(run.run(Path(d)/(arm+'.json'),arm=arm,subset_path=subset,transport=fake,mock=True,**kwargs))
+                results.append(run.run(Path(d).resolve()/(arm+'.json'),arm=arm,subset_path=subset,transport=fake,mock=True,**kwargs))
             self.assertEqual([r['calls'] for r in results],[10,20,20])
             self.assertEqual({r['metrics']['positive_denominator'] for r in results},{5})
             self.assertEqual(len({r['scope_manifest_sha256'] for r in results}),1)
@@ -294,11 +333,17 @@ class ReaggregationTests(unittest.TestCase):
         positive=next(x for x in labels if x['vulnerable'])['id']
         rows=[{'id':x['id'],'source_sha256':x['source_sha256'],'fingerprint':x['id'],'status':'complete',
                'detected':False,'surfaced':x['id']==positive,'finder_candidate':{'vulnerability':x['id']==positive}} for x in payloads]
-        frozen={'eligible_pairs':sorted({x['pair_id'] for x in labels})}
+        _,all_labels=p.generate()
+        canonical=json.dumps({'kind':'unit-fixture-only','no-oracle-executed':True})+'\n'
+        frozen={'schema':p.SCHEMA,'canonical_sha256':p.digest(canonical),
+                'manifest_sha256':p.digest(all_labels),'positive_denominator':10,
+                'canonical_rebuildable_denominator':0,'eligible_pairs':[],
+                'excluded_from_canonical_denominator':sorted({x['pair_id'] for x in all_labels})}
         raw={'schema':p.SCHEMA,'rows':rows,'frozen_denominator_sha256':p.digest(frozen),
              'scope_manifest':p.fixed_subset(),'scope_manifest_sha256':p.digest(p.fixed_subset())}
         with tempfile.TemporaryDirectory() as d:
-            base=Path(d); source=base/'raw.json';source.write_text(json.dumps(raw));denominator=base/'denominator.json';denominator.write_text(json.dumps(frozen))
+            base=Path(d).resolve(); source=base/'raw.json';source.write_text(json.dumps(raw));denominator=base/'denominator.json';denominator.write_text(json.dumps(frozen))
+            (base/'canonical-oracle.json').write_text(canonical)
             report=aggregate.aggregate(source,denominator)
             self.assertEqual(report['metrics']['positive_denominator'],5)
             self.assertIsNone(report['metrics']['detection_recall'])
@@ -338,7 +383,7 @@ class CanonicalFailureRetentionTests(unittest.TestCase):
                 if args[1:3]==['image','inspect']: return json.dumps([{'Id':'sha256:mock','RepoDigests':[]}])
                 raise OSError('create unavailable')
             with self.subTest(scenario=scenario),tempfile.TemporaryDirectory() as d,patch.object(p.subprocess,'check_output',side_effect=check):
-                out=Path(d)/'canonical-oracle.json'
+                out=Path(d).resolve()/'canonical-oracle.json'
                 result=p.canonical(out)
                 raw=json.loads(out.read_text())
                 self.assertEqual(len(raw['rows']),20)
@@ -357,7 +402,7 @@ class StageAndModelIdentityTests(unittest.TestCase):
                 if kind=='timeout': raise TimeoutError('controlled')
                 return {'message':{'content':'not JSON'}}
             with self.subTest(kind=kind),tempfile.TemporaryDirectory() as d:
-                result=run.run(Path(d)/'raw.json',arm='samefamily',verifier_model='mock-verifier',verifier_family='qwen',transport=fake,mock=True)
+                result=run.run(Path(d).resolve()/'raw.json',arm='samefamily',verifier_model='mock-verifier',verifier_family='qwen',transport=fake,mock=True)
                 self.assertEqual(result['rows'][0]['status'],kind)
                 self.assertEqual(result['rows'][0]['failed_stage'],'finder')
 
@@ -368,8 +413,8 @@ class StageAndModelIdentityTests(unittest.TestCase):
             for kwargs in [{'arm':'crossfamily','verifier_family':'other'},
                            {'arm':'crossfamily','model':'same-model','verifier_model':'same-model','verifier_family':'other'}]:
                 with self.subTest(kwargs=kwargs):
-                    with self.assertRaises(ValueError): run.run(Path(d)/'raw.json',transport=forbidden,mock=True,**kwargs)
-                    self.assertFalse((Path(d)/'raw.json').exists())
+                    with self.assertRaises(ValueError): run.run(Path(d).resolve()/'raw.json',transport=forbidden,mock=True,**kwargs)
+                    self.assertFalse((Path(d).resolve()/'raw.json').exists())
 
     def test_real_family_mapping_does_not_trust_arm_string(self):
         import run,tempfile,json
@@ -379,5 +424,5 @@ class StageAndModelIdentityTests(unittest.TestCase):
             def __exit__(self,*args): pass
             def read(self,*args): return json.dumps({'models':[{'name':'qwen2.5-coder:7b','digest':'sha256:mock','details':{'family':'qwen2'}}]}).encode()
         with tempfile.TemporaryDirectory() as d,patch.object(run.urllib.request,'urlopen',return_value=Response()):
-            with self.assertRaises(ValueError): run.run(Path(d)/'raw.json',finder_family='claude')
-            self.assertFalse((Path(d)/'raw.json').exists())
+            with self.assertRaises(ValueError): run.run(Path(d).resolve()/'raw.json',finder_family='claude')
+            self.assertFalse((Path(d).resolve()/'raw.json').exists())

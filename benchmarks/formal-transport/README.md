@@ -1,6 +1,6 @@
 # Formal transport v1（離線工程準備）
 
-這個獨立入口把 twins、context selection、counterexample RAG 接到同一個扣額及傳輸路徑，並提供可重算的只讀報告、逐階段覆核註記與成本附件。**正式 provider readiness 仍為 unknown／disabled，真 provider 呼叫為0**。本輪87項離線測試已通過；既有 run／compare／selection／rag、protocol 與原實驗分母不變。
+這個獨立入口把 twins、context selection、counterexample RAG 接到同一個扣額及傳輸路徑，並提供可重算的只讀報告、逐階段覆核註記與成本附件。**正式 provider readiness 仍為 unknown／disabled，真 provider 呼叫為0**。本輪離線測試以實際執行結果為準；twins 的凍結分母現在由 canonical rows 重建，不能只憑檔案 SHA 與自述 eligible pairs 放大。
 
 `transport_v1.py` 保存單 writer ledger、預扣額、固定 localhost HTTP worker 及 usage；`run_v1.py` 建資料與顯式執行入口；`report_v1.py` 只讀新版 formal-v1 和歷史 synthetic twins raw，formal 報告預設從 immutable attempt 重播 derived 欄位；`review_v1.py` 與 `cost_v1.py` 分別處理逐階段註記與估算。它不接管 recall／OWASP／ranking readers，也沒有改產品預設 prompt 或安全政策。
 
@@ -8,7 +8,7 @@
 
 使用 Python 3.11+ stdlib；正式 process capture 限既有 POSIX helper 範圍，native Windows 未驗。source checkout 必須保有 frozen benchmark helpers 及 `scripts/runtime/{process_capture_v2.py,process_supervisor.py}`。Unit tests 自行建立 temporary synthetic source／manifest／subset 與 control-only denominator，eligible_pairs為空，沒有容器canonical成功或歷史模型證據主張，不依賴私有raw。production twins prepare 另外要求使用者已備妥真實本機 materialized sources與既有canonical／denominator，沒有fixture fallback；公開包存在不代表該前置已完成。本輪不安裝依賴、下載權重或啟動 server。
 
-由 repo 根目錄使用下列離線入口。先前31項控制測試已有本機證據；新版完整 discovery 使用 `test_*.py`，包含 `test_report_integrity.py`。本輪root以受控driver對同一discovery pattern實跑87項，全部通過（原31項＋新增56項）。下列prepare／report為佔位用法；本輪report CLI另用root自建fixture驗證，不是這些使用者檔名的實驗。輸出parent須已存在，output必須是新路徑：
+由 repo 根目錄使用下列離線入口。先前31項控制測試已有本機證據；新版完整 discovery 使用 `test_*.py`，包含 `test_report_integrity.py`。先前 root 曾以受控 driver 實跑87項；目前本機完整 discovery 為 **94 項／0 fail**，公開 CI 仍待執行。下列prepare／report為佔位用法；report CLI 先前另用 root 自建 fixture 驗證，不是這些使用者檔名的實驗。輸出parent須已存在，output必須是新路徑：
 
 ```bash
 python3 -B -I -S -m unittest discover -s benchmarks/formal-transport -p 'test_*.py' -v

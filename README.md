@@ -115,6 +115,9 @@ vettalon scan . --profile deep --time-budget 1200 --report report.json
 # Record a trace of every model call (JSON Lines: step, model, byte counts, latency, outcome; no content)
 vettalon scan . --profile deep --trace trace.jsonl
 
+# Opt in to per-finder source snapshot and assembled-prompt SHA-256 receipts in report.json
+vettalon scan . --profile deep --source-receipts --report report.json
+
 # Policy gate (repeatable): fail CI when more than 0 findings of "high" or above are upheld by a
 # cross-family verifier or confirmed by a human.
 # With --gate and no --fail-on, only the gate conditions decide the exit code.
@@ -281,6 +284,8 @@ Verification independence counts only verifications that actually returned a ver
 **AI never declares "confirmed" on its own.** The highest status AI can reach is `needs_human`; only a person can mark a finding `confirmed`.
 
 The report format is defined in [`crates/vettalon/src/audit/schema.rs`](crates/vettalon/src/audit/schema.rs), and the validator always runs before a report is written. The SARIF 2.1.0 output can be uploaded directly to GitHub code scanning; refuted findings are marked as suppressed rather than deleted. Each result's properties also carry the CAPEC attack patterns for that finding (`vettalon.capec`) and an exploitability grade derived from its preconditions (`vettalon.exploitability`: direct/conditional/hard_to_reach). For findings with a CWE mapping, the report adds a section with an attack scenario and CAPEC reference links. `--trace` writes a separate JSON Lines file with one entry per model call (step, model, byte counts, latency and outcome only; no content).
+
+`--source-receipts` adds SHA-256 hashes of source bytes read, exact source prefixes included, and locally assembled finder prompts to each module attempt, including reflector retries. It records whether a caller returned a reply and whether that reply passed the JSON contract; transport failures remain unknown. The receipts contain no source text and are off by default. They do not prove provider delivery, model attention, comprehension, or recall. Keep reports containing private source hashes private.
 
 ## Known limitations
 

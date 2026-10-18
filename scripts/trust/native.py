@@ -4,16 +4,158 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 
-def npm_graph(lock):
+class UnsupportedInventoryError(ValueError):
+    """A source feature that cannot be reconciled without more resolution."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def is_local_npm_reference(value):
+    return isinstance(value, str) and (
+        value.startswith(("file:", "/", "./", "../"))
+        or bool(re.match(r"^[a-zA-Z]:[\\/]", value))
+    )
+
+
+def is_unsupported_npm_spec(value):
+    return not isinstance(value, str) or not value.strip() or bool(
+        re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", value)
+        or any(character in value for character in ("/", "\\", "#", "@"))
+    )
+
+
+def is_supported_npm_resolved(value):
+    if not isinstance(value, str):
+        return False
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def read_npm_file_bytes(path, kind, max_bytes, required=False):
+    code = "npm-" + kind + "-file-unsafe"
+    label = "package-lock.json" if kind == "source" else "package.json"
+    try:
+        expected = path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise ValueError("npm " + label + " is missing")
+        return None
+    except OSError as error:
+        raise UnsupportedInventoryError(
+            code, "cannot inspect npm " + label + " safely"
+        ) from error
+    if (
+        not stat.S_ISREG(expected.st_mode)
+        or expected.st_nlink != 1
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        raise UnsupportedInventoryError(
+            code, "npm " + label + " must be a regular in-directory file"
+        )
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError as error:
+        raise UnsupportedInventoryError(
+            code, "cannot open npm " + label + " without following links"
+        ) from error
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise UnsupportedInventoryError(
+                code, "npm " + label + " changed during safe read"
+            )
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            content = stream.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise UnsupportedInventoryError(
+                code, "npm " + label + " exceeds the safe size limit"
+            )
+        return content
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def npm_graph(lock, manifest=None):
     if lock.get("lockfileVersion") != 3:
         raise ValueError("native npm graph supports lock v3 only")
     packages = lock["packages"]
+    root = packages.get("", {})
+    if manifest is not None:
+        if not isinstance(manifest, dict):
+            raise ValueError("npm package.json must be an object")
+        dependency_keys = ("dependencies", "devDependencies", "optionalDependencies")
+        for key in ("name", "version", "workspaces", *dependency_keys):
+            default = {} if key in dependency_keys else None
+            if manifest.get(key, default) != root.get(key, default):
+                raise UnsupportedInventoryError(
+                    "npm-manifest-lock-mismatch",
+                    "npm package.json and lock root disagree on " + key,
+                )
+    if (
+        root.get("workspaces")
+        or any(entry.get("link") for entry in packages.values())
+        or any(path and not path.startswith("node_modules/") for path in packages)
+    ):
+        raise UnsupportedInventoryError(
+            "npm-workspace-link",
+            "npm workspace links require separate source resolution",
+        )
+    for entry in packages.values():
+        version = entry.get("version")
+        if version is not None and (
+            is_local_npm_reference(version) or is_unsupported_npm_spec(version)
+        ):
+            raise UnsupportedInventoryError(
+                "npm-unsupported-protocol",
+                "npm package versions must be plain registry versions",
+            )
+        resolved = entry.get("resolved")
+        if is_local_npm_reference(resolved):
+            raise UnsupportedInventoryError(
+                "npm-local-file",
+                "npm local file dependencies require separate source resolution",
+            )
+        if resolved is not None and not is_supported_npm_resolved(resolved):
+            raise UnsupportedInventoryError(
+                "npm-unsupported-protocol",
+                "npm source resolution supports HTTPS package URLs only",
+            )
+        for key in ("dependencies", "devDependencies", "optionalDependencies"):
+            for spec in entry.get(key, {}).values():
+                if is_local_npm_reference(spec):
+                    raise UnsupportedInventoryError(
+                        "npm-local-file",
+                        "npm local file dependencies require separate source resolution",
+                    )
+                if is_unsupported_npm_spec(spec):
+                    raise UnsupportedInventoryError(
+                        "npm-unsupported-protocol",
+                        "npm dependency specs must be registry versions or tags "
+                        "without protocols or paths",
+                    )
     nodes = {}
     edges = set()
     direct = set()
@@ -23,7 +165,7 @@ def npm_graph(lock):
             for key in ("link", "optional", "peerDependencies", "os", "cpu")
         ):
             raise ValueError(
-                "workspace links/peers/conditional npm nodes require separate resolution"
+                "peers/conditional npm nodes require separate resolution"
             )
         name = entry.get("name") or path.rsplit("node_modules/", 1)[-1]
         if name and entry.get("version"):
@@ -210,23 +352,82 @@ def go_graph(manifest, graph, selected, exclusions=None):
     return nodes, edges, direct
 
 
+def reject_reserved_bom_properties(bom):
+    pending = [bom]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, dict):
+            properties = value.get("properties")
+            if properties is not None:
+                if not isinstance(properties, list):
+                    raise ValueError("input BOM properties must be an array")
+                for property_entry in properties:
+                    if not isinstance(property_entry, dict):
+                        raise ValueError("input BOM property must be an object")
+                    name = property_entry.get("name")
+                    if isinstance(name, str) and name.strip().casefold().startswith("vettalon:"):
+                        raise ValueError("input BOM contains reserved vettalon property")
+            pending.extend(value.values())
+
+
 def enrich(bom, nodes, edges, direct, kind, source_hash):
+    expected_type = {
+        "npm-lock-v3": "npm",
+        "pip-inspect": "pypi",
+        "go-native": "golang",
+    }.get(kind)
+    if not expected_type:
+        raise ValueError("unsupported native inventory kind")
+    reject_reserved_bom_properties(bom)
+    def package_type(purl):
+        match = re.match(r"^pkg:([a-z][a-z0-9.+-]*)/", purl) if isinstance(purl, str) else None
+        if not match:
+            raise ValueError("catalog component lacks an explicit package ecosystem purl")
+        return match.group(1)
+
+    metadata = bom.setdefault("metadata", {})
+    metadata_component = metadata.get("component")
+    excluded_refs = set()
+    excluded_count = 0
+    foreign_refs = set()
+    if metadata_component:
+        root_purl = metadata_component.get("purl")
+        if not root_purl:
+            if metadata_component.get("type") != "file":
+                raise ValueError("unclassified metadata component has no purl")
+            if metadata_component.get("bom-ref"):
+                excluded_refs.add(metadata_component["bom-ref"])
+            excluded_count += 1
+            del metadata["component"]
+        elif package_type(root_purl) == expected_type:
+            raise ValueError("native ecosystem metadata component requires separate reconciliation")
+        elif metadata_component.get("bom-ref"):
+            foreign_refs.add(metadata_component["bom-ref"])
     mapping = {}
+    retained_components = []
     for component in bom.get("components", []):
-        purl = component.get("purl", "")
+        purl = component.get("purl")
+        if not purl:
+            if component.get("type") != "file":
+                raise ValueError("unclassified catalog component has no purl")
+            if component.get("bom-ref"):
+                excluded_refs.add(component["bom-ref"])
+            excluded_count += 1
+            continue
+        ecosystem = package_type(purl)
+        retained_components.append(component)
         name = component["name"]
-        expected_type = {
-            "npm-lock-v3": "npm",
-            "pip-inspect": "pypi",
-            "go-native": "golang",
-        }.get(kind)
-        if not expected_type:
-            raise ValueError("unsupported native inventory kind")
         if expected_type == "pypi":
             name = re.sub(r"[-_.]+", "-", name).lower()
         key = (name, component.get("version"))
-        if purl and not purl.startswith(f"pkg:{expected_type}/"):
-            continue  # Preserve unrelated ecosystems without relabeling their nodes.
+        if ecosystem != expected_type:
+            if component.get("bom-ref"):
+                foreign_refs.add(component["bom-ref"])
+            continue  # Preserve explicit unrelated ecosystems as unverified catalog nodes.
+        if key not in nodes:
+            raise ValueError("catalog component absent from native source graph")
         if key in nodes:
             expected_identity = f"pkg:{expected_type}/{name}@{component.get('version')}"
             if "?" in purl or "#" in purl or unquote(purl) != expected_identity:
@@ -249,6 +450,7 @@ def enrich(bom, nodes, edges, direct, kind, source_hash):
                     },
                 ]
             )
+    bom["components"] = retained_components
     missing = nodes - set(mapping)
     if missing and kind != "go-native":
         raise ValueError(
@@ -289,11 +491,27 @@ def enrich(bom, nodes, edges, direct, kind, source_hash):
             }
         )
         mapping[(name, version)] = purl
-    existing = {
-        r["ref"]: set(r.get("dependsOn", [])) for r in bom.get("dependencies", [])
-    }
-    for left, right in edges:
-        existing.setdefault(mapping[left], set()).add(mapping[right])
+    native_refs = set(mapping.values())
+    native_edges = {(mapping[left], mapping[right]) for left, right in edges}
+    allowed_refs = native_refs | foreign_refs
+    existing = {}
+    for row in bom.get("dependencies", []):
+        ref = row["ref"]
+        targets = row.get("dependsOn", [])
+        if ref in excluded_refs or any(target in excluded_refs for target in targets):
+            raise ValueError("excluded file artifact dependency cannot be reconciled")
+        if ref not in allowed_refs or any(target not in allowed_refs for target in targets):
+            raise ValueError("unknown catalog dependency ref cannot be reconciled")
+        for target in targets:
+            if ref in native_refs or target in native_refs:
+                if (ref, target) not in native_edges:
+                    raise ValueError("catalog dependency edge absent from native source graph")
+            else:
+                existing.setdefault(ref, set()).add(target)
+        if ref not in native_refs and not row.get("dependsOn"):
+            existing.setdefault(ref, set())
+    for ref, target in native_edges:
+        existing.setdefault(ref, set()).add(target)
     bom["dependencies"] = [
         {"ref": ref, "dependsOn": sorted(targets)}
         for ref, targets in sorted(existing.items())
@@ -306,6 +524,19 @@ def enrich(bom, nodes, edges, direct, kind, source_hash):
             + source_hash,
         }
     )
+    bom["metadata"]["properties"].append(
+        {
+            "name": "vettalon:graph:edge-policy",
+            "value": "native refs source-authoritative; unproven catalog edges fail; explicit foreign-purl edges unverified",
+        }
+    )
+    if excluded_count:
+        bom["metadata"]["properties"].append(
+            {
+                "name": "vettalon:graph:excluded-unclassified-file-artifacts",
+                "value": str(excluded_count),
+            }
+        )
     return bom
 
 
@@ -333,10 +564,21 @@ def main():
         exclusions = []
         marker_exclusions = []
         marker_environment = None
-        source = args.source.read_bytes()
+        digest = None
+        manifest_digest = None
+        if args.kind == "npm-lock-v3":
+            source = read_npm_file_bytes(args.source, "source", 64 * 1024 * 1024, required=True)
+        else:
+            source = args.source.read_bytes()
         digest = hashlib.sha256(source).hexdigest()
         if args.kind == "npm-lock-v3":
-            nodes, edges, direct = npm_graph(json.loads(source))
+            manifest_path = args.source.with_name("package.json")
+            manifest = None
+            manifest_bytes = read_npm_file_bytes(manifest_path, "manifest", 4 * 1024 * 1024)
+            if manifest_bytes is not None:
+                manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+                manifest = json.loads(manifest_bytes)
+            nodes, edges, direct = npm_graph(json.loads(source), manifest=manifest)
         elif args.kind == "pip-inspect":
             inspect = json.loads(source)
             nodes, edges, direct = pip_graph(inspect, exclusions=marker_exclusions)
@@ -359,6 +601,10 @@ def main():
         bom = enrich(
             json.loads(args.bom.read_text()), nodes, edges, direct, args.kind, digest
         )
+        if manifest_digest is not None:
+            bom["metadata"]["properties"].append(
+                {"name": "vettalon:graph:manifest-sha256", "value": manifest_digest}
+            )
         if marker_environment is not None:
             bom["metadata"]["properties"].extend(
                 [
@@ -383,6 +629,7 @@ def main():
                 {
                     "source_kind": args.kind,
                     "source_sha256": digest,
+                    **({"manifest_sha256": manifest_digest} if manifest_digest else {}),
                     "nodes": len(nodes),
                     "edges": len(edges),
                     "direct": len(direct),
@@ -392,6 +639,20 @@ def main():
                 }
             )
         )
+    except UnsupportedInventoryError as error:
+        print(
+            json.dumps(
+                {
+                    "status": "unsupported",
+                    "code": error.code,
+                    "source_kind": args.kind,
+                    **({"source_sha256": digest} if digest else {}),
+                    **({"manifest_sha256": manifest_digest} if manifest_digest else {}),
+                    "boundary": "no reconciled BOM emitted; Syft catalog alone is not a resolved npm source graph",
+                }
+            )
+        )
+        parser.exit(2)
     except (ValueError, OSError, KeyError) as error:
         parser.exit(1, str(error) + "\n")
 

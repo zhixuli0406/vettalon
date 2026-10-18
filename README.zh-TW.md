@@ -102,6 +102,9 @@ vettalon scan . --profile deep --time-budget 1200 --report report.json
 # 記錄每次模型呼叫的追蹤（JSON Lines：步驟、模型、位元組數、延遲、結果，不含內文）
 vettalon scan . --profile deep --trace trace.jsonl
 
+# 選擇記錄每次 finder 的來源快照及本機組裝提示 SHA-256 收據，寫入 report.json
+vettalon scan . --profile deep --source-receipts --report report.json
+
 # 政策門檻（可重複）：跨家族覆核成立或人工確認的「高」以上發現超過 0 筆就讓 CI 失敗
 # 有 --gate 而沒指定 --fail-on 時，只由門檻條件決定結束碼
 vettalon scan . --profile deep \

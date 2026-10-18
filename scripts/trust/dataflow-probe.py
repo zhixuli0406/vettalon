@@ -17,6 +17,7 @@ import threading
 import time
 
 MARKER = "VETTALON_PUBLIC_FIXTURE_SOURCE_MARKER"
+FIXTURE_SOURCE = f'def echo(value):\n    return "{MARKER}" + value\n'.encode("utf-8")
 STDOUT_CAP, STDERR_CAP = 1024 * 1024, 256 * 1024
 MAX_SECONDS = 90.0
 HELPER = Path(__file__).resolve().parents[2] / "benchmarks/reachability/adapter.py"
@@ -145,6 +146,7 @@ class FixtureHTTP:
             raise ValueError("json-body-must-be-object")
         self.captures.append({"path": lines[0].split(" ")[1], "body": payload})
         response = json.dumps({"choices": [{"message": {"content": "[]"}, "finish_reason": "stop"}]}).encode()
+        event["response_body"] = response
         response = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
                     + str(len(response)).encode() + b"\r\n\r\n" + response)
         sent = 0
@@ -169,7 +171,7 @@ class FixtureHTTP:
                 with self.lock:
                     self.connection = connection
                 self.admitted += 1
-                event = {"header": b"", "body": b"", "complete": False, "error": None}
+                event = {"header": b"", "body": b"", "response_body": b"", "complete": False, "error": None}
                 header_before, body_before = self.headers, self.bodies
                 try:
                     self.request(connection, min(self.deadline, time.monotonic() + self.connection_seconds), event)
@@ -188,7 +190,9 @@ class FixtureHTTP:
                         "header_base64": base64.b64encode(event["header"]).decode(),
                         "body_base64": base64.b64encode(event["body"]).decode(),
                         "header_sha256": hashlib.sha256(event["header"]).hexdigest(),
-                        "body_sha256": hashlib.sha256(event["body"]).hexdigest()})
+                        "body_sha256": hashlib.sha256(event["body"]).hexdigest(),
+                        "response_body_base64": base64.b64encode(event["response_body"]).decode(),
+                        "response_body_sha256": hashlib.sha256(event["response_body"]).hexdigest()})
                     connection.close()
                     with self.lock:
                         self.connection = None
@@ -233,6 +237,16 @@ def raw_capture(run, name):
     return run.get(name, "").encode("utf-8", "strict")
 
 
+def private_open(path):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    return os.fdopen(descriptor, "wb")
+
+
+def private_write(path, data):
+    with private_open(path) as stream:
+        stream.write(data)
+
+
 def run_probe(binary, output, *, timeout_seconds=MAX_SECONDS, stdout_cap=STDOUT_CAP, stderr_cap=STDERR_CAP):
     started = time.monotonic()
     if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
@@ -245,7 +259,7 @@ def run_probe(binary, output, *, timeout_seconds=MAX_SECONDS, stdout_cap=STDOUT_
     if supplied_output.is_symlink():
         raise ValueError("output-symlink")
     output = supplied_output.resolve(); binary = Path(binary).resolve()
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
     server, cleanup, run, error, cli_valid = None, {"cleanup_complete": False}, {}, None, False
     attempted = 0
     try:
@@ -256,7 +270,8 @@ def run_probe(binary, output, *, timeout_seconds=MAX_SECONDS, stdout_cap=STDOUT_
             raise FixtureStartError("fixture-thread-start-failed") from failure
         with tempfile.TemporaryDirectory(prefix="vettalon-dataflow-") as temporary:
             root = Path(temporary); fixture = root / "fixture"; fixture.mkdir()
-            (fixture / "app.py").write_text(f'def echo(value):\n    return "{MARKER}" + value\n')
+            source_file = fixture / "app.py"
+            source_file.write_bytes(FIXTURE_SOURCE)
             home = root / "home"; home.mkdir()
             config = root / "roster.toml"
             config.write_text(f'[[model]]\nid="local-probe"\nbackend="openai"\nfamily="fixture"\nbase_url="http://127.0.0.1:{server.port}/v1"\nmodel="fixture"\nroles=["finder","verifier"]\ntimeout_secs=15\n')
@@ -268,22 +283,23 @@ def run_probe(binary, output, *, timeout_seconds=MAX_SECONDS, stdout_cap=STDOUT_
             env = {"PATH": os.defpath, "HOME": str(home), "TMPDIR": str(root), "LANG": "C.UTF-8",
                    "NO_PROXY": "127.0.0.1,localhost", "PYTHONDONTWRITEBYTECODE": "1"}
             attempted = 1
-            with (output / "cli-attempt.json").open("x") as receipt:
-                json.dump({"attempt": attempted, "maximum": 1, "phase": "debited-before-invoke",
-                           "not_actual_spawn_proof": True, "command": command,
-                           "elapsed_before": time.monotonic() - started,
-                           "timeout_seconds": remaining}, receipt, indent=2)
-                receipt.write("\n")
+            private_write(output / "cli-attempt.json", (json.dumps({"attempt": attempted, "maximum": 1,
+                "phase": "debited-before-invoke", "not_actual_spawn_proof": True, "command": command,
+                "elapsed_before": time.monotonic() - started, "timeout_seconds": remaining}, indent=2) + "\n").encode())
             remaining = min(remaining, deadline - time.monotonic() - 1.5)
             if remaining <= 0:
                 raise TimeoutError("probe-budget-exhausted-before-launch")
             run = invoke(command, root, env, remaining, stdout_cap=stdout_cap, stderr_cap=stderr_cap)
+            source_after = source_file.read_bytes()
+            private_write(output / "fixture-source.py", source_after)
+            if source_after != FIXTURE_SOURCE:
+                error = {"kind": "source_mismatch", "message": "Disposable fixture source changed during CLI run"}
             valid = dict(run)
             # Exit 1 is the established CLI findings exit, not a harness failure.
             if type(valid.get("returncode")) is int and valid["returncode"] == 1 and valid.get("error") == "nonzero-exit":
                 valid.update(returncode=0, error=None)
             cli_valid = process_adapter().successful_run(valid)
-            if not cli_valid:
+            if not cli_valid and error is None:
                 error = {"kind": "timeout" if run.get("timed_out") else
                          ("cli_start_error" if run.get("error") == "process-error" else "cli_control_error"),
                          "message": "CLI incomplete; bounded partial evidence retained; no retry"}
@@ -297,10 +313,10 @@ def run_probe(binary, output, *, timeout_seconds=MAX_SECONDS, stdout_cap=STDOUT_
     snapshot = server.snapshot() if server is not None else {"captures": [], "events": [], "errors": ["server-not-started"]}
     observed = any(MARKER in json.dumps(capture["body"]) for capture in snapshot["captures"])
     for name in ("stdout", "stderr"):
-        (output / (name + ".txt")).write_bytes(raw_capture(run, name))
-    (output / "requests.json").write_text(json.dumps(snapshot["captures"], indent=2) + "\n")
+        private_write(output / (name + ".txt"), raw_capture(run, name))
+    private_write(output / "requests.json", (json.dumps(snapshot["captures"], indent=2) + "\n").encode())
     raw_events = (json.dumps(snapshot["events"], indent=2) + "\n").encode()
-    (output / "http-events.json").write_bytes(raw_events)
+    private_write(output / "http-events.json", raw_events)
     # Missing exit/control metadata cannot establish cleanup from absence of an error.
     cli_cleanup = True if cli_valid else (False if run.get("cleanup_error") else None)
     cleanup_complete = cleanup["cleanup_complete"] and cli_cleanup is True
@@ -338,7 +354,11 @@ def run_probe(binary, output, *, timeout_seconds=MAX_SECONDS, stdout_cap=STDOUT_
     # Raw bytes live in the retained capped stream files, not duplicated in the final receipt.
     for capture in record["cli"].get("captures", {}).values():
         capture.pop("raw_base64", None)
-    (output / "result.json").write_text(json.dumps(record, indent=2) + "\n")
+    private_write(output / "result.json", (json.dumps(record, indent=2) + "\n").encode())
+    # The CLI owns report.json; the private directory protects it during the run.
+    for artifact in output.iterdir():
+        if artifact.is_file() and not artifact.is_symlink():
+            artifact.chmod(0o600)
     return record
 
 
