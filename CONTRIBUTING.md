@@ -15,6 +15,7 @@ The open-source core: OSS scanners (semgrep / gitleaks / cargo-audit) plus an AI
 - **Setup**: `cargo build`, `cargo test`, `cargo clippy --all-targets -- -D warnings`. No real model is called in tests.
 - **Style**: `cargo fmt`; match the file you are editing. For security or routing decisions, no unanchored `contains` and no raw byte-index string slicing.
 - **Branches and PRs**: branch from `main` (`feat/…`, `fix/…`, `docs/…`, `chore/…`), open the PR against `main`. CI runs fmt, clippy and tests on Linux and macOS; desktop Windows builds use a separate pipeline. A separate Windows scanner process-limit job is configured; native and hosted execution evidence is tracked separately.
+- **Dependency updates**: Dependabot opens weekly PRs for Cargo, GitHub Actions, the trust tools' pip lock and the Docker base images. Maintainers apply them upstream and sync the result here, so a bot PR may be closed after the sync lands instead of being merged.
 - **Commits**: [Conventional Commits](https://www.conventionalcommits.org/) (`feat:` / `fix:` / `docs:` …).
 - **Tests**: new functionality and bug fixes must include automated tests in the same PR (`cargo test`, or `python -m unittest` for the Python tools). A PR without tests must say why in its description.
 - **Definition of done**: build + tests pass locally; behaviour changes update the docs **in the same PR** (README/CHANGELOG — stale docs are treated as bugs); add a `CHANGELOG.md [Unreleased]` entry.

@@ -10,10 +10,12 @@
 - Claude Code plugin 可從 GitHub 安裝：repo 根目錄新增 `.claude-plugin/marketplace.json`（名稱 `vettalon`），用 `/plugin marketplace add zhixuli0406/vettalon` 加入後 `/plugin install vettalon@vettalon`。原本的 `vettalon-local` 本機開發流程不變。
 - `.bestpractices.json`：OpenSSF Best Practices passing 等級的自評答案（66 條有答案：60 Met、4 N/A、2 Unmet，Unmet 都是 SUGGESTED），在 bestpractices.dev 建立專案時會自動帶入，送出前仍由維護者逐條確認。
 - README 加上 OpenSSF Best Practices badge：專案 15717 於 2026-10-20 達到 passing 等級（自我認證）。
+- CodeQL 掃描（Rust、Python、workflow）與 Dependabot 每週相依更新。
 
 ### Changed
 - README 註明 Pro 桌面 App 支援的平台（Apple Silicon Mac、Windows x64、Linux x86_64，不支援 Intel Mac）並連到官網下載頁；開源 CLI 的支援平台不變。
 - 貢獻指南要求新功能與修 bug 在同一個 PR 附自動化測試，PR 範本加上對應勾選項。
+- 供應鏈固定：CI 與發版 workflow 的所有 action 釘在 commit SHA；trust 工具的 pip 安裝改為 hash 鎖定（`--require-hashes`）；agent 與 egress Docker 基底映像釘在 digest。SECURITY.md 補上回報網址與 email。
 
 ### Fixed
 - Release verifier 改用單一 exact certificate identity，避免新版 GitHub CLI 拒絕同時指定 `--cert-identity` 與 `--signer-workflow`；workflow／tag、issuer、來源 SHA 與 hosted runner 限制保留。此修正不改已發布的 binary 或版本 tag。

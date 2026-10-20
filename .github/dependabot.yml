@@ -1,0 +1,27 @@
+# Weekly dependency update PRs. Fixture lockfiles under fixtures/ and
+# benchmarks/ are frozen test inputs and are deliberately not listed.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /scripts/trust
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directories: [/docker/agents, /docker/egress]
+    schedule:
+      interval: weekly

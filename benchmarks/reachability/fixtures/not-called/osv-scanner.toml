@@ -1,0 +1,18 @@
+# OSV-Scanner / OpenSSF Scorecard: these advisories are expected in this frozen
+# test fixture. It is never built into or shipped with Vettalon.
+
+[[IgnoredVulns]]
+id = "GO-2021-0113"
+reason = "Reachability fixture: pins golang.org/x/text v0.3.5 on purpose so the called/not-called experiment has a known vulnerable function; not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2022-1059"
+reason = "Reachability fixture: pins golang.org/x/text v0.3.5 on purpose so the called/not-called experiment has a known vulnerable function; not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-5970"
+reason = "Reachability fixture: pins golang.org/x/text v0.3.5 on purpose so the called/not-called experiment has a known vulnerable function; not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-6629"
+reason = "Reachability fixture: pins golang.org/x/text v0.3.5 on purpose so the called/not-called experiment has a known vulnerable function; not shipped."
