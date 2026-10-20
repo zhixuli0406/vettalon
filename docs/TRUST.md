@@ -49,6 +49,28 @@ own checks. A valid Desktop updater signature is not a CLI Cosign signature,
 GitHub attestation, or CycloneDX BOM. A draft release remains a candidate until
 its own version-specific readback and native acceptance are complete.
 
+## npm packages: trusted publishing, staged
+
+From the release after 0.2.1, the `npm-publish` job holds no npm token. It uses
+[npm trusted publishing](https://docs.npmjs.com/trusted-publishers): the job's
+GitHub OIDC token (`id-token: write`) is exchanged for a short-lived credential,
+and npm attaches a provenance attestation because the repository and packages
+are public. The trusted publisher for each of the five packages (`vettalon`,
+`@vettalon/darwin-arm64`, `@vettalon/darwin-x64`, `@vettalon/linux-x64`,
+`@vettalon/linux-arm64`) is bound to `zhixuli0406/vettalon` and
+`release.yml`, and allows only `npm stage publish`. A staged version is not
+installable until a maintainer approves it with 2FA:
+
+```bash
+npm stage list vettalon          # and each @vettalon/* package
+npm stage approve <stage-id>     # platform packages first, then vettalon
+```
+
+Check a published version's provenance with `npm audit signatures` in a project
+that installs it, or on the package page on npmjs.com. Provenance shows which
+workflow run built the package; it does not prove the source is safe, and a
+compromised workflow could still produce valid provenance.
+
 ## Verify a downloaded CLI archive
 
 Install `cosign`, GitHub CLI (`gh` with attestation support), Python 3.11+ and the

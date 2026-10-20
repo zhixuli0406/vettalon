@@ -1,0 +1,60 @@
+[package]
+name = "vettalon-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+percent-encoding = "2.3"
+tempfile = "3"
+unicode-normalization = "0.1"
+vettalon = { path = "../crates/vettalon", features = ["fuzzing"] }
+vettalon-contract = { path = "../crates/vettalon-contract" }
+
+# A workspace of its own: fuzzing needs nightly and sanitizers, so this crate
+# must never join the main (stable) workspace in the repository root.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "lockfiles"
+path = "fuzz_targets/lockfiles.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_reply"
+path = "fuzz_targets/model_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "contract_ids"
+path = "fuzz_targets/contract_ids.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_extract"
+path = "fuzz_targets/archive_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redaction"
+path = "fuzz_targets/redaction.rs"
+test = false
+doc = false
+bench = false

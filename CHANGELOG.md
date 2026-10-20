@@ -11,13 +11,16 @@
 - `.bestpractices.json`：OpenSSF Best Practices passing 等級的自評答案（66 條有答案：60 Met、4 N/A、2 Unmet，Unmet 都是 SUGGESTED），在 bestpractices.dev 建立專案時會自動帶入，送出前仍由維護者逐條確認。
 - README 加上 OpenSSF Best Practices badge：專案 15717 於 2026-10-20 達到 passing 等級（自我認證）。
 - CodeQL 掃描（Rust、Python、workflow）與 Dependabot 每週相依更新。
+- cargo-fuzz 模糊測試（`fuzz/`）：五個 target 餵不可信輸入給 hunt 的 lockfile 解析、模型回覆合約與 pre-check、路徑與 ID 原語、相依套件壓縮檔解壓、機密遮罩，除了不得 panic 也檢查不變式（例如 pre-check 放行的行號一定取得到程式碼、解壓不會寫到目的地之外、已知前綴的憑證遮罩後不會殘留）。CI 新增 `fuzz` job，用固定日期的 nightly 每個 target 跑 45 秒。用法見 `fuzz/README.md`。`.bestpractices.json` 的 `dynamic_analysis` 與 `dynamic_analysis_fixed` 隨之改為 Met。
 
 ### Changed
 - README 註明 Pro 桌面 App 支援的平台（Apple Silicon Mac、Windows x64、Linux x86_64，不支援 Intel Mac）並連到官網下載頁；開源 CLI 的支援平台不變。
 - 貢獻指南要求新功能與修 bug 在同一個 PR 附自動化測試，PR 範本加上對應勾選項。
 - 供應鏈固定：CI 與發版 workflow 的所有 action 釘在 commit SHA；trust 工具的 pip 安裝改為 hash 鎖定（`--require-hashes`）；agent 與 egress Docker 基底映像釘在 digest。SECURITY.md 補上回報網址與 email。
+- npm 發布改用 trusted publishing（GitHub OIDC，不再使用長期 `NPM_TOKEN`），並只做 staged publish：每個版本先進 npm 的待核准區，由維護者以 2FA 執行 `npm stage approve` 後才上線；npm 對公開套件自動附 provenance。發布 job 會先檢查 npm ≥ 11.5.1。
 
 ### Fixed
+- hunt 讀 lockfile 時，名稱或版本是空字串的項目不再變成目標（go.sum 只有 `/go.mod` 欄位、package-lock.json 或 Cargo.lock 的空 `name`／`version`）。由新加的 fuzz target 找到；go.sum 與 npm 的正式 intake 原本就會濾掉，Cargo.lock 的空值則會一路成為目標，下載時打到不存在的 crates.io 網址。
 - Release verifier 改用單一 exact certificate identity，避免新版 GitHub CLI 拒絕同時指定 `--cert-identity` 與 `--signer-workflow`；workflow／tag、issuer、來源 SHA 與 hosted runner 限制保留。此修正不改已發布的 binary 或版本 tag。
 
 ### Security

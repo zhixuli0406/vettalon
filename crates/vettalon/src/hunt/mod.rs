@@ -126,7 +126,8 @@ pub fn parse_cargo_lock(
     let mut targets: Vec<DependencyTarget> = Vec::new();
     for p in lock.package {
         // No source = a local workspace member, not a third-party dependency.
-        if p.source.is_none() {
+        // An empty name or version names nothing that can be fetched.
+        if p.source.is_none() || p.name.is_empty() || p.version.is_empty() {
             continue;
         }
         if !seen.insert((p.name.clone(), p.version.clone())) {
@@ -199,7 +200,10 @@ pub fn parse_npm_lock(text: &str) -> Result<Vec<DependencyTarget>, String> {
             let Some(version) = meta.get("version").and_then(|x| x.as_str()) else {
                 continue; // link/workspace entries carry no concrete version
             };
-            if name.is_empty() || !seen.insert((name.to_string(), version.to_string())) {
+            if name.is_empty()
+                || version.is_empty()
+                || !seen.insert((name.to_string(), version.to_string()))
+            {
                 continue;
             }
             out.push(DependencyTarget {
@@ -225,6 +229,8 @@ fn collect_npm_v1(
 ) {
     for (name, meta) in deps {
         if let Some(version) = meta.get("version").and_then(|x| x.as_str())
+            && !name.is_empty()
+            && !version.is_empty()
             && seen.insert((name.clone(), version.to_string()))
         {
             out.push(DependencyTarget {
@@ -332,7 +338,8 @@ pub fn parse_go_sum(sum_text: &str, direct_modules: &HashSet<String>) -> Vec<Dep
             continue;
         };
         let version = raw_version.trim_end_matches("/go.mod");
-        if !seen.insert((module.to_string(), version.to_string())) {
+        // A bare `/go.mod` field leaves no version to fetch.
+        if version.is_empty() || !seen.insert((module.to_string(), version.to_string())) {
             continue;
         }
         out.push(DependencyTarget {
@@ -898,6 +905,42 @@ pub fn targets_from_dir(project: &std::path::Path) -> Result<Vec<DependencyTarge
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression tests from the `lockfiles` fuzz target (fuzz/): an entry
+    // with an empty name or version names nothing fetchable and must never
+    // become a hunt target.
+    #[test]
+    fn go_sum_bare_go_mod_field_is_not_a_target() {
+        // Minimised fuzz input: go.sum row `\u{fffd}\t/go.mod`.
+        assert!(parse_go_sum("\u{fffd}\t/go.mod", &HashSet::new()).is_empty());
+        assert!(parse_go_sum("example.com/m /go.mod h1:x=", &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn npm_lock_entries_without_name_or_version_are_not_targets() {
+        let v3 = r#"{"packages": {"": {}, "node_modules/a": {"version": ""}, "node_modules/": {"version": "1.0.0"}}}"#;
+        assert!(parse_npm_lock(v3).unwrap().is_empty());
+        let v1 = r#"{"dependencies": {"": {"version": "1.0.0"}, "b": {"version": "", "dependencies": {"c": {"version": "2.0.0"}}}}}"#;
+        let t = parse_npm_lock(v1).unwrap();
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!((t[0].name.as_str(), t[0].version.as_str()), ("c", "2.0.0"));
+    }
+
+    #[test]
+    fn cargo_lock_entries_without_name_or_version_are_not_targets() {
+        let lock = r#"
+[[package]]
+name = ""
+version = "1.0.0"
+source = "registry+https://example.invalid/index"
+
+[[package]]
+name = "serde"
+version = ""
+source = "registry+https://example.invalid/index"
+"#;
+        assert!(parse_cargo_lock(lock, &HashSet::new()).unwrap().is_empty());
+    }
 
     #[test]
     fn npm_workspace_members_are_own_code_and_their_deps_direct() {
