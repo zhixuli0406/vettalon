@@ -17,6 +17,16 @@ for every lockfile variant, optional feature, workspace, platform, malformed inp
 installed artifact or package ecosystem. Customer BOMs and caches are private until
 reviewed; public export includes only these self-contained fixture sources.
 
+`confusion/` holds seven small Cargo projects built to mislead a manifest or
+lock parser: a dependency in a comment, a package table inside a multi-line
+string, a stray CycloneDX file, duplicate keys in `Cargo.lock` and in
+`Cargo.toml`, an unrelated nested project with its own lock, and a stale lock.
+Each has its own `[workspace]` table so the repository workspace ignores it.
+`differential/` records, per case and for `rust/`, the sanitized raw Syft 1.34.2
+BOM and a `snapshot.json` with the `cargo metadata --locked` and nightly
+precursor oracles. See `scripts/trust/sbom_diff.py` and the Trust document for
+how they are produced and what the verdicts mean.
+
 The `npm-negative-*` lock snapshots are negative controls copied byte-for-byte
 from the private R14 workspace, local-file and git-file receipt inputs. They
 exercise explicit unsupported outcomes in both private and public trust tests.

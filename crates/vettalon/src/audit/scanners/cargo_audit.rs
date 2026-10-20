@@ -148,12 +148,24 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
             } else {
                 format!("Cargo.lock ({} {})", package.name, package.version)
             };
-            let cve: Vec<String> = advisory
+            // CVE Record Format ids only (4–19 digit sequence); the local
+            // advisory database is not a published-record check, so these
+            // stay `unverified` in the report.
+            let mut cve: Vec<String> = Vec::new();
+            for id in advisory
                 .aliases
                 .iter()
-                .filter(|a| a.starts_with("CVE-"))
-                .cloned()
-                .collect();
+                .filter_map(|a| crate::audit::cve::normalize(a))
+            {
+                if !cve.contains(&id) {
+                    cve.push(id);
+                }
+            }
+            let package_ref = crate::audit::schema::PackageRef {
+                ecosystem: "cargo".to_string(),
+                name: package.name.clone(),
+                version: package.version.clone(),
+            };
             // RustSec ships the CVSS vector as a string; score it only when it
             // parses (a malformed vector is dropped, never guessed).
             let cvss = advisory
@@ -174,6 +186,7 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
             );
             f.cve = cve;
             f.cvss = cvss;
+            f.package = Some(package_ref);
             f
         })
         .collect())
@@ -198,7 +211,7 @@ mod tests {
               "title": "Use-after-free in somepkg",
               "description": "A use-after-free bug can be triggered by...",
               "date": "2021-01-01",
-              "aliases": ["CVE-2021-9999"],
+              "aliases": ["CVE-1900-9999", "GHSA-test-test-test", "CVE-1900-123456", "CVE-1900-12", "CVE-1900-9999"],
               "categories": ["memory-corruption"],
               "keywords": [],
               "cvss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
@@ -226,7 +239,18 @@ mod tests {
         assert!(f.title.contains("Use-after-free"));
         assert!(f.file.contains("somepkg"));
         assert!(f.line.is_none());
-        assert_eq!(f.cve, vec!["CVE-2021-9999".to_string()]);
+        assert_eq!(
+            f.cve,
+            vec!["CVE-1900-9999".to_string(), "CVE-1900-123456".to_string()],
+            "4–19 digits, deduped, malformed dropped"
+        );
+        let pkg = f.package.as_ref().expect("dependency coordinates recorded");
+        assert_eq!(pkg.purl(), "pkg:cargo/somepkg@1.0.0");
+        assert!(
+            f.cve_refs()
+                .iter()
+                .all(|r| r.state == crate::audit::cve::CveState::Unverified)
+        );
         let cvss = f.cvss.as_ref().expect("source-supplied vector is scored");
         assert_eq!(cvss.base_score, 9.8);
         assert_eq!(cvss.cvss_version, "3.1");

@@ -1,0 +1,71 @@
+{
+  "adapter": {
+    "packages": {
+      "itoa@1.0.15": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "string-smuggled-package@0.1.0": {
+        "licenses": []
+      }
+    },
+    "status": "ok"
+  },
+  "case": "string-smuggled-package",
+  "features": "default",
+  "lockfile_sha256": "1de0fc037ed62440b52dea9b37cc5a2b0cbdd863dee2d86b31f492dbfb0f50bf",
+  "metadata": {
+    "edges": [
+      "string-smuggled-package@0.1.0 -> itoa@1.0.15"
+    ],
+    "packages": {
+      "itoa@1.0.15": {
+        "license": "MIT OR Apache-2.0",
+        "origin": "registry"
+      },
+      "string-smuggled-package@0.1.0": {
+        "license": "Apache-2.0",
+        "origin": "path"
+      }
+    },
+    "roots": [
+      "string-smuggled-package@0.1.0"
+    ],
+    "status": "ok"
+  },
+  "precursor": {
+    "packages": {
+      "itoa@1.0.15": {
+        "license": null,
+        "origin": "registry"
+      },
+      "string-smuggled-package@0.1.0": {
+        "license": null,
+        "origin": "path"
+      }
+    },
+    "rustc": "1.101.0-nightly",
+    "status": "ok",
+    "toolchain": "nightly-2026-10-17"
+  },
+  "schema": 1,
+  "syft": {
+    "duplicates": [],
+    "packages": {
+      "itoa@1.0.15": {
+        "licenses": []
+      },
+      "string-smuggled-package@0.1.0": {
+        "licenses": []
+      }
+    },
+    "status": "ok"
+  },
+  "syft_scope": "directory",
+  "target": "aarch64-apple-darwin",
+  "tools": {
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "syft": "1.34.2"
+  }
+}

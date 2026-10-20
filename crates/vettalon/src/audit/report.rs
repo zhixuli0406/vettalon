@@ -275,9 +275,11 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
     }
     for finding in &report.findings {
         out.push_str(&format!(
-            "  Proof {}:\n{}\n",
+            "  Proof {}:\n{}\n  Evidence {}: {}\n",
             finding.id,
-            finding.proof_summary()
+            finding.proof_summary(),
+            finding.id,
+            finding.evidence_summary()
         ));
     }
     let policy_failed = crate::audit::gate::any_failed(&report.summary.policy);
@@ -357,10 +359,13 @@ fn incomplete_reason(r: vettalon_contract::coverage::IncompleteReason) -> &'stat
             "預算不足以保留覆核額度",
             "the budget could not reserve verification capacity",
         ),
-        R::CriticBudgetExhausted => pick("覆核預算用盡", "the verification budget ran out"),
+        R::CriticBudgetExhausted => pick(
+            "覆核預算用盡，部分發現未覆核（--refuter-budget）",
+            "the verification budget ran out and some findings were not reviewed (--refuter-budget)",
+        ),
         R::TimeBudgetExhausted => pick(
-            "已達掃描時間預算，部分模組未審（--time-budget）",
-            "the time budget ran out and some modules were not reviewed (--time-budget)",
+            "已達時間預算，部分模組未審或 PoC 未執行（--time-budget、--finder-budget 或 --poc-budget）",
+            "the time budget ran out, so some modules were not reviewed or some PoCs did not run (--time-budget, --finder-budget or --poc-budget)",
         ),
         R::Interrupted => pick("執行被中斷", "the run was interrupted"),
         R::ModelRefused => pick(
@@ -441,11 +446,15 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
         "  覆核獨立性：{line}\n",
         "  Verifier independence: {line}\n"
     ));
+    // Findings, not votes: repeated refuter runs add one vote per run.
     let self_reviews = report
         .findings
         .iter()
-        .flat_map(|f| f.verification.iter())
-        .filter(|v| v.same_model && v.verdict != super::schema::VoteVerdict::NoVerdict)
+        .filter(|f| {
+            f.verification
+                .iter()
+                .any(|v| v.same_model && v.verdict != super::schema::VoteVerdict::NoVerdict)
+        })
         .count();
     if self_reviews > 0 {
         out.push_str(&tr!(
@@ -453,14 +462,29 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
             "  Self-review: {self_reviews} verified by their own finder (no other verifier available in the roster)\n"
         ));
     }
-    let unverified = report
+    let pending: Vec<&super::schema::Finding> = report
         .findings
         .iter()
         .filter(|f| {
             f.source_engine == super::schema::AI_AUDIT_ENGINE_NAME
                 && f.status == super::schema::FindingStatus::Candidate
         })
+        .collect();
+    let uncertain = pending
+        .iter()
+        .filter(|f| {
+            f.evidence
+                .iter()
+                .any(|e| e.kind == super::schema::EvidenceKind::VerifyUncertain)
+        })
         .count();
+    let unverified = pending.len() - uncertain;
+    if uncertain > 0 {
+        out.push_str(&tr!(
+            "  覆核不一致：{uncertain} 筆 AI 候選的多次反駁覆核結論不一致，維持 candidate（見各發現的 verify_uncertain）\n",
+            "  Inconsistent: {uncertain} AI candidates got disagreeing verdicts from repeated refuter runs and stay candidate (see each finding's verify_uncertain)\n"
+        ));
+    }
     if unverified > 0 {
         out.push_str(&tr!(
             "  未覆核：{unverified} 筆 AI 候選沒有得到覆核結論（見各發現的 verify_error）\n",
@@ -472,6 +496,34 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
             "  雙模型複審：{} 個模組由兩家族各審一次（高風險、疑似 injection 或 --cross-check-top）\n",
             "  Cross-checked: {} modules reviewed once by each of two families (high risk, suspected injection, or --cross-check-top)\n",
             report.ensemble.cross_checked
+        ));
+    }
+    if let Some(d) = &report.ensemble.dual_finder {
+        render_dual_finder(d, out);
+    }
+    let count_kind = |k: super::schema::EvidenceKind| {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.evidence.iter().any(|e| e.kind == k))
+            .count()
+    };
+    let sensitive = count_kind(super::schema::EvidenceKind::CommentSensitivity);
+    if sensitive > 0 {
+        out.push_str(&tr!(
+            "  註解影響判斷：{sensitive} 筆發現在「看得到註解」與「去除註解」兩種覆核下結論相反（見 comment_sensitivity；可能是註解植入攻擊）\n",
+            "  Comment-sensitive: {sensitive} findings got opposite verdicts with and without code comments (see comment_sensitivity; possible comment injection)\n"
+        ));
+    }
+    let tier_split = report
+        .findings
+        .iter()
+        .filter(|f| super::exploitability::assess_finding(f).disagreement())
+        .count();
+    if tier_split > 0 {
+        out.push_str(&tr!(
+            "  可利用性判斷不一致：{tier_split} 筆發現的發現模型與反駁覆核給出不同可利用性等級，已採摩擦較高者（見 tier_disagreement）\n",
+            "  Tier disagreement: {tier_split} findings got a different exploitability tier from the refuter than from the finder; the higher-friction tier is used (see tier_disagreement)\n"
         ));
     }
     if !report.ensemble.suspected_injection.is_empty() {
@@ -571,6 +623,52 @@ pub fn save_report(home_dir: &Path, report: &AuditReport) -> std::io::Result<Pat
     // already-saved report (the write already succeeded above).
     let _ = crate::util::set_owner_only(&path);
     Ok(path)
+}
+
+/// O9 `--dual-finder-top`: per-family unique root causes and the marginal
+/// yield of the added finder family.
+fn render_dual_finder(d: &crate::audit::DualFinderReport, out: &mut String) {
+    if let Some(why) = &d.skipped {
+        out.push_str(&tr!(
+            "  雙家族 finder（--dual-finder-top {}）：未執行，{why}\n",
+            "  Dual finder (--dual-finder-top {}): not run, {why}\n",
+            d.top
+        ));
+        return;
+    }
+    let merged = d.merged_same_patch + d.merged_location_cwe + d.merged_identical_claim;
+    out.push_str(&tr!(
+        "  雙家族 finder（--dual-finder-top {}）：{} 個模組，合併 {merged} 筆重複（同一修補 {}、位置＋CWE {}、相同主張 {}），兩家族都找到的根因 {}\n",
+        "  Dual finder (--dual-finder-top {}): {} modules, {merged} duplicates merged (same patch {}, location+CWE {}, identical claim {}), {} root causes found by both families\n",
+        d.top,
+        d.modules.len(),
+        d.merged_same_patch,
+        d.merged_location_cwe,
+        d.merged_identical_claim,
+        d.shared_root_causes
+    ));
+    for y in &d.families {
+        out.push_str(&tr!(
+            "    [{}] 候選 {}，獨有根因 {}（其中 needs_human {}）\n",
+            "    [{}] {} candidates, {} unique root causes ({} needs_human)\n",
+            y.family,
+            y.candidates,
+            y.unique_root_causes,
+            y.unique_needs_human
+        ));
+    }
+    let m = &d.marginal;
+    let per = m
+        .calls_per_extra_needs_human
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    out.push_str(&tr!(
+        "    邊際產出：加開的 finder 呼叫 {} 次（送出原始碼 {} KiB），多 {} 筆 needs_human，每筆約 {per} 次呼叫\n",
+        "    Marginal yield: the added finder made {} calls ({} KiB of source sent) for {} extra needs_human, about {per} calls each\n",
+        m.calls,
+        m.prompt_bytes.div_ceil(1024),
+        m.extra_needs_human
+    ));
 }
 
 #[cfg(test)]

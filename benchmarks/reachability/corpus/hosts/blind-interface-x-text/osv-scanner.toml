@@ -1,0 +1,22 @@
+# OSV-Scanner / OpenSSF Scorecard: these advisories are expected in this frozen
+# reachability corpus host. It is never built into or shipped with Vettalon.
+
+[[IgnoredVulns]]
+id = "GO-2020-0015"
+reason = "Reachability corpus fixture: pins golang.org/x/text v0.3.2 on purpose; GO-2020-0015 is the corpus target. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2021-0113"
+reason = "Reachability corpus fixture: pins golang.org/x/text v0.3.2 on purpose; GO-2021-0113 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2022-1059"
+reason = "Reachability corpus fixture: pins golang.org/x/text v0.3.2 on purpose; GO-2022-1059 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-5970"
+reason = "Reachability corpus fixture: pins golang.org/x/text v0.3.2 on purpose; GO-2026-5970 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-6629"
+reason = "Reachability corpus fixture: pins golang.org/x/text v0.3.2 on purpose; GO-2026-6629 also affects this pinned version. Not shipped."

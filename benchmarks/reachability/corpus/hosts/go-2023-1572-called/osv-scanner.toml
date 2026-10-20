@@ -1,0 +1,54 @@
+# OSV-Scanner / OpenSSF Scorecard: these advisories are expected in this frozen
+# reachability corpus host. It is never built into or shipped with Vettalon.
+
+[[IgnoredVulns]]
+id = "GO-2023-1572"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2023-1572 is the corpus target. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2023-1989"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2023-1989 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2023-1990"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2023-1990 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2024-2937"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2024-2937 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-4815"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-4815 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-4961"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-4961 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-4962"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-4962 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-5031"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-5031 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-5032"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-5032 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-5061"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-5061 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-5062"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-5062 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-5066"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-5066 also affects this pinned version. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-6222"
+reason = "Reachability corpus fixture: pins golang.org/x/image v0.4.0 on purpose; GO-2026-6222 also affects this pinned version. Not shipped."

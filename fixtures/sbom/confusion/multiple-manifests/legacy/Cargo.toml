@@ -1,0 +1,12 @@
+[package]
+name = "legacy-tool"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+memchr = "=2.8.3"
+ryu = "=1.0.23"
+
+[workspace]

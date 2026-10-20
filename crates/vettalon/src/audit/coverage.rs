@@ -9,6 +9,7 @@
 //! | reviewed, zero findings | `covered` |
 //! | reviewed, ≥1 finding (pre-check refutations included) | `candidate` |
 //! | outside `--max-modules` | `deferred`, reason `max_modules` |
+//! | in the `--prescreen` pool but below its cut | `deferred`, reason `prescreen_cut` |
 //! | run-wide candidate cap already reached | `deferred`, reason `candidate_cap` |
 //! | not attempted after the engine was found unreachable | `deferred`, reason `engine_unavailable` |
 //! | no readable text | `unreadable` |

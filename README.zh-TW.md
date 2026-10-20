@@ -87,6 +87,11 @@ vettalon scan . --profile deep --finders claude,grok --verifiers codex --max-mod
 # 高風險模組預設雙家族審；--cross-check-top 把前 N 個高分模組也納入雙審
 vettalon scan . --profile deep --cross-check-top 5
 
+# 預設關閉。前 N 個模組由兩個 finder 家族各自獨立審；同一個修補建議能同時改掉兩邊的 sink 行就合併
+# （沒有可用修補時改看同一 sink 前後 3 行內且 CWE 相同），再交第三家族反駁。這些模組的 finder 呼叫加倍，
+# 加開的那一家帶來多少新發現記在 ensemble.dual_finder
+vettalon scan . --profile deep --finders claude,codex --verifiers grok --dual-finder-top 3
+
 # 存一份到 ~/.vettalon/reports，下次掃描時，沒改過的檔案沿用上次的判定
 vettalon scan . --profile deep --save
 
@@ -96,11 +101,21 @@ vettalon scan . --lang zh-TW
 # 檢查報告檔有沒有被改壞
 vettalon validate report.json
 
+# 相依套件公告類發現輸出成 CycloneDX 1.6 VDR/VEX（給 Dependency-Track 等 SBOM 工具）
+vettalon scan . --cyclonedx bom.cdx.json
+
 # 全部模組都審（--max-modules 0；受安全上限 40 個模組約束，其餘列為 deferred）
 vettalon scan . --profile deep --max-modules 0 --report report.json
 
 # 給 AI 深審一個整體時間預算：用完就把待審模組 deferred、標為 incomplete，不再無止境磨
 vettalon scan . --profile deep --time-budget 1200 --report report.json
+
+# 在總預算內再給每個角色上限（秒，從該步驟開始算）。0、低於 60、或大於 --time-budget 的值
+# 會在任何東西執行前就停下（exit 2）；開始時印出實際預算表，並寫進 report.json 的 ensemble.budget
+vettalon scan . --profile deep --poc --time-budget 1800 --finder-budget 1200 --refuter-budget 400 --poc-budget 300
+
+# High 以上的發現預設跑 3 次獨立反駁覆核，必須全部一致；--refuter-runs 1 改回只跑一次（便宜但較弱），上限 5
+vettalon scan . --profile deep --refuter-runs 1
 
 # 記錄每次模型呼叫的追蹤（JSON Lines：步驟、模型、位元組數、延遲、結果，不含內文）
 vettalon scan . --profile deep --trace trace.jsonl
@@ -113,10 +128,12 @@ vettalon scan . --profile deep --source-receipts --report report.json
 vettalon scan . --profile deep \
   --gate 'severity>=high status=confirmed,needs_human cross_family count>0'
 
-# 漏洞提交草稿：先列出可提交的項目，再為其中一項產生指定管道的草稿
-# （只產生草稿，不會替你送出；只有經覆核「需人工研判」或人工確認的項目才能產生）
+# 漏洞提交草稿：先列出可提交的項目，再為其中一項產生草稿
+# （只產生草稿，不會替你送出；必須給人工審閱者化名，化名會出現在草稿中）
 vettalon disclose report.json
-vettalon disclose report.json --finding <id> --channel twcert --out draft.txt
+vettalon disclose report.json --finding <id> --reviewer <化名> --format minimal --out draft.txt
+# 維護者回覆後，解除該專案的節流
+vettalon disclose-ledger close github:<owner>/<repo>
 
 # 供應鏈獵捕：稽核專案相依 OSS 套件的原始碼，找尚未登錄的新漏洞
 # 先預覽會審哪些（不花 token），再真的跑
@@ -124,20 +141,46 @@ vettalon hunt . --dry-run
 vettalon hunt . --finders claude --verifiers codex --max-deps 20
 
 # 寫出完整報告，並為新漏洞候選產上游揭露草稿（只草稿，不會送出）
-vettalon hunt . --report hunt.json --disclose-dir drafts/
+vettalon hunt . --report hunt.json --disclose-dir drafts/ --reviewer <化名>
+
+# 依風險排序相依、把過去的安全修補當成 finder 的線索、檢查惡意套件訊號
+vettalon hunt . --dry-run --dep-priority risk --malicious-signals
+vettalon hunt . --dep-priority risk --variant-seeds --report hunt.json
+vettalon mal-index update --ecosystem npm     # 給 --malicious-signals 用的本機 MAL-* 索引
+vettalon rule-draft hunt.json --finding <id>  # 從人工確認的 finding 產 Semgrep 規則草稿
 ```
 
 ### 供應鏈獵捕（`vettalon hunt`）
 
 `vettalon hunt <project>` 從專案的 lockfile（Cargo.lock、npm `package-lock.json`、pip `requirements.txt`、Go `go.sum`）解出相依套件，抓它們的官方發佈原始碼來審，找**還沒被登錄成 CVE** 的新漏洞——和既有 SCA 工具（比對已知 CVE）互補。先查 OSV 分出「已知」與「可能是新的」，預設只審**直接依賴**、跳過 OSV 已有 CVE 的版本（那些 SCA 已在追），把 AI 預算集中在未登錄的；每個相依用跟 `scan --profile deep` 一樣的跨家族對抗覆核。OSV 未命中且覆核留下的發現仍是待人工研判候選（`needs_human`）；未命中不等於已證明新穎性，pattern PoC 跑通也不等於確認。
 
-旗標：`--max-deps N`（上限，預設 20）、`--include-transitive`（連間接依賴）、`--reaudit-known`（連已知 CVE 版本也審）、`--dry-run`（只預覽選取，不抓取不花 token）、`--report <檔>`（寫出完整 JSON）、`--disclose-dir <目錄>`（為新候選產上游負責任揭露草稿，附送出前檢查清單，只草稿、永不送出）、`--dep-timeout <秒>`（每個相依 fetch+audit 的時限，預設 300，逾時記錯誤並續跑）、`--dep-concurrency N`（同時審查幾個相依，1–4，預設 2；總 token 用量不變，但每個模型同時收到 N 個呼叫，CLI 帳號遇到限流就調低）、`--poc`、`--finders`／`--verifiers`。OSV 以批次查詢，大型相依樹也只打少數幾次。獵捕模式會連網抓原始碼與查 OSV，出口限定套件登錄處與 `api.osv.dev`；登錄處／OSV 查詢傳送相依套件身分；深審仍會把相依套件原始碼送往設定的模型 provider。抓取 allowlist 不限制模型流量，詳見[資料流](docs/DATA-FLOW.md)。
+旗標：`--max-deps N`（上限，預設 20）、`--include-transitive`（連間接依賴）、`--reaudit-known`（連已知 CVE 版本也審）、`--dry-run`（只預覽選取，不抓取不花 token）、`--report <檔>`（寫出完整 JSON）、`--disclose-dir <目錄>`（為新候選產上游負責任揭露草稿，附送出前檢查清單，只草稿、永不送出；可用 `disclose` 的同一組草稿旗標，審閱者會在獵捕開始前檢查）、`--dep-timeout <秒>`（每個相依 fetch+audit 的時限，預設 300、最少 90，逾時記錯誤並續跑）、`--hunt-budget <秒>`（改用總預算：每個相依開始時分到「剩餘預算 ÷ 剩餘相依數」，沒用完的時間往後滾給下一個；同時給 `--dep-timeout` 時，它是單一相依的上限；剩下的預算不夠 90 秒時，若還有相依在跑就等它結束拿回沒用完的時間，沒有相依在跑才記為 deferred，整次標成 incomplete；預算算的是各相依自己的耗時，`--dep-concurrency 2` 時牆鐘時間約一半；計畫與每個相依分到的額度寫在報告的 `budget`）、`--dep-concurrency N`（同時審查幾個相依，1–4，預設 2；總 token 用量不變，但每個模型同時收到 N 個呼叫，CLI 帳號遇到限流就調低）、`--poc`、`--finders`／`--verifiers`。OSV 以批次查詢，大型相依樹也只打少數幾次。獵捕模式會連網抓原始碼與查 OSV，出口限定套件登錄處與 `api.osv.dev`（草稿加 `--check-duplicates` 時另連 `api.github.com`）；登錄處／OSV 查詢傳送相依套件身分；深審仍會把相依套件原始碼送往設定的模型 provider。抓取 allowlist 不限制模型流量，詳見[資料流](docs/DATA-FLOW.md)。
+
+另有三個選配功能，預設都關閉：
+
+- `--dep-priority risk`：在 `--max-deps` 截斷前，依 `exposure × reach × criticality` 排序，並逐項印出分數與依據。exposure 查固定表（套件名稱字詞與常見套件；反序列化與 parser 1.0、網路與壓縮 0.9、加解密 0.8、沒有訊號 0.3），訊號來自下一層相依時乘 0.8。reach 依 lockfile 相依圖（只有 Cargo.lock 與 npm v2/v3 有邊）：直接依賴 1.0、深度 2 為 0.7、更深 0.5；`--reach-evidence <檔>` 的 `reachable` 可提到 1.0，`not-observed` 不會拿來調低。criticality 用內附的熱門套件快照（每個生態系前 1,000 名，前 100 名 1.0、其餘 0.8）與本機被依賴數。查不到訊號的一律標 `unknown`（`?`），以 0.6 計分，不當成安全。這部分完全離線，不查下載數、deps.dev 或 OpenSSF criticality；Scorecard 不列入風險分數。
+- `--variant-seeds`（搭配 `--seed-days N`，預設 90）：把該套件最多 5 筆 OSV 紀錄、以及上游 GitHub 近期提到 security／CVE／GHSA 的最多 5 個 commit，整理成有邊界標記、上限 4 KB 的資料區塊交給 finder，內容一律當成不可信資料。只有 finder 的 prompt 會帶，覆核模型看不到。審完後會對鎖定版本再查一次 OSV。CWE 相同、檔名又出現在 advisory 裡的 finding，只有在該 advisory 的修補版本比鎖定版本新時，才記為已知重複、不列入新漏洞候選；否則仍是候選，並標註「可能是該 advisory 的變體」。種子查詢失敗會讓這次 hunt 標為未完成。上游 repo 是套件自己在 manifest 裡寫的，所以會提醒 finder 這段文字可能故意誤導。`vettalon rule-draft <報告> --finding <id>` 可把人工確認的 finding 轉成本機 Semgrep 規則草稿，標記 `review_required`，vettalon 不會自己載入或執行。
+- `--malicious-signals`：純規則判定，不經模型。規則有：版本發布未滿 `--cooldown-hours`（預設 72，可用 `--cooldown-exclude` 排除）、比前一版新增安裝期掛鉤（npm `preinstall`／`install`／`postinstall`、Cargo `build.rs`、Python `setup.py` 的 `cmdclass` 與 `.pth` 檔）、npm provenance 消失或 workflow／repository／ref 類型改變（比對 attestation 欄位，不驗簽章）、OSV 或本機 `MAL-*` 命中、名稱與熱門套件編輯距離 1–2、登錄處查無此名稱。一個強訊號（MAL-ID、npm 安全佔位套件）或兩個不同的中訊號才會產生 `malicious_package_signal` finding，狀態固定是 `needs_human`；較弱的訊號只列為觀察。`vettalon mal-index update --ecosystem <npm|PyPI|crates.io|Go>` 下載 OSV 匯出檔，只保留來自 ossf/malicious-packages（Apache-2.0）的 `MAL-*` 紀錄，可用 `--expect-sha256` 鎖定雜湊。任何規則沒辦法判定（OSV 查詢失敗、登錄處錯誤、沒有索引、Go 沒有名稱快照）都會讓報告標為未完成，不會當成「沒有訊號」。加 `--dry-run` 時只跑離線規則（OSV 結果、本機索引、名稱），登錄處規則記為未知。
+
+  回放檢查只到單元層級，不是精確率／召回率：用近 90 天 893 筆真實 `MAL-*` 名稱（只有 metadata）。本機索引是用同一批紀錄建的，全部命中只證明比對邏輯正確。只靠名稱規則命中 11 筆（1.2%），單靠名稱不會產生 finding。拿 3,000 個不在內附清單裡的熱門套件、配固定的舊版登錄資料測：名稱規則標了 55 個（1.8%），finding 為 0。發布時間、安裝掛鉤、provenance 三條規則還沒有用真實套件量過。
+
+`--variant-seeds` 會多連 `api.github.com`；`--malicious-signals` 會向同一批套件登錄處多查 metadata；`mal-index update` 連 `osv-vulnerabilities.storage.googleapis.com`。詳見[資料流](docs/DATA-FLOW.md)。
 
 付費的 Vettalon Pro 另可把獵捕報告產成企業供應鏈報告（Word／PDF／HTML）。
 
 ### 漏洞提交草稿
 
-`vettalon disclose` 依本機 repo 資訊（git remote、SECURITY.md、套件設定，不連網）建議管道，產生 GitHub、專案安全信箱、TWCERT/CC 或 HITCON ZeroDay 格式的未核准本機草稿。送出前須留下獨立人工覆核、對應目標與來源識別的沙盒重現紀錄，核對維護者／管道現行政策，再取得明確核准。`needs_human` 或人工確認可產草稿，不代表上述條件已成立。日期僅供協調檢查；保留的 90／60 天計算不是已核實的平台政策，也不授權公開。公開須另行核准，vettalon 不會替你送出任何東西。
+`vettalon disclose` 依本機 repo 資訊（git remote、SECURITY.md、套件設定）建議管道並產生未核准的本機草稿。格式用 `--format ghsa | minimal | kernel | email`（預設依管道；TWCERT/CC 與 HITCON ZeroDay 維持原表單）。每份草稿都遵守這些規則：
+
+- 證據門檻：預設只為有執行框架判定 PoC、或已人工確認的項目產生草稿。`--allow-unproven` 也會為只過了覆核的項目產生，並在開頭標示「未證實」。只有掃描器命中的項目一律不產生。
+- AI 使用聲明：工具與版本、哪些模型負責發現、覆核與寫 PoC，以及人工審閱者化名與審閱日期（`--reviewer`／`--review-date`，或設定檔 `[disclosure] reviewer`）。沒有審閱者就不產生，化名會公開。
+- 嚴重度不由工具自填，除非是人工設定的；模型建議另記在審閱備註供日後對照。
+- `--no-patch` 拿掉修補建議段落，給不收工具寫的修補的專案用。`--format kernel` 依 Linux 核心流程：AI 輔助發現視為公開，不要公開重現程式。
+- `--check-duplicates` 在送出前查 OSV 與上游 GitHub repo（近 90 天動到該檔案的 commit、未結的 issue／PR）；沒加這個旗標，每項都寫「未檢查」。除此之外不連網。
+- 同一專案一次只能有一份未獲回覆的草稿（本機紀錄在 `~/.vettalon`）；`--force-throttle <理由>` 可覆寫，`vettalon disclose-ledger close <專案>` 解除。
+- 目標專案的 SECURITY.md 一律當資料：列出需要你確認的要求，裡面的指示不會被照做。
+
+送出前須留下獨立人工覆核、對應目標與來源識別的沙盒重現紀錄，核對維護者／管道現行政策，再取得明確核准。可產生草稿不代表上述條件已成立。日期僅供協調檢查；保留的 90／60 天計算不是已核實的平台政策，也不授權公開。公開須另行核准，vettalon 不會替你送出任何東西。
 
 ### 政策門檻（`--gate`）
 
@@ -170,6 +213,17 @@ vettalon scan . --profile deep --rank jev
 - 送出前由 `assert_metadata_only` 逐檔比對原始碼，任何程式碼內容外洩就 fail-closed。
 - Jev 不可用（斷線／逾時／回錯）時自動退回啟發式，出一行提示，不中斷掃描。
 - Jev 只排序，**不取代** finder／verifier。
+
+**兩段式排序（`--prescreen`，預設關閉）**：排序之後，用模型清單裡一個便宜的模型替前 40 個審查單元各打 1–5 分，只有前 20% 進入深審（仍受 `--max-modules` 限制）。訂閱制 CLI 拿不到機率，所以分數就是 1–5 的整數。沒進入的單元在 coverage 記為 `deferred`／`prescreen_cut`。
+
+```bash
+vettalon scan . --profile deep --prescreen cheap-model --prescreen-model haiku
+# --prescreen-pool N（打分的單元數，1–200，預設 40）、--prescreen-top PCT（1–100，預設 20）
+```
+
+- 每個打分的單元是一次對該模型的呼叫，prompt **含程式碼片段**（單一檔案最多 60 行／2 KiB，加上檔案路徑），會送到該模型的 provider。機密檔不取片段。程式碼裡有對 AI 審查者下指令的文字時，該單元不送出、一律保留。
+- 報告的 `ensemble.prescreen` 記錄呼叫數、送出與收到的位元組、耗時與每個單元的分數，可以拿來判斷值不值得。沒有任何分數、有單元因 `--time-budget` 用完而沒開始、或超過一半的呼叫沒拿到分數時，維持原排序、不裁切。因 injection 文字被強制保留的單元會像 5 分一樣占用入選名額。
+- 同樣預算下能不能多找到東西還沒量過；用真模型對照 hit@40 排序基準的測量尚未執行。
 
 金鑰設定（兩種，config 一律不存 key 本身）：
 ```toml
@@ -251,7 +305,11 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 2. **分工找洞**：前 `--max-modules` 個模組依序輪流分配給各個 finder，一個模組只交給一個模型審，所以成本跟單一模型差不多。
 3. **前置檢查**：不呼叫任何模型，只核對模型講的檔案、行號和呼叫鏈是否真的存在，對不上就直接證偽。
 4. **高風險模組雙審**：git 安全熱點或進入點的模組（天然少數）會自動再交給一家不同家族的 finder 審一次，兩家各讀一遍；加 `--cross-check-top N` 可把前 N 個高分模組也納入。一家漏看、另一家補上。
+   `--dual-finder-top N`（預設關閉）在前 N 個模組上再多做一步：兩家 finder 都被要求替每筆候選附一個選填的修補建議（單一檔案、最多 10 行），覆核前先依根因合併兩邊的清單。兩家回報同一個 id 的主張會最先配對（`identical_claim`）。其餘的，把某個修補套到檔案的記憶體副本上，若兩筆候選的 sink 行都被改掉，就合併成一筆（`dedupe_basis=same_patch`）；修補沒動到另一筆的 sink 行，或兩筆的 CWE 不同，就保留兩筆。兩邊都沒有可用修補時，退回看同一個 sink 檔案、sink 行相距 3 行內且 CWE 相同（`location_cwe`），缺 CWE 一律不合併。在 sink 行上方加防禦、sink 行本身沒變的修補不算數，所以會留下一些重複，這是比較安全的方向。合併後的那筆在 `found_by` 列出兩家 finder，並帶一筆 `dual_finder_merge` 證據。之後每筆候選盡量交給第三個家族的模型反駁。報告的 `ensemble.dual_finder` 逐家族記錄候選數、只有該家族找到的根因數（以及其中幾筆最後是 `needs_human`），也記錄加開那一家的呼叫次數、送出的原始碼量，和每多一筆 `needs_human` 花了幾次呼叫。Vettalon 看不到每次呼叫的價格，金額請用你自己的費率換算。finder 只有一個家族時，這個旗標會記為 skipped。這 N 個模組指的是實際送審模組的前 N 個（有開 `--prescreen` 時是篩選後的順序）。第二家族的模組審查和其他 finder 共用同一個期限（`--finder-budget` 或 `--time-budget`），用完後剩下的模組照常列為 deferred，邊際產出只計實際跑完的呼叫。
 5. **跨家族覆核**：每個候選交給一個與 finder 不同家族的 verifier，要它從零開始試著推翻。推翻不了的標成 `needs_human`，附上「還需要確認什麼」的清單。模型清單裡沒有其他家族時，會退回同家族的其他模型，再不行就由 finder 自己覆核，投票紀錄裡會寫明（`same_model`）。
+   verifier 只拿到主張（位置、威脅模型、trace 位置、前置條件）和重新讀取的程式碼，看不到 finder 的推理，prompt 預設「程式碼證明不了就推翻」。High 以上的發現跑 3 次獨立覆核（`--refuter-runs`，1 到 5）：3 次都判可能成立才標 `needs_human` 並記 `refuter_consistent: 3/3`，3 次都推翻才算證偽，結論不一致就維持 `candidate` 並記 `verify_uncertain: k/n plausible`。每一次都各記一票。推翻理由若依賴某個防禦檢查，必須附上該檢查的檔案與行號；行號不存在或不在主張的 trace 上，這次推翻不採用（`verify_error: refutation cites missing guard`），發現維持 `candidate`。覆核沒跑完（呼叫失敗、拒答，或 `--time-budget` 用完而不再開始額外的覆核）時，發現維持 `candidate` 並記 `verify_error: incomplete refuter runs`，整次執行標成 incomplete。
+   verifier 讀到的程式碼會先去掉註解與 docstring，行號不變。ALIBI 研究（arXiv 2607.24964）在真實漏洞旁植入「此處已驗證安全」或假造的掃描結果，騙過 LLM 審查的比例超過九成，而且去掉註解比在 prompt 裡警告有效得多。被去掉的文字仍會另外附上，標明是程式作者寫的資料。會改變編譯器或檢查工具行為的註解保留：`# type:`、`# noqa`、`# pragma: no cover`、`//go:build`、`// +build`、cgo preamble、`/// <reference>`、`// @ts-ignore`、`{-# LANGUAGE #-}`、第一行的 shebang 與編碼宣告。每一種都要完全符合已知格式，而且只留符合的那段（最多 120 位元組）：`# nosec: audited, verified safe` 在程式碼裡只剩 `# nosec`，其餘照樣去掉。主張引用的某一行若落在多行註解或 docstring 裡，那段摘錄改用原檔內容，避免 lexer 判斷錯誤或偽裝成註解的程式碼把被指稱的程式碼藏起來。支援的語言有 Rust、Go、C/C++/Java/C#/Kotlin/Swift/Scala/Dart、JavaScript/TypeScript、PHP、Python、Ruby、shell、YAML/TOML、Perl/R/Elixir、Terraform/HCL、SQL、Lua、Haskell，其他檔案原樣送出。一筆發現本來就要跑多次覆核時，第二次會讀帶註解的原始碼；如果這一次的結論跟所有去註解的覆核相反，就記一筆 `comment_sensitivity`，此時各次結論不一致，發現維持 `candidate`。第 6 步的零 LLM injection 掃描照舊先跑，而且掃的是原始檔。帶註解的那一次本來就是 `--refuter-runs` 其中一次，不多花呼叫，也受 refuter 預算限制：`--refuter-budget`（或 `--time-budget`）用完後就不開始，那筆發現也不會有 `comment_sensitivity` 紀錄。
+   verifier 判可能成立時，也要列出它自己看到的前置條件（報告裡的 `refuter_conditions`）。可利用性等級取 finder 與 verifier 兩者中摩擦較高的那個；兩邊等級不同時記一筆 `tier_disagreement`，CLI 摘要、SARIF 與 Pro 報告都會標出來。
 6. **偵測寫給模型看的指令**：審查前先用零 LLM 的規則掃過每個模組，找出「叫審查模型回報乾淨」這類文字（例如 `respond with {"candidates": []}`、「report no vulnerabilities」、「this file is secure」）。命中的模組會額外交給另一家族的模型再審一次，並記在報告的 `ensemble.suspected_injection`；模型清單只有一個家族、無法交叉覆審時，整次執行標成 `incomplete`。
 7. **PoC**（`--poc`）：對 High 以上的 `needs_human`，盡量交給另一家模型寫腳本，在 Docker 沙箱裡執行。沙箱的限制：
    - 斷網、根目錄唯讀、拿掉所有 capabilities、以非 root 身分執行
@@ -261,22 +319,39 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 
    容器裡只有 Python 標準函式庫和 bash，repo 本身不在容器內，所以 PoC 要用標準函式庫重現有漏洞的寫法。沙箱起不來就跳過，絕不在本機執行。PoC 跑通也不會自動把發現標成 confirmed。
 
+   指令注入（CWE-78/77）、路徑穿越／讀檔（CWE-22/73）、SQL 注入（CWE-89）這三類改由 harness 判定，不看 PoC 自己印的結論。harness 每次開容器都產一組一次性秘密，看的是真實副作用：注入的 shell 複製了秘密檔、`../` 讀到允許目錄外的檔、`UNION` 撈出秘密那一列。PoC 只印「成功」沒有用，漏洞得真的被打穿。執行前先跑零 LLM 的靜態檢查，PoC 若寫死秘密、自己寫出效果檔、根本沒呼叫真正的 sink、或去讀 harness 原始碼，直接拒絕。接著用良性輸入跑一次對照（產品路徑沒有上游修補可比），再換新秘密開新容器重跑。結果記成 `poc_oracle` 證據（`effect`／`control`／`rerun`／`nonce_bound`／`rejected`），旁邊另存一份已遮罩的執行紀錄。攻擊時有效果、對照時沒有、重跑也重現，才算差分（`poc_differential`）。SSRF（CWE-918）做不了，因為沙箱沒有網路，也起不了 loopback listener；其他類別同樣沒有可行的 oracle，都維持上面的獨立模式示範。兩條路的狀態都停在 `needs_human`。
+
 **拒答不轉送。** 模型拒絕審查時，只有那個模組記成「未審」，同一個模型分到的其他模組照常進行。拒答會列在 `ensemble.refusals`，整次執行標成 `incomplete`（`model_refused`），不會悄悄改丟給別的模型。覆蓋缺口要攤開給你看，換不換模型由你決定。
 
 **誠實的完成狀態。** 下列情況都會讓報告標成 `incomplete`，並附上原因：
 - 某個 finder 完全連不上
 - 有模組的呼叫失敗，或回覆不符合格式
-- 有候選沒拿到覆核結論
+- 有候選沒拿到覆核結論（每次覆核都有回覆、只是結論不一致，不算這種情況：`verify_uncertain` 讓發現維持 `candidate`，但整次執行不因此標成 incomplete）
 
 覆核獨立性只計算真正給出判定的覆核，呼叫失敗或拒答都不算。同一個 verifier 第一次就連不上時，同組其餘的候選會直接標成未覆核，不會每一筆都等滿逾時。
 
 **AI 不會自動宣告「確認」。** AI 能做到的最高狀態是 `needs_human`，`confirmed` 只能由人來標。
 
-報告格式定義在 [`crates/vettalon/src/audit/schema.rs`](crates/vettalon/src/audit/schema.rs)，寫檔前一律先跑 validator。SARIF 2.1.0 輸出可以直接上傳到 GitHub code scanning，被證偽的發現會標成 suppressed，不會刪掉；result 的 properties 另帶該發現對應的 CAPEC 攻擊模式（`vettalon.capec`）與依前置條件推導的可利用性分級（`vettalon.exploitability`：direct／conditional／hard_to_reach）。有 CWE 對應的發現，報告會多一段攻擊情境與 CAPEC 參考連結。`--trace` 會另寫一份逐次模型呼叫的 JSON Lines（只記步驟、模型、位元組數、延遲、結果，不含內文）。
+**證據等級。** JSON 報告與 SARIF 的每筆發現都帶 `evidence_level`，由弱到強是 `static_only`、`refuter_survived`、`refuter_consistent`、`poc_effect_no_control`、`poc_differential`、`maintainer_confirmed`（只有人能給）。旁邊的 `proof_gaps` 列出還缺什麼（`no_refuter`、`refuter_inconsistent`、`no_poc`、`poc_not_harness_judged`、`no_control`、`no_fresh_rerun`、`reachability_unknown`、`no_maintainer_confirmation`），`strongest_counterevidence` 引用最不利的推翻理由或失敗的對照組，已遮罩、上限 300 位元組。三者都在寫報告時從證據鏈算出來，模型設定不了，報告檔裡存的值讀回時一律忽略，舊報告則依它本來有的證據推導。有 `verify_error` 時最高只到 `static_only`，有 `verify_uncertain` 時最高只到 `refuter_survived`。沙箱的 pattern PoC 不會提高等級，只有 harness 判定的 oracle 紀錄（`poc_oracle`）可以。
+
+**修補建議。** 發現可以帶 `suggested_fix`（unified diff，上限 64 KB，讀報告時超過就拒絕）。報告不會因為有這段 diff 就當它驗證過：凡是帶修補建議的發現，JSON 報告都有衍生欄位 `fix_check`，SARIF 有 `vettalon.fix_check`，其中 `outcome` 只有 `fix_verified`、`fix_check_partial`、`fix_rejected`、`fix_unverified` 四種。加了 `--poc` 時，對會跑 PoC 的同一批發現，vettalon 把掃描的目錄複製兩份到暫存目錄，只把 diff 套到其中一份，你的檔案只讀不寫。diff 碰到目錄外的路徑、二進位檔、符號連結、`.git` 或秘密檔，或是改名、刪檔、改權限，都在執行任何東西之前拒絕。檢查 A 在同一次執行裡，用 harness 對該類別的每個 fixture 輸入，分別在原始副本與修補副本跑上面的 oracle：原始副本要仍有效果，修補副本要沒有，而且 harness 的良性輸入在修補副本上要照常運作（不拋例外，讀檔與 SQL 類別還要拿到預期結果），只是把程式改壞的修補會被否決。連接 harness 與專案程式的 adapter 由模型撰寫，只能 import 並呼叫專案程式（自己執行危險操作、讀專案檔、檢視已 import 的模組、執行期組程式碼的 adapter 會被靜態檢查擋下），兩份副本用同一個 adapter，所以目前只適用可以 import 的 Python 程式。檢查 B 只在你明確設定測試指令時才跑（`--fix-test-command "python3 -m pytest -q"`，或設定檔 `[fix_check]` 的 `test_command`），vettalon 不會自己猜。它沿用 PoC 沙箱的限制（無網路、120 秒、目錄唯讀、只有 `/tmp` 可寫），先跑原始副本再跑修補副本；原始副本的測試就失敗時，B 記為無法判定。修補檢查和 PoC 共用時間預算（`--poc-budget`／`--time-budget`），預算用完而沒檢查到的修補記為 `fix_unverified`，`reason` 為 `time_budget_exhausted`。結果只看 A 和 B：兩者都通過才是 `fix_verified`；A 通過但沒設定測試指令是 `fix_check_partial`；修補副本仍有效果或測試失敗是 `fix_rejected`；其他情況（被拒絕、沒有沙箱、原始副本已重現不出效果、類別沒有 harness、從沒檢查過）都是 `fix_unverified`，並附 `reason`。結果存成固定格式的 `fix_check` 證據，綁定 diff 的 SHA-256，之後改了 diff，標籤就回到 `fix_unverified`。
+
+報告格式定義在 [`crates/vettalon/src/audit/schema.rs`](crates/vettalon/src/audit/schema.rs)，寫檔前一律先跑 validator。SARIF 2.1.0 輸出可以直接上傳到 GitHub code scanning，被證偽的發現會標成 suppressed，不會刪掉；result 的 properties 另帶該發現對應的 CAPEC 攻擊模式（`vettalon.capec`）、依前置條件推導的可利用性分級（`vettalon.exploitability`：direct／conditional／hard_to_reach，取 finder 與 verifier 中摩擦較高者；verifier 有給自己的前置條件時另帶 `vettalon.exploitability_finder`／`vettalon.exploitability_refuter`，兩者不同時帶 `vettalon.tier_disagreement: true`）、結論隨註解翻轉時的 `vettalon.comment_sensitivity: true`，以及證據等級與缺口（`vettalon.evidence_level`、`vettalon.proof_gaps`、`vettalon.strongest_counterevidence`）。有 CWE 對應的發現，報告會多一段攻擊情境與 CAPEC 參考連結。
+
+**嚴重度、CVSS、CWE 與 CVE。** CVSS 分數只在來源（例如 RustSec 公告）提供向量時才出現，模型不估分。CVSS v3.0／v3.1 算 Base 分數；CVSS v4.0 用 FIRST 的 MacroVector 方法計分，程式移植自 FIRST 官方計算機，測試比對 FIRST 公布的範例和 300 筆官方計算機輸出（另做過一次 6 萬筆的大量比對）。分數一律和版本、等級、向量一起出現，v4.0 再加上命名，例如 `CVSS v4.0 8.7 High (CVSS-B)`。vettalon 不會在來源向量上自行加 Threat 或 Environmental 指標：Environmental 屬於部署方，vettalon 的 PoC 也不公開，所以就算日後加 Threat 指標，也只會是 `E:U`。
+
+SARIF 裡 GitHub 用的 `security-severity`，只有在同一條 rule 的每筆發現都有 CVSS 向量時才設定，值取其中最高分；否則直接不給，定性嚴重度不會被換成看起來像 CVSS 的數字，GitHub 會改用 SARIF `level` 排序。rule 的 `vettalon.security_severity_basis` 註明是哪種情況（`cvss_max`、`omitted_no_cvss`、`omitted_partial_cvss`，分數為 0.0 時是 `omitted_cvss_zero`，GitHub 不收 0.0）。CWE 另外以 SARIF taxonomy（MITRE CWE List 4.20）輸出，有 CWE 的發現都帶 `cwe_mapping`，記錄 CWE 版本和 MITRE 的對應建議（`allowed`、`allowed-with-review`、`discouraged`、`prohibited`、`not-in-catalog`）。MITRE 不建議或禁止拿來對應漏洞的編號，例如 Pillar、Category、View、CWE-20、CWE-200、CWE-284、CWE-1426，會加上警示並列出知識庫裡更具體的編號。AI 發現只有在它自己的類別正好指向某個更具體的子項時才會改用子項，原本的編號留在 `cwe_replaced`。CVE 編號接受 4 到 19 位的流水號；只有 vettalon 手上的 OSV 資料列出某個 CVE 時才能標 `published`；`vettalon scan` 沒有 OSV 資料，它的 CVE 參照都來自本機 RustSec 資料庫，一律是 `unverified`。報告檔裡存的 CVSS 分數不會被採信，讀回時一律從向量重算。
+
+`--cyclonedx` 會把相依套件公告類發現寫成 CycloneDX 1.6 VDR/VEX：受影響套件（Package URL）、公告、CVE 參照、來源給的 CVSS 評分、vettalon 的定性評分（不帶數字）、CWE，以及只依紀錄證據決定的 `analysis.state`。操作者確認過是 `exploitable`，操作者判定誤報是 `false_positive`，其他情況都是 `in_triage`。`not_affected` 一律不輸出，因為它需要操作者提供 VEX 理由，而 vettalon 目前還沒有收這項資料。程式碼類發現仍放在 SARIF。
+
+`--trace` 會另寫一份逐次模型呼叫的 JSON Lines（只記步驟、模型、位元組數、延遲、結果，不含內文）。
 
 ## 已知限制
 
 - 一般模組只有一個 finder 審，那個模型漏看就是漏掉。高風險模組（熱點／進入點）、疑似 injection 的模組、以及 `--cross-check-top` 指定的前 N 個會由兩家審；其餘仍是一家。實測時 grok 有一輪漏掉了 `fixtures/demo-app` 的 path traversal，前一輪卻找得到，模型輸出有隨機性。重要的程式碼請多跑幾次，或用 `--finders` 換模型。
+- High 以上跑 3 次反駁覆核，這些發現的 verifier 呼叫數變成三倍。預設 prompt 偏向推翻，對誤報率與召回率的影響還沒在 OWASP 樣本上重測。
+- `--dual-finder-top N` 讓這 N 個模組的 finder 呼叫加倍（原始碼也多送給一家廠商），要求附修補建議也會讓 finder 的回覆變長。第二家族找到的東西值不值這個成本，還沒用真實模型量過；跑完看 `ensemble.dual_finder.marginal`，加得少就把旗標拿掉。
+- 去註解用的是各語言的小型 lexer，不是完整 parser。少見寫法（JavaScript 在 `)` 或 `}` 之後的 regex literal、內含 `#` 或 `//` 的 shell／PHP heredoc、Perl／Ruby 的 quote-like 運算子、Dart raw 字串、Groovy slashy 字串）可能讓那一行多去掉一點程式碼或留下一點註解，但行號一定不變，被引用的行落在多行註解裡時也會改用原檔內容。Python 中獨立一行、前一行以 `:` 結尾的三引號字串會被當成 docstring，即使它其實是 dict 的值。
 - 嚴重度是模型自己評的，同一個漏洞，claude 評 high、codex 評 medium，而 PoC 只對 High 以上的發現跑。
 - `osv-scanner` 需要連網，刻意不呼叫。
 - semgrep 內建規則很少，還沒在實機的 semgrep 上驗證過。

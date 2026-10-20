@@ -12,7 +12,7 @@
 //! (SCA tools already track those — the AI budget goes to finding the NOT-yet
 //! disclosed), and at most `max_deps` are audited.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -20,7 +20,10 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::fetch::SourceFetcher;
+use super::malicious::MaliciousReport;
 use super::osv::{DependencyAdvisories, KnownVuln, OsvClient, OsvEvidence, OsvStatus, scan_known};
+use super::priority::{DepPriority, DependencyPriority, ReachRecord};
+use super::seeds::{SeedContext, SeedOptions, SeedRecord, SeedSource};
 use super::{DependencyTarget, Ecosystem, IntakeEvidence, intake_from_dir};
 use crate::audit::schema::{Finding, FindingStatus};
 use vettalon_contract::coverage::{IncompleteReason, RunStatus};
@@ -43,6 +46,17 @@ pub struct HuntOptions {
     /// each model receives (one per in-flight dependency), so CLI accounts can
     /// hit rate limits sooner. Clamped to `1..=MAX_DEP_CONCURRENCY`.
     pub dep_concurrency: usize,
+    /// Candidate order before the `max_deps` cap (`--dep-priority`).
+    pub dep_priority: DepPriority,
+    /// Operator-supplied reachability verdicts used by the risk score.
+    pub reach_evidence: Vec<ReachRecord>,
+    /// `Some` = collect variant seeds for each audited dependency (O7).
+    pub variant_seeds: Option<SeedOptions>,
+    /// `--hunt-budget`: a total split across dependencies with rollover
+    /// ([`crate::budget::DepBudget`]). When set, `per_dep_timeout` is not
+    /// used; the rollover's own cap bounds one share. `None` = a fixed
+    /// `per_dep_timeout` for every dependency.
+    pub rollover: Option<crate::budget::RolloverBudget>,
 }
 
 /// Upper bound on [`HuntOptions::dep_concurrency`]: each in-flight dependency
@@ -57,6 +71,10 @@ impl Default for HuntOptions {
             reaudit_known: false,
             per_dep_timeout: std::time::Duration::from_secs(300),
             dep_concurrency: 2,
+            dep_priority: DepPriority::Default,
+            reach_evidence: Vec::new(),
+            variant_seeds: None,
+            rollover: None,
         }
     }
 }
@@ -93,6 +111,10 @@ pub struct UpstreamInfo {
     pub github: Option<String>,
     /// Security-contact emails found in the package's SECURITY.md.
     pub security_emails: Vec<String>,
+    /// Requirement-looking lines from the package's security policy, quoted
+    /// as DATA for human confirmation (never acted on).
+    #[serde(default)]
+    pub policy_requirements: Vec<String>,
 }
 
 /// Stage evidence is unknown for reports written before this ledger existed.
@@ -152,6 +174,9 @@ pub struct DependencyHunt {
     pub audit_evidence: DependencyAuditEvidence,
     #[serde(default)]
     pub duration_ms: u64,
+    /// Variant-seed ledger when `--variant-seeds` ran for this dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeds: Option<SeedRecord>,
 }
 
 impl DependencyHunt {
@@ -172,6 +197,20 @@ impl DependencyHunt {
             )
         })
     }
+
+    /// Novelty candidates in this dependency: actionable findings when OSV
+    /// reports no advisory for the locked version, minus findings the
+    /// variant-seed de-dup tied to a known advisory. Empty otherwise.
+    pub fn novel_findings(&self) -> impl Iterator<Item = &Finding> {
+        let eligible = self.known.is_empty() && self.osv.status == OsvStatus::Unmatched;
+        self.actionable().filter(move |f| {
+            eligible
+                && !self
+                    .seeds
+                    .as_ref()
+                    .is_some_and(|s| s.is_known_duplicate(&f.id))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +228,19 @@ pub struct HuntReport {
     pub run_status: Option<RunStatus>,
     #[serde(default)]
     pub incomplete_reasons: Vec<String>,
+    /// Candidate ordering used for this hunt (legacy reports: default order).
+    #[serde(default)]
+    pub dep_priority: DepPriority,
+    /// Score breakdown per candidate when `--dep-priority risk` ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub priorities: Vec<DependencyPriority>,
+    /// Rule-based malicious-package signals when `--malicious-signals` ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub malicious: Option<MaliciousReport>,
+    /// The budget mode, what each dependency was granted and used, and how
+    /// many were deferred. Absent in reports from earlier releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::budget::HuntBudgetRecord>,
 }
 
 impl HuntReport {
@@ -205,8 +257,7 @@ impl HuntReport {
     pub fn novel_candidates(&self) -> Vec<(&DependencyHunt, &Finding)> {
         self.audited
             .iter()
-            .filter(|d| d.known.is_empty() && d.osv.status == OsvStatus::Unmatched)
-            .flat_map(|d| d.actionable().map(move |f| (d, f)))
+            .flat_map(|d| d.novel_findings().map(move |f| (d, f)))
             .collect()
     }
 }
@@ -224,6 +275,16 @@ pub trait DirAuditor: Send + Sync {
             findings: self.audit(dir).await?,
             evidence: DependencyAuditEvidence::default(),
         })
+    }
+
+    /// Audit with variant seeds for the finder. Returns whether the seeds were
+    /// actually delivered; the default ignores them (and says so).
+    async fn audit_seeded(
+        &self,
+        dir: &Path,
+        _seeds: &SeedContext,
+    ) -> Result<(DirAuditResult, bool), String> {
+        Ok((self.audit_with_evidence(dir).await?, false))
     }
 }
 
@@ -248,24 +309,65 @@ impl DirAuditor for EngineAuditor {
     }
 
     async fn audit_with_evidence(&self, dir: &Path) -> Result<DirAuditResult, String> {
+        self.scan(dir, self.finders.clone()).await
+    }
+
+    async fn audit_seeded(
+        &self,
+        dir: &Path,
+        seeds: &SeedContext,
+    ) -> Result<(DirAuditResult, bool), String> {
+        if seeds.block.is_empty() {
+            return Ok((self.scan(dir, self.finders.clone()).await?, false));
+        }
+        // Only finder prompts carry seeds; verifiers and PoC models never see them.
+        let block: std::sync::Arc<str> = std::sync::Arc::from(seeds.block.as_str());
+        let finders = self
+            .finders
+            .iter()
+            .map(|m| crate::llm::ModelHandle {
+                id: m.id.clone(),
+                family: m.family.clone(),
+                caller: std::sync::Arc::new(super::seeds::SeededCaller {
+                    inner: m.caller.clone(),
+                    block: block.clone(),
+                }),
+            })
+            .collect();
+        Ok((self.scan(dir, finders).await?, true))
+    }
+}
+
+impl EngineAuditor {
+    async fn scan(
+        &self,
+        dir: &Path,
+        finders: Vec<crate::llm::ModelHandle>,
+    ) -> Result<DirAuditResult, String> {
         let opts = crate::audit::ScanOptions {
             repo_path: dir.to_path_buf(),
             profile: "deep".into(),
             report: None,
             sarif: None,
+            cyclonedx: None,
             fail_on: "none".into(),
             gates: Vec::new(),
             max_modules: self.max_modules,
             poc: self.poc,
             save: false,
             cross_check_top: 0,
+            dual_finder_top: 0,
             fail_on_needs_human: false,
             no_prior: true,
             rank: crate::audit::RankStrategy::Heuristic,
             trace: None,
             source_receipts: false,
             time_budget: None,
-            finders: self.finders.clone(),
+            refuter_runs: crate::audit::DEFAULT_REFUTER_RUNS,
+            prescreen: None,
+            role_caps: Default::default(),
+            fix_test_command: None,
+            finders,
             verifiers: self.verifiers.clone(),
             poc_models: self.poc_models.clone(),
             roster: self.roster.clone(),
@@ -291,10 +393,37 @@ impl DirAuditor for EngineAuditor {
 /// that were classified; `pre_skipped` carries the transitive ones already set
 /// aside. Direct dependencies fill the `max_deps` budget first.
 pub fn partition(
-    mut rows: Vec<DependencyAdvisories>,
+    rows: Vec<DependencyAdvisories>,
     opts: &HuntOptions,
 ) -> (Vec<DependencyAdvisories>, Vec<SkippedDep>) {
-    rows.sort_by_key(|r| !r.target.direct); // direct first (stable)
+    partition_scored(rows, opts, None)
+}
+
+type ScoreKey = (Ecosystem, String, String);
+
+/// [`partition`] with an optional risk score per candidate
+/// (`--dep-priority risk`): highest score first, ties direct-first then name.
+pub fn partition_scored(
+    mut rows: Vec<DependencyAdvisories>,
+    opts: &HuntOptions,
+    scores: Option<&HashMap<ScoreKey, DependencyPriority>>,
+) -> (Vec<DependencyAdvisories>, Vec<SkippedDep>) {
+    match scores {
+        Some(scores) => {
+            let score_of = |t: &DependencyTarget| {
+                scores
+                    .get(&(t.ecosystem, t.name.clone(), t.version.clone()))
+                    .map_or(0.0, |p| p.score)
+            };
+            rows.sort_by(|a, b| {
+                super::priority::risk_cmp(
+                    (&a.target, score_of(&a.target)),
+                    (&b.target, score_of(&b.target)),
+                )
+            });
+        }
+        None => rows.sort_by_key(|r| !r.target.direct), // direct first (stable)
+    }
     let mut selected = Vec::new();
     let mut skipped = Vec::new();
     for row in rows {
@@ -329,6 +458,42 @@ pub struct HuntPlan {
     pub total_targets: usize,
     pub selected: Vec<DependencyAdvisories>,
     pub skipped: Vec<SkippedDep>,
+    #[serde(default)]
+    pub dep_priority: DepPriority,
+    /// Score breakdown for every OSV-classified candidate (risk order only),
+    /// in selection order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub priorities: Vec<DependencyPriority>,
+}
+
+impl HuntPlan {
+    /// Every candidate the plan classified with OSV, plus pre-filtered ones,
+    /// paired with its advisory row when one exists.
+    pub fn all_targets(&self) -> Vec<DependencyTarget> {
+        self.selected
+            .iter()
+            .map(|r| r.target.clone())
+            .chain(self.skipped.iter().map(|s| s.target.clone()))
+            .collect()
+    }
+
+    /// OSV rows for every classified candidate (selected and skipped-after-OSV).
+    pub fn osv_rows(&self) -> Vec<DependencyAdvisories> {
+        self.selected
+            .iter()
+            .cloned()
+            .chain(
+                self.skipped
+                    .iter()
+                    .filter(|s| s.osv.status != OsvStatus::Unknown)
+                    .map(|s| DependencyAdvisories {
+                        target: s.target.clone(),
+                        known: s.known.clone(),
+                        osv: s.osv.clone(),
+                    }),
+            )
+            .collect()
+    }
 }
 
 /// Resolve the plan: intake, direct pre-filter (before OSV, to save calls),
@@ -374,8 +539,22 @@ pub async fn plan_hunt<O: OsvClient>(
         })
         .collect();
 
+    let scores = (opts.dep_priority == DepPriority::Risk).then(|| {
+        let graph = super::graph::graph_from_dir(project);
+        super::priority::score_all(&candidates, &graph, &opts.reach_evidence)
+    });
     let rows = scan_known(&candidates, osv).await;
-    let (selected, known_or_budget) = partition(rows, opts);
+    let (selected, known_or_budget) = partition_scored(rows, opts, scores.as_ref());
+    let priorities = scores
+        .map(|mut scores| {
+            selected
+                .iter()
+                .map(|r| &r.target)
+                .chain(known_or_budget.iter().map(|s| &s.target))
+                .filter_map(|t| scores.remove(&(t.ecosystem, t.name.clone(), t.version.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
     skipped.extend(known_or_budget);
 
     Ok(HuntPlan {
@@ -384,6 +563,8 @@ pub async fn plan_hunt<O: OsvClient>(
         total_targets,
         selected,
         skipped,
+        dep_priority: opts.dep_priority,
+        priorities,
     })
 }
 
@@ -396,6 +577,8 @@ pub async fn plan_hunt<O: OsvClient>(
 pub trait HuntProgress {
     fn start(&self, index: usize, total: usize, target: &DependencyTarget);
     fn done(&self, index: usize, total: usize, hunt: &DependencyHunt);
+    /// The effective budget table, once the plan's dependency count is known.
+    fn budget(&self, _table: &str) {}
 }
 
 /// A no-op sink for callers that do not want progress.
@@ -435,25 +618,82 @@ where
     A: DirAuditor,
     P: HuntProgress,
 {
+    run_hunt_seeded(project, opts, osv, fetcher, auditor, progress, None).await
+}
+
+/// [`run_hunt_with_progress`] with an optional variant-seed source. Seeds are
+/// collected only when `opts.variant_seeds` is set; without a source that
+/// request is recorded per dependency as an error, never silently dropped.
+pub async fn run_hunt_seeded<O, F, A, P>(
+    project: &Path,
+    opts: &HuntOptions,
+    osv: &O,
+    fetcher: &F,
+    auditor: &A,
+    progress: &P,
+    seeds: Option<&dyn SeedSource>,
+) -> Result<HuntReport, String>
+where
+    O: OsvClient,
+    F: SourceFetcher,
+    A: DirAuditor,
+    P: HuntProgress,
+{
     let plan = plan_hunt(project, opts, osv).await?;
+    let seeding = opts.variant_seeds.as_ref().map(|o| SeedPlan {
+        source: seeds,
+        options: o,
+        osv,
+    });
+    let seeding = seeding.as_ref();
     let total = plan.selected.len();
     let limit = opts.dep_concurrency.clamp(1, MAX_DEP_CONCURRENCY);
+    let mode = match opts.rollover {
+        Some(r) => crate::budget::HuntBudget::Rollover(r),
+        None => crate::budget::HuntBudget::Fixed {
+            per_dep: opts.per_dep_timeout,
+        },
+    };
+    progress.budget(&mode.render_table(total));
+    let allocator = opts
+        .rollover
+        .map(|r| crate::budget::DepBudget::new(r.total, r.cap, total));
+    let allocator = allocator.as_ref();
     // Runs on the caller's task (no spawn), so the injected traits need not be
     // 'static. Results are re-sorted into plan order: the report must not
-    // depend on which dependency happened to finish first.
-    let mut finished: Vec<(usize, DependencyHunt)> =
+    // depend on which dependency happened to finish first. A rollover share
+    // is computed when the dependency starts, so time an earlier dependency
+    // left unused reaches the later ones.
+    let mut finished: Vec<(usize, DependencyHunt, Option<std::time::Duration>)> =
         futures::stream::iter(plan.selected.iter().enumerate())
             .map(|(i, row)| async move {
                 progress.start(i + 1, total, &row.target);
-                let hunt = audit_within_timeout(row, opts.per_dep_timeout, fetcher, auditor).await;
+                let (hunt, granted) = match allocator {
+                    None => (
+                        audit_dependency(row, opts.per_dep_timeout, fetcher, auditor, seeding)
+                            .await,
+                        Some(opts.per_dep_timeout),
+                    ),
+                    Some(budget) => match budget.allocate().await {
+                        None => (deferred_for_budget(row), None),
+                        Some(share) => {
+                            let hunt =
+                                audit_dependency(row, share, fetcher, auditor, seeding).await;
+                            budget
+                                .settle(share, std::time::Duration::from_millis(hunt.duration_ms));
+                            (hunt, Some(share))
+                        }
+                    },
+                };
                 progress.done(i + 1, total, &hunt);
-                (i, hunt)
+                (i, hunt, granted)
             })
             .buffer_unordered(limit)
             .collect()
             .await;
-    finished.sort_by_key(|(i, _)| *i);
-    let audited: Vec<DependencyHunt> = finished.into_iter().map(|(_, hunt)| hunt).collect();
+    finished.sort_by_key(|(i, ..)| *i);
+    let budget = budget_record(&mode, &finished);
+    let audited: Vec<DependencyHunt> = finished.into_iter().map(|(_, hunt, _)| hunt).collect();
     let mut incomplete_reasons = Vec::new();
     if !plan
         .intake
@@ -471,12 +711,21 @@ where
     {
         incomplete_reasons.push("advisory_query_unknown".into());
     }
+    if audited
+        .iter()
+        .any(|d| d.seeds.as_ref().is_some_and(|s| !s.errors.is_empty()))
+    {
+        incomplete_reasons.push("variant_seed_lookup_failed".into());
+    }
     if plan
         .skipped
         .iter()
         .any(|d| d.reason == SkipReason::OverBudget)
     {
         incomplete_reasons.push("dependency_budget_exhausted".into());
+    }
+    if budget.deferred > 0 {
+        incomplete_reasons.push("hunt_time_budget_exhausted".into());
     }
     let run_status = Some(if incomplete_reasons.is_empty() {
         RunStatus::Complete
@@ -491,16 +740,100 @@ where
         skipped: plan.skipped,
         run_status,
         incomplete_reasons,
+        dep_priority: plan.dep_priority,
+        priorities: plan.priorities,
+        malicious: None,
+        budget: Some(budget),
     })
+}
+
+/// A dependency `--hunt-budget` could no longer fund: recorded, not started.
+fn deferred_for_budget(row: &DependencyAdvisories) -> DependencyHunt {
+    DependencyHunt {
+        target: row.target.clone(),
+        known: row.known.clone(),
+        osv: row.osv.clone(),
+        audited: false,
+        error: Some(DEFERRED_FOR_BUDGET.into()),
+        upstream: UpstreamInfo::default(),
+        findings: Vec::new(),
+        fetch: StageEvidence {
+            status: StageStatus::NotStarted,
+            ..Default::default()
+        },
+        audit: StageEvidence {
+            status: StageStatus::NotStarted,
+            ..Default::default()
+        },
+        audit_evidence: DependencyAuditEvidence::default(),
+        duration_ms: 0,
+        seeds: None,
+    }
+}
+
+/// Error text of a dependency deferred by `--hunt-budget`.
+pub const DEFERRED_FOR_BUDGET: &str =
+    "deferred: the hunt budget could not fund this dependency (--hunt-budget)";
+
+fn budget_record(
+    mode: &crate::budget::HuntBudget,
+    finished: &[(usize, DependencyHunt, Option<std::time::Duration>)],
+) -> crate::budget::HuntBudgetRecord {
+    let allocations: Vec<crate::budget::DepAllocation> = finished
+        .iter()
+        .map(|(_, h, granted)| crate::budget::DepAllocation {
+            ecosystem: h.target.ecosystem.as_str().to_string(),
+            name: h.target.name.clone(),
+            version: h.target.version.clone(),
+            granted_secs: granted.map(|d| d.as_secs()),
+            used_ms: h.duration_ms,
+            deferred: granted.is_none(),
+        })
+        .collect();
+    let (mode_name, total_secs, dep_cap_secs) = match mode {
+        crate::budget::HuntBudget::Fixed { per_dep } => ("fixed", None, Some(per_dep.as_secs())),
+        crate::budget::HuntBudget::Rollover(r) => (
+            "rollover",
+            Some(r.total.as_secs()),
+            r.cap.map(|c| c.as_secs()),
+        ),
+    };
+    crate::budget::HuntBudgetRecord {
+        mode: mode_name.into(),
+        total_secs,
+        dep_cap_secs,
+        spent_ms: allocations.iter().map(|a| a.used_ms).sum(),
+        deferred: allocations.iter().filter(|a| a.deferred).count(),
+        allocations,
+    }
+}
+
+/// Variant-seed inputs for one hunt.
+struct SeedPlan<'a> {
+    source: Option<&'a dyn SeedSource>,
+    options: &'a SeedOptions,
+    /// Re-queried after the audit so a known advisory is never reported as novel.
+    osv: &'a dyn OsvClient,
 }
 
 /// Fetch + audit one dependency, recording a timeout as an unaudited
 /// dependency instead of failing the hunt.
+#[cfg(test)]
 async fn audit_within_timeout<F: SourceFetcher, A: DirAuditor>(
     row: &DependencyAdvisories,
     timeout: std::time::Duration,
     fetcher: &F,
     auditor: &A,
+) -> DependencyHunt {
+    audit_dependency(row, timeout, fetcher, auditor, None).await
+}
+
+async fn audit_dependency<F: SourceFetcher, A: DirAuditor>(
+    row: &DependencyAdvisories,
+    timeout: std::time::Duration,
+    fetcher: &F,
+    auditor: &A,
+    seeding: Option<&SeedPlan<'_>>,
 ) -> DependencyHunt {
     let started = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
@@ -524,6 +857,7 @@ async fn audit_within_timeout<F: SourceFetcher, A: DirAuditor>(
         },
         audit_evidence: DependencyAuditEvidence::default(),
         duration_ms: 0,
+        seeds: None,
     };
     let tmp = match tempfile::tempdir() {
         Ok(dir) => dir,
@@ -560,8 +894,57 @@ async fn audit_within_timeout<F: SourceFetcher, A: DirAuditor>(
         return result;
     }
     result.upstream = detect_upstream(tmp.path(), &row.target);
+    let context = match seeding {
+        None => None,
+        Some(plan) => Some(match plan.source {
+            None => SeedContext {
+                record: SeedRecord {
+                    errors: vec!["no seed source configured".into()],
+                    ..Default::default()
+                },
+                block: String::new(),
+            },
+            Some(source) => {
+                let collecting = super::seeds::collect(
+                    source,
+                    &row.target,
+                    result.upstream.github.as_deref(),
+                    plan.options,
+                    chrono::Utc::now(),
+                );
+                match tokio::time::timeout_at(deadline, collecting).await {
+                    Ok(ctx) => ctx,
+                    Err(_) => SeedContext {
+                        record: SeedRecord {
+                            errors: vec!["seed collection timed out".into()],
+                            ..Default::default()
+                        },
+                        block: String::new(),
+                    },
+                }
+            }
+        }),
+    };
     let auditing = std::time::Instant::now();
-    let audit = tokio::time::timeout_at(deadline, auditor.audit_with_evidence(tmp.path())).await;
+    let audit = match &context {
+        Some(ctx) => tokio::time::timeout_at(deadline, auditor.audit_seeded(tmp.path(), ctx))
+            .await
+            .map(|r| {
+                r.map(|(audit, delivered)| {
+                    result.seeds = Some(SeedRecord {
+                        delivered_to_finders: delivered,
+                        ..ctx.record.clone()
+                    });
+                    audit
+                })
+            }),
+        None => tokio::time::timeout_at(deadline, auditor.audit_with_evidence(tmp.path())).await,
+    };
+    if result.seeds.is_none()
+        && let Some(ctx) = &context
+    {
+        result.seeds = Some(ctx.record.clone());
+    }
     result.audit.duration_ms = elapsed(auditing);
     match audit {
         Ok(Ok(audit)) => {
@@ -592,6 +975,38 @@ async fn audit_within_timeout<F: SourceFetcher, A: DirAuditor>(
         Err(_) => {
             result.audit.status = StageStatus::TimedOut;
             result.error = Some(format!("timed out after {}s (audit)", timeout.as_secs()));
+        }
+    }
+    if let (Some(plan), Some(record)) = (seeding, result.seeds.as_mut()) {
+        record.dedup = super::seeds::dedup(&result.findings, record, &row.target.version);
+        // Re-check OSV after seeding: anything published for this version
+        // meanwhile makes the dependency known, so nothing in it is novel.
+        match plan
+            .osv
+            .known_vulns_batch(std::slice::from_ref(&row.target))
+            .await
+        {
+            Ok(rows) if rows.len() == 1 => {
+                let known = rows.into_iter().next().unwrap_or_default();
+                if known.is_empty() {
+                    record.osv_recheck = OsvStatus::Unmatched;
+                } else {
+                    record.osv_recheck = OsvStatus::Matched;
+                    result.known = known;
+                    result.osv.status = OsvStatus::Matched;
+                }
+            }
+            other => {
+                record.osv_recheck = OsvStatus::Failed;
+                result.osv.status = OsvStatus::Failed;
+                result.osv.error = Some(match other {
+                    Err(e) => format!(
+                        "post-seed OSV re-check failed: {}",
+                        crate::util::mask_sensitive_text(crate::util::truncate_bytes(&e, 200))
+                    ),
+                    Ok(_) => "post-seed OSV re-check returned the wrong row count".into(),
+                });
+            }
         }
     }
     result.duration_ms = elapsed(started);
@@ -656,10 +1071,16 @@ pub fn render_plan(plan: &HuntPlan) -> String {
         plan.skipped.len(),
     );
     out.push_str(&render_intake(plan.intake.as_ref(), plan.total_targets));
-    out.push_str(crate::lang::pick(
-        "  將審查（OSV 查無已知漏洞、優先直接依賴）：\n",
-        "  Will audit (no known vulnerability in OSV, direct dependencies first):\n",
-    ));
+    out.push_str(match plan.dep_priority {
+        DepPriority::Default => crate::lang::pick(
+            "  將審查（OSV 查無已知漏洞、優先直接依賴）：\n",
+            "  Will audit (no known vulnerability in OSV, direct dependencies first):\n",
+        ),
+        DepPriority::Risk => crate::lang::pick(
+            "  將審查（OSV 查無已知漏洞、依風險分數 exposure × reach × criticality 排序；? 表示未知，以中性值計）：\n",
+            "  Will audit (no known vulnerability in OSV, ordered by risk score exposure × reach × criticality; ? = unknown, neutral value used):\n",
+        ),
+    });
     for row in &plan.selected {
         out.push_str(&format!(
             "    - {} {}@{}{}\n",
@@ -672,8 +1093,17 @@ pub fn render_plan(plan: &HuntPlan) -> String {
                 crate::lang::pick("（transitive）", " (transitive)")
             },
         ));
+        out.push_str(&priority_line(&plan.priorities, &row.target));
     }
     out
+}
+
+fn priority_line(priorities: &[DependencyPriority], t: &DependencyTarget) -> String {
+    priorities
+        .iter()
+        .find(|p| p.target == *t)
+        .map(|p| format!("        {}\n", super::priority::render_breakdown(p)))
+        .unwrap_or_default()
 }
 
 /// Summary of a completed hunt.
@@ -726,6 +1156,20 @@ pub fn render_summary(report: &HuntReport) -> String {
             f.line.map(|l| format!(":{l}")).unwrap_or_default(),
         ));
     }
+    out.push_str(&render_seeds(report));
+    if !report.priorities.is_empty() {
+        out.push_str(crate::lang::pick(
+            "  依賴優先序（風險分數）：\n",
+            "  Dependency priority (risk score):\n",
+        ));
+        for d in &report.audited {
+            out.push_str(&format!("    - {}@{}\n", d.target.name, d.target.version));
+            out.push_str(&priority_line(&report.priorities, &d.target));
+        }
+    }
+    if let Some(m) = &report.malicious {
+        out.push_str(&super::malicious::render(m));
+    }
     if !errors.is_empty() {
         out.push_str(crate::lang::pick(
             "  抓取／審查失敗：\n",
@@ -744,6 +1188,41 @@ pub fn render_summary(report: &HuntReport) -> String {
     out
 }
 
+/// Variant-seed lines: what was seeded, de-dup verdicts, and lookup gaps.
+fn render_seeds(report: &HuntReport) -> String {
+    let mut out = String::new();
+    for d in &report.audited {
+        let Some(s) = &d.seeds else { continue };
+        out.push_str(&crate::tr!(
+            "  變體種子 {}@{}：OSV 紀錄 {}、安全相關 commit {}、{}送入 finder；OSV 複查 {:?}\n",
+            "  Variant seeds {}@{}: {} OSV records, {} security commits, {} to finders; OSV re-check {:?}\n",
+            d.target.name,
+            d.target.version,
+            s.advisories.len(),
+            s.commits.len(),
+            if s.delivered_to_finders {
+                crate::lang::pick("已", "delivered")
+            } else {
+                crate::lang::pick("未", "not delivered")
+            },
+            s.osv_recheck,
+        ));
+        for e in &s.errors {
+            out.push_str(&format!("    ! {e}\n"));
+        }
+        for x in &s.dedup {
+            out.push_str(&format!(
+                "    · {} {:?} {} ({})\n",
+                x.finding_id,
+                x.verdict,
+                x.advisories.join(", "),
+                x.reason
+            ));
+        }
+    }
+    out
+}
+
 /// One upstream disclosure draft for a novelty candidate. Draft only — the
 /// human reviews, decides the channel, and sends (nothing is sent here).
 #[derive(Debug, Clone, Serialize)]
@@ -752,7 +1231,27 @@ pub struct HuntDisclosure {
     pub dependency: String,
     pub finding_id: String,
     pub finding_title: String,
-    pub draft: crate::disclose::Draft,
+    pub package: crate::disclose::DisclosurePackage,
+}
+
+/// A novelty candidate the drafting rules skipped, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedDraft {
+    pub dependency: String,
+    pub finding_id: String,
+    pub reason: String,
+}
+
+/// Planned channel for one novelty candidate (no draft, no reviewer needed):
+/// what a delivery report shows as the disclosure plan.
+#[derive(Debug, Clone, Serialize)]
+pub struct HuntDisclosurePlan {
+    pub dependency: String,
+    pub finding_id: String,
+    pub channel: crate::disclose::Channel,
+    pub submit: Option<String>,
+    pub disclose_by: String,
+    pub evidence_level: crate::audit::evidence_level::EvidenceLevel,
 }
 
 fn project_meta_for(dep: &DependencyHunt) -> crate::disclose::ProjectMeta {
@@ -770,60 +1269,136 @@ fn project_meta_for(dep: &DependencyHunt) -> crate::disclose::ProjectMeta {
         commit: None,
         security_policy: None,
         security_emails: dep.upstream.security_emails.clone(),
+        policy_requirements: dep.upstream.policy_requirements.clone(),
     }
 }
 
-/// Build upstream disclosure drafts for every eligible novelty candidate
-/// (confirmed / needs-human, in a dependency with no known OSV advisory).
-/// The channel is the top recommendation for that dependency's upstream.
-/// Drafts only — the review + send stay a human step.
-pub fn disclosure_drafts(report: &HuntReport, today: chrono::NaiveDate) -> Vec<HuntDisclosure> {
+fn dep_key(dep: &DependencyHunt) -> String {
+    format!("{}@{}", dep.target.name, dep.target.version)
+}
+
+/// Channel plan for every novelty candidate that could ever be drafted (not
+/// `static_only`, not refuted/suppressed). Unproven ones still need
+/// `--allow-unproven` and a human reproduction before any draft.
+pub fn disclosure_plan(report: &HuntReport, today: chrono::NaiveDate) -> Vec<HuntDisclosurePlan> {
+    report
+        .novel_candidates()
+        .into_iter()
+        .filter_map(|(dep, f)| {
+            let e = crate::disclose::draft_eligibility(f, true).ok()?;
+            let top = crate::disclose::recommend(&project_meta_for(dep))
+                .into_iter()
+                .next()?;
+            Some(HuntDisclosurePlan {
+                dependency: dep_key(dep),
+                finding_id: f.id.clone(),
+                channel: top.channel,
+                submit: top.submit,
+                disclose_by: (today + chrono::Duration::days(top.window_days)).to_string(),
+                evidence_level: e.level,
+            })
+        })
+        .collect()
+}
+
+async fn hunt_extras(
+    report: &HuntReport,
+    dep: &DependencyHunt,
+    f: &Finding,
+    meta: &crate::disclose::ProjectMeta,
+    dedupe: Option<&dyn crate::disclose::DedupeSource>,
+    today: chrono::NaiveDate,
+) -> crate::disclose::FindingExtras {
+    let dedupe = match dedupe {
+        Some(src) => crate::disclose::dedupe::check(src, meta, &f.file, today).await,
+        None => crate::disclose::DedupeReport::not_requested(),
+    };
+    crate::disclose::FindingExtras {
+        dedupe,
+        dependency: Some((dep_key(dep), report.project.clone())),
+    }
+}
+
+/// Build upstream disclosure drafts for every novelty candidate that passes
+/// the drafting rules (evidence gate, throttle). The channel is the top
+/// recommendation for that dependency's upstream. Within one call a second
+/// candidate for the same upstream is skipped like an unanswered draft
+/// (unless the throttle is forced). Drafts only; the caller records each
+/// written draft with [`crate::disclose::record_draft`].
+pub async fn disclosure_drafts(
+    report: &HuntReport,
+    today: chrono::NaiveDate,
+    opts: &crate::disclose::DraftOptions,
+    dedupe: Option<&dyn crate::disclose::DedupeSource>,
+) -> (Vec<HuntDisclosure>, Vec<SkippedDraft>) {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    let mut drafted_projects: Vec<String> = Vec::new();
     for (dep, f) in report.novel_candidates() {
-        if crate::disclose::eligible(f).is_err() {
+        let skip = |reason: String| SkippedDraft {
+            dependency: dep_key(dep),
+            finding_id: f.id.clone(),
+            reason,
+        };
+        if let Err(e) = crate::disclose::draft_eligibility(f, opts.allow_unproven) {
+            skipped.push(skip(e));
             continue;
         }
         let meta = project_meta_for(dep);
-        let channel = crate::disclose::recommend(&meta)
-            .into_iter()
-            .next()
-            .map(|c| c.channel)
-            .unwrap_or(crate::disclose::Channel::GithubAdvisory);
-        out.push(HuntDisclosure {
-            dependency: format!("{}@{}", dep.target.name, dep.target.version),
-            finding_id: f.id.clone(),
-            finding_title: f.title.clone(),
-            draft: crate::disclose::draft(f, &meta, channel, today),
-        });
+        let project = crate::disclose::ledger::project_key(&meta);
+        if drafted_projects.contains(&project) && opts.force_throttle.is_none() {
+            skipped.push(skip(crate::tr!(
+                "節流：本次已為 {project} 產生一份草稿；一次只送一份（或用 --force-throttle <理由>）。",
+                "throttled: a draft for {project} was already produced in this run; send one at a time (or pass --force-throttle <reason>)."
+            )));
+            continue;
+        }
+        let extras = hunt_extras(report, dep, f, &meta, dedupe, today).await;
+        match crate::disclose::package_for(f, meta, None, today, opts, extras) {
+            Ok(package) => {
+                drafted_projects.push(project);
+                out.push(HuntDisclosure {
+                    dependency: dep_key(dep),
+                    finding_id: f.id.clone(),
+                    finding_title: f.title.clone(),
+                    package,
+                });
+            }
+            Err(e) => skipped.push(skip(e)),
+        }
     }
-    out
+    (out, skipped)
 }
 
 /// Full disclosure package (ranked channels, draft, pre-send checklist) for
 /// one novelty candidate, so the dashboard/desktop can reuse the scan report's
-/// disclosure panel. Only an eligible novelty candidate qualifies: a finding in
-/// a dependency with a known OSV advisory, or one not confirmed/needs-human,
+/// disclosure panel. Only a novelty candidate qualifies: a finding in a
+/// dependency with a known OSV advisory, or one the drafting rules refuse,
 /// is refused. Draft only — nothing is sent.
-pub fn disclosure_package(
+pub async fn disclosure_package(
     report: &HuntReport,
     dependency: &str,
     finding_id: &str,
     channel: Option<crate::disclose::Channel>,
     today: chrono::NaiveDate,
+    opts: &crate::disclose::DraftOptions,
+    dedupe: Option<&dyn crate::disclose::DedupeSource>,
 ) -> Result<crate::disclose::DisclosurePackage, String> {
     let (dep, f) = report
         .novel_candidates()
         .into_iter()
-        .find(|(d, f)| {
-            f.id == finding_id && format!("{}@{}", d.target.name, d.target.version) == dependency
-        })
+        .find(|(d, f)| f.id == finding_id && dep_key(d) == dependency)
         .ok_or_else(|| {
             crate::tr!(
                 "{dependency} 沒有可揭露的新漏洞候選 {finding_id}",
                 "{dependency} has no disclosable novelty candidate {finding_id}"
             )
         })?;
-    crate::disclose::package_for(f, project_meta_for(dep), channel, today)
+    // Gate before any network use.
+    crate::disclose::draft_eligibility(f, opts.allow_unproven)?;
+    let meta = project_meta_for(dep);
+    let extras = hunt_extras(report, dep, f, &meta, dedupe, today).await;
+    crate::disclose::package_for(f, meta, channel, today, opts, extras)
 }
 
 /// Read a saved hunt report (`vettalon hunt --report`) for delivery: size
@@ -900,6 +1475,7 @@ fn detect_upstream(extracted: &Path, target: &DependencyTarget) -> UpstreamInfo 
     UpstreamInfo {
         github,
         security_emails: meta.security_emails,
+        policy_requirements: meta.policy_requirements,
     }
 }
 
@@ -934,6 +1510,10 @@ fn manifest_repository(root: &Path, target: &DependencyTarget) -> Option<String>
         }
     }
 }
+
+#[cfg(test)]
+#[path = "run_seed_tests.rs"]
+mod seed_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1256,7 +1836,7 @@ mod tests {
         assert!(report.audited[0].osv.error.is_some());
         assert!(report.novel_candidates().is_empty());
         assert!(
-            disclosure_drafts(
+            disclosure_plan(
                 &report,
                 chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap()
             )
@@ -1340,8 +1920,8 @@ mod tests {
         assert_eq!(novel[0].0.target.name, "good");
     }
 
-    #[test]
-    fn disclosure_drafts_only_for_eligible_novelty_candidates() {
+    #[tokio::test]
+    async fn disclosure_drafts_only_for_eligible_novelty_candidates() {
         let mut nh = Finding::candidate(
             "ai_audit",
             FindingKind::Other,
@@ -1351,9 +1931,16 @@ mod tests {
             Some(10),
             "s",
             "ai-audit/sql_injection",
-            vec![],
+            vec![crate::audit::schema::EvidenceItem {
+                kind: crate::audit::schema::EvidenceKind::AdversarialReview,
+                source: "verifier".into(),
+                detail: "plausible: unescaped input reaches the query".into(),
+                recorded_at: "2026-10-14T00:00:00Z".into(),
+            }],
         );
         nh.status = FindingStatus::NeedsHuman;
+        let mut nh2 = nh.clone();
+        nh2.id = "second-in-same-upstream".into();
         let clean_dep = DependencyHunt {
             osv: OsvEvidence {
                 status: OsvStatus::Unmatched,
@@ -1370,8 +1957,10 @@ mod tests {
             upstream: UpstreamInfo {
                 github: Some("acme/vuln-lib".into()),
                 security_emails: vec![],
+                policy_requirements: vec![],
             },
-            findings: vec![nh],
+            findings: vec![nh, nh2],
+            seeds: None,
         };
         // A dependency with a known CVE is NOT a novelty candidate → no draft.
         let known_dep = DependencyHunt {
@@ -1406,27 +1995,56 @@ mod tests {
                 f.status = FindingStatus::NeedsHuman;
                 f
             }],
+            seeds: None,
         };
         let report = HuntReport {
             intake: None,
             run_status: None,
             incomplete_reasons: Vec::new(),
+            dep_priority: Default::default(),
+            priorities: Vec::new(),
+            malicious: None,
+            budget: None,
             project: "p".into(),
             total_targets: 2,
             audited: vec![clean_dep, known_dep],
             skipped: vec![],
         };
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap();
-        let drafts = disclosure_drafts(&report, today);
-        assert_eq!(drafts.len(), 1, "only the clean dep's finding drafts");
+        let home = tempfile::tempdir().unwrap();
+        let reviewer =
+            crate::disclose::Reviewer::resolve(Some("night-owl"), None, None, today).unwrap();
+        let mut opts = crate::disclose::DraftOptions::new(reviewer, home.path());
+        // Refuter-only evidence: nothing by default, only with --allow-unproven.
+        let (drafts, skipped) = disclosure_drafts(&report, today, &opts, None).await;
+        assert!(drafts.is_empty());
+        assert!(
+            skipped
+                .iter()
+                .all(|s| s.reason.contains("--allow-unproven"))
+        );
+        opts.allow_unproven = true;
+        let (drafts, skipped) = disclosure_drafts(&report, today, &opts, None).await;
+        assert_eq!(drafts.len(), 1, "one draft per upstream per run");
         assert_eq!(drafts[0].dependency, "vuln-lib@1.0.0");
-        assert!(!drafts[0].draft.body.is_empty());
-        assert!(!drafts[0].draft.subject.is_empty());
+        assert!(drafts[0].package.unproven);
+        assert!(drafts[0].package.draft.body.starts_with("!!! UNPROVEN"));
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].reason.contains("--force-throttle"));
+        let scope = drafts[0].package.dependency_scope.as_ref().unwrap();
+        assert_eq!(scope.host_project, "p");
+        assert_eq!(
+            scope.host_reachability,
+            crate::disclose::Reachability::Unknown
+        );
+        assert_eq!(disclosure_plan(&report, today).len(), 2);
 
         // The UI's per-candidate package: same eligibility, plus channels and
         // the pre-send checklist; GitHub upstream ranks the advisory first.
         let fid = drafts[0].finding_id.clone();
-        let pkg = disclosure_package(&report, "vuln-lib@1.0.0", &fid, None, today).unwrap();
+        let pkg = disclosure_package(&report, "vuln-lib@1.0.0", &fid, None, today, &opts, None)
+            .await
+            .unwrap();
         assert_eq!(pkg.finding_id, fid);
         assert_eq!(
             pkg.channels[0].channel,
@@ -1435,8 +2053,16 @@ mod tests {
         assert!(!pkg.checklist.is_empty());
         // A known-CVE dependency's finding, or a wrong dependency, is refused.
         let known_id = report.audited[1].findings[0].id.clone();
-        assert!(disclosure_package(&report, "known@1.0.0", &known_id, None, today).is_err());
-        assert!(disclosure_package(&report, "other@1.0.0", &fid, None, today).is_err());
+        assert!(
+            disclosure_package(&report, "known@1.0.0", &known_id, None, today, &opts, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            disclosure_package(&report, "other@1.0.0", &fid, None, today, &opts, None)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1446,6 +2072,10 @@ mod tests {
             intake: None,
             run_status: None,
             incomplete_reasons: Vec::new(),
+            dep_priority: Default::default(),
+            priorities: Vec::new(),
+            malicious: None,
+            budget: None,
             project: "p".into(),
             total_targets: 0,
             audited: vec![],
@@ -1577,6 +2207,110 @@ mod tests {
             "{:?}",
             report.audited[0].error
         );
+    }
+
+    #[tokio::test]
+    async fn fixed_budget_is_recorded_per_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cargo_project(dir.path());
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        let b = report.budget.expect("budget record");
+        assert_eq!(b.mode, "fixed");
+        assert_eq!(b.total_secs, None);
+        assert_eq!(b.dep_cap_secs, Some(300));
+        assert_eq!(b.deferred, 0);
+        assert_eq!(b.allocations.len(), 1);
+        assert_eq!(b.allocations[0].name, "good");
+        assert_eq!(b.allocations[0].granted_secs, Some(300));
+    }
+
+    #[tokio::test]
+    async fn rollover_budget_grants_shares_and_records_them() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cargo_project_with(dir.path(), &["a", "b", "c"]);
+        let opts = HuntOptions {
+            dep_concurrency: 1,
+            rollover: Some(crate::budget::RolloverBudget {
+                total: std::time::Duration::from_secs(600),
+                cap: None,
+            }),
+            ..Default::default()
+        };
+        let report = run_hunt(
+            dir.path(),
+            &opts,
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        let b = report.budget.clone().expect("budget record");
+        assert_eq!(b.mode, "rollover");
+        assert_eq!(b.total_secs, Some(600));
+        assert_eq!(b.deferred, 0);
+        let granted: Vec<Option<u64>> = b.allocations.iter().map(|a| a.granted_secs).collect();
+        // Each dependency finishes almost at once, so nearly all of its share
+        // rolls forward: 600/3, then ~600/2, then ~600.
+        assert_eq!(granted[0], Some(200));
+        assert!(granted[1].unwrap() >= 299, "{granted:?}");
+        assert!(granted[2].unwrap() >= 598, "{granted:?}");
+        assert!(report.audited.iter().all(|d| d.audited));
+        assert!(
+            !report
+                .incomplete_reasons
+                .contains(&"hunt_time_budget_exhausted".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rollover_budget_that_cannot_fund_a_dependency_defers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cargo_project(dir.path());
+        // A per-dependency cap below the 90 s minimum: nothing can be funded.
+        // (The CLI rejects this at startup; the library still fails safe.)
+        let opts = HuntOptions {
+            rollover: Some(crate::budget::RolloverBudget {
+                total: std::time::Duration::from_secs(600),
+                cap: Some(std::time::Duration::from_secs(10)),
+            }),
+            ..Default::default()
+        };
+        let report = run_hunt(
+            dir.path(),
+            &opts,
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        let dep = &report.audited[0];
+        assert!(!dep.audited);
+        assert_eq!(dep.fetch.status, StageStatus::NotStarted);
+        assert_eq!(dep.error.as_deref(), Some(DEFERRED_FOR_BUDGET));
+        let b = report.budget.as_ref().unwrap();
+        assert_eq!(b.deferred, 1);
+        assert!(b.allocations[0].deferred);
+        assert_eq!(b.allocations[0].granted_secs, None);
+        assert_eq!(report.run_status, Some(RunStatus::Incomplete));
+        assert!(
+            report
+                .incomplete_reasons
+                .contains(&"hunt_time_budget_exhausted".to_string())
+        );
+        // The record round-trips through JSON (the report a GUI reads).
+        let json = serde_json::to_string(&report).unwrap();
+        let back: HuntReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.budget, report.budget);
     }
 
     #[tokio::test]
@@ -1722,5 +2456,126 @@ mod tests {
     #[test]
     fn default_dependency_concurrency_is_two() {
         assert_eq!(HuntOptions::default().dep_concurrency, 2);
+    }
+
+    /// `--malicious-signals` results never become disclosure drafts: they
+    /// live in `report.malicious` (not in any dependency's findings), and a
+    /// hand-edited report that smuggles one into the findings is refused by
+    /// the drafting gate before anything is recorded.
+    #[tokio::test]
+    async fn malicious_signal_findings_never_become_disclosure_drafts() {
+        use super::super::malicious::{
+            MaliciousFinding, MaliciousReport, MaliciousStatus, Signal, SignalKind, Strength,
+        };
+        let evil = target("evil-pkg", true);
+        let mut smuggled = Finding::candidate(
+            "ai_audit",
+            FindingKind::Other,
+            Severity::Critical,
+            "install hook exfiltrates env",
+            "package.json",
+            Some(1),
+            "s",
+            crate::disclose::eligibility::MALICIOUS_SIGNAL_KIND,
+            vec![crate::audit::schema::EvidenceItem {
+                kind: crate::audit::schema::EvidenceKind::AdversarialReview,
+                source: "verifier".into(),
+                detail: "plausible: hook runs on install".into(),
+                recorded_at: "2026-10-20T00:00:00Z".into(),
+            }],
+        );
+        smuggled.id = "smuggled".into();
+        smuggled.status = FindingStatus::NeedsHuman;
+        let dep = DependencyHunt {
+            osv: OsvEvidence {
+                status: OsvStatus::Unmatched,
+                ..Default::default()
+            },
+            fetch: StageEvidence::default(),
+            audit: StageEvidence::default(),
+            audit_evidence: DependencyAuditEvidence::default(),
+            duration_ms: 0,
+            target: evil.clone(),
+            known: vec![],
+            audited: true,
+            error: None,
+            upstream: UpstreamInfo {
+                github: Some("evil/evil-pkg".into()),
+                security_emails: vec![],
+                policy_requirements: vec![],
+            },
+            findings: vec![smuggled],
+            seeds: None,
+        };
+        let report = HuntReport {
+            intake: None,
+            run_status: None,
+            incomplete_reasons: Vec::new(),
+            project: "p".into(),
+            total_targets: 1,
+            audited: vec![dep],
+            skipped: vec![],
+            dep_priority: Default::default(),
+            priorities: vec![],
+            budget: None,
+            malicious: Some(MaliciousReport {
+                rules: "test".into(),
+                cooldown_hours: 72,
+                checks: vec![],
+                findings: vec![MaliciousFinding {
+                    kind: "malicious_package_signal".into(),
+                    target: evil,
+                    status: MaliciousStatus::NeedsHuman,
+                    signals: vec![Signal {
+                        kind: SignalKind::MalIdMatch,
+                        strength: Strength::Strong,
+                        evidence: "MAL-2026-1".into(),
+                        source: "osv".into(),
+                    }],
+                    rationale: "strong rule signal".into(),
+                }],
+                mal_index: vec![],
+                complete: true,
+                incomplete_reasons: vec![],
+            }),
+        };
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let reviewer =
+            crate::disclose::Reviewer::resolve(Some("night-owl"), None, None, today).unwrap();
+        let mut opts = crate::disclose::DraftOptions::new(reviewer, home.path());
+        opts.allow_unproven = true;
+        opts.force_throttle = Some("test".into());
+        let (drafts, skipped) = disclosure_drafts(&report, today, &opts, None).await;
+        assert!(drafts.is_empty(), "no draft for a malicious-package signal");
+        assert!(
+            skipped
+                .iter()
+                .all(|s| s.reason.contains("malicious-package") || s.reason.contains("惡意套件")),
+            "{skipped:?}"
+        );
+        assert!(disclosure_plan(&report, today).is_empty());
+        let err = disclosure_package(
+            &report,
+            "evil-pkg@1.0.0",
+            "smuggled",
+            None,
+            today,
+            &opts,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("malicious-package") || err.contains("惡意套件"),
+            "{err}"
+        );
+        assert!(
+            !home
+                .path()
+                .join(crate::disclose::ledger::LEDGER_FILE)
+                .exists(),
+            "nothing recorded"
+        );
     }
 }

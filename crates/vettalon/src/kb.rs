@@ -1,4 +1,5 @@
-//! zh-TW CWE knowledge base for report enrichment (`cwe_kb.json`).
+//! CWE knowledge base for report enrichment: zh-TW (`cwe_kb.json`) plus
+//! en / ja / ko report text (`cwe_kb_<lang>.json`, see [`localized`]).
 //!
 //! 58 curated entries built from MITRE's CWE catalogue (v4.20 XML) and
 //! cross-checked against the OWASP Top 10 2021 mapped-CWE lists. A report
@@ -140,6 +141,101 @@ pub fn owasp_info(category: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// Report text for one CWE in a non-Chinese report language. Written in our
+/// own words from the zh-TW entry (not copied from MITRE's descriptions);
+/// one file per language with the same ids and order as `cwe_kb.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalizedCwe {
+    pub id: String,
+    /// Short name in the report language (MITRE's full name is `name_en`).
+    pub name: String,
+    pub summary: String,
+    pub mitigations: Vec<String>,
+    pub attack_scenario: Option<String>,
+    pub capec: Vec<LocalizedCapec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalizedCapec {
+    pub id: String,
+    pub name: String,
+}
+
+const KB_EN: &str = include_str!("cwe_kb_en.json");
+const KB_JA: &str = include_str!("cwe_kb_ja.json");
+const KB_KO: &str = include_str!("cwe_kb_ko.json");
+
+fn localized_kb(lang: &str) -> Option<&'static HashMap<String, LocalizedCwe>> {
+    static EN: OnceLock<HashMap<String, LocalizedCwe>> = OnceLock::new();
+    static JA: OnceLock<HashMap<String, LocalizedCwe>> = OnceLock::new();
+    static KO: OnceLock<HashMap<String, LocalizedCwe>> = OnceLock::new();
+    let (cell, src) = match lang {
+        "en" => (&EN, KB_EN),
+        "ja" => (&JA, KB_JA),
+        "ko" => (&KO, KB_KO),
+        _ => return None,
+    };
+    Some(cell.get_or_init(|| {
+        // Same degrade-to-empty policy as the zh-TW KB (reports fall back to
+        // MITRE's name); tests keep it valid, and a broken file says so.
+        let v: Vec<LocalizedCwe> = serde_json::from_str(src).unwrap_or_else(|e| {
+            eprintln!(
+                "[vettalon] cwe_kb_{lang}.json is invalid ({e}); CWE text falls back to names"
+            );
+            Vec::new()
+        });
+        v.into_iter().map(|e| (e.id.clone(), e)).collect()
+    }))
+}
+
+/// Localized entry for a `CWE-<n>` id in `lang` (`en` | `ja` | `ko`).
+pub fn localized(cwe: &str, lang: &str) -> Option<&'static LocalizedCwe> {
+    let id = crate::audit::cwe::normalize(cwe)?;
+    localized_kb(lang)?.get(&id)
+}
+
+/// OWASP Top 10 2021 title in `lang` plus the official page. English titles
+/// are the project's own; Japanese titles are the OWASP project's Japanese
+/// translation (OWASP/Top10 repo, `2021/docs/ja`). There is no Korean
+/// translation of the 2021 list, so `ko` uses the English title. `zh-TW`
+/// (or anything else) falls back to [`owasp_info`].
+pub fn owasp_info_lang(category: &str, lang: &str) -> Option<(&'static str, &'static str)> {
+    let (zh, url) = owasp_info(category)?;
+    let code = category.get(..3)?;
+    let en = match code {
+        "A01" => "A01:2021 Broken Access Control",
+        "A02" => "A02:2021 Cryptographic Failures",
+        "A03" => "A03:2021 Injection",
+        "A04" => "A04:2021 Insecure Design",
+        "A05" => "A05:2021 Security Misconfiguration",
+        "A06" => "A06:2021 Vulnerable and Outdated Components",
+        "A07" => "A07:2021 Identification and Authentication Failures",
+        "A08" => "A08:2021 Software and Data Integrity Failures",
+        "A09" => "A09:2021 Security Logging and Monitoring Failures",
+        "A10" => "A10:2021 Server-Side Request Forgery (SSRF)",
+        _ => return None,
+    };
+    let ja = match code {
+        "A01" => "A01:2021 アクセス制御の不備",
+        "A02" => "A02:2021 暗号化の失敗",
+        "A03" => "A03:2021 インジェクション",
+        "A04" => "A04:2021 安全が確認されない不安な設計",
+        "A05" => "A05:2021 セキュリティの設定ミス",
+        "A06" => "A06:2021 脆弱で古くなったコンポーネント",
+        "A07" => "A07:2021 識別と認証の失敗",
+        "A08" => "A08:2021 ソフトウェアとデータの整合性の不具合",
+        "A09" => "A09:2021 セキュリティログとモニタリングの失敗",
+        _ => "A10:2021 サーバーサイドリクエストフォージェリ (SSRF)",
+    };
+    Some(match lang {
+        "en" | "ko" => (en, url),
+        "ja" => (ja, url),
+        _ => (zh, url),
+    })
+}
+
 /// MITRE definition page for a CWE id.
 pub fn cwe_url(cwe: &str) -> Option<String> {
     let id = crate::audit::cwe::normalize(cwe)?;
@@ -233,6 +329,78 @@ mod tests {
         assert_eq!(for_kind("xss").unwrap().id, "CWE-79");
         assert!(for_kind("definitely_not_a_kind").is_none());
         assert!(lookup("CWE-999999").is_none());
+    }
+
+    #[test]
+    fn localized_kbs_cover_every_entry_in_order() {
+        let zh: Vec<CweEntry> = serde_json::from_str(KB_JSON).unwrap();
+        for (lang, src) in [("en", KB_EN), ("ja", KB_JA), ("ko", KB_KO)] {
+            let loc: Vec<LocalizedCwe> = serde_json::from_str(src)
+                .unwrap_or_else(|e| panic!("cwe_kb_{lang}.json must match LocalizedCwe: {e}"));
+            assert_eq!(loc.len(), zh.len(), "{lang}");
+            for (z, l) in zh.iter().zip(&loc) {
+                assert_eq!(z.id, l.id, "{lang}: order");
+                assert!(
+                    !l.name.is_empty() && !l.summary.is_empty(),
+                    "{lang} {}",
+                    l.id
+                );
+                assert_eq!(
+                    z.mitigations_zh.len(),
+                    l.mitigations.len(),
+                    "{lang} {}",
+                    l.id
+                );
+                assert_eq!(
+                    z.attack_scenario_zh.is_some(),
+                    l.attack_scenario.is_some(),
+                    "{lang} {}",
+                    l.id
+                );
+                let ids = |v: Vec<&str>| v.join(",");
+                assert_eq!(
+                    ids(z.capec.iter().map(|c| c.id.as_str()).collect()),
+                    ids(l.capec.iter().map(|c| c.id.as_str()).collect()),
+                    "{lang} {}",
+                    l.id
+                );
+            }
+            assert!(localized("cwe-89", lang).is_some());
+        }
+        // Script hygiene over every entry: no Han characters in Korean text,
+        // no CJK at all in English text.
+        let han = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        let cjk = |s: &str| {
+            s.chars()
+                .any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF))
+        };
+        for (lang, bad) in [("ko", &han as &dyn Fn(&str) -> bool), ("en", &cjk)] {
+            let src = if lang == "ko" { KB_KO } else { KB_EN };
+            let entries: Vec<LocalizedCwe> = serde_json::from_str(src).unwrap();
+            for e in &entries {
+                let mut texts = vec![e.name.as_str(), e.summary.as_str()];
+                texts.extend(e.mitigations.iter().map(String::as_str));
+                texts.extend(e.attack_scenario.as_deref());
+                texts.extend(e.capec.iter().map(|c| c.name.as_str()));
+                for t in texts {
+                    assert!(!bad(t), "{lang} {}: {t}", e.id);
+                }
+            }
+        }
+        assert!(localized("CWE-79", "zh-TW").is_none());
+    }
+
+    #[test]
+    fn owasp_titles_per_language() {
+        let c = "A03:2021-Injection";
+        assert_eq!(owasp_info_lang(c, "en").unwrap().0, "A03:2021 Injection");
+        assert_eq!(
+            owasp_info_lang(c, "ja").unwrap().0,
+            "A03:2021 インジェクション"
+        );
+        assert_eq!(owasp_info_lang(c, "ko").unwrap().0, "A03:2021 Injection");
+        assert_eq!(owasp_info_lang(c, "zh-TW"), owasp_info(c));
+        assert!(owasp_info_lang("A99", "en").is_none());
     }
 
     #[test]

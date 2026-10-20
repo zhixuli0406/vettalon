@@ -1,0 +1,197 @@
+{
+  "adapter": {
+    "packages": {
+      "itoa@1.0.15": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "memchr@2.8.3": {
+        "licenses": [
+          "Unlicense OR MIT"
+        ]
+      },
+      "proc-macro2@1.0.107": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "quote@1.0.47": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "ryu@1.0.23": {
+        "licenses": [
+          "Apache-2.0 OR BSL-1.0"
+        ]
+      },
+      "sbom-fixture@0.1.0": {
+        "licenses": []
+      },
+      "serde@1.0.229": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "serde_core@1.0.229": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "serde_derive@1.0.229": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "serde_json@1.0.140": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "syn@3.0.9": {
+        "licenses": [
+          "MIT OR Apache-2.0"
+        ]
+      },
+      "unicode-ident@1.0.27": {
+        "licenses": [
+          "(MIT OR Apache-2.0) AND Unicode-3.0"
+        ]
+      }
+    },
+    "status": "ok"
+  },
+  "case": "rust",
+  "features": "default",
+  "lockfile_sha256": "409982a1185424cf8c19a30c3da81a942cee72ed00f6aa1a71b03fa78eff43ad",
+  "metadata": {
+    "edges": [
+      "sbom-fixture@0.1.0 -> itoa@1.0.15",
+      "sbom-fixture@0.1.0 -> serde_json@1.0.140",
+      "serde@1.0.229 -> serde_core@1.0.229",
+      "serde_json@1.0.140 -> itoa@1.0.15",
+      "serde_json@1.0.140 -> memchr@2.8.3",
+      "serde_json@1.0.140 -> ryu@1.0.23",
+      "serde_json@1.0.140 -> serde@1.0.229"
+    ],
+    "packages": {
+      "itoa@1.0.15": {
+        "license": "MIT OR Apache-2.0",
+        "origin": "registry"
+      },
+      "memchr@2.8.3": {
+        "license": "Unlicense OR MIT",
+        "origin": "registry"
+      },
+      "ryu@1.0.23": {
+        "license": "Apache-2.0 OR BSL-1.0",
+        "origin": "registry"
+      },
+      "sbom-fixture@0.1.0": {
+        "license": "Apache-2.0",
+        "origin": "path"
+      },
+      "serde@1.0.229": {
+        "license": "MIT OR Apache-2.0",
+        "origin": "registry"
+      },
+      "serde_core@1.0.229": {
+        "license": "MIT OR Apache-2.0",
+        "origin": "registry"
+      },
+      "serde_json@1.0.140": {
+        "license": "MIT OR Apache-2.0",
+        "origin": "registry"
+      }
+    },
+    "roots": [
+      "sbom-fixture@0.1.0"
+    ],
+    "status": "ok"
+  },
+  "precursor": {
+    "packages": {
+      "itoa@1.0.15": {
+        "license": null,
+        "origin": "registry"
+      },
+      "memchr@2.8.3": {
+        "license": null,
+        "origin": "registry"
+      },
+      "ryu@1.0.23": {
+        "license": null,
+        "origin": "registry"
+      },
+      "sbom-fixture@0.1.0": {
+        "license": null,
+        "origin": "path"
+      },
+      "serde@1.0.229": {
+        "license": null,
+        "origin": "registry"
+      },
+      "serde_core@1.0.229": {
+        "license": null,
+        "origin": "registry"
+      },
+      "serde_json@1.0.140": {
+        "license": null,
+        "origin": "registry"
+      }
+    },
+    "rustc": "1.101.0-nightly",
+    "status": "ok",
+    "toolchain": "nightly-2026-10-17"
+  },
+  "schema": 1,
+  "syft": {
+    "duplicates": [],
+    "packages": {
+      "itoa@1.0.15": {
+        "licenses": []
+      },
+      "memchr@2.8.3": {
+        "licenses": []
+      },
+      "proc-macro2@1.0.107": {
+        "licenses": []
+      },
+      "quote@1.0.47": {
+        "licenses": []
+      },
+      "ryu@1.0.23": {
+        "licenses": []
+      },
+      "sbom-fixture@0.1.0": {
+        "licenses": []
+      },
+      "serde@1.0.229": {
+        "licenses": []
+      },
+      "serde_core@1.0.229": {
+        "licenses": []
+      },
+      "serde_derive@1.0.229": {
+        "licenses": []
+      },
+      "serde_json@1.0.140": {
+        "licenses": []
+      },
+      "syn@3.0.9": {
+        "licenses": []
+      },
+      "unicode-ident@1.0.27": {
+        "licenses": []
+      }
+    },
+    "status": "ok"
+  },
+  "syft_scope": "directory",
+  "target": "aarch64-apple-darwin",
+  "tools": {
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "syft": "1.34.2"
+  }
+}

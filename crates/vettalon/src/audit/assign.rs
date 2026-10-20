@@ -53,6 +53,23 @@ pub fn verifier_for(
     })
 }
 
+/// O9: a verifier from none of `families` (the finder families of a
+/// dual-finder module), rotating with `nth`. `None` when the roster has no
+/// such third family; the caller then falls back to [`verifier_for`].
+pub fn verifier_outside(
+    families: &[String],
+    verifiers: &[ModelHandle],
+    nth: usize,
+) -> Option<VerifierPick> {
+    let third: Vec<usize> = (0..verifiers.len())
+        .filter(|&i| !families.contains(&verifiers[i].family))
+        .collect();
+    (!third.is_empty()).then(|| VerifierPick {
+        index: third[nth % third.len()],
+        cross_family: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

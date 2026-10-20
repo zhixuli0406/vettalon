@@ -32,6 +32,25 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "proxy.golang.org",
 ];
 
+/// Hosts the pre-send duplicate check may reach (`--check-duplicates`):
+/// upstream recent commits and open issues/PRs on GitHub. Kept apart from
+/// [`ALLOWED_HOSTS`] so archive downloads cannot be redirected there. OSV
+/// lookups keep their own `api.osv.dev` client.
+pub const UPSTREAM_CHECK_HOSTS: &[&str] = &["api.github.com"];
+
+/// Same rules as [`host_allowed`], against [`UPSTREAM_CHECK_HOSTS`].
+pub fn upstream_check_host_allowed(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url
+                .host_str()
+                .is_some_and(|host| UPSTREAM_CHECK_HOSTS.contains(&host))
+    })
+}
+
 /// Compressed download cap (the artifact itself).
 pub const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// Total uncompressed cap across all entries (bomb guard).
@@ -134,7 +153,7 @@ pub fn host_allowed(url: &str) -> bool {
 // ── safe extraction (pure over bytes) ────────────────────────────────────
 
 /// A relative path with only normal / `.` components — no `/`, `..` or prefix.
-fn is_safe_relative(p: &Path) -> bool {
+pub(crate) fn is_safe_relative(p: &Path) -> bool {
     let mut any = false;
     for c in p.components() {
         match c {
@@ -425,6 +444,23 @@ mod tests {
             go_url("github.com/pkg/errors", "v0.9.1"),
             "https://proxy.golang.org/github.com/pkg/errors/@v/v0.9.1.zip"
         );
+    }
+
+    #[test]
+    fn upstream_check_hosts_are_separate_from_archive_hosts() {
+        assert!(upstream_check_host_allowed(
+            "https://api.github.com/repos/a/b/commits"
+        ));
+        assert!(!host_allowed("https://api.github.com/repos/a/b/commits"));
+        for bad in [
+            "http://api.github.com/x",
+            "https://api.github.com:444/x",
+            "https://u@api.github.com/x",
+            "https://github.com/a/b",
+            "https://crates.io/x",
+        ] {
+            assert!(!upstream_check_host_allowed(bad), "{bad}");
+        }
     }
 
     #[test]

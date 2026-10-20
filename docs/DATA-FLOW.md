@@ -14,9 +14,15 @@ local. Choose providers and review their retention terms before scanning sensiti
 | Deep + CLI provider | Prompt including source is passed to selected CLI via stdin/arguments/a temporary prompt file; the CLI may send it to its provider | Vettalon cannot establish the CLI's internal network/retention behavior. Agent container isolation limits filesystem access; it does not turn cloud inference into offline inference. |
 | Deep + local Ollama / loopback HTTP | Same source-bearing prompts go to loopback endpoint | Preload model weights, scanners, rules/DB and Docker images. Keep Jev off, use local providers for **every** role; independently deny external egress. Loopback address does not prove the server itself has no outbound connections. |
 | `--rank jev` (deep only, explicit opt-in) | Paths, extensions, sizes, entry-point flags, git touch counts and language/git metadata go to configured Jev endpoint | No source content in this ranking payload. Paths may disclose project names. Payload guard rejects source-like content. Missing credentials/config fail the request; unavailable/error ranking falls back with a notice to heuristic. Model requests remain a separate data flow. |
-| `hunt` | Dependency identities to OSV; source archives from allowed registries; dependency source/context to selected deep-review models | Online operation. OSV requests/redirects stay on HTTPS `api.osv.dev:443`; registry requests/redirects stay on the HTTPS allowlist at port 443. Both limit redirects to three hops, use a 30-second request timeout, and disable retries; the per-dependency total timeout remains separate. The registry/OSV allowlist governs fetching/lookup, **not** model-provider egress. The host project's own source is not the dependency audit input; package identities can still reveal project composition. OSV miss means unlisted candidate, not proven novelty. |
-| `disclose` | Draft files and local repository metadata | Does not submit or send messages. Human review, channel and disclosure authorization remain required. |
-| `--poc` | Model receives selected source/context to generate a script; script runs in network-disabled Docker | Preload image. Existing sandbox reproduces a **pattern**, not the complete target application. Success never sets `confirmed`. |
+| `--prescreen cheap-model --prescreen-model <id>` (deep only, explicit opt-in) | For each of the top `--prescreen-pool` audit units (default 40): unit path, file paths (up to 20), heuristic rank, risk flag, and an excerpt of at most 60 lines / 2,048 bytes of one file, in a prompt capped at 6 KiB, go to the provider of the named roster model. One call per unit | The model must come from the operator's roster (never from the scanned repo). Secret-bearing files are never excerpted (same list as deep review). A unit whose source carries text aimed at the auditing model is not sent: its score is forced to 5, so planted text cannot push it below the cut (several such units can fill the cut instead; `forced` is recorded). No prescreen call is made when the scan has no finder model. Off by default; `off` makes no prescreen call. These excerpts are **source** and leave the machine like any other model call, even when the deep-review models are local. |
+| `hunt` | Dependency identities to OSV; source archives from allowed registries; dependency source/context to selected deep-review models | Online operation. OSV requests/redirects stay on HTTPS `api.osv.dev:443`; registry requests/redirects stay on the HTTPS allowlist at port 443. Both limit redirects to three hops, use a 30-second request timeout, and disable retries; the per-dependency total timeout remains separate. The registry/OSV allowlist governs fetching/lookup, **not** model-provider egress. The host project's own source is not the dependency audit input; package identities can still reveal project composition. OSV miss means unlisted candidate, not proven novelty. Opt-in additions are listed under [Hunt opt-in endpoints](#hunt-opt-in-endpoints-o7-o8-o18). |
+| `hunt --variant-seeds` | Package name/ecosystem to OSV (all versions); upstream `owner/repo` slug and a `since` date to `api.github.com`; the resulting seed text to the selected **finder** models | Unauthenticated GitHub REST (60 requests/hour). HTTPS `api.github.com:443` only, three same-host redirects, 30-second timeout, no retries, 4 MiB reply cap. Seed text is untrusted data, capped at 4 KB and never sent to verifiers. A lookup failure is recorded, not treated as "no seeds". |
+| `hunt --malicious-signals` | Package identities to the existing registry allowlist (new metadata paths); for Cargo and PyPI also archives of the locked and previous versions. Not sent with `--dry-run`, which runs only the offline rules | Same hosts/policy as hunt fetching, User-Agent names the project URL, 32 MiB metadata cap, `--malicious-max-registry` lookups (default 100). Archives are only extracted and read; no install hook or build script runs. The budget counts dependencies, so the worst case is about two archive downloads per counted dependency. No model call. |
+| `mal-index update` | None beyond the download request | One GET to `osv-vulnerabilities.storage.googleapis.com/<ecosystem>/all.zip` (HTTPS, no redirects, 600-second timeout, 512 MiB cap). `--from-file` builds the index offline. |
+| `hunt --dep-priority risk`, `rule-draft` | None | Offline: lockfile graph, shipped popularity snapshot, local files. |
+| `disclose` | Draft files and local repository metadata | Does not submit or send messages. Human review, channel and disclosure authorization remain required. Writes the local throttle ledger `~/.vettalon/disclosure-ledger.json` (project key, finding id, dates, override reason). Without `--check-duplicates` it makes no network request. |
+| `disclose` / `hunt --disclose-dir` / Pro disclosure panel with `--check-duplicates` (explicit opt-in) | (1) Package `name@version` and ecosystem to `api.osv.dev` (`POST /v1/query`). (2) GitHub `owner/repo`, the finding's file path and a 90-day `since` date to `api.github.com` (`GET /repos/{owner}/{repo}/commits?path=…&since=…&per_page=10`). (3) `repo:{owner}/{repo} is:open <file base name>` to `api.github.com` (`GET /search/issues`) | Finding text, code, severity and the host project's identity are not sent. OSV keeps its own client (HTTPS `api.osv.dev:443` only). GitHub requests go through the hunt egress allowlist `UPSTREAM_CHECK_HOSTS = ["api.github.com"]` (HTTPS, port 443, no userinfo, at most three redirects on the same allowlist, 20-second timeout, no retries, 1 MiB response cap), kept separate from the registry allowlist so archive downloads cannot be redirected there. Unauthenticated: no token leaves the machine, and GitHub's rate limit turns a check into "query failed". Offline or failed checks are written as "not checked"; an empty result never reads as "no duplicates" (private reports are invisible). Returned commit messages and issue titles are external text: shown as one bounded line with invisible characters made visible. |
+| `--poc` | Model receives selected source/context to generate a script; script runs in network-disabled Docker | Preload image. The sandbox reproduces a **pattern**, not the complete target application. For command injection, path traversal and SQL injection the harness judges a real effect via a one-time nonce (no new network: SSRF stays unsupported precisely because the sandbox has no network); the same `--network=none` isolation is unchanged. Success never sets `confirmed`. |
 | Report / SARIF | Local output files; integrations upload only if the operator does so | Source excerpts and findings can be sensitive despite secret masking. Reports are not proof that no source was sent during review. |
 | Install / doctor / agent image build / trust tools | Package registries, model/image downloads, version probes, GitHub verification or explicitly requested inventory tools | Prepare separately. Their traffic must not be confused with a scan's observed traffic. |
 
@@ -24,14 +30,36 @@ local. Choose providers and review their retention terms before scanning sensiti
 
 Model roster configuration is the operator's selection of destinations. Files under
 review cannot supply the trusted configuration. `--rank jev` consents to that
-additional metadata flow for that run; omitting it must not call Jev. No background
+additional metadata flow for that run; omitting it must not call Jev.
+`--prescreen cheap-model` likewise consents, for that run, to sending the
+prescreen excerpts to the provider of `--prescreen-model`; that model is chosen
+by id from the same roster, and its calls appear in `--trace` as step
+`prescreen`. The report records what the prescreen sent (`ensemble.prescreen`:
+calls, prompt/reply bytes, time, per-unit score). No background
 usage telemetry is introduced by the trust tooling. Third-party scanner/CLI
 telemetry must be controlled and verified separately.
 
 A transport/parse/read failure, cap or exhausted budget must remain visible as an
-incomplete run/coverage gap. Empty findings are not a complete security assessment.
+incomplete run/coverage gap. Budget flags (`--time-budget`, `--finder-budget`,
+`--refuter-budget`, `--poc-budget`, hunt `--hunt-budget` / `--dep-timeout`) are
+validated before any scanner, fetch or model call: zero, a value below one call's
+minimum (60 s; 90 s for a hunt dependency) or a role cap above `--time-budget`
+exits 2. Units below the prescreen cut are coverage `deferred` / `prescreen_cut`;
+a refuter cap leaves findings unverified (`critic_budget_exhausted`); a PoC cap
+records `poc_skipped` and marks the run incomplete (`time_budget_exhausted`); a
+hunt dependency the budget cannot fund (with no other dependency still running)
+is recorded as not started (`hunt_time_budget_exhausted`).
+Empty findings are not a complete security assessment.
 AI can leave a finding at `needs_human`; only an explicit human triage may set
-`confirmed`. A successful pattern PoC and OSV non-match are different evidence types.
+`confirmed`. `evidence_level` / `proof_gaps` are derived from recorded evidence when a
+report is written; no model reply sets them. Repeated refuter runs (`--refuter-runs`,
+default 3 for High and above) send the same claim-only prompt to the verifier
+provider once per run, so that provider receives the same excerpts up to n times. The
+verifier reads excerpts with comments removed, but the removed comment text is still
+sent in a separate block, and one of several runs sends the excerpts with comments, so
+comment stripping does not reduce what leaves the machine. `--dual-finder-top N` (off
+by default) sends the top N modules to finders of two providers instead of one, and a
+refuter of a third provider when the roster has one. A successful pattern PoC and OSV non-match are different evidence types.
 
 Secret-bearing filenames are excluded from AI context according to the maintained
 list. Hard-coded secrets in ordinary source can still be sent; masking local report
@@ -212,6 +240,23 @@ Lockfile intake itself is offline. It records fixed relative input names, bounde
 ### Rust API migration reference
 
 This next-release preview is not fully Rust source-compatible: external `HuntReport` / `HuntPlan` struct literals must supply the new public `intake` field, and exhaustive `SkipReason` matches must handle `DirectnessUnknown`. The current reader still deserializes older JSON without `intake` as `None` / unknown; missing evidence must not be replaced with a fabricated complete ledger. `targets_from_dir(&Path) -> Result<Vec<DependencyTarget>, String>` retains its signature but now returns `Err` for incomplete intake. Call `intake_from_dir` to retain the usable `targets` together with their `evidence` when inputs are partial. This preview does not change the release version.
+
+## Hunt opt-in endpoints (O7, O8, O18)
+
+Every addition below is off by default. A plain `vettalon hunt` keeps the egress described in the matrix above.
+
+| Flag | Host | Request | Sent | Limits |
+|---|---|---|---|---|
+| `--dep-priority risk` | none | none | nothing | Offline. Download counts, deps.dev and OpenSSF criticality scores are not queried; missing signals are recorded as `unknown`. |
+| `--variant-seeds` | `api.osv.dev` (existing) | `POST /v1/query` with package only (history), then `POST /v1/querybatch` for the locked version after the audit | ecosystem, package name (and version for the re-check) | Existing OSV client policy. A failed re-check marks the dependency `failed`, so nothing in it can become a novelty candidate. |
+| `--variant-seeds` | `api.github.com` (**new**) | `GET /repos/{owner}/{repo}/commits?since=…&per_page=100` | the upstream slug detected from the fetched manifest (chosen by the package author, so untrusted) and a date | HTTPS 443, same-host redirects ≤3, 30 s, no retries, 4 MiB cap, no token. Only commit subjects matching security/CVE/GHSA/vulnerab are kept. |
+| `--malicious-signals` | `registry.npmjs.org` (existing) | `GET /<name>` (packument), `GET /-/npm/v1/attestations/<name>@<version>` only when both versions attest | package name, versions | Hunt registry allowlist and redirect policy; 32 MiB cap. Attestation fields are compared; signatures are not verified. |
+| `--malicious-signals` | `crates.io`, `static.crates.io` (existing) | `GET /api/v1/crates/<name>`, then the `.crate` download for the locked and previous versions | package name, versions | Same; `build.rs` is read, never compiled. |
+| `--malicious-signals` | `pypi.org`, `files.pythonhosted.org` (existing) | `GET /pypi/<name>/json`, then the sdist/wheel of both versions | package name, versions | Same; `setup.py` and `.pth` files are read, never executed. |
+| `--malicious-signals` | `proxy.golang.org` (existing) | `GET /<module>/@v/<version>.info`, `GET /<module>/@v/list` | module path, version | Same. |
+| `mal-index update` | `osv-vulnerabilities.storage.googleapis.com` (**new**) | `GET /<ecosystem>/all.zip` | nothing beyond the request | No redirects, 600 s, 512 MiB. The archive SHA-256 is printed and stored; `--expect-sha256` refuses a mismatch. Only `MAL-*` records (from ossf/malicious-packages, Apache-2.0) are kept; a record with ranges but no version list matches every version. The saved index has a SHA-256 sidecar checked on every load; it catches corruption, not someone who can rewrite both files. With `--from-file`, only the file's basename is recorded. |
+
+Seeds reach model providers as part of the finder prompt, the same flow as dependency source. Malicious-package findings are produced by rules only and stay `needs_human`; no model is asked to judge them.
 
 ## Bounded hunt transport checks
 

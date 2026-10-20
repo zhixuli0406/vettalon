@@ -30,6 +30,8 @@ hash with every result.
 | [Query refinement public V2](../benchmarks/query-refinement/PUBLIC-V2.md) | Explicit runtime/approved-lock bindings and a finite Python query revision, holdout, replay and minimization protocol | Reproduction of the historical private eight-call batch, tool authenticity/full dependency attestation, real OSS effectiveness, a hard resource sandbox or production adoption |
 | [Loopback source transport probe](../scripts/trust/dataflow-probe.py) | One CLI attempt on a generated disposable source fixture, bounded process captures and local HTTP framing/cleanup evidence | Complete scan coverage, every provider/mode, cloud retention, hard OS wall/resource containment or permission to use customer source |
 | [Go reachability](../benchmarks/reachability/adapter.py) | Optional official-tool adapter, two self-authored hosts, one fixed public advisory subset | Exploitability, comprehensive SCA, runtime unreachability, Rust support or a basis to suppress an alert |
+| [Go reachability corpus](../benchmarks/reachability/corpus/README.md) | 16 advisories, 40 self-authored hosts, coverage-labelled ground truth, adapter states vs govulncheck v1.4.0/latest OpenVEX, false-unreachable gate | Recall on arbitrary repositories, a held-out evaluation of the blind-spot rule, or any `not_affected` statement |
+| [Cargo SBOM differential](../scripts/trust/sbom_diff.py) | Syft CycloneDX vs `cargo metadata --locked` and the nightly precursor on recorded fixtures; parser-confusion verdicts | Conformance with any SBOM regulation, other ecosystems, or correctness of the precursor itself |
 
 A candidate without independent adjudication remains **U**. Category/label matches
 are synthetic proxies, not adjudicated precision or root-cause recall. Detection,
@@ -305,8 +307,12 @@ not run this prototype by default.
 
 ## Two-host Go reachability experiment
 
-This adapter supports the two self-authored Go fixtures and one advisory subset.
-It is not a general customer-repository execution framework. Rust returns unknown
+This runner supports the two self-authored Go fixtures and one advisory subset;
+the adapter itself also accepts one named advisory per scan, which the corpus
+below uses. It is not a general customer-repository execution framework.
+Adapter 0.3.0 matches pointer receivers (`*T`) to advisory `T.Method` symbols
+and reports `unknown` instead of `not-observed` when the host source uses
+`reflect`, `unsafe` or `//go:linkname`. Rust returns unknown
 as unsupported. `not-observed` means this analysis configuration did not observe a
 symbol path; it does not remove an alert. Reachable/unknown/not-observed retain
 `under_investigation`. The policy record is not a complete OpenVEX document and
@@ -367,6 +373,25 @@ The maker reports 47 tests for the current process-control subset; independent
 runtime diff review approved that implementation. Root runtime and public-stage
 acceptance must be checked against their own source-bound receipts.
 Earlier two-host/cache results belong to their recorded source checkpoint.
+
+## Go reachability corpus
+
+[The corpus](../benchmarks/reachability/corpus/README.md) extends the two-host
+experiment to 16 Go advisories with symbol lists, each with a called and a
+not-called host, plus two hosts each for reflection, interface dispatch,
+function values and unsafe/linkname. Ground truth is one coverage-instrumented
+execution per host. `run_corpus.py prepare` is the only networked step (Go proxy
+and checksum DB); `run` uses `GOPROXY=off`, `GOFLAGS=-mod=mod` and detects any
+`go.mod` rewrite. The run compares adapter states with govulncheck v1.4.0 and
+the latest release in OpenVEX mode.
+
+On 2026-10-20 (Go 1.27.0, govulncheck v1.4.0 and v1.9.0) all gates passed:
+zero false-unreachable, no blind-spot host reported `not-observed`. Both
+govulncheck versions issued `not_affected` for the four reflection/unsafe hosts
+whose vulnerable function ran; the adapter reported `unknown` for them. One
+not-called host was statically reachable but not executed. The adapter's
+blind-spot rule was designed with this corpus, so the result is not a held-out
+measurement.
 
 ## Tests and interpretation
 

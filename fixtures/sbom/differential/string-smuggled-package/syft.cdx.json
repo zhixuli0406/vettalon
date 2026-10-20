@@ -1,0 +1,150 @@
+{
+  "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "author": "anchore",
+          "name": "syft",
+          "version": "1.34.2"
+        }
+      ]
+    },
+    "component": {
+      "bom-ref": "857f81375e2a280d",
+      "type": "file",
+      "name": "./"
+    }
+  },
+  "components": [
+    {
+      "bom-ref": "pkg:cargo/itoa@1.0.15?package-id=324b6258bdf445ff",
+      "type": "library",
+      "name": "itoa",
+      "version": "1.0.15",
+      "cpe": "cpe:2.3:a:itoa:itoa:1.0.15:*:*:*:*:*:*:*",
+      "purl": "pkg:cargo/itoa@1.0.15",
+      "externalReferences": [
+        {
+          "url": "registry+https://github.com/rust-lang/crates.io-index",
+          "type": "distribution"
+        }
+      ],
+      "properties": [
+        {
+          "name": "syft:package:foundBy",
+          "value": "rust-cargo-lock-cataloger"
+        },
+        {
+          "name": "syft:package:language",
+          "value": "rust"
+        },
+        {
+          "name": "syft:package:type",
+          "value": "rust-crate"
+        },
+        {
+          "name": "syft:package:metadataType",
+          "value": "rust-cargo-lock-entry"
+        },
+        {
+          "name": "syft:location:0:path",
+          "value": "/Cargo.lock"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:cargo/string-smuggled-package@0.1.0?package-id=ab8fe7d4a472a478",
+      "type": "library",
+      "name": "string-smuggled-package",
+      "version": "0.1.0",
+      "cpe": "cpe:2.3:a:string-smuggled-package:string-smuggled-package:0.1.0:*:*:*:*:*:*:*",
+      "purl": "pkg:cargo/string-smuggled-package@0.1.0",
+      "properties": [
+        {
+          "name": "syft:package:foundBy",
+          "value": "rust-cargo-lock-cataloger"
+        },
+        {
+          "name": "syft:package:language",
+          "value": "rust"
+        },
+        {
+          "name": "syft:package:type",
+          "value": "rust-crate"
+        },
+        {
+          "name": "syft:package:metadataType",
+          "value": "rust-cargo-lock-entry"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string-smuggled-package:string_smuggled_package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string_smuggled_package:string-smuggled-package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string_smuggled_package:string_smuggled_package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string-smuggled:string-smuggled-package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string-smuggled:string_smuggled_package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string_smuggled:string-smuggled-package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string_smuggled:string_smuggled_package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string:string-smuggled-package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:string:string_smuggled_package:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:location:0:path",
+          "value": "/Cargo.lock"
+        }
+      ]
+    },
+    {
+      "bom-ref": "c6bea2c24af05bc1",
+      "type": "file",
+      "name": "./Cargo.lock",
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "e3cdced486d689f72c27e2bbcc8679039658abfb"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "1de0fc037ed62440b52dea9b37cc5a2b0cbdd863dee2d86b31f492dbfb0f50bf"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:cargo/string-smuggled-package@0.1.0?package-id=ab8fe7d4a472a478",
+      "dependsOn": [
+        "pkg:cargo/itoa@1.0.15?package-id=324b6258bdf445ff"
+      ]
+    }
+  ]
+}

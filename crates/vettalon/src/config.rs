@@ -112,6 +112,41 @@ pub struct Config {
     /// boundaries. Never holds a key value — only where to find one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jev: Option<JevSettings>,
+    /// O19: suggested-fix checks. Only `test_command` today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_check: Option<FixCheckSettings>,
+    /// Disclosure-draft settings (`[disclosure]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<DisclosureSettings>,
+}
+
+/// `[disclosure]`: defaults for `vettalon disclose` / `hunt --disclose-dir`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisclosureSettings {
+    /// Human reviewer pseudonym named in every draft's AI use statement.
+    /// Public: it appears in the draft. `--reviewer` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+}
+
+impl Config {
+    /// The configured reviewer pseudonym, if any.
+    pub fn disclosure_reviewer(&self) -> Option<&str> {
+        self.disclosure.as_ref().and_then(|d| d.reviewer.as_deref())
+    }
+}
+
+/// `[fix_check]`: settings for checking a finding's suggested fix (`--poc`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixCheckSettings {
+    /// Shell command that runs the project's own tests (`sh -c`), in the PoC
+    /// sandbox on a read-only temporary copy of the tree. Unset = the project
+    /// tests are not run (`tests=not_run`); vettalon never guesses one.
+    /// `--fix-test-command` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<String>,
 }
 
 /// Config for the Jev metadata-only ranker. Like a model's `api_key_env`,
@@ -224,10 +259,22 @@ impl Config {
                 temperature: None,
             })
             .collect();
-        (Config { models, jev: None }, skipped)
+        (
+            Config {
+                models,
+                jev: None,
+                disclosure: None,
+                fix_check: None,
+            },
+            skipped,
+        )
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(r) = self.disclosure_reviewer() {
+            crate::disclose::ai_use::validate_pseudonym(r)
+                .map_err(|e| format!("[disclosure] reviewer: {e}"))?;
+        }
         let mut ids = HashSet::new();
         for m in &self.models {
             if m.id.is_empty()
@@ -736,6 +783,28 @@ roles = ["finder", "verifier"]
             "no probe ⇒ no call"
         );
         assert_eq!(st[1].roles, vec!["finder"]);
+    }
+
+    #[test]
+    fn disclosure_reviewer_parses_and_is_validated() {
+        let c = Config::parse("[disclosure]\nreviewer = \"night-owl\"\n").unwrap();
+        assert_eq!(c.disclosure_reviewer(), Some("night-owl"));
+        assert!(Config::parse("[disclosure]\nreviewer = \"a\\u202Eb\"\n").is_err());
+        assert!(Config::parse("[disclosure]\nunknown = 1\n").is_err());
+        assert_eq!(Config::parse("").unwrap().disclosure_reviewer(), None);
+    }
+
+    #[test]
+    fn fix_check_test_command_is_explicit_and_strict() {
+        assert!(Config::parse(SAMPLE).unwrap().fix_check.is_none());
+        let with = format!("{SAMPLE}\n[fix_check]\ntest_command = \"python3 -m pytest -q\"\n");
+        let c = Config::parse(&with).unwrap();
+        assert_eq!(
+            c.fix_check.unwrap().test_command.as_deref(),
+            Some("python3 -m pytest -q")
+        );
+        let typo = format!("{SAMPLE}\n[fix_check]\ntest_cmd = \"pytest\"\n");
+        assert!(Config::parse(&typo).is_err(), "unknown keys are refused");
     }
 
     #[test]
