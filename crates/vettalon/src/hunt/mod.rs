@@ -11,11 +11,19 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 pub mod fetch;
+pub mod graph;
+pub mod mal_index;
+pub mod malicious;
 pub mod osv;
+pub mod popular;
+pub mod priority;
+pub mod registry;
+pub mod rule_draft;
 pub mod run;
+pub mod seeds;
 
 /// The package ecosystem a dependency comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ecosystem {
     Cargo,

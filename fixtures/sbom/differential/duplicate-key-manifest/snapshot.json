@@ -1,0 +1,36 @@
+{
+  "adapter": {
+    "error": "Cannot overwrite a value (at line 10, column 17)",
+    "status": "refused"
+  },
+  "case": "duplicate-key-manifest",
+  "features": "default",
+  "lockfile_sha256": "f9c835fce44e1effa393f1cf68423a3a05fd6f4db4906b11bcb4177bd8af1c12",
+  "metadata": {
+    "error": "   | | 10 | itoa = \"=1.0.15\" |    | ^^^^",
+    "status": "error"
+  },
+  "precursor": {
+    "error": "   | | 10 | itoa = \"=1.0.15\" |    | ^^^^",
+    "status": "error"
+  },
+  "schema": 1,
+  "syft": {
+    "duplicates": [],
+    "packages": {
+      "duplicate-key-manifest@0.1.0": {
+        "licenses": []
+      },
+      "itoa@1.0.15": {
+        "licenses": []
+      }
+    },
+    "status": "ok"
+  },
+  "syft_scope": "directory",
+  "target": "aarch64-apple-darwin",
+  "tools": {
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "syft": "1.34.2"
+  }
+}

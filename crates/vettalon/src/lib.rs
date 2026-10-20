@@ -7,6 +7,7 @@
 //! repaired.
 
 pub mod audit;
+pub mod budget;
 pub mod config;
 pub mod disclose;
 pub mod guard;

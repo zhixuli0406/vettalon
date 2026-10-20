@@ -7,11 +7,16 @@
 //! 2. Run every installed OSS scanner ([`scanners::run_all`]), always.
 //! 3. `--profile deep` additionally:
 //!    - a: intake ([`intake::build_profile`]): language census, entry
-//!      points, git hotspots; modules are ranked ([`ai_audit::rank_modules`]);
+//!      points, git hotspots; modules are ranked ([`ai_audit::rank_modules`]),
+//!      and with `--prescreen cheap-model` a cheap model re-orders the head
+//!      of that order and only its top fraction is audited ([`prescreen`]);
 //!    - b: AI audit: the first `--max-modules` ranked modules are dealt
 //!      round-robin to the finder models ([`assign::finder_for`]); each
 //!      module is audited by exactly one model, candidates pass the
-//!      zero-LLM pre-check;
+//!      zero-LLM pre-check; high-risk, injection-flagged and
+//!      `--cross-check-top` modules get a second family, and with
+//!      `--dual-finder-top` the top N modules' two candidate lists are merged
+//!      by root cause ([`dual_finder`]);
 //!    - c: adversarial review: each candidate goes to a verifier of a
 //!      different family from its finder when the roster has one
 //!      ([`assign::verifier_for`]), settling it `Refuted` or `NeedsHuman`
@@ -28,20 +33,34 @@
 //! incomplete (`model_refused`), so the gap is visible to the operator.
 
 mod adversarial;
+pub use adversarial::{DEFAULT_REFUTER_RUNS, MAX_REFUTER_RUNS};
 mod ai_audit;
 mod assign;
+mod comment_strip;
 mod coverage;
+pub mod cve;
+mod dual_finder;
+pub use dual_finder::{
+    DedupeBasis, DualFinderReport, DualModule, FamilyYield, FinderSide, MarginalYield,
+};
 pub mod cvss;
+pub mod cvss4;
 pub mod cwe;
+pub mod cyclonedx;
+pub mod evidence_level;
 pub mod exploitability;
+pub mod fix_check;
+mod fix_diff;
 pub mod gate;
 mod injection;
 mod intake;
 mod jev;
 mod llm_util;
 mod poc;
+mod poc_oracle;
 pub use poc::attach_proof_evidence;
 mod precheck;
+pub mod prescreen;
 mod prior_run;
 mod prompts;
 pub mod rank_snapshot;
@@ -82,8 +101,8 @@ use crate::llm::{ModelHandle, RefusalLog, StepCaller, TraceLog};
 use ai_audit::{AiAuditOutcome, ModuleAuditReport, ModuleOutcome, ModuleTarget};
 use schema::{
     AuditReport, CURRENT_SCHEMA_VERSION, EngineMissing, EngineRun, EnsembleInfo, Finding,
-    FindingStatus, GatePolicy, ModelInfo, ModuleCoverage, ProfileMode, ScanProfile, Severity,
-    Summary, VerifierIndependence, VerifierInfo, VerifierVote, VoteVerdict,
+    GatePolicy, ModelInfo, ModuleCoverage, ProfileMode, ScanProfile, Severity, Summary,
+    VerifierIndependence, VerifierInfo, VerifierVote, VoteVerdict,
 };
 
 pub use poc::set_poc_image;
@@ -107,6 +126,8 @@ pub struct ScanOptions {
     pub profile: String,
     pub report: Option<PathBuf>,
     pub sarif: Option<PathBuf>,
+    /// CycloneDX 1.6 VDR/VEX of the dependency findings (`--cyclonedx`).
+    pub cyclonedx: Option<PathBuf>,
     /// `"critical"|"high"|"medium"|"low"|"info"`, or `"none"` (only the
     /// policy gate, if any, decides the exit code).
     pub fail_on: String,
@@ -120,6 +141,11 @@ pub struct ScanOptions {
     /// The top N ranked modules get a second cross-family finder, on top of
     /// the always-cross-checked high-risk and injection-flagged ones.
     pub cross_check_top: usize,
+    /// O9 `--dual-finder-top`: the top N ranked modules are audited by two
+    /// finder families independently; their candidates are merged by root
+    /// cause ("the same patch fixes both", else location + CWE) and reviewed by
+    /// a refuter of a third family when the roster has one. `0` = off.
+    pub dual_finder_top: usize,
     pub fail_on_needs_human: bool,
     pub no_prior: bool,
     /// Module ranker (`--rank`). Default heuristic; `Jev` sends metadata only.
@@ -131,7 +157,25 @@ pub struct ScanOptions {
     /// Wall-clock budget for the whole AI deep-audit. When it runs out, the
     /// modules still pending are deferred and the run is marked incomplete
     /// (`TimeBudgetExhausted`) instead of grinding on. `None` = no budget.
+    /// Extra refuter runs (`refuter_runs`) are not started after it either.
     pub time_budget: Option<std::time::Duration>,
+    /// `--refuter-runs`: independent refuter calls for each finding at
+    /// severity ≥ High (default [`DEFAULT_REFUTER_RUNS`], max
+    /// [`MAX_REFUTER_RUNS`]); lower severities always get one. All runs must
+    /// agree to settle the finding; disagreement leaves it `Candidate` with
+    /// `verify_uncertain`.
+    pub refuter_runs: usize,
+    /// `--prescreen cheap-model`: score the top of the ranked pool with a
+    /// cheap model and give the deep audit only the top fraction. `None` =
+    /// off (the default; no prescreen call is made).
+    pub prescreen: Option<prescreen::PrescreenOptions>,
+    /// `--finder-budget` / `--refuter-budget` / `--poc-budget`: per-role
+    /// wall-clock caps, validated at startup ([`crate::budget::validate_scan`]).
+    pub role_caps: crate::budget::RoleCaps,
+    /// O19: the operator's test command for suggested-fix check B
+    /// (`--fix-test-command` or `[fix_check] test_command`). `None` = B is
+    /// not run; it is never inferred or auto-discovered.
+    pub fix_test_command: Option<String>,
     pub finders: Vec<ModelHandle>,
     pub verifiers: Vec<ModelHandle>,
     pub poc_models: Vec<ModelHandle>,
@@ -362,17 +406,28 @@ pub async fn run_scan_with_progress(
     let mut cross_checked = 0usize;
     let mut ranker = String::new();
     let mut rank_degraded = false;
+    // One scan-wide deadline (--time-budget) for the prescreen, the finders,
+    // extra refuter runs and new PoCs.
+    let scan_deadline = opts.time_budget.map(|d| std::time::Instant::now() + d);
+    let mut prescreen_record = None;
+    let mut finder_cap_hit = false;
+    let mut dual_run: Option<dual_finder::DualRun> = None;
     if let Some(intake_profile) = intake_profile.as_ref() {
         progress.phase(Phase::AiAudit, "finder models auditing modules");
         let step = run_audit_step(
             &repo_root,
             opts,
             intake_profile,
-            &refusals,
-            &trace,
-            progress,
+            AuditContext {
+                refusals: &refusals,
+                trace: &trace,
+                progress,
+                scan_deadline,
+            },
         )
         .await;
+        prescreen_record = step.prescreen;
+        finder_cap_hit = step.finder_cap_hit;
         engines_run.extend(step.engine_runs);
         engines_missing.extend(step.missing);
         findings.extend(step.findings);
@@ -383,6 +438,7 @@ pub async fn run_scan_with_progress(
         cross_checked = step.cross_checked;
         ranker = step.ranker.to_string();
         rank_degraded = step.rank_degraded;
+        dual_run = step.dual;
     }
 
     let dropped = dedup_by_id(&mut findings);
@@ -406,21 +462,65 @@ pub async fn run_scan_with_progress(
             .map(|idx| prior_run::apply_prior(&mut findings, &idx))
     };
 
+    let refuter_cap_hit = std::sync::atomic::AtomicBool::new(false);
+    let mut poc_cap_hit = false;
+    let mut poc_budget_skipped = false;
     if ai_ran {
         if findings.iter().any(adversarial::is_eligible) {
             progress.phase(Phase::Review, "cross-family verifiers reviewing candidates");
-            findings = review_step(&repo_root, findings, opts, &refusals, &trace, progress).await;
+            let review_start = std::time::Instant::now();
+            findings = review_step(
+                &repo_root,
+                findings,
+                opts,
+                ReviewLimits {
+                    extra_runs_deadline: crate::budget::step_deadline(
+                        scan_deadline,
+                        opts.role_caps.refuter,
+                        review_start,
+                    ),
+                    cap_deadline: opts.role_caps.refuter.map(|c| review_start + c),
+                    cap_hit: &refuter_cap_hit,
+                },
+                dual_run.as_ref(),
+                &refusals,
+                &trace,
+                progress,
+            )
+            .await;
         }
         if opts.poc {
             progress.phase(Phase::Poc, "sandboxed PoC generation");
-            poc_step(&repo_root, &mut findings, opts, &refusals, &trace, progress).await;
+            let poc_start = std::time::Instant::now();
+            let poc_deadline =
+                crate::budget::step_deadline(scan_deadline, opts.role_caps.poc, poc_start);
+            let poc_cap_binds = opts
+                .role_caps
+                .poc
+                .is_some_and(|c| scan_deadline.is_none_or(|s| poc_start + c < s));
+            poc_budget_skipped = poc_step(
+                &repo_root,
+                &mut findings,
+                opts,
+                poc_deadline,
+                &refusals,
+                &trace,
+                progress,
+            )
+            .await;
+            poc_cap_hit = poc_budget_skipped && poc_cap_binds;
         }
     }
+    let refuter_cap_hit = refuter_cap_hit.into_inner();
 
     let mut refusal_events = refusals.snapshot();
     refusal_events.sort_by(|a, b| (&a.step, &a.model).cmp(&(&b.step, &b.model)));
     // Precedence: whole shares lost > budget cap > refusals > other gaps.
-    let unverified = findings.iter().any(adversarial::is_eligible);
+    // A finding the refuter runs disagreed on was reviewed (verify_uncertain);
+    // only findings with no usable verdict make the run incomplete.
+    let unverified = findings
+        .iter()
+        .any(|f| adversarial::is_eligible(f) && !adversarial::is_uncertain(f));
     let scanner_failed = scanners::runs_failed(&engines_run);
     let units_failed = coverage.iter().any(|c| {
         matches!(
@@ -438,8 +538,11 @@ pub async fn run_scan_with_progress(
                 .any(|a| a.timed_out || a.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET))
     });
     if incomplete_reason.is_none() {
-        incomplete_reason = if time_budget_hit {
+        // A PoC the budget never started is requested work left undone.
+        incomplete_reason = if time_budget_hit || poc_budget_skipped {
             Some(IncompleteReason::TimeBudgetExhausted)
+        } else if refuter_cap_hit {
+            Some(IncompleteReason::CriticBudgetExhausted)
         } else if !refusal_events.is_empty() {
             Some(IncompleteReason::ModelRefused)
         } else if unverified || units_failed || scanner_failed {
@@ -452,6 +555,15 @@ pub async fn run_scan_with_progress(
     }
 
     let verifier = verifier_info(&findings, opts, profile_mode);
+    // O9: what the second family added, measured after review.
+    let dual_report = dual_run.as_ref().map(|d| {
+        d.report(&findings, |model| {
+            opts.finders
+                .iter()
+                .find(|f| f.id == model)
+                .map(|f| f.family.clone())
+        })
+    });
     let gate = GatePolicy {
         include_needs_human: opts.fail_on_needs_human,
     };
@@ -491,6 +603,9 @@ pub async fn run_scan_with_progress(
             cross_checked,
             ranker,
             rank_degraded,
+            prescreen: prescreen_record,
+            budget: budget_record(opts, finder_cap_hit, refuter_cap_hit, poc_cap_hit),
+            dual_finder: dual_report,
         },
     };
 
@@ -516,6 +631,30 @@ pub async fn run_scan_with_progress(
     }
     progress.phase(Phase::Done, "complete");
     Ok(audit_report)
+}
+
+/// The scan budget as recorded in the report; `None` when no budget flag was
+/// set (nothing to record).
+fn budget_record(
+    opts: &ScanOptions,
+    finder_cap_hit: bool,
+    refuter_cap_hit: bool,
+    poc_cap_hit: bool,
+) -> Option<crate::budget::ScanBudgetRecord> {
+    let caps = opts.role_caps;
+    let set = opts.time_budget.is_some()
+        || caps.finder.is_some()
+        || caps.refuter.is_some()
+        || caps.poc.is_some();
+    set.then(|| crate::budget::ScanBudgetRecord {
+        total_secs: opts.time_budget.map(|d| d.as_secs()),
+        finder_cap_secs: caps.finder.map(|d| d.as_secs()),
+        refuter_cap_secs: caps.refuter.map(|d| d.as_secs()),
+        poc_cap_secs: caps.poc.map(|d| d.as_secs()),
+        finder_cap_hit,
+        refuter_cap_hit,
+        poc_cap_hit,
+    })
 }
 
 /// P2-1: write the LLM-call trace as JSON Lines (one [`crate::llm::TraceEvent`]
@@ -601,6 +740,27 @@ pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
             crate::tr!("SARIF 已寫入：{}", "SARIF written: {}", path.display())
         );
     }
+    if let Some(path) = &opts.cyclonedx {
+        if let Err(e) = cyclonedx::write_cyclonedx(&audit_report, path) {
+            eprintln!(
+                "[vettalon] {}",
+                crate::tr!(
+                    "無法寫入 CycloneDX {}：{e}",
+                    "cannot write CycloneDX {}: {e}",
+                    path.display()
+                )
+            );
+            return 2;
+        }
+        println!(
+            "{}",
+            crate::tr!(
+                "CycloneDX VDR/VEX 已寫入：{}",
+                "CycloneDX VDR/VEX written: {}",
+                path.display()
+            )
+        );
+    }
     if opts.save {
         match report::save_report(home_dir, &audit_report) {
             Ok(path) => println!(
@@ -646,7 +806,11 @@ const NON_TEXT_FIELDS: &[&str] = &[
     "family",
     "verdict",
     "cwe",
+    // Finding.cwe_replaced (a CWE id) and PackageRef.ecosystem (a PURL
+    // type). Keys are matched at any depth: never add a generic name here.
+    "cwe_replaced",
     "cve",
+    "ecosystem",
     "cvss_version",
     "cvss_vector",
 ];
@@ -731,6 +895,35 @@ struct AuditStep {
     ranker: &'static str,
     /// True when Jev was requested but failed and the heuristic order was used.
     rank_degraded: bool,
+    /// `--prescreen` cost and outcome, when it ran.
+    prescreen: Option<prescreen::PrescreenRecord>,
+    /// `--finder-budget` (not the scan total) deferred or cut module work.
+    finder_cap_hit: bool,
+    /// O9 `--dual-finder-top` state (`None` when off).
+    dual: Option<dual_finder::DualRun>,
+}
+
+/// Run-wide handles the audit step needs.
+#[derive(Clone, Copy)]
+struct AuditContext<'a> {
+    refusals: &'a RefusalLog,
+    trace: &'a TraceLog,
+    progress: &'a dyn Progress,
+    /// `--time-budget` deadline, set when the AI steps began.
+    scan_deadline: Option<std::time::Instant>,
+}
+
+/// Units in the prescreen pool that fell below its cut are deferred for
+/// that reason, not for `--max-modules`.
+fn mark_prescreen_cut(coverage: &mut [ModuleCoverage], cut: Option<(usize, usize)>) {
+    let Some((cut, pool)) = cut else { return };
+    for c in coverage.iter_mut().take(pool).skip(cut) {
+        if c.status == schema::ModuleCoverageStatus::Deferred
+            && c.reason.as_deref() == Some(coverage::DEFER_MAX_MODULES)
+        {
+            c.reason = Some(prescreen::DEFER_PRESCREEN_CUT.into());
+        }
+    }
 }
 
 /// The host a Jev config would reach, for the egress notice.
@@ -749,10 +942,14 @@ async fn run_audit_step(
     repo_root: &Path,
     opts: &ScanOptions,
     intake_profile: &intake::RepoProfile,
-    refusals: &RefusalLog,
-    trace: &TraceLog,
-    progress: &dyn Progress,
+    ctx: AuditContext<'_>,
 ) -> AuditStep {
+    let AuditContext {
+        refusals,
+        trace,
+        progress,
+        scan_deadline,
+    } = ctx;
     // Shared with `rank_snapshot` (benchmark dump) so the two cannot drift.
     let ranked = rank_snapshot::ranked_modules(repo_root, intake_profile);
     // Opt-in metadata-only re-ranking (`--rank jev`). On any failure keep the
@@ -790,6 +987,46 @@ async fn run_audit_step(
     // populous flat directory is audited, not dropped once the budget fills.
     let ranked =
         ai_audit::paginate_modules(repo_root, ranked, ai_audit::MODULE_PROMPT_BUDGET_BYTES);
+    // Opt-in second stage: a cheap model scores the head of the order and
+    // only the top fraction goes on to the deep audit.
+    let (ranked, prescreen_record, prescreen_cut) = match &opts.prescreen {
+        None => (ranked, None, None),
+        // Nothing to audit, or no finder to audit it: do not send excerpts.
+        Some(_) if ranked.is_empty() || opts.finders.is_empty() => (ranked, None, None),
+        Some(p) => {
+            let calls = p.pool.min(ranked.len());
+            eprintln!(
+                "[vettalon] {}",
+                crate::tr!(
+                    "預篩：把前 {calls} 個審查單元的 metadata 與每單元一小段程式碼（≤{} 行／{} bytes）送給 {}（{}）打 1–5 分，只有前 {}% 進入深審",
+                    "prescreen: sending metadata and a short code excerpt (≤{} lines / {} bytes) for each of the top {calls} audit units to {} ({}) for a 1–5 score; only the top {}% go on to the deep audit",
+                    prescreen::EXCERPT_MAX_LINES,
+                    prescreen::EXCERPT_MAX_BYTES,
+                    p.model.id,
+                    p.model.family,
+                    p.top_percent
+                )
+            );
+            progress.phase(Phase::AiAudit, "prescreen: cheap model scoring audit units");
+            let out = prescreen::run(repo_root, ranked, p, trace, scan_deadline).await;
+            let r = &out.record;
+            if r.degraded {
+                eprintln!(
+                    "[vettalon] {}",
+                    crate::tr!(
+                        "預篩分數不足（成功 {}、失敗 {}、拒答 {}、未開始 {}），維持原排序、不裁切",
+                        "prescreen incomplete ({} scored, {} failed, {} refused, {} not started); keeping the original order with no cut",
+                        r.scored,
+                        r.failed,
+                        r.refused,
+                        r.not_started
+                    )
+                );
+            }
+            let cut = out.cut.map(|k| (k, r.pool));
+            (out.ranked, Some(out.record), cut)
+        }
+    };
     // `max_modules == 0` means "every ranked module" (the GUI's "完整" / full
     // coverage); any positive value caps it to the top-N by risk. A hard
     // safety ceiling then bounds the worst case so a big repo cannot grind
@@ -798,6 +1035,10 @@ async fn run_audit_step(
         ranked.len()
     } else {
         opts.max_modules.min(ranked.len())
+    };
+    let requested = match prescreen_cut {
+        Some((cut, _)) => requested.min(cut),
+        None => requested,
     };
     let take = requested.min(ai_audit::MAX_AUDIT_MODULES_CEILING);
     if take < requested {
@@ -821,6 +1062,8 @@ async fn run_audit_step(
             .iter()
             .map(|m| deferred_report(m, coverage::DEFER_ENGINE_UNAVAILABLE))
             .collect();
+        let mut coverage = coverage::build_module_coverage(&ranked, &reports);
+        mark_prescreen_cut(&mut coverage, prescreen_cut);
         return AuditStep {
             engine_runs: Vec::new(),
             missing: vec![EngineMissing {
@@ -828,13 +1071,16 @@ async fn run_audit_step(
                 reason,
             }],
             findings: Vec::new(),
-            coverage: coverage::build_module_coverage(&ranked, &reports),
+            coverage,
             incomplete: (take > 0).then_some(IncompleteReason::EngineUnavailable),
             ran: false,
             injection: Vec::new(),
             cross_checked: 0,
             ranker,
             rank_degraded,
+            prescreen: prescreen_record,
+            finder_cap_hit: false,
+            dual: None,
         };
     }
 
@@ -853,13 +1099,21 @@ async fn run_audit_step(
     let mut shares: Vec<Vec<ModuleTarget>> = vec![Vec::new(); opts.finders.len()];
     // Per finder: the modules it audits as the second (cross-check) finder.
     let mut second_pass: Vec<HashSet<String>> = vec![HashSet::new(); opts.finders.len()];
+    // O9: the top `--dual-finder-top` modules get two families as well, and
+    // their candidates are merged by root cause afterwards.
+    let mut dual =
+        (opts.dual_finder_top > 0).then(|| dual_finder::DualRun::new(opts.dual_finder_top));
+    let mut ask_fix_set: HashSet<String> = HashSet::new();
     for (i, m) in ranked[..take].iter().enumerate() {
         let Some(primary) = assign::finder_for(i, opts.finders.len()) else {
             continue;
         };
         shares[primary].push(m.clone());
-        let cross_check =
-            flagged.contains(m.module_path.as_str()) || m.high_risk || i < opts.cross_check_top;
+        let is_dual = i < opts.dual_finder_top;
+        let cross_check = flagged.contains(m.module_path.as_str())
+            || m.high_risk
+            || i < opts.cross_check_top
+            || is_dual;
         if cross_check
             && let Some(second) = opts
                 .finders
@@ -869,7 +1123,34 @@ async fn run_audit_step(
         {
             shares[second].push(m.clone());
             second_pass[second].insert(m.module_path.clone());
+            if is_dual && let Some(d) = dual.as_mut() {
+                let side = |f: &ModelHandle| dual_finder::FinderSide {
+                    model: f.id.clone(),
+                    family: f.family.clone(),
+                };
+                d.modules.push(dual_finder::DualModule {
+                    module_path: m.module_path.clone(),
+                    primary: side(&opts.finders[primary]),
+                    second: side(&opts.finders[second]),
+                });
+                ask_fix_set.insert(m.module_path.clone());
+            }
         }
+    }
+    if let Some(d) = dual.as_mut()
+        && d.modules.is_empty()
+    {
+        d.skipped = Some(
+            "the finder roster has a single model family, so no module could get a second family"
+                .to_string(),
+        );
+        eprintln!(
+            "[vettalon] {}",
+            crate::lang::pick(
+                "提示：--dual-finder-top 需要至少兩個不同家族的 finder 模型；本次沒有模組被雙家族審查。",
+                "note: --dual-finder-top needs finder models from at least two families; no module got a second family this run."
+            )
+        );
     }
     // Modules that ended up with more than one finder.
     let cross_checked = {
@@ -887,8 +1168,15 @@ async fn run_audit_step(
     let cap = (ai_audit::MAX_TOTAL_AI_CANDIDATES / busy).max(ai_audit::MAX_CANDIDATES_PER_MODULE);
     let audited = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let total_modules = take as u32;
-    // Scan-wide wall-clock deadline shared by every finder (--time-budget).
-    let deadline = opts.time_budget.map(|d| std::time::Instant::now() + d);
+    // Finder deadline: the scan-wide --time-budget, or --finder-budget from
+    // now when that is earlier.
+    let dispatch = std::time::Instant::now();
+    let deadline = crate::budget::step_deadline(scan_deadline, opts.role_caps.finder, dispatch);
+    let finder_cap_binds = opts
+        .role_caps
+        .finder
+        .is_some_and(|c| scan_deadline.is_none_or(|s| dispatch + c < s));
+    let ask_fix = &ask_fix_set;
     let runs = futures::future::join_all(
         opts.finders
             .iter()
@@ -913,6 +1201,7 @@ async fn run_audit_step(
                             audited: &audited,
                             total: total_modules,
                             cross_check: second,
+                            ask_fix,
                             deadline,
                             source_receipts: opts.source_receipts,
                         },
@@ -935,6 +1224,9 @@ async fn run_audit_step(
         cross_checked,
         ranker,
         rank_degraded,
+        prescreen: prescreen_record,
+        finder_cap_hit: false,
+        dual: None,
     };
     let mut reports: Vec<ModuleAuditReport> = Vec::new();
     let mut unreachable = false;
@@ -994,7 +1286,20 @@ async fn run_audit_step(
             }
         }
     }
+    // O9 merge first: coverage then cites the surviving ids only.
+    if let Some(mut d) = dual {
+        d.merge(repo_root, &mut step.findings, &mut reports);
+        step.dual = Some(d);
+    }
     step.coverage = coverage::build_module_coverage(&ranked, &reports);
+    mark_prescreen_cut(&mut step.coverage, prescreen_cut);
+    step.finder_cap_hit = finder_cap_binds
+        && step.coverage.iter().any(|c| {
+            c.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET)
+                || c.attempts.iter().any(|a| {
+                    a.timed_out || a.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET)
+                })
+        });
     // A flagged module seen by only one family is not genuinely cross-checked.
     let single_family = opts
         .finders
@@ -1064,10 +1369,27 @@ fn finder_of<'a>(f: &Finding, opts: &'a ScanOptions) -> Option<&'a ModelHandle> 
 /// first call fails to reach the model is not retried for the rest of its
 /// group (those findings stay unverified, and the run is marked
 /// incomplete), so a dead endpoint costs one timeout, not one per finding.
+/// Findings at severity ≥ High get `opts.refuter_runs` independent calls
+/// from their verifier (`adversarial::review_with`), one vote per call.
+/// Time limits of the review step.
+struct ReviewLimits<'a> {
+    /// Extra refuter runs (2..n) do not start after this (`--time-budget`
+    /// or `--refuter-budget`, whichever is earlier).
+    extra_runs_deadline: Option<std::time::Instant>,
+    /// `--refuter-budget`: no new finding review starts after this; the
+    /// finding stays unverified with a `verify_error` and the run is
+    /// incomplete (`critic_budget_exhausted`).
+    cap_deadline: Option<std::time::Instant>,
+    cap_hit: &'a std::sync::atomic::AtomicBool,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn review_step(
     repo_root: &Path,
     findings: Vec<Finding>,
     opts: &ScanOptions,
+    limits: ReviewLimits<'_>,
+    dual: Option<&dual_finder::DualRun>,
     refusals: &RefusalLog,
     trace: &TraceLog,
     progress: &dyn Progress,
@@ -1094,7 +1416,25 @@ async fn review_step(
         let Some(finder) = finder_of(f, opts) else {
             continue;
         };
-        if let Some(pick) = assign::verifier_for(finder, &opts.verifiers, nth) {
+        // O9: a dual-finder candidate goes to a refuter outside both finder
+        // families when the roster has one.
+        let dual_families = dual.and_then(|d| d.families_by_id.get(&f.id));
+        let third =
+            dual_families.and_then(|fams| assign::verifier_outside(fams, &opts.verifiers, nth));
+        if let Some(mut pick) = third.or_else(|| assign::verifier_for(finder, &opts.verifiers, nth))
+        {
+            // Cross-family only when it differs from every finder family
+            // that found this root cause.
+            if dual_families.is_some() {
+                let found: Vec<&str> = f
+                    .found_by
+                    .iter()
+                    .filter_map(|m| opts.finders.iter().find(|h| &h.id == m))
+                    .map(|h| h.family.as_str())
+                    .collect();
+                let fam = opts.verifiers[pick.index].family.as_str();
+                pick.cross_family = !found.contains(&fam);
+            }
             groups[pick.index].push((i, pick));
         }
         nth += 1;
@@ -1115,6 +1455,7 @@ async fn review_step(
         let verifier = opts.verifiers[vi].clone();
         let log = refusals.clone();
         let reviewed = reviewed.clone();
+        let limits = &limits;
         jobs.push(async move {
             let caller = StepCaller::new(verifier.clone(), "verify", log).with_trace(trace.clone());
             let mut answered_once = false;
@@ -1132,6 +1473,20 @@ async fn review_step(
                         total: review_total.max(1),
                     },
                 );
+                if limits
+                    .cap_deadline
+                    .is_some_and(|d| std::time::Instant::now() >= d)
+                {
+                    limits
+                        .cap_hit
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    adversarial::note_unverified(
+                        &mut f,
+                        "refuter budget exhausted (--refuter-budget); not reviewed",
+                    );
+                    out.push((i, f));
+                    continue;
+                }
                 if dead {
                     adversarial::note_unverified(
                         &mut f,
@@ -1143,22 +1498,26 @@ async fn review_step(
                     out.push((i, f));
                     continue;
                 }
-                let verdict = match adversarial::review_one(repo_root, &mut f, &caller).await {
-                    adversarial::ReviewOutcome::ZeroLlm => None,
-                    adversarial::ReviewOutcome::Answered => {
-                        answered_once = true;
-                        Some(match f.status {
-                            FindingStatus::Refuted => VoteVerdict::Refuted,
-                            FindingStatus::NeedsHuman => VoteVerdict::Plausible,
-                            _ => VoteVerdict::NoVerdict,
-                        })
-                    }
-                    adversarial::ReviewOutcome::CallFailed { refused } => {
-                        dead = !refused && !answered_once;
-                        Some(VoteVerdict::NoVerdict)
+                let plan = adversarial::ReviewPlan {
+                    runs: adversarial::runs_for(&f, opts.refuter_runs),
+                    deadline: limits.extra_runs_deadline,
+                };
+                let votes = match adversarial::review_with(repo_root, &mut f, &caller, plan).await {
+                    adversarial::ReviewOutcome::ZeroLlm => Vec::new(),
+                    adversarial::ReviewOutcome::Reviewed {
+                        votes,
+                        answered,
+                        call_failed,
+                        refused,
+                    } => {
+                        answered_once |= answered;
+                        if call_failed {
+                            dead = !refused && !answered_once;
+                        }
+                        votes
                     }
                 };
-                if let Some(verdict) = verdict {
+                for verdict in votes {
                     f.verification.push(VerifierVote {
                         model: verifier.id.clone(),
                         family: verifier.family.clone(),
@@ -1180,14 +1539,19 @@ async fn review_step(
 
 /// Step 3d: PoC generation, by a PoC-role model of another family than the
 /// finder when possible. `maybe_run_poc` applies the eligibility gate.
+/// Returns true when the time budget (`--time-budget` or `--poc-budget`)
+/// left an eligible finding without a PoC. After `deadline` (the earlier of `--time-budget`
+/// and `--poc-budget`) no new PoC starts; each eligible finding left out gets
+/// a `poc_skipped` record. A PoC already running finishes.
 async fn poc_step(
     repo_root: &Path,
     findings: &mut [Finding],
     opts: &ScanOptions,
+    deadline: Option<std::time::Instant>,
     refusals: &RefusalLog,
     trace: &TraceLog,
     progress: &dyn Progress,
-) {
+) -> bool {
     if opts.poc_models.is_empty() {
         eprintln!(
             "[vettalon] {}",
@@ -1196,12 +1560,23 @@ async fn poc_step(
                 "note: no poc model configured, skipping PoCs."
             )
         );
-        return;
+        return false;
     }
     let total = findings.len() as u32;
     // P0-2: one run-wide PoC execution budget shared across every finding.
     let budget = poc::PocBudget::new(poc::POC_MAX_RUNS);
+    let mut skipped = false;
     for (nth, f) in findings.iter_mut().enumerate() {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            let why = if opts.role_caps.poc.is_some() {
+                "time budget for PoCs ran out (--poc-budget / --time-budget)"
+            } else {
+                "time budget ran out (--time-budget)"
+            };
+            skipped |= poc::skip_for_budget(f, opts.poc, why);
+            skipped |= fix_check::skip_for_budget(f, opts.poc);
+            continue;
+        }
         let pick = finder_of(f, opts)
             .and_then(|finder| assign::verifier_for(finder, &opts.poc_models, nth))
             .map(|p| p.index)
@@ -1224,7 +1599,23 @@ async fn poc_step(
         let caller = StepCaller::new(opts.poc_models[pick].clone(), "poc", refusals.clone())
             .with_trace(trace.clone());
         poc::maybe_run_poc(repo_root, f, &caller, opts.poc, &budget).await;
+        // O19: the fix check shares the PoC role's time budget; the PoC above
+        // may have used it up.
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            skipped |= fix_check::skip_for_budget(f, opts.poc);
+            continue;
+        }
+        fix_check::maybe_check_fix(
+            repo_root,
+            f,
+            &caller,
+            opts.poc,
+            opts.fix_test_command.as_deref(),
+            &budget,
+        )
+        .await;
     }
+    skipped
 }
 
 /// `vettalon validate <report.json>`: run the report validator on a
@@ -1411,18 +1802,24 @@ mod tests {
             profile: "quick".to_string(),
             report: None,
             sarif: None,
+            cyclonedx: None,
             fail_on: "high".to_string(),
             gates: Vec::new(),
             max_modules: 5,
             poc: false,
             save: false,
             cross_check_top: 0,
+            dual_finder_top: 0,
             fail_on_needs_human: false,
             no_prior: true,
             rank: RankStrategy::Heuristic,
             trace: None,
             source_receipts: false,
             time_budget: None,
+            refuter_runs: 1,
+            prescreen: None,
+            role_caps: Default::default(),
+            fix_test_command: None,
             finders: Vec::new(),
             verifiers: Vec::new(),
             poc_models: Vec::new(),
@@ -1675,6 +2072,95 @@ mod tests {
         assert_eq!(cmd_validate(&report_path).await, 0);
     }
 
+    /// O3 end to end: a High candidate gets `refuter_runs` calls, one vote
+    /// each; the report validates and carries the derived evidence fields in
+    /// JSON and SARIF.
+    async fn scan_with_refuter_replies(
+        replies: Vec<&str>,
+    ) -> (serde_json::Value, usize, serde_json::Value) {
+        let dir = repo_with_module();
+        let home = tempfile::tempdir().unwrap();
+        let cand = format!("[{}]", ai_audit::tests::cand_json("a/main.rs", 3));
+        let (finder, _) = model("claude", "anthropic", vec![Ok(cand)]);
+        let (other, other_s) = model(
+            "codex",
+            "openai",
+            replies.into_iter().map(|r| Ok(r.to_string())).collect(),
+        );
+        let report_path = dir.path().join("r.json");
+        let sarif_path = dir.path().join("r.sarif");
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.report = Some(report_path.clone());
+        o.sarif = Some(sarif_path.clone());
+        o.roster = info(&[&finder, &other]);
+        o.finders = vec![finder.clone()];
+        o.verifiers = vec![other.clone()];
+        o.refuter_runs = 3;
+        cmd_scan(home.path(), o).await;
+        assert_eq!(cmd_validate(&report_path).await, 0);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let sarif: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sarif_path).unwrap()).unwrap();
+        let ai = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["source_engine"] == "ai_audit")
+            .expect("ai finding")
+            .clone();
+        let res = sarif["runs"][0]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["properties"]["vettalon.engine"] == "ai_audit")
+            .expect("ai result")
+            .clone();
+        assert_eq!(
+            res["properties"]["vettalon.evidence_level"],
+            ai["evidence_level"]
+        );
+        assert_eq!(res["properties"]["vettalon.proof_gaps"], ai["proof_gaps"]);
+        let calls = other_s.prompts.lock().unwrap().len();
+        (ai, calls, v)
+    }
+
+    #[tokio::test]
+    async fn high_finding_gets_three_refuter_runs_and_consistent_level() {
+        let p = adversarial::tests::PLAUSIBLE;
+        let (ai, calls, _) = scan_with_refuter_replies(vec![p, p, p]).await;
+        assert_eq!(calls, 3);
+        assert_eq!(ai["status"], "needs_human");
+        assert_eq!(ai["verification"].as_array().unwrap().len(), 3);
+        assert_eq!(ai["evidence_level"], "refuter_consistent");
+        assert!(
+            ai["proof_gaps"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("no_poc"))
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_refuter_runs_stay_candidate_without_failing_the_run() {
+        let (p, r) = (adversarial::tests::PLAUSIBLE, adversarial::tests::REFUTED);
+        let (ai, calls, report) = scan_with_refuter_replies(vec![p, r, p]).await;
+        assert_ne!(report["incomplete_reason"], "units_failed", "{report:#}");
+        assert_eq!(calls, 3);
+        assert_eq!(ai["status"], "candidate");
+        assert_eq!(ai["evidence_level"], "static_only");
+        let last = ai["evidence"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["kind"], "verify_uncertain");
+        assert_eq!(last["detail"], "verify_uncertain: 2/3 plausible");
+        assert!(
+            ai["proof_gaps"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("refuter_inconsistent"))
+        );
+    }
+
     /// Run the real intake/ranking/audit/report path with a fixed local caller.
     #[tokio::test]
     async fn source_receipt_opt_in_survives_report_and_sarif_without_source_text() {
@@ -1907,6 +2393,212 @@ mod tests {
         assert_eq!(v["run_status"], "incomplete");
         assert_eq!(v["incomplete_reason"], "model_refused");
         assert_eq!(cmd_validate(&report_path).await, 0);
+    }
+
+    /// Prescreen fake scorer: 5 for the unit named in `high`, 1 otherwise.
+    struct UnitScorer {
+        high: &'static str,
+        calls: Mutex<usize>,
+    }
+    #[async_trait]
+    impl LlmCaller for UnitScorer {
+        async fn complete(&self, p: &str) -> crate::llm::Result<String> {
+            *self.calls.lock().unwrap() += 1;
+            let score = if p.contains(&format!("unit: {}\n", self.high)) {
+                5
+            } else {
+                1
+            };
+            Ok(format!("{{\"score\": {score}}}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn prescreen_reorders_cuts_and_records_its_cost_in_the_report() {
+        let dir = repo_with_modules(&["a", "b", "c", "d", "e"]);
+        let home = tempfile::tempdir().unwrap();
+        let (f, s) = model("claude", "anthropic", vec![Ok("[]".into())]);
+        let scorer = Arc::new(UnitScorer {
+            high: "d",
+            calls: Mutex::new(0),
+        });
+        let cheap = ModelHandle {
+            id: "cheap".into(),
+            family: "fake".into(),
+            caller: scorer.clone(),
+        };
+        let report_path = dir.path().join("r.json");
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.report = Some(report_path.clone());
+        o.roster = info(&[&f, &cheap]);
+        o.finders = vec![f];
+        o.prescreen = Some(prescreen::PrescreenOptions {
+            model: cheap,
+            pool: 40,
+            top_percent: 20,
+        });
+        assert_eq!(cmd_scan(home.path(), o).await, 0);
+        assert_eq!(*scorer.calls.lock().unwrap(), 5, "one call per pool unit");
+        let finder_prompts = s.prompts.lock().unwrap().clone();
+        assert_eq!(
+            finder_prompts.len(),
+            1,
+            "only the top 20% (1 of 5) is audited"
+        );
+        assert!(finder_prompts[0].contains("d/main.rs"));
+        assert_eq!(cmd_validate(&report_path).await, 0);
+
+        let v = read_report(&report_path);
+        let p = &v["ensemble"]["prescreen"];
+        assert_eq!(p["model"], "cheap");
+        assert_eq!(p["pool"], 5);
+        assert_eq!(p["top_percent"], 20);
+        assert_eq!(p["selected"], 1);
+        assert_eq!(p["calls"], 5);
+        assert_eq!(p["scored"], 5);
+        assert_eq!(p["failed"], 0);
+        assert_eq!(p["degraded"], false);
+        assert!(p["prompt_bytes"].as_u64().unwrap() > 0);
+        assert!(p["reply_bytes"].as_u64().unwrap() > 0);
+        assert!(p["duration_ms"].is_u64());
+        assert_eq!(p["units"][0]["module_path"], "d");
+        assert_eq!(p["units"][0]["score"], 5);
+        assert_eq!(p["units"][0]["selected"], true);
+        assert!(
+            v["ensemble"]["budget"].is_null(),
+            "no budget flag, no record"
+        );
+        let cov = v["coverage"].as_array().unwrap();
+        assert_eq!(cov[0]["module_path"], "d");
+        assert_eq!(cov[0]["status"], "covered");
+        assert!(
+            cov[1..]
+                .iter()
+                .all(|c| c["status"] == "deferred" && c["reason"] == "prescreen_cut"),
+            "{cov:#?}"
+        );
+        assert_eq!(v["run_status"], "incomplete");
+        assert_eq!(v["incomplete_reason"], "scope_not_fully_reviewed");
+    }
+
+    #[tokio::test]
+    async fn prescreen_off_makes_no_prescreen_call_and_no_record() {
+        let dir = repo_with_modules(&["a", "b"]);
+        let home = tempfile::tempdir().unwrap();
+        let (f, s) = model("claude", "anthropic", vec![Ok("[]".into()); 2]);
+        let report_path = dir.path().join("r.json");
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.report = Some(report_path.clone());
+        o.roster = info(&[&f]);
+        o.finders = vec![f];
+        assert_eq!(cmd_scan(home.path(), o).await, 0);
+        assert_eq!(s.prompts.lock().unwrap().len(), 2);
+        let v = read_report(&report_path);
+        assert!(v["ensemble"]["prescreen"].is_null());
+    }
+
+    #[tokio::test]
+    async fn refuter_budget_leaves_findings_unverified_and_is_recorded() {
+        let dir = repo_with_module();
+        let home = tempfile::tempdir().unwrap();
+        let cand = format!("[{}]", ai_audit::tests::cand_json("a/main.rs", 3));
+        let (finder, _) = model("claude", "anthropic", vec![Ok(cand)]);
+        let (other, other_s) = model(
+            "codex",
+            "openai",
+            vec![Ok(adversarial::tests::PLAUSIBLE.to_string())],
+        );
+        let report_path = dir.path().join("r.json");
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.report = Some(report_path.clone());
+        o.roster = info(&[&finder, &other]);
+        o.finders = vec![finder];
+        o.verifiers = vec![other];
+        // Already spent when the review starts (the CLI would reject 0; the
+        // library treats it as an exhausted cap).
+        o.role_caps.refuter = Some(std::time::Duration::ZERO);
+        cmd_scan(home.path(), o).await;
+        assert_eq!(
+            other_s.prompts.lock().unwrap().len(),
+            0,
+            "no review started"
+        );
+        assert_eq!(cmd_validate(&report_path).await, 0);
+        let v = read_report(&report_path);
+        let ai = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["source_engine"] == "ai_audit")
+            .unwrap()
+            .clone();
+        assert_eq!(ai["status"], "candidate");
+        assert!(
+            ai["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("refuter budget exhausted")),
+            "{ai:#}"
+        );
+        assert_eq!(v["run_status"], "incomplete");
+        assert_eq!(v["incomplete_reason"], "critic_budget_exhausted");
+        let b = &v["ensemble"]["budget"];
+        assert_eq!(b["refuter_cap_secs"], 0);
+        assert_eq!(b["refuter_cap_hit"], true);
+        assert_eq!(b["finder_cap_hit"], false);
+    }
+
+    #[tokio::test]
+    async fn poc_budget_skips_new_pocs_with_a_record() {
+        let dir = repo_with_module();
+        let home = tempfile::tempdir().unwrap();
+        let cand = format!("[{}]", ai_audit::tests::cand_json("a/main.rs", 3));
+        let (finder, _) = model("claude", "anthropic", vec![Ok(cand)]);
+        let (other, _) = model(
+            "codex",
+            "openai",
+            vec![Ok(adversarial::tests::PLAUSIBLE.to_string())],
+        );
+        let (poc_model, poc_s) = model("pocker", "openai", Vec::new());
+        let report_path = dir.path().join("r.json");
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.report = Some(report_path.clone());
+        o.roster = info(&[&finder, &other]);
+        o.finders = vec![finder];
+        o.verifiers = vec![other];
+        o.poc = true;
+        o.poc_models = vec![poc_model];
+        o.role_caps.poc = Some(std::time::Duration::ZERO);
+        cmd_scan(home.path(), o).await;
+        assert!(poc_s.prompts.lock().unwrap().is_empty(), "no PoC call");
+        assert_eq!(cmd_validate(&report_path).await, 0);
+        let v = read_report(&report_path);
+        let ai = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["source_engine"] == "ai_audit")
+            .unwrap()
+            .clone();
+        assert_eq!(ai["status"], "needs_human");
+        assert!(
+            ai["evidence"].as_array().unwrap().iter().any(|e| {
+                e["kind"] == "poc_skipped"
+                    && e["detail"].as_str().unwrap_or("").contains("--poc-budget")
+            }),
+            "{ai:#}"
+        );
+        assert_eq!(v["ensemble"]["budget"]["poc_cap_hit"], true);
+        assert_eq!(v["run_status"], "incomplete");
+        assert_eq!(v["incomplete_reason"], "time_budget_exhausted");
     }
 
     /// `max_modules == 0` audits every ranked module (full coverage), not
@@ -2349,5 +3041,179 @@ mod tests {
         let mut fs = vec![f.clone(), f.clone(), f];
         assert_eq!(dedup_by_id(&mut fs), 2);
         assert_eq!(fs.len(), 1);
+    }
+
+    // ── O9: --dual-finder-top ─────────────────────────────────────────
+
+    fn repo_with_two_sinks() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(
+            dir.path().join("a/main.rs"),
+            "fn main() {\n    let q = read();\n    db.execute(q);\n    let p = read();\n    shell.run(p);\n}\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn with_fix(cand: String, start: u32, end: u32, replacement: &str) -> String {
+        let fix = serde_json::json!({
+            "file": "a/main.rs",
+            "start_line": start,
+            "end_line": end,
+            "replacement": replacement,
+        });
+        let mut v: serde_json::Value = serde_json::from_str(&cand).unwrap();
+        v["fix"] = fix;
+        v.to_string()
+    }
+
+    /// Two finder families audit the top module; the same SQL root cause
+    /// (one proposed patch changes both sinks) is merged, the second
+    /// family's command injection stays its own row, both go to a refuter
+    /// of a third family, and the report says what the second family added.
+    #[tokio::test]
+    async fn dual_finder_merges_by_patch_and_uses_a_third_family_refuter() {
+        let dir = repo_with_two_sinks();
+        let home = tempfile::tempdir().unwrap();
+        let a = with_fix(
+            ai_audit::tests::cand_json("a/main.rs", 3),
+            3,
+            3,
+            "    db.execute_prepared(&[q]);",
+        );
+        let b_sql = with_fix(
+            ai_audit::tests::cand_json("a/main.rs", 3).replace("sql_injection", "sqli"),
+            2,
+            3,
+            "    let q = read_checked();\n    db.query(\"SELECT ?\", &[q]);",
+        );
+        let b_cmd = ai_audit::tests::cand_json("a/main.rs", 5)
+            .replace("sql_injection", "command_injection");
+        let (f1, s1) = model("claude", "anthropic", vec![Ok(format!("[{a}]"))]);
+        let (f2, s2) = model("codex", "openai", vec![Ok(format!("[{b_sql},{b_cmd}]"))]);
+        let plausible = || Ok(adversarial::tests::PLAUSIBLE.to_string());
+        let (v3, s3) = model("grok", "xai", vec![plausible(), plausible()]);
+        let report_path = dir.path().join("r.json");
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.dual_finder_top = 1;
+        o.report = Some(report_path.clone());
+        o.roster = info(&[&f1, &f2, &v3]);
+        o.finders = vec![f1.clone(), f2.clone()];
+        o.verifiers = vec![f1, f2, v3];
+        cmd_scan(home.path(), o).await;
+
+        // Both finders were asked for an optional fix on the dual module.
+        for s in [&s1, &s2] {
+            let prompts = s.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert!(prompts[0].contains("MAY carry one extra key, \"fix\""));
+        }
+        let v = read_report(&report_path);
+        let ai: Vec<&serde_json::Value> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["source_engine"] == "ai_audit")
+            .collect();
+        assert_eq!(ai.len(), 2, "{v:#}");
+        let merged = ai.iter().find(|f| f["line"] == 3).unwrap();
+        assert_eq!(merged["found_by"], serde_json::json!(["claude", "codex"]));
+        assert!(merged["evidence"].as_array().unwrap().iter().any(|e| {
+            e["kind"] == "dual_finder_merge"
+                && e["detail"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("from codex (openai) dedupe_basis=same_patch")
+        }));
+        let cmd = ai.iter().find(|f| f["line"] == 5).unwrap();
+        assert_eq!(cmd["found_by"], serde_json::json!(["codex"]));
+        // Third-party refuter for both rows, recorded as cross-family.
+        for f in &ai {
+            assert_eq!(f["status"], "needs_human");
+            assert_eq!(f["verification"][0]["model"], "grok");
+            assert_eq!(f["verification"][0]["cross_family"], true);
+        }
+        assert_eq!(s3.prompts.lock().unwrap().len(), 2);
+        // The proposed fix is model output used only for dedupe: not in the report.
+        assert!(merged.get("proposed_fix").is_none());
+
+        let d = &v["ensemble"]["dual_finder"];
+        assert_eq!(d["top"], 1);
+        assert_eq!(d["modules"][0]["module_path"], "a");
+        assert_eq!(d["modules"][0]["primary"]["family"], "anthropic");
+        assert_eq!(d["modules"][0]["second"]["family"], "openai");
+        assert_eq!(d["merged_same_patch"], 1);
+        assert_eq!(d["merged_location_cwe"], 0);
+        assert_eq!(d["usable_fixes"], 2);
+        assert_eq!(d["shared_root_causes"], 1);
+        let fam = |name: &str| {
+            d["families"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|y| y["family"] == name)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(fam("anthropic")["candidates"], 1);
+        assert_eq!(fam("anthropic")["unique_root_causes"], 0);
+        assert_eq!(fam("openai")["candidates"], 2);
+        assert_eq!(fam("openai")["unique_root_causes"], 1);
+        assert_eq!(fam("openai")["unique_needs_human"], 1);
+        assert_eq!(d["marginal"]["calls"], 1);
+        assert_eq!(d["marginal"]["extra_root_causes"], 1);
+        assert_eq!(d["marginal"]["extra_needs_human"], 1);
+        assert_eq!(d["marginal"]["calls_per_extra_needs_human"], 1);
+        assert!(d["marginal"]["prompt_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(cmd_validate(&report_path).await, 0);
+        // The CLI summary names the marginal yield.
+        let report: AuditReport =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let summary = report::render_summary_with(&report, None);
+        assert!(
+            summary.contains("1 extra needs_human") || summary.contains("多 1 筆 needs_human"),
+            "{summary}"
+        );
+    }
+
+    /// Off by default; with one finder family it is recorded as skipped.
+    #[tokio::test]
+    async fn dual_finder_is_off_by_default_and_skipped_with_one_family() {
+        let dir = repo_with_two_sinks();
+        let home = tempfile::tempdir().unwrap();
+        let (f1, _) = model("claude", "anthropic", vec![Ok("[]".into())]);
+        let report_path = dir.path().join("r.json");
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.report = Some(report_path.clone());
+        o.roster = info(&[&f1]);
+        o.finders = vec![f1.clone()];
+        cmd_scan(home.path(), o).await;
+        assert!(
+            read_report(&report_path)["ensemble"]
+                .get("dual_finder")
+                .is_none()
+        );
+
+        let (f1, s1) = model("claude", "anthropic", vec![Ok("[]".into())]);
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.dual_finder_top = 3;
+        o.report = Some(report_path.clone());
+        o.roster = info(&[&f1]);
+        o.finders = vec![f1];
+        cmd_scan(home.path(), o).await;
+        let d = &read_report(&report_path)["ensemble"]["dual_finder"];
+        assert!(
+            d["skipped"]
+                .as_str()
+                .unwrap()
+                .contains("single model family")
+        );
+        assert_eq!(d["modules"], serde_json::json!([]));
+        // No fix request without a second family.
+        assert!(!s1.prompts.lock().unwrap()[0].contains("\"fix\""));
     }
 }

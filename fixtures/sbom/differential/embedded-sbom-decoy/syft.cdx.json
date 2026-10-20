@@ -1,0 +1,150 @@
+{
+  "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "author": "anchore",
+          "name": "syft",
+          "version": "1.34.2"
+        }
+      ]
+    },
+    "component": {
+      "bom-ref": "206a24b60058b073",
+      "type": "file",
+      "name": "./"
+    }
+  },
+  "components": [
+    {
+      "bom-ref": "pkg:cargo/embedded-sbom-decoy@0.1.0?package-id=94fceb3c184efbb6",
+      "type": "library",
+      "name": "embedded-sbom-decoy",
+      "version": "0.1.0",
+      "cpe": "cpe:2.3:a:embedded-sbom-decoy:embedded-sbom-decoy:0.1.0:*:*:*:*:*:*:*",
+      "purl": "pkg:cargo/embedded-sbom-decoy@0.1.0",
+      "properties": [
+        {
+          "name": "syft:package:foundBy",
+          "value": "rust-cargo-lock-cataloger"
+        },
+        {
+          "name": "syft:package:language",
+          "value": "rust"
+        },
+        {
+          "name": "syft:package:type",
+          "value": "rust-crate"
+        },
+        {
+          "name": "syft:package:metadataType",
+          "value": "rust-cargo-lock-entry"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded-sbom-decoy:embedded_sbom_decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded_sbom_decoy:embedded-sbom-decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded_sbom_decoy:embedded_sbom_decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded-sbom:embedded-sbom-decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded-sbom:embedded_sbom_decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded_sbom:embedded-sbom-decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded_sbom:embedded_sbom_decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded:embedded-sbom-decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:cpe23",
+          "value": "cpe:2.3:a:embedded:embedded_sbom_decoy:0.1.0:*:*:*:*:*:*:*"
+        },
+        {
+          "name": "syft:location:0:path",
+          "value": "/Cargo.lock"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:cargo/itoa@1.0.15?package-id=324b6258bdf445ff",
+      "type": "library",
+      "name": "itoa",
+      "version": "1.0.15",
+      "cpe": "cpe:2.3:a:itoa:itoa:1.0.15:*:*:*:*:*:*:*",
+      "purl": "pkg:cargo/itoa@1.0.15",
+      "externalReferences": [
+        {
+          "url": "registry+https://github.com/rust-lang/crates.io-index",
+          "type": "distribution"
+        }
+      ],
+      "properties": [
+        {
+          "name": "syft:package:foundBy",
+          "value": "rust-cargo-lock-cataloger"
+        },
+        {
+          "name": "syft:package:language",
+          "value": "rust"
+        },
+        {
+          "name": "syft:package:type",
+          "value": "rust-crate"
+        },
+        {
+          "name": "syft:package:metadataType",
+          "value": "rust-cargo-lock-entry"
+        },
+        {
+          "name": "syft:location:0:path",
+          "value": "/Cargo.lock"
+        }
+      ]
+    },
+    {
+      "bom-ref": "c6bea2c24af05bc1",
+      "type": "file",
+      "name": "./Cargo.lock",
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "ba26984063018f6874da9385f18974f7fc17b888"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "a50a36ce7df46acdcc00f9945eb965d88e4b151b9317c319305666baced125c2"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:cargo/embedded-sbom-decoy@0.1.0?package-id=94fceb3c184efbb6",
+      "dependsOn": [
+        "pkg:cargo/itoa@1.0.15?package-id=324b6258bdf445ff"
+      ]
+    }
+  ]
+}

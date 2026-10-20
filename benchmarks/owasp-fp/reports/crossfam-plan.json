@@ -1,0 +1,173 @@
+{
+ "arms": [
+  {
+   "arm": "A>B",
+   "calls_cap": 4160,
+   "calls_expected": 640,
+   "cases": 160,
+   "finder": "a1",
+   "finder_calls_cap": 320,
+   "kind": "cross_family",
+   "output_tokens_cap": 4259840,
+   "output_tokens_expected_cap": 655360,
+   "refuter": "b1",
+   "verify_calls_cap": 3840,
+   "wall_seconds_cap": 374400,
+   "wall_seconds_expected": 19200
+  },
+  {
+   "arm": "B>A",
+   "calls_cap": 4160,
+   "calls_expected": 640,
+   "cases": 160,
+   "finder": "b1",
+   "finder_calls_cap": 320,
+   "kind": "cross_family",
+   "output_tokens_cap": 4259840,
+   "output_tokens_expected_cap": 655360,
+   "refuter": "a1",
+   "verify_calls_cap": 3840,
+   "wall_seconds_cap": 374400,
+   "wall_seconds_expected": 19200
+  },
+  {
+   "arm": "A>A2",
+   "calls_cap": 4160,
+   "calls_expected": 640,
+   "cases": 160,
+   "finder": "a1",
+   "finder_calls_cap": 320,
+   "kind": "same_family",
+   "output_tokens_cap": 4259840,
+   "output_tokens_expected_cap": 655360,
+   "refuter": "a2",
+   "verify_calls_cap": 3840,
+   "wall_seconds_cap": 374400,
+   "wall_seconds_expected": 19200
+  },
+  {
+   "arm": "B>B2",
+   "calls_cap": 4160,
+   "calls_expected": 640,
+   "cases": 160,
+   "finder": "b1",
+   "finder_calls_cap": 320,
+   "kind": "same_family",
+   "output_tokens_cap": 4259840,
+   "output_tokens_expected_cap": 655360,
+   "refuter": "b2",
+   "verify_calls_cap": 3840,
+   "wall_seconds_cap": 374400,
+   "wall_seconds_expected": 19200
+  },
+  {
+   "arm": "A>A=",
+   "calls_cap": 4160,
+   "calls_expected": 640,
+   "cases": 160,
+   "finder": "a1",
+   "finder_calls_cap": 320,
+   "kind": "same_model_fresh",
+   "output_tokens_cap": 4259840,
+   "output_tokens_expected_cap": 655360,
+   "refuter": "a1",
+   "verify_calls_cap": 3840,
+   "wall_seconds_cap": 374400,
+   "wall_seconds_expected": 19200
+  },
+  {
+   "arm": "B>B=",
+   "calls_cap": 4160,
+   "calls_expected": 640,
+   "cases": 160,
+   "finder": "b1",
+   "finder_calls_cap": 320,
+   "kind": "same_model_fresh",
+   "output_tokens_cap": 4259840,
+   "output_tokens_expected_cap": 655360,
+   "refuter": "b1",
+   "verify_calls_cap": 3840,
+   "wall_seconds_cap": 374400,
+   "wall_seconds_expected": 19200
+  }
+ ],
+ "assumptions": {
+  "assumed_seconds_per_call": 30,
+  "expected_candidates_per_case": 1.0,
+  "expected_finder_calls_per_case": 1,
+  "note": "estimates only; ceilings are exact. Measure both in the first case rows."
+ },
+ "blockers": [
+  {
+   "detail": "vettalon re-asks the finder up to 1 time when its JSON breaks the contract (AI_AUDIT_PARSE_RETRIES, no CLI switch). D01 says zero retries: accept it as a budgeted correction call (already in the ceiling) or add a switch first.",
+   "id": "finder_reflector_call",
+   "owner_can_accept": true
+  },
+  {
+   "detail": "CLI presets (claude, codex) cannot enforce 1,024 output tokens; formal arms must use backend openai/ollama with max_tokens <= 1024 and timeout_secs <= 90.",
+   "id": "cli_backend_output_cap",
+   "owner_can_accept": false
+  },
+  {
+   "detail": "vettalon has no verify-only entry, so every arm re-runs its finder; finder noise enters arm-to-arm comparisons and is reported as finder agreement.",
+   "id": "no_verify_only_entry",
+   "owner_can_accept": true
+  },
+  {
+   "detail": "the same-family model must be close in capability to the cross-family refuter, or family and capability stay confounded (B8, B9).",
+   "id": "capability_matching",
+   "owner_can_accept": true
+  }
+ ],
+ "input_bytes_cap_per_call": {
+  "finder_source": 49152,
+  "note": "prompt templates not included; the trace records prompt_bytes",
+  "verifier_source": 24576
+ },
+ "model_calls_so_far": 0,
+ "per_call": {
+  "automatic_retries": 0,
+  "inflight": 1,
+  "output_tokens_max": 1024,
+  "timeout_seconds": 90
+ },
+ "per_case_ceiling": {
+  "basis": "1 page x (1 + 1 reflector) + 8 candidates x 3 refuter runs",
+  "calls": 26,
+  "finder_calls": 2,
+  "verify_calls": 24
+ },
+ "pilot_budget": {
+  "calls": 540,
+  "cases": 16,
+  "output_tokens": 552960,
+  "purpose": "first stratified case rows only: measure real calls per case and latency before the full budget is approved",
+  "wall_seconds_ceiling": 48600
+ },
+ "plan_sha256": "c6075d0bac2ae4ba2bf6ca9a52e9f721842439cbdf081c024be5691495a501f3",
+ "proposed_budget": {
+  "calls": 3996,
+  "output_tokens": 4091904,
+  "rule": "ledger reserves one full case row (all arms at the ceiling) before each case and stops when it does not fit; unrun cases stay in n",
+  "wall_seconds_ceiling": 359640
+ },
+ "refuter_runs": 3,
+ "schema": "owasp-xfam-plan-v1",
+ "status": "awaiting owner approval (D01)",
+ "total": {
+  "calls_cap": 24960,
+  "calls_expected": 3840,
+  "cases": 960,
+  "finder_calls_cap": 1920,
+  "output_tokens_cap": 25559040,
+  "output_tokens_expected_cap": 3932160,
+  "verify_calls_cap": 23040,
+  "wall_seconds_cap": 2246400,
+  "wall_seconds_expected": 115200
+ },
+ "usd": {
+  "formula": "sum over calls of input_tokens*price_in + output_tokens*price_out",
+  "value": null,
+  "why_null": "providers and prices are not chosen yet"
+ }
+}

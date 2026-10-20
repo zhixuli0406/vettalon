@@ -14,7 +14,9 @@ use vettalon_contract::safe_path::SafeRepoPath;
 
 use super::schema::{AuditReport, EvidenceKind, Finding, FindingStatus, Severity};
 
-const SARIF_SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
+/// OASIS SARIF 2.1.0 (Errata 01) schema.
+const SARIF_SCHEMA: &str =
+    "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json";
 
 fn level(s: Severity) -> &'static str {
     match s {
@@ -24,16 +26,27 @@ fn level(s: Severity) -> &'static str {
     }
 }
 
-/// GitHub's `security-severity` (CVSS-like 0.0–10.0 string).
-fn security_severity(s: Severity) -> &'static str {
-    match s {
-        Severity::Critical => "9.5",
-        Severity::High => "8.0",
-        Severity::Medium => "5.5",
-        Severity::Low => "3.0",
-        Severity::Info => "0.0",
-    }
+fn severity_key(s: Severity) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
+
+/// Why a rule does or does not carry GitHub's `security-severity`.
+///
+/// GitHub reads `security-severity` as a CVSS-style 0.1–10.0 score. vettalon
+/// only emits one when every finding of the rule has a source-supplied CVSS
+/// vector (the value is their highest score); a qualitative severity is
+/// never turned into a CVSS-looking number. Without it GitHub falls back to
+/// the SARIF `level` (error / warning / note).
+const BASIS_CVSS_MAX: &str = "cvss_max";
+const BASIS_NO_CVSS: &str = "omitted_no_cvss";
+const BASIS_PARTIAL_CVSS: &str = "omitted_partial_cvss";
+const BASIS_ZERO_CVSS: &str = "omitted_cvss_zero";
+
+/// Index of the CWE taxonomy in `runs[0].taxonomies`.
+const CWE_TAXONOMY_INDEX: usize = 0;
 
 fn status_str(s: FindingStatus) -> String {
     serde_json::to_value(s)
@@ -55,7 +68,7 @@ fn uri_path(p: &str) -> String {
     out
 }
 
-fn result(f: &Finding) -> Value {
+fn result(f: &Finding, taxa: &[String]) -> Value {
     // A pre-check-refuted finding keeps the model's claimed path verbatim,
     // which may be absolute or escape the repo: never emit it as a location.
     let location = SafeRepoPath::parse(&f.file).ok().map(|_| {
@@ -84,10 +97,39 @@ fn result(f: &Finding) -> Value {
             "vettalon.proof_level": f.proof_evidence.last().map(|proof| proof.level.key()).unwrap_or("unknown"),
             "vettalon.proof_evidence": f.proof_evidence,
             "vettalon.proof_limits": f.proof_summary(),
+            "vettalon.evidence_level": f.evidence_level(),
+            "vettalon.proof_gaps": f.proof_gaps(),
         }
     });
+    if let Some(counter) = f.strongest_counterevidence() {
+        r["properties"]["vettalon.strongest_counterevidence"] = json!(counter);
+    }
+    // O19: a suggested fix is labelled with its derived check outcome.
+    if let Some(fix) = f.fix_check() {
+        r["properties"]["vettalon.fix_check"] = json!(fix);
+    }
     if let Some(cwe) = &f.cwe {
         r["properties"]["vettalon.cwe"] = json!(cwe);
+        // CWE List version + MITRE mapping usage; Discouraged / Prohibited
+        // ids carry a warning and the more specific ids vettalon knows.
+        if let Some(m) = f.cwe_mapping() {
+            if let Some(warning) = m.warning() {
+                r["properties"]["vettalon.cwe_mapping_warning"] = json!(warning);
+            }
+            r["properties"]["vettalon.cwe_mapping"] = json!(m);
+        }
+        if let Some(original) = &f.cwe_replaced {
+            r["properties"]["vettalon.cwe_replaced"] = json!(original);
+        }
+        if let Some(n) = cwe_number(cwe)
+            && let Some(index) = taxa.iter().position(|t| *t == n)
+        {
+            r["taxa"] = json!([{
+                "id": n,
+                "index": index,
+                "toolComponent": { "name": "CWE", "index": CWE_TAXONOMY_INDEX }
+            }]);
+        }
         // P0-3: the CAPEC attack patterns mapped to this CWE, machine-readable
         // alongside the weakness id.
         let capec: Vec<&str> = crate::kb::lookup(cwe)
@@ -99,16 +141,36 @@ fn result(f: &Finding) -> Value {
     }
     if !f.cve.is_empty() {
         r["properties"]["vettalon.cve"] = json!(f.cve);
+        r["properties"]["vettalon.cve_refs"] = json!(f.cve_refs());
     }
     if let Some(cvss) = &f.cvss {
         r["properties"]["vettalon.cvss"] = json!(cvss);
+        r["properties"]["vettalon.cvss_label"] = json!(cvss.label());
     }
-    // P1-2: deterministic exploitability tier from the finding's preconditions.
-    r["properties"]["vettalon.exploitability"] = json!(
-        crate::audit::exploitability::assess(&f.conditions)
-            .tier
-            .key()
-    );
+    r["properties"]["vettalon.severity"] = json!(severity_key(f.severity));
+    r["properties"]["vettalon.severity_basis"] = json!(f.severity_basis);
+    // P1-2: deterministic exploitability tier from the finding's
+    // preconditions; O11: the higher-friction of finder and refuter.
+    let ex = crate::audit::exploitability::assess_finding(f);
+    r["properties"]["vettalon.exploitability"] = json!(ex.effective.tier.key());
+    if let Some(refuter) = &ex.refuter {
+        r["properties"]["vettalon.exploitability_finder"] = json!(ex.finder.tier.key());
+        r["properties"]["vettalon.exploitability_refuter"] = json!(refuter.tier.key());
+        if ex.disagreement() {
+            r["properties"][format!(
+                "vettalon.{}",
+                crate::audit::exploitability::TIER_DISAGREEMENT_KEY
+            )] = json!(true);
+        }
+    }
+    // O10: the verdict flipped between reading the code with and without
+    // its comments.
+    if f.evidence
+        .iter()
+        .any(|e| e.kind == EvidenceKind::CommentSensitivity)
+    {
+        r["properties"]["vettalon.comment_sensitivity"] = json!(true);
+    }
     if matches!(f.status, FindingStatus::Refuted | FindingStatus::Suppressed) {
         let why = f
             .evidence
@@ -127,59 +189,153 @@ fn result(f: &Finding) -> Value {
     r
 }
 
+/// `CWE-89` → `"89"` (SARIF taxon ids use the bare number, as in the spec's
+/// CWE taxonomy example).
+fn cwe_number(cwe: &str) -> Option<String> {
+    crate::audit::cwe::normalize(cwe).map(|id| id.trim_start_matches("CWE-").to_string())
+}
+
+/// `runs[0].taxonomies[0]`: the CWE List the bundled mapping table comes
+/// from, with one taxon per CWE id the report's findings carry.
+fn cwe_taxonomy(taxa: &[String]) -> Value {
+    let (version, date, _) = crate::audit::cwe::catalog().unwrap_or(("unknown", "", ""));
+    let taxa: Vec<Value> = taxa
+        .iter()
+        .map(|n| {
+            let id = format!("CWE-{n}");
+            let m = crate::audit::cwe::mapping(&id);
+            let mut t = json!({
+                "id": n,
+                "helpUri": crate::kb::cwe_url(&id),
+                "properties": {
+                    "vettalon.mapping_usage": m.as_ref().map(|m| m.usage.key()),
+                    "vettalon.abstraction": m.as_ref().and_then(|m| m.abstraction),
+                }
+            });
+            if let Some(name) = m.as_ref().and_then(|m| m.name) {
+                t["name"] = json!(name);
+                t["shortDescription"] = json!({ "text": name });
+            }
+            t
+        })
+        .collect();
+    let mut tax = json!({
+        "name": "CWE",
+        "version": version,
+        "organization": "MITRE",
+        "shortDescription": { "text": "The MITRE Common Weakness Enumeration" },
+        "informationUri": "https://cwe.mitre.org/",
+        "downloadUri": format!("https://cwe.mitre.org/data/xml/cwec_v{version}.xml.zip"),
+        "isComprehensive": false,
+        "taxa": taxa,
+    });
+    if !date.is_empty() {
+        tax["releaseDateUtc"] = json!(date);
+    }
+    tax
+}
+
 pub fn to_sarif(report: &AuditReport) -> Value {
     // One rule per rule id, at the highest severity seen for it, tagged with
-    // every CWE its findings carry (GitHub's `external/cwe/cwe-NNN` form) and
-    // scored from a source-supplied CVSS vector when one exists.
+    // every CWE its findings carry (GitHub's `external/cwe/cwe-NNN` form).
+    // `security-severity` only from source-supplied CVSS vectors.
     struct RuleAgg {
         severity: Severity,
         tags: std::collections::BTreeSet<String>,
-        max_cvss: Option<f64>,
+        max: Option<crate::audit::cvss::CvssScore>,
+        findings: usize,
+        scored: usize,
     }
     let mut rules: BTreeMap<&str, RuleAgg> = BTreeMap::new();
+    let mut taxa: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     for f in &report.findings {
         let e = rules.entry(f.rule_id.as_str()).or_insert_with(|| RuleAgg {
             severity: f.severity,
             tags: std::collections::BTreeSet::new(),
-            max_cvss: None,
+            max: None,
+            findings: 0,
+            scored: 0,
         });
+        e.findings += 1;
         if f.severity > e.severity {
             e.severity = f.severity;
         }
         if let Some(tag) = f.cwe.as_deref().and_then(crate::audit::cwe::sarif_tag) {
             e.tags.insert(tag);
         }
-        if let Some(score) = f.cvss.as_ref().map(|c| c.base_score) {
-            e.max_cvss = Some(e.max_cvss.map_or(score, |m: f64| m.max(score)));
+        // Only ids that exist in the bundled CWE List become taxa of the
+        // versioned taxonomy; others keep their warning property only.
+        let in_catalog = f
+            .cwe_mapping()
+            .is_some_and(|m| m.usage != crate::audit::cwe::MappingUsage::NotInCatalog);
+        if in_catalog && let Some(n) = f.cwe.as_deref().and_then(cwe_number) {
+            taxa.extend(n.parse::<u32>().ok());
+        }
+        if let Some(c) = &f.cvss {
+            e.scored += 1;
+            if e.max.as_ref().is_none_or(|m| c.base_score > m.base_score) {
+                e.max = Some(c.clone());
+            }
         }
     }
+    let taxa: Vec<String> = taxa.into_iter().map(|n| n.to_string()).collect();
     let rules: Vec<Value> = rules
         .into_iter()
         .map(|(id, agg)| {
             let mut tags = vec!["security".to_string()];
             tags.extend(agg.tags);
-            let sec_sev = agg
-                .max_cvss
-                .map(|s| format!("{s:.1}"))
-                .unwrap_or_else(|| security_severity(agg.severity).to_string());
+            let mut props = json!({
+                "tags": tags,
+                "vettalon.severity": severity_key(agg.severity),
+            });
+            match (&agg.max, agg.scored == agg.findings) {
+                // GitHub's range is >0.0–10.0: a 0.0 CVSS score has no
+                // security-severity, but the vector still travels.
+                (Some(max), true) if max.base_score <= 0.0 => {
+                    props["vettalon.security_severity_basis"] = json!(BASIS_ZERO_CVSS);
+                    props["vettalon.cvss_version"] = json!(max.cvss_version);
+                    props["vettalon.cvss_vector"] = json!(max.cvss_vector);
+                }
+                (Some(max), true) => {
+                    props["security-severity"] = json!(format!("{:.1}", max.base_score));
+                    props["vettalon.security_severity_basis"] = json!(BASIS_CVSS_MAX);
+                    props["vettalon.cvss_version"] = json!(max.cvss_version);
+                    props["vettalon.cvss_vector"] = json!(max.cvss_vector);
+                    if let Some(n) = max.nomenclature() {
+                        props["vettalon.cvss_nomenclature"] = json!(n);
+                    }
+                }
+                (Some(_), false) => {
+                    props["vettalon.security_severity_basis"] = json!(BASIS_PARTIAL_CVSS);
+                }
+                (None, _) => {
+                    props["vettalon.security_severity_basis"] = json!(BASIS_NO_CVSS);
+                }
+            }
             json!({
                 "id": id,
                 "shortDescription": { "text": id },
                 "defaultConfiguration": { "level": level(agg.severity) },
-                "properties": { "security-severity": sec_sev, "tags": tags }
+                "properties": props
             })
         })
         .collect();
-    json!({
+    let mut driver = json!({
+        "name": "vettalon",
+        "version": env!("CARGO_PKG_VERSION"),
+        "rules": rules,
+    });
+    let mut run_taxonomies = Vec::new();
+    if !taxa.is_empty() {
+        driver["supportedTaxonomies"] = json!([{ "name": "CWE", "index": CWE_TAXONOMY_INDEX }]);
+        run_taxonomies.push(cwe_taxonomy(&taxa));
+    }
+    let mut out = json!({
         "$schema": SARIF_SCHEMA,
         "version": "2.1.0",
         "runs": [{
-            "tool": { "driver": {
-                "name": "vettalon",
-                "version": env!("CARGO_PKG_VERSION"),
-                "rules": rules,
-            }},
-            "results": report.findings.iter().map(result).collect::<Vec<_>>(),
+            "tool": { "driver": driver },
+            "results": report.findings.iter().map(|f| result(f, &taxa)).collect::<Vec<_>>(),
             "properties": {
                 "vettalon.run_status": report.run_status,
                 "vettalon.incomplete_reason": report.incomplete_reason,
@@ -189,7 +345,11 @@ pub fn to_sarif(report: &AuditReport) -> Value {
                 "vettalon.refusals": report.ensemble.refusals,
             }
         }]
-    })
+    });
+    if !run_taxonomies.is_empty() {
+        out["runs"][0]["taxonomies"] = json!(run_taxonomies);
+    }
+    out
 }
 
 pub fn write_sarif(report: &AuditReport, path: &Path) -> std::io::Result<()> {
@@ -276,9 +436,17 @@ mod tests {
         a.cvss = crate::audit::cvss::CvssScore::from_vector(
             "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
         );
-        a.cve = vec!["CVE-2021-9999".into()];
+        a.cve = vec!["CVE-1900-9999".into()];
         let sarif = to_sarif(&report(vec![a]));
         let rule = &sarif["runs"][0]["tool"]["driver"]["rules"][0];
+        assert_eq!(
+            rule["properties"]["vettalon.security_severity_basis"],
+            "cvss_max"
+        );
+        assert_eq!(
+            rule["properties"]["vettalon.cvss_vector"],
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        );
         let tags: Vec<&str> = rule["properties"]["tags"]
             .as_array()
             .unwrap()
@@ -293,7 +461,130 @@ mod tests {
         );
         let res = &sarif["runs"][0]["results"][0];
         assert_eq!(res["properties"]["vettalon.cwe"], "CWE-89");
-        assert_eq!(res["properties"]["vettalon.cve"][0], "CVE-2021-9999");
+        assert_eq!(res["properties"]["vettalon.cve"][0], "CVE-1900-9999");
+        assert_eq!(
+            res["properties"]["vettalon.cve_refs"][0]["state"],
+            "unverified"
+        );
+        assert_eq!(res["properties"]["vettalon.cvss"]["rating"], "critical");
+        assert_eq!(
+            res["properties"]["vettalon.cvss_label"],
+            "CVSS v3.1 9.8 Critical"
+        );
+        // CWE as a SARIF taxonomy (CWE List 4.20), referenced by the result.
+        let tax = &sarif["runs"][0]["taxonomies"][0];
+        assert_eq!(tax["name"], "CWE");
+        assert_eq!(tax["version"], "4.20");
+        assert_eq!(tax["releaseDateUtc"], "2026-04-30");
+        assert_eq!(tax["taxa"][0]["id"], "89");
+        assert_eq!(
+            tax["taxa"][0]["properties"]["vettalon.mapping_usage"],
+            "allowed"
+        );
+        assert_eq!(res["taxa"][0]["id"], "89");
+        assert_eq!(res["taxa"][0]["toolComponent"]["name"], "CWE");
+        assert_eq!(
+            sarif["runs"][0]["tool"]["driver"]["supportedTaxonomies"][0]["name"],
+            "CWE"
+        );
+        assert_eq!(
+            res["properties"]["vettalon.cwe_mapping"]["cwe_version"],
+            "4.20"
+        );
+        assert!(
+            res["properties"]
+                .get("vettalon.cwe_mapping_warning")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_cvss_means_no_security_severity_number() {
+        // Qualitative severity never becomes a CVSS-looking number.
+        let s = to_sarif(&report(vec![finding(
+            Severity::Critical,
+            FindingStatus::Candidate,
+            Some(1),
+        )]));
+        let rule = &s["runs"][0]["tool"]["driver"]["rules"][0];
+        assert!(rule["properties"].get("security-severity").is_none());
+        assert_eq!(
+            rule["properties"]["vettalon.security_severity_basis"],
+            "omitted_no_cvss"
+        );
+        assert_eq!(rule["properties"]["vettalon.severity"], "critical");
+        assert_eq!(rule["defaultConfiguration"]["level"], "error");
+        assert!(
+            s["runs"][0].get("taxonomies").is_none(),
+            "no CWE, no taxonomy"
+        );
+        // One scored and one unscored finding under the same rule: a max of
+        // the scored one would understate the other, so no number at all.
+        let mut a = finding(Severity::Critical, FindingStatus::Candidate, Some(1));
+        let mut b = finding(Severity::Low, FindingStatus::Candidate, Some(2));
+        b.cvss = crate::audit::cvss::CvssScore::from_vector(
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N/SC:N/SI:N/SA:N",
+        );
+        a.cwe = Some("CWE-20".into());
+        let s = to_sarif(&report(vec![a, b]));
+        let rule = &s["runs"][0]["tool"]["driver"]["rules"][0];
+        assert!(rule["properties"].get("security-severity").is_none());
+        assert_eq!(
+            rule["properties"]["vettalon.security_severity_basis"],
+            "omitted_partial_cvss"
+        );
+        // The Discouraged CWE-20 is flagged, with its CWE List version.
+        let res = &s["runs"][0]["results"][0];
+        assert_eq!(
+            res["properties"]["vettalon.cwe_mapping"]["usage"],
+            "discouraged"
+        );
+        assert!(
+            res["properties"]["vettalon.cwe_mapping_warning"]
+                .as_str()
+                .unwrap()
+                .contains("CWE-20 is discouraged")
+        );
+        let v4 = &s["runs"][0]["results"][1]["properties"];
+        assert_eq!(v4["vettalon.cvss"]["nomenclature"], "CVSS-B");
+        assert_eq!(v4["vettalon.cvss_label"], "CVSS v4.0 6.9 Medium (CVSS-B)");
+    }
+
+    #[test]
+    fn zero_cvss_and_unknown_cwe_stay_out_of_github_fields() {
+        let mut a = finding(Severity::Low, FindingStatus::Candidate, Some(3));
+        a.cvss = crate::audit::cvss::CvssScore::from_vector(
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:N/SC:N/SI:N/SA:N",
+        );
+        a.cwe = Some("CWE-99999".into());
+        let s = to_sarif(&report(vec![a]));
+        let rule = &s["runs"][0]["tool"]["driver"]["rules"][0];
+        assert!(rule["properties"].get("security-severity").is_none());
+        assert_eq!(
+            rule["properties"]["vettalon.security_severity_basis"],
+            "omitted_cvss_zero"
+        );
+        assert!(s["runs"][0].get("taxonomies").is_none());
+        let res = &s["runs"][0]["results"][0];
+        assert!(res.get("taxa").is_none());
+        assert_eq!(
+            res["properties"]["vettalon.cwe_mapping"]["usage"],
+            "not-in-catalog"
+        );
+    }
+
+    #[test]
+    fn v40_cvss_drives_security_severity_with_its_nomenclature() {
+        let mut a = finding(Severity::High, FindingStatus::Candidate, Some(3));
+        a.cvss = crate::audit::cvss::CvssScore::from_vector(
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+        );
+        let s = to_sarif(&report(vec![a]));
+        let rule = &s["runs"][0]["tool"]["driver"]["rules"][0];
+        assert_eq!(rule["properties"]["security-severity"], "8.7");
+        assert_eq!(rule["properties"]["vettalon.cvss_version"], "4.0");
+        assert_eq!(rule["properties"]["vettalon.cvss_nomenclature"], "CVSS-B");
+        assert_eq!(s["$schema"], SARIF_SCHEMA);
     }
 
     #[test]
@@ -317,7 +608,8 @@ mod tests {
         );
         let rules = s["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0]["properties"]["security-severity"], "9.5");
+        assert!(rules[0]["properties"].get("security-severity").is_none());
+        assert_eq!(rules[0]["defaultConfiguration"]["level"], "error");
     }
 
     #[test]
@@ -356,5 +648,79 @@ mod tests {
         let res = &s["runs"][0]["results"][0];
         assert_eq!(res["suppressions"][0]["kind"], "external");
         assert_eq!(res["properties"]["vettalon.status"], "refuted");
+    }
+
+    #[test]
+    fn evidence_level_and_proof_gaps_are_sarif_properties() {
+        let mut f = finding(Severity::High, FindingStatus::Refuted, Some(1));
+        f.evidence.push(crate::audit::schema::EvidenceItem {
+            kind: EvidenceKind::AdversarialReview,
+            source: "adversarial".into(),
+            detail: "refuted: input is escaped".into(),
+            recorded_at: String::new(),
+        });
+        let s = to_sarif(&report(vec![f]));
+        let props = &s["runs"][0]["results"][0]["properties"];
+        assert_eq!(props["vettalon.evidence_level"], "static_only");
+        assert_eq!(props["vettalon.proof_gaps"][0], "no_poc");
+        assert_eq!(
+            props["vettalon.strongest_counterevidence"],
+            "refuter: input is escaped"
+        );
+        let clean = to_sarif(&report(vec![finding(
+            Severity::Low,
+            FindingStatus::Candidate,
+            None,
+        )]));
+        let props = &clean["runs"][0]["results"][0]["properties"];
+        assert_eq!(props["vettalon.proof_gaps"][0], "no_refuter");
+        assert!(props.get("vettalon.strongest_counterevidence").is_none());
+    }
+
+    #[test]
+    fn a_suggested_fix_carries_its_derived_label() {
+        let mut f = finding(Severity::High, FindingStatus::NeedsHuman, Some(1));
+        let props = |f: &Finding| {
+            to_sarif(&report(vec![f.clone()]))["runs"][0]["results"][0]["properties"].clone()
+        };
+        assert!(props(&f).get("vettalon.fix_check").is_none());
+        f.suggested_fix = Some("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n".to_string());
+        let p = props(&f);
+        assert_eq!(p["vettalon.fix_check"]["outcome"], "fix_unverified");
+        assert_eq!(p["vettalon.fix_check"]["reason"], "not_checked");
+    }
+
+    #[test]
+    fn tier_disagreement_and_comment_sensitivity_are_sarif_properties() {
+        use crate::audit::schema::{Condition, ConditionKind};
+        let mut f = finding(Severity::High, FindingStatus::NeedsHuman, Some(1));
+        f.refuter_conditions = Some(vec![Condition {
+            kind: ConditionKind::TimingDependency,
+            description: "race".into(),
+        }]);
+        f.evidence.push(crate::audit::schema::EvidenceItem {
+            kind: EvidenceKind::CommentSensitivity,
+            source: "adversarial".into(),
+            detail: "comment_sensitivity: with_comments=refuted without_comments=plausible (2/2 stripped runs)".into(),
+            recorded_at: String::new(),
+        });
+        let s = to_sarif(&report(vec![f]));
+        let props = &s["runs"][0]["results"][0]["properties"];
+        assert_eq!(props["vettalon.exploitability"], "conditional");
+        assert_eq!(props["vettalon.exploitability_finder"], "direct");
+        assert_eq!(props["vettalon.exploitability_refuter"], "conditional");
+        assert_eq!(props["vettalon.tier_disagreement"], true);
+        assert_eq!(props["vettalon.comment_sensitivity"], true);
+        // Without refuter preconditions nothing new appears.
+        let plain = to_sarif(&report(vec![finding(
+            Severity::Low,
+            FindingStatus::Candidate,
+            None,
+        )]));
+        let props = &plain["runs"][0]["results"][0]["properties"];
+        assert_eq!(props["vettalon.exploitability"], "direct");
+        assert!(props.get("vettalon.exploitability_refuter").is_none());
+        assert!(props.get("vettalon.tier_disagreement").is_none());
+        assert!(props.get("vettalon.comment_sensitivity").is_none());
     }
 }

@@ -78,8 +78,24 @@ timeout_secs = 1200
 # Fully offline scans need local providers, cached tools/DB/images and egress denial. If Jev is
 # unreachable the scan falls back to the heuristic order. The key is never
 # written here — give an env var name (preferred) or a 0600 key file.
+# ── Suggested-fix checks (optional, with --poc) ─────────────────────
+# Shell command that runs THIS project's own tests when a finding's
+# suggested fix is checked. It runs in the PoC sandbox (no network,
+# 120 s, read-only temporary copy of the tree, only /tmp writable).
+# Unset = project tests are not run (outcome at best fix_check_partial);
+# vettalon never guesses a command. `--fix-test-command` overrides it.
+# [fix_check]
+# test_command = "python3 -m pytest -q"
+
 # [jev]
 # api_key_env = "TYPESAFE_API_KEY"
 # api_key_file = "/home/you/.config/vettalon/typesafe.key"   # alt: 0600 file
 # base_url = "https://api.typesafe.ai"   # optional (must be https)
 # model = "jev-latest"                   # optional
+
+# ── Disclosure drafts (optional) ───────────────────────────────────
+# Every draft names the human who reviewed and reproduced it. The pseudonym
+# is PUBLIC: it appears in the draft's AI use statement. `--reviewer`
+# overrides it; with neither, `disclose` and `hunt --disclose-dir` refuse.
+# [disclosure]
+# reviewer = "your-handle"

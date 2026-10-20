@@ -130,6 +130,25 @@ class ResourceAggregationTests(unittest.TestCase):
             raw_path.write_text(json.dumps(original))
             with self.assertRaises(ValueError): aggregate.aggregate(raw_path,protocol.ARTIFACTS/'denominator.json')
 
+    def test_recompute_attaches_interval_and_n_for_every_rate_without_changing_metrics(self):
+        import aggregate
+        with tempfile.TemporaryDirectory() as directory:
+            raw_path=Path(directory).resolve()/'raw.json'
+            run.run(raw_path,mock=True,max_calls=1,transport=lambda *args,**kwargs: (_ for _ in ()).throw(TimeoutError('controlled')))
+            original=json.loads(raw_path.read_text())
+            recomputed=aggregate.aggregate(raw_path,protocol.ARTIFACTS/'denominator.json')
+            self.assertEqual(recomputed['metrics'],aggregate.aggregate(raw_path,protocol.ARTIFACTS/'denominator.json')['metrics'])
+            self.assertEqual(json.loads(raw_path.read_text()),original)
+            rates=recomputed['uncertainty']['rates']
+            self.assertFalse(recomputed['uncertainty']['normal_approximation_used'])
+            recall=rates['detection_recall']
+            # The timeout and the never-attempted positives stay in n=10 and widen the bracket.
+            self.assertEqual((recall['n'],recall['k_lower'],recall['k_upper']),(10,0,10))
+            self.assertEqual(recall['interval'],[0.0,1.0])
+            self.assertEqual(recall['point_bounds'],recomputed['metrics']['detection_recall_bounds'])
+            self.assertEqual(rates['adjudicated_precision']['n'],0)
+            self.assertIsNone(rates['adjudicated_precision']['interval'])
+
     def test_multiple_runs_do_not_reset_or_add_lifetime_rss(self):
         implementation=MeasurementTests.implementation
         snapshots=iter([types.SimpleNamespace(ru_utime=x,ru_stime=0,ru_maxrss=rss)

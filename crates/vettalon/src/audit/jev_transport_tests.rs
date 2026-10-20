@@ -125,18 +125,24 @@ fn opts(repo: &Path, rank: crate::audit::RankStrategy) -> crate::audit::ScanOpti
         profile: "deep".into(),
         report: None,
         sarif: None,
+        cyclonedx: None,
         fail_on: "none".into(),
         gates: vec![],
         max_modules: 2,
         poc: false,
         save: false,
         cross_check_top: 0,
+        dual_finder_top: 0,
         fail_on_needs_human: false,
         no_prior: true,
         rank,
         trace: None,
         source_receipts: false,
         time_budget: Some(Duration::from_secs(5)),
+        refuter_runs: 1,
+        prescreen: None,
+        role_caps: Default::default(),
+        fix_test_command: None,
         finders: vec![],
         verifiers: vec![],
         poc_models: vec![],
@@ -181,9 +187,12 @@ async fn tls_metadata_opt_in_and_explicit_fallback() {
             repo.path(),
             &opts(repo.path(), rank),
             &profile,
-            &Default::default(),
-            &Default::default(),
-            &crate::audit::NoProgress,
+            crate::audit::AuditContext {
+                refusals: &Default::default(),
+                trace: &Default::default(),
+                progress: &crate::audit::NoProgress,
+                scan_deadline: None,
+            },
         )
         .await;
         assert_eq!(step.ranker, "heuristic");
@@ -199,9 +208,12 @@ async fn tls_metadata_opt_in_and_explicit_fallback() {
         repo.path(),
         &opts(repo.path(), crate::audit::RankStrategy::Jev(cfg.clone())),
         &profile,
-        &Default::default(),
-        &Default::default(),
-        &crate::audit::NoProgress,
+        crate::audit::AuditContext {
+            refusals: &Default::default(),
+            trace: &Default::default(),
+            progress: &crate::audit::NoProgress,
+            scan_deadline: None,
+        },
     )
     .await;
     assert_eq!(fallback.ranker, "jev");

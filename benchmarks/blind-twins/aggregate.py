@@ -2,8 +2,10 @@
 import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 import math
+import sys
 from pathlib import Path
 from identity_views import build_paired_manifest, build_view, validate_view
 from ledger import IDENTITY_SOURCE_FILE_CAP, read_regular
@@ -191,6 +193,23 @@ def verify_identified_lineage(raw, payloads, labels, binding_path):
         raise ValueError('Identified run status differs from row completion')
 
 
+def _report_schema():
+    """Shared interval reporting (benchmarks/common), loaded by path."""
+    key='vettalon_eval_common_report_schema'
+    if key not in sys.modules:
+        spec=importlib.util.spec_from_file_location(key,Path(__file__).resolve().parents[1]/'common'/'report_schema.py')
+        module=importlib.util.module_from_spec(spec); sys.modules[key]=module; spec.loader.exec_module(module)
+    return sys.modules[key]
+
+
+def with_uncertainty(report):
+    """Attach Wilson/exact intervals and n for every metrics rate; metrics stay unchanged."""
+    metrics=report.get('metrics') if type(report) is dict else None
+    if type(metrics) is not dict or metrics.get('metric_schema')!='adjudication-aware-v3':
+        return report
+    return {**report,'uncertainty':_report_schema().adjudication_uncertainty(metrics)}
+
+
 def has_identified_marker(row):
     if type(row) is not dict:
         return False
@@ -237,7 +256,7 @@ def aggregate(raw_path,denominator_path,overlay_path=None,identity_binding_path=
         report=project_formal_report(raw_path,denominator_path)
         if report['raw_sha256']!=raw_sha256:
             raise ValueError('Formal raw changed after classification')
-        return report
+        return with_uncertainty(report)
     frozen=json.loads(read_regular(Path(denominator_path).absolute(),2*1024*1024))
     validate_frozen_canonical(frozen,read_regular(canonical_path_for_denominator(denominator_path).absolute(),2*1024*1024))
     if raw.get('schema')!='vettalon-synthetic-twins-v1' or 'rows' not in raw: raise ValueError('Unsupported raw schema')
@@ -264,9 +283,9 @@ def aggregate(raw_path,denominator_path,overlay_path=None,identity_binding_path=
         overlay_bytes=read_regular(Path(overlay_path).absolute(),1024*1024)
         overlay=json.loads(overlay_bytes)
         raw=apply_overlay(raw,overlay,raw_sha256)
-    return {'overlay_file':str(overlay_path) if overlay_path else None,'overlay_sha256':hashlib.sha256(overlay_bytes).hexdigest() if overlay_path else None,'reviewer':overlay['reviewer'] if overlay else None,'kind':'recomputed-metrics','raw_file':raw_path.name,'raw_sha256':raw_sha256,
+    return with_uncertainty({'overlay_file':str(overlay_path) if overlay_path else None,'overlay_sha256':hashlib.sha256(overlay_bytes).hexdigest() if overlay_path else None,'reviewer':overlay['reviewer'] if overlay else None,'kind':'recomputed-metrics','raw_file':raw_path.name,'raw_sha256':raw_sha256,
             'aggregator_sha256':digest(Path(__file__).read_text()),'measurement_sha256':digest(Path(__file__).with_name('measurement.py').read_text()),'protocol_sha256':digest(Path(__file__).with_name('protocol.py').read_text()),
-            'metrics':metrics(labels,raw['rows'],eligible_pairs,raw.get('resource_evidence'),raw.get('implementation'))}
+            'metrics':metrics(labels,raw['rows'],eligible_pairs,raw.get('resource_evidence'),raw.get('implementation'))})
 
 
 def aggregate_formal_batch(raw_paths, denominator_path, ledger_path):
@@ -339,3 +358,5 @@ if __name__=='__main__':
     args=parser.parse_args()
     report=aggregate(args.raw,args.denominator,args.overlay,args.identity_binding_path)
     with args.output.open('x') as handle: json.dump(report,handle,indent=2); handle.write('\n')
+    if 'uncertainty' in report:
+        for line in _report_schema().format_uncertainty(report['uncertainty']): print(line)

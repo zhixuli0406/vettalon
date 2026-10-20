@@ -269,6 +269,43 @@ class ScanIntegrationTests(unittest.TestCase):
             self.assertIn("run", result)
 
 
+    def test_blind_spot_host_never_reports_not_observed(self):
+        def not_observed(command, cwd, env, timeout):
+            result = self.fake_run(command, cwd, env, timeout)
+            if command[0] == str(self.tool.resolve()):
+                result = observed_run(command, stream())
+            return result
+        with patch("adapter.invoke", side_effect=not_observed):
+            self.assertEqual(self.run_scan()["status"], "not-observed")
+            (self.host / "main.go").write_text('package main\n\nimport (\n\t"fmt"\n\t"reflect"\n)\n')
+            result = self.run_scan()
+        self.assertEqual((result["status"], result["reason"]), ("unknown", "blind-spot-reflect"))
+        self.assertEqual(result["vex"]["status"], "under_investigation")
+        self.assertFalse(result["suppress_alert"])
+
+    def test_candidate_goflags_and_pre_module_dependency(self):
+        other = {"id": "GO-2099-0001", "purl": "pkg:golang/example.com/old@v1.0.0", "module": "example.com/old", "version": "v1.0.0"}
+        (self.host / "go.mod").write_text("module host\nrequire example.com/old v1.0.0\n")
+        (self.dep / "go.mod").unlink()  # pre-module source: bound only by go list Dir
+        def fake(command, cwd, env, timeout):
+            if "list" in command:
+                self.assertEqual(env["GOFLAGS"], "-mod=mod")
+                return observed_run(command, json.dumps({"Path": other["module"], "Version": other["version"], "Dir": str(self.dep.resolve())}))
+            if command[0] == str(self.tool.resolve()):
+                return observed_run(command, stream(True).replace("GO-2021-0113", other["id"]).replace("golang.org/x/text\"", "example.com/old\"").replace("v0.3.5", "v1.0.0").replace("golang.org/x/text/language", "example.com/old/language"))
+            return self.fake_run(command, cwd, env, timeout)
+        with patch("adapter.invoke", side_effect=fake):
+            result = self.run_scan(candidate=other, goflags="-mod=mod")
+        self.assertEqual(result["status"], "reachable", result.get("error"))
+        self.assertEqual(result["cache_material"]["advisory"], other["id"])
+        self.assertIn("GOFLAGS=-mod=mod", result["cache_material"]["scan_options"])
+        self.assertEqual(self.run_scan(candidate=other, goflags="-mod=vendor")["reason"], "input-or-source-error")
+        self.assertEqual(self.run_scan(candidate={"id": "x"})["reason"], "input-or-source-error")
+        mismatched = dict(other, purl="pkg:golang/example.com/other@v1.0.0")
+        self.assertEqual(self.run_scan(candidate=mismatched)["reason"], "input-or-source-error")
+        (self.host / "go.mod").write_text("module host\nrequire example.com/old v1.0.05\n")
+        self.assertEqual(self.run_scan(candidate=other)["reason"], "input-or-source-error")
+
 class RunnerTests(unittest.TestCase):
     def test_runner_success_and_setup_failures(self):
         import run_experiment
@@ -332,3 +369,26 @@ class OutputSafetyTests(unittest.TestCase):
             with patch("sys.argv", ["runner", "--tool", "/tmp/tool", "--db", str(db), "--output", str(db / "new")]), patch("builtins.print"):
                 self.assertEqual(run_experiment.main(), 2)
                 self.assertFalse((db / "new").exists())
+
+
+class BlindSpotAndReceiverTests(unittest.TestCase):
+    def test_pointer_and_generic_receivers_match_advisory_symbols(self):
+        raw = stream(True).replace('"symbols": ["Parse"]', '"symbols": ["Decoder.Decode"]').replace(
+            '"function": "Parse"', '"function": "Decode", "receiver": "*Decoder[T]"')
+        self.assertEqual(adapter.classify(raw, 0, TARGET)["status"], "reachable")
+
+    def test_blind_spot_signals_are_conservative(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "main.go").write_text('package main\n\nimport "fmt"\n')
+            self.assertEqual(adapter.blind_spot_signals(root), [])
+            (root / "main_test.go").write_text('package main\n\nimport "reflect"\n')
+            (root / "vendor" / "x").mkdir(parents=True)
+            (root / "vendor" / "x" / "x.go").write_text('package x\n\nimport "unsafe"\n')
+            self.assertEqual(adapter.blind_spot_signals(root), [])
+            (root / "raw.go").write_text("package main\n\nimport (\n\t// comment ) here\n\tu `unsafe`\n)\n")
+            (root / "link.go").write_text("package main\n\n//go:linkname f other.F\nfunc f()\n")
+            self.assertEqual(adapter.blind_spot_signals(root), ["linkname", "unsafe"])
+            (root / "loop.go").symlink_to(root / "raw.go")
+            with self.assertRaises(ValueError):
+                adapter.blind_spot_signals(root)

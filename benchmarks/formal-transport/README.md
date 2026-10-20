@@ -4,6 +4,8 @@
 
 `transport_v1.py` 保存單 writer ledger、預扣額、固定 localhost HTTP worker 及 usage；`run_v1.py` 建資料與顯式執行入口；`report_v1.py` 只讀新版 formal-v1 和歷史 synthetic twins raw，formal 報告預設從 immutable attempt 重播 derived 欄位；`review_v1.py` 與 `cost_v1.py` 分別處理逐階段註記與估算。它不接管 recall／OWASP／ranking readers，也沒有改產品預設 prompt 或安全政策。
 
+`report_v1.py` 的報告只要有 metrics，就另附 `uncertainty` 區塊：每個比率的 95% 區間與 n，算法與規則見 [../common/README.md](../common/README.md)。原 metrics 欄位不變。
+
 ## 前置與離線用法
 
 使用 Python 3.11+ stdlib；正式 process capture 限既有 POSIX helper 範圍，native Windows 未驗。source checkout 必須保有 frozen benchmark helpers 及 `scripts/runtime/{process_capture_v2.py,process_supervisor.py}`。Unit tests 自行建立 temporary synthetic source／manifest／subset 與 control-only denominator，eligible_pairs為空，沒有容器canonical成功或歷史模型證據主張，不依賴私有raw。production twins prepare 另外要求使用者已備妥真實本機 materialized sources與既有canonical／denominator，沒有fixture fallback；公開包存在不代表該前置已完成。本輪不安裝依賴、下載權重或啟動 server。

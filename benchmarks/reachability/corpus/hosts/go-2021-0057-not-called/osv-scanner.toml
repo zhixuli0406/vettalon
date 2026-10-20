@@ -1,0 +1,10 @@
+# OSV-Scanner / OpenSSF Scorecard: these advisories are expected in this frozen
+# reachability corpus host. It is never built into or shipped with Vettalon.
+
+[[IgnoredVulns]]
+id = "GO-2021-0057"
+reason = "Reachability corpus fixture: pins github.com/buger/jsonparser v1.1.0 on purpose; GO-2021-0057 is the corpus target. Not shipped."
+
+[[IgnoredVulns]]
+id = "GO-2026-4514"
+reason = "Reachability corpus fixture: pins github.com/buger/jsonparser v1.1.0 on purpose; GO-2026-4514 also affects this pinned version. Not shipped."

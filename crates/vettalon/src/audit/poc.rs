@@ -78,7 +78,7 @@ impl PocBudget {
 
     /// Claim one execution slot. `false` once the run-wide budget is spent.
     /// Saturating: never wraps below zero even under concurrent finders.
-    fn try_claim(&self) -> bool {
+    pub(crate) fn try_claim(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let mut cur = self.remaining.load(SeqCst);
         loop {
@@ -218,6 +218,77 @@ fn push_evidence(finding: &mut Finding, kind: EvidenceKind, tag: &str, detail: &
     });
 }
 
+/// Record a non-executed PoC attempt as `PocSkipped` with a `tag:` reason.
+/// Shared with the oracle path ([`poc_oracle`]).
+pub(super) fn push_skip(finding: &mut Finding, tag: &str, detail: &str) {
+    push_evidence(finding, EvidenceKind::PocSkipped, tag, detail);
+}
+
+/// Record a harness-judged oracle verdict as `PocOracle`. The detail is
+/// written only by [`super::schema::PocOracle::to_detail`] (the same type the
+/// evidence-level derivation parses), never truncated or masked: it is short
+/// and carries no secret.
+pub(super) fn push_oracle_evidence(finding: &mut Finding, oracle: &super::schema::PocOracle) {
+    finding.evidence.push(EvidenceItem {
+        kind: EvidenceKind::PocOracle,
+        source: "poc".to_string(),
+        detail: oracle.to_detail(),
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    });
+}
+
+/// Record the oracle's target run for human review as a `PocTranscript`
+/// (a genuine sandbox execution happened). Sink source and output are masked
+/// and truncated like every other transcript. The harness runner is left out:
+/// it only holds that run's one-time secrets and fixed setup code.
+pub(super) fn push_oracle_transcript(finding: &mut Finding, class: &str, sink: &str, output: &str) {
+    let detail = format!(
+        "oracle={class} phase=target\n--- sink (python) ---\n{}\n--- output ---\n{}",
+        crate::util::truncate_bytes(
+            &crate::util::mask_sensitive_text(sink),
+            POC_EVIDENCE_MAX_BYTES
+        ),
+        crate::util::truncate_bytes(
+            &crate::util::mask_sensitive_text(output),
+            POC_EVIDENCE_MAX_BYTES
+        ),
+    );
+    finding.evidence.push(EvidenceItem {
+        kind: EvidenceKind::PocTranscript,
+        source: "poc".to_string(),
+        detail,
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    });
+}
+
+/// The configured PoC sandbox image, or the default when the CLI never set one.
+pub(super) fn poc_image() -> String {
+    POC_IMAGE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| crate::sandbox::DEFAULT_POC_IMAGE.to_string())
+}
+
+/// The gate [`maybe_run_poc`] applies before any model or sandbox cost.
+/// The suggested-fix check (O19) runs on exactly the same findings.
+pub(super) fn poc_eligible(finding: &Finding, poc_flag: bool) -> bool {
+    poc_flag
+        && finding.severity >= Severity::High
+        && finding.status == FindingStatus::NeedsHuman
+        && finding.source_engine == AI_AUDIT_ENGINE
+}
+
+/// Record that an eligible finding got no PoC because the time budget ran
+/// out. Returns false (and records nothing) for a finding that would not
+/// have had a PoC anyway.
+pub(crate) fn skip_for_budget(finding: &mut Finding, poc_flag: bool, why: &str) -> bool {
+    if !poc_eligible(finding, poc_flag) {
+        return false;
+    }
+    push_evidence(finding, EvidenceKind::PocSkipped, "poc_skipped", why);
+    true
+}
+
 /// Attempt a PoC for one finding, mutating its evidence in place. A pure
 /// no-op (zero evidence added, zero LLM/sandbox cost) unless ALL of:
 /// `poc_flag`, `severity >= High`, `status == NeedsHuman`, and it originated
@@ -229,57 +300,26 @@ pub async fn maybe_run_poc<C: LlmCaller>(
     poc_flag: bool,
     budget: &PocBudget,
 ) {
-    if !poc_flag
-        || finding.severity < Severity::High
-        || finding.status != FindingStatus::NeedsHuman
-        || finding.source_engine != AI_AUDIT_ENGINE
-    {
+    if !poc_eligible(finding, poc_flag) {
         return;
     }
 
-    // The model-supplied path is read only through `resolve_in_repo`: an
-    // absolute, `..` or symlinked path can never leave the repo root.
-    let abs = match crate::util::resolve_in_repo(repo_root, &finding.file) {
-        Ok(p) => p,
-        Err(e) => {
-            push_evidence(
-                finding,
-                EvidenceKind::PocSkipped,
-                "poc_skipped",
-                &format!("unsafe file path: {e}"),
-            );
+    let excerpt = match read_excerpt(repo_root, finding) {
+        Ok(e) => e,
+        Err(reason) => {
+            push_evidence(finding, EvidenceKind::PocSkipped, "poc_skipped", &reason);
             return;
         }
     };
-    // A model can name a secret file, or a symlink to one: its text must not
-    // go into the PoC prompt.
-    if let Some(reason) = crate::util::secret_file_reason(&finding.file, &abs) {
-        push_evidence(finding, EvidenceKind::PocSkipped, "poc_skipped", &reason);
+
+    // O2: for a class with a feasible in-sandbox effect oracle, take the
+    // harness-judged path (nonce/canary oracle, control + fresh re-run) instead
+    // of the printed-conclusion transcript. Unsupported classes fall through to
+    // the standalone pattern-demonstration path below.
+    if let Some(class) = super::poc_oracle::classify(finding) {
+        super::poc_oracle::run_for_finding(finding, caller, &excerpt, class, budget).await;
         return;
     }
-    let excerpt = match std::fs::read_to_string(&abs) {
-        Ok(content) => match numbered_context_window(&content, finding.line, CONTEXT_LINES) {
-            Some(w) => w,
-            None => {
-                push_evidence(
-                    finding,
-                    EvidenceKind::PocSkipped,
-                    "poc_skipped",
-                    "claimed line is outside the file",
-                );
-                return;
-            }
-        },
-        Err(e) => {
-            push_evidence(
-                finding,
-                EvidenceKind::PocSkipped,
-                "poc_skipped",
-                &format!("referenced file unreadable: {e}"),
-            );
-            return;
-        }
-    };
 
     let prompt = build_poc_prompt(finding, &excerpt);
     let raw = match caller.complete(&prompt).await {
@@ -377,6 +417,24 @@ pub async fn maybe_run_poc<C: LlmCaller>(
             );
         }
     }
+}
+
+/// The fresh, numbered excerpt around the finding's line, for a PoC or a
+/// fix-check prompt. `Err` is the human-readable skip reason.
+pub(super) fn read_excerpt(repo_root: &Path, finding: &Finding) -> Result<String, String> {
+    // The model-supplied path is read only through `resolve_in_repo`: an
+    // absolute, `..` or symlinked path can never leave the repo root.
+    let abs = crate::util::resolve_in_repo(repo_root, &finding.file)
+        .map_err(|e| format!("unsafe file path: {e}"))?;
+    // A model can name a secret file, or a symlink to one: its text must not
+    // go into the PoC prompt.
+    if let Some(reason) = crate::util::secret_file_reason(&finding.file, &abs) {
+        return Err(reason);
+    }
+    let content =
+        std::fs::read_to_string(&abs).map_err(|e| format!("referenced file unreadable: {e}"))?;
+    numbered_context_window(&content, finding.line, CONTEXT_LINES)
+        .ok_or_else(|| "claimed line is outside the file".to_string())
 }
 
 /// Image the PoC sandbox runs (`--poc-image`, default

@@ -1,0 +1,71 @@
+{
+  "adapter": {
+    "error": "extra or wrong Cargo BOM package",
+    "status": "refused"
+  },
+  "case": "multiple-manifests",
+  "features": "default",
+  "lockfile_sha256": "b91cc31eba40ddd281da73e23789f7618e0fba7fc66674647f38cc96d4123002",
+  "metadata": {
+    "edges": [
+      "multiple-manifests@0.1.0 -> itoa@1.0.15"
+    ],
+    "packages": {
+      "itoa@1.0.15": {
+        "license": "MIT OR Apache-2.0",
+        "origin": "registry"
+      },
+      "multiple-manifests@0.1.0": {
+        "license": "Apache-2.0",
+        "origin": "path"
+      }
+    },
+    "roots": [
+      "multiple-manifests@0.1.0"
+    ],
+    "status": "ok"
+  },
+  "precursor": {
+    "packages": {
+      "itoa@1.0.15": {
+        "license": null,
+        "origin": "registry"
+      },
+      "multiple-manifests@0.1.0": {
+        "license": null,
+        "origin": "path"
+      }
+    },
+    "rustc": "1.101.0-nightly",
+    "status": "ok",
+    "toolchain": "nightly-2026-10-17"
+  },
+  "schema": 1,
+  "syft": {
+    "duplicates": [],
+    "packages": {
+      "itoa@1.0.15": {
+        "licenses": []
+      },
+      "legacy-tool@0.1.0": {
+        "licenses": []
+      },
+      "memchr@2.8.3": {
+        "licenses": []
+      },
+      "multiple-manifests@0.1.0": {
+        "licenses": []
+      },
+      "ryu@1.0.23": {
+        "licenses": []
+      }
+    },
+    "status": "ok"
+  },
+  "syft_scope": "directory",
+  "target": "aarch64-apple-darwin",
+  "tools": {
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "syft": "1.34.2"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "decoy",
+      "bom-ref": "decoy"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "ryu",
+      "version": "1.0.23",
+      "bom-ref": "pkg:cargo/ryu@1.0.23",
+      "purl": "pkg:cargo/ryu@1.0.23"
+    }
+  ]
+}

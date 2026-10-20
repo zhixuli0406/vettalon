@@ -1,0 +1,6 @@
+# OSV-Scanner / OpenSSF Scorecard: these advisories are expected in this frozen
+# reachability corpus host. It is never built into or shipped with Vettalon.
+
+[[IgnoredVulns]]
+id = "GO-2022-0244"
+reason = "Reachability corpus fixture: pins github.com/satori/go.uuid v1.2.1-0.20180103161547-0ef6afb2f6cd on purpose; GO-2022-0244 is the corpus target. Not shipped."

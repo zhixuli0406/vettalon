@@ -216,6 +216,43 @@ credentials, bounds execution to 180 seconds and does not publish. Missing token
 rate limiting or timeout is not a successful assessment. See
 [Best Practices evidence/gaps](../../docs/TRUST-BEST-PRACTICES.md).
 
+## Cargo SBOM differential test
+
+`sbom_diff.py collect` records one case; `report` recomputes metrics offline.
+Collection needs the pinned venv (the adapter validates the schema), Syft,
+Cargo with a warm registry cache, and optionally a nightly toolchain. It runs
+`cargo metadata --locked --offline` and `cargo +<nightly> build --locked
+--offline -Zsbom` with `CARGO_BUILD_SBOM=true` and a disposable
+`CARGO_TARGET_DIR`; nothing is downloaded and no lockfile is written.
+
+```bash
+.venv-trust/bin/python scripts/trust/sbom_diff.py collect --source fixtures/sbom/rust \
+  --case rust --syft /tmp/NEW_TRUST_DIRECTORY/syft --target aarch64-apple-darwin \
+  --precursor-toolchain nightly-2026-10-17 --record-bom --output /tmp/NEW_SBOM_DIFF/rust
+python3 scripts/trust/sbom_diff.py report fixtures/sbom/differential/rust/snapshot.json
+```
+
+Use `--lock-only` for a workspace: Syft then scans a staged copy holding only
+`Cargo.toml`, `Cargo.lock` and `crates/*/Cargo.toml`, so other lockfiles in the
+tree cannot leak in. `--features` is passed to `cargo metadata` (default features
+otherwise). The precursor is a nightly-only oracle with known issues; a failed
+precursor build is recorded, never substituted.
+
+Each case keeps `snapshot.json` (oracle and observed inventories, tool versions,
+lock hash, adapter outcome) and, with `--record-bom`, the raw Syft BOM with
+absolute paths, timestamp and serial number removed. Verdicts are `refused`,
+`matches-oracle`, `differs-from-oracle` or `accepted-invalid-input` (Cargo
+itself rejects the input). Recorded cases live in `fixtures/sbom/differential/`;
+`tests/test_sbom_diff.py` replays them without Syft or Cargo:
+
+```bash
+python3 -B -I -S -m unittest discover -s scripts/trust/tests -p 'test_sbom_diff.py'
+```
+
+Without `jsonschema` one full-adapter replay test is skipped; the graph replay
+still runs. The stale-lock test is an expected failure (known limitation, see
+[Trust](../../docs/TRUST.md#how-accurate-is-the-cargo-inventory)).
+
 ## Native graph reconciliation examples
 
 ```bash

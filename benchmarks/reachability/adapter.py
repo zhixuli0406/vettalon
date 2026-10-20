@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import selectors
@@ -16,9 +17,15 @@ import subprocess
 import tempfile
 import time
 
-ADAPTER_VERSION = "0.2.0"
+ADAPTER_VERSION = "0.3.0"
 TOOL_VERSION = "v1.4.0"
 TARGET = {"id": "GO-2021-0113", "purl": "pkg:golang/golang.org/x/text@v0.3.5", "module": "golang.org/x/text", "version": "v0.3.5"}
+# Source-mode call graphs do not follow reflection, unsafe pointer laundering
+# or go:linkname (govulncheck documents reflect/unsafe as false-negative
+# sources). A host that uses them never gets not-observed, only unknown.
+BLIND_SPOT_IMPORTS = ("reflect", "unsafe")
+BLIND_SPOT_FILE_LIMIT = 4096
+BLIND_SPOT_BYTE_LIMIT = 32 * 1024 * 1024
 CACHE_FIELDS = ("purl", "advisory", "dependency_source_sha256", "host_source_sha256", "toolchain", "tool_binary_sha256", "tool_version", "adapter_version", "adapter_source_sha256", "features", "tags", "target", "db_snapshot_sha256", "scan_options")
 
 
@@ -45,6 +52,40 @@ def tree_hash(root):
             hasher.update(path.relative_to(root).as_posix().encode() + b"\0")
             hasher.update(len(content).to_bytes(8, "big") + content)
     return hasher.hexdigest()
+
+
+def blind_spot_signals(root):
+    """Conservatively list host-authored reflection/unsafe/linkname use.
+
+    Scans every non-test .go file outside vendor/testdata/./_ directories for
+    any "reflect"/"unsafe" string literal or //go:linkname line. It does not
+    parse, strip comments or evaluate build tags, so it can only over-report. Third-party
+    dependency code is out of scope (documented residual blind spot).
+    """
+    root = Path(root)
+    signals = set()
+    files = 0
+    size = 0
+    for path in sorted(root.rglob("*.go")):
+        parts = path.relative_to(root).parts
+        if (path.name.endswith("_test.go") or any(part in ("vendor", "testdata") or part.startswith((".", "_")) for part in parts[:-1])):
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("unsupported host source entry")
+        files += 1
+        content = path.read_bytes()
+        size += len(content)
+        if files > BLIND_SPOT_FILE_LIMIT or size > BLIND_SPOT_BYTE_LIMIT:
+            raise ValueError("host source exceeds blind-spot scan limit")
+        text = content.decode("utf-8", "replace")
+        if re.search(r"(?m)^\s*//go:linkname\s", text):
+            signals.add("linkname")
+        # Any interpreted or raw string literal naming the package counts;
+        # a non-import literal only adds a false unknown, never a miss.
+        for name in BLIND_SPOT_IMPORTS:
+            if re.search(r'["`]' + name + r'["`]', text):
+                signals.add(name)
+    return sorted(signals)
 
 
 def cache_key(material):
@@ -99,7 +140,9 @@ def classify(raw, returncode, target):
             if frame.get("module") != target["module"] or frame.get("version") != target["version"]:
                 raise ValueError("target frame mismatch")
             if frame.get("function"):
-                symbol = (frame.get("receiver", "") + "." if frame.get("receiver") else "") + frame["function"]
+                # govulncheck reports pointer receivers as "*T"; advisories list "T.Method".
+                receiver = frame.get("receiver", "").lstrip("*").split("[", 1)[0]
+                symbol = (receiver + "." if receiver else "") + frame["function"]
                 if (frame.get("package"), symbol) not in symbols:
                     raise ValueError("unrecognised symbol")
                 traces.append(trace)
@@ -423,7 +466,8 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
 
 
-def scan(project, output, tool, *, language="go", dependency=None, db=None, tags="", target=None, cache=None, timeout=120):
+def scan(project, output, tool, *, language="go", dependency=None, db=None, tags="", target=None, cache=None, timeout=120,
+         candidate=None, goflags=""):
     project, output, tool = Path(project).resolve(), Path(output).resolve(), Path(tool).resolve()
     protected = [project] + [Path(path).resolve() for path in (dependency, db) if path is not None]
     destinations = [output] + ([Path(cache).resolve()] if cache else [])
@@ -434,7 +478,8 @@ def scan(project, output, tool, *, language="go", dependency=None, db=None, tags
     except FileExistsError:
         return unknown("output-exists")
     result = unknown("unsupported" if language != "go" else "missing-tool")
-    result.update({"adapter_version": ADAPTER_VERSION, "candidate": TARGET, "cache": {"hit": False}, "scope": "single-advisory Go source symbol analysis"})
+    candidate = dict(candidate or TARGET)
+    result.update({"adapter_version": ADAPTER_VERSION, "candidate": candidate, "cache": {"hit": False}, "scope": "single-advisory Go source symbol analysis"})
     try:
         if language != "go" or not tool.is_file():
             return result
@@ -442,17 +487,30 @@ def scan(project, output, tool, *, language="go", dependency=None, db=None, tags
             raise ValueError("dependency source and local DB snapshot are required")
         dependency, db = Path(dependency).resolve(), Path(db).resolve()
         module = (project / "go.mod").read_text()
-        if "replace" in module or "toolchain" in module or TARGET["module"] + " " + TARGET["version"] not in module:
+        if set(candidate) != {"id", "purl", "module", "version"} or not all(isinstance(v, str) and v for v in candidate.values()):
+            raise ValueError("candidate needs id, purl, module and version")
+        if goflags not in ("", "-mod=mod"):
+            raise ValueError("only empty GOFLAGS or -mod=mod are supported")
+        if candidate["purl"] != "pkg:golang/%s@%s" % (candidate["module"], candidate["version"]):
+            raise ValueError("candidate purl must name the same module and version")
+        pinned = re.search(r"(?m)^\s*(?:require\s+)?" + re.escape(candidate["module"]) + r"\s+" + re.escape(candidate["version"]) + r"(?:\s|$)", module)
+        if "replace" in module or "toolchain" in module or pinned is None:
             raise ValueError("fixture must pin target without replace/toolchain")
-        if not (dependency / "go.mod").read_text().startswith("module " + TARGET["module"] + "\n"):
-            raise ValueError("dependency source module mismatch")
+        dependency_mod = dependency / "go.mod"
+        if dependency_mod.exists() or dependency_mod.is_symlink():
+            declared = re.search(r'(?m)^module\s+"?([^"\s]+)"?\s*$', dependency_mod.read_text())
+            if declared is None or declared.group(1) != candidate["module"]:
+                raise ValueError("dependency source module mismatch")
+        elif not dependency.is_dir():
+            raise ValueError("dependency source directory missing")
+        # Pre-module sources (no go.mod) are bound only by the go list Dir check below.
         go = shutil.which("go")
         if not go:
             result["reason"] = "missing-go"
             return result
         with tempfile.TemporaryDirectory(prefix="vettalon-reachability-") as home:
             env = {"PATH": str(Path(go).parent) + os.pathsep + os.defpath, "HOME": home, "TMPDIR": tempfile.gettempdir(),
-                   "GOTOOLCHAIN": "local", "GOENV": "off", "GOWORK": "off", "GOFLAGS": "", "CGO_ENABLED": "0", "GOTELEMETRY": "off",
+                   "GOTOOLCHAIN": "local", "GOENV": "off", "GOWORK": "off", "GOFLAGS": goflags, "CGO_ENABLED": "0", "GOTELEMETRY": "off",
                    "GOPROXY": "off", "GOSUMDB": "off", "GOMODCACHE": str(dependency.parents[2]),
                    "GOCACHE": str(Path(tempfile.gettempdir()) / "vettalon-reachability-go-build")}
             # GOMODCACHE is the explicit preloaded cache root, not a dependency-relative guess.
@@ -466,13 +524,13 @@ def scan(project, output, tool, *, language="go", dependency=None, db=None, tags
             if not successful_run(version_run) or not successful_run(env_run):
                 result["reason"] = "toolchain-error"
                 return result
-            resolution = invoke([go, "list", "-m", "-json", TARGET["module"]], project, env, 20)
+            resolution = invoke([go, "list", "-m", "-json", candidate["module"]], project, env, 20)
             result["preflight"]["module_resolution"] = resolution
             write_json(output / "module-resolution.json", resolution)
             try:
                 resolved = json.loads(resolution["stdout"])
-                if (not successful_run(resolution) or resolved.get("Path") != TARGET["module"]
-                        or resolved.get("Version") != TARGET["version"] or "Replace" in resolved
+                if (not successful_run(resolution) or resolved.get("Path") != candidate["module"]
+                        or resolved.get("Version") != candidate["version"] or "Replace" in resolved
                         or Path(resolved["Dir"]).resolve() != dependency):
                     raise ValueError("resolved dependency source mismatch")
             except (ValueError, KeyError, TypeError):
@@ -483,12 +541,13 @@ def scan(project, output, tool, *, language="go", dependency=None, db=None, tags
             if len(selected.split("/")) != 2:
                 raise ValueError("target must be GOOS/GOARCH")
             env["GOOS"], env["GOARCH"] = selected.split("/")
-            material = {"purl": TARGET["purl"], "advisory": TARGET["id"], "dependency_source_sha256": tree_hash(dependency),
+            material = {"purl": candidate["purl"], "advisory": candidate["id"], "dependency_source_sha256": tree_hash(dependency),
                         "host_source_sha256": tree_hash(project), "toolchain": version_run["stdout"].strip(),
                         "tool_binary_sha256": digest(tool.read_bytes()), "tool_version": TOOL_VERSION,
                         "adapter_version": ADAPTER_VERSION, "adapter_source_sha256": digest(implementation_fingerprint().encode()),
                         "features": {"cgo": False, "goexperiment": "", "test": False}, "tags": tags,
-                        "target": selected, "db_snapshot_sha256": tree_hash(db), "scan_options": ["source", "symbol", "./..."]}
+                        "target": selected, "db_snapshot_sha256": tree_hash(db),
+                        "scan_options": ["source", "symbol", "./..."] + (["GOFLAGS=" + goflags] if goflags else [])}
             key = cache_key(material)
             result.update({"cache_key": key, "cache_material": material, "data_flow": "preloaded dependency and local advisory subset; GOPROXY=off; no credentials inherited; no host execution"})
             lockroot = Path(tempfile.gettempdir()) / "vettalon-reachability.lock"
@@ -502,9 +561,9 @@ def scan(project, output, tool, *, language="go", dependency=None, db=None, tags
                 cached = None
                 if cachefile and cachefile.exists():
                     try:
-                        candidate = json.loads(cachefile.read_text())
-                        if candidate["key"] == key and valid_cached_run(candidate.get("run")) and candidate["raw_sha256"] == digest(candidate["run"]["stdout"].encode()):
-                            cached = candidate["run"]
+                        entry = json.loads(cachefile.read_text())
+                        if entry["key"] == key and valid_cached_run(entry.get("run")) and entry["raw_sha256"] == digest(entry["run"]["stdout"].encode()):
+                            cached = entry["run"]
                     except (ValueError, KeyError, TypeError):
                         pass
                 if cached:
@@ -515,7 +574,12 @@ def scan(project, output, tool, *, language="go", dependency=None, db=None, tags
                     if tags:
                         command += ["-tags=" + tags]
                     run = invoke(command + ["./..."], project, env, timeout)
-                result.update(classify(run["stdout"], run["returncode"], TARGET))
+                result.update(classify(run["stdout"], run["returncode"], candidate))
+                if result["status"] == "not-observed":
+                    signals = blind_spot_signals(project)
+                    if signals:
+                        result.update(unknown("blind-spot-" + "+".join(signals)))
+                        result["blind_spot_signals"] = signals
                 if not successful_run(run):
                     result.update(unknown(run.get("error") or "incomplete-process-observation"))
                 result["run"] = {k: v for k, v in run.items() if k not in ("stdout", "stderr")}

@@ -1,0 +1,349 @@
+{
+  "schema": 1,
+  "snapshot": {
+    "source": "https://vuln.go.dev/ID/{id}.json",
+    "fetched": "2026-10-20",
+    "license": "Go vulnerability database entries, CC-BY-4.0 (https://go.dev/security/vuln/database#license)",
+    "files": {
+      "GO-2020-0015.json": "78ceda18ba81b46a842b4d6d3574cf8b0d791f5d66d57d2325096ecc181ec8f8",
+      "GO-2020-0016.json": "2c518da032e195c363c041bf800ed9eae1ab04e2829eb9a526e68fafe23aba5d",
+      "GO-2020-0017.json": "d5dd2d641233c3b5015b37e62fe7577b852ab13f448e33abacaa606f9c8a54f8",
+      "GO-2020-0036.json": "ce331ce5dd659b0e01e250621d1f743bec8e3b7cece975561c08066bd63b96bf",
+      "GO-2021-0057.json": "e803fa3e9a8300f6351eb24a90157724f0975a8965cd18e8867e088fbd57885a",
+      "GO-2021-0265.json": "f7414288d7b1ac990cd5d044d94ecd13081f39ffaae8b570e153dc520eab5958",
+      "GO-2022-0244.json": "aa40e0f302ac5485c92ffea620e55bb5856163becf2331dd482d801615760b54",
+      "GO-2022-0411.json": "5e0476205c7ddb4fa942bec8da6bcc3142a0a0317448622a1e923a2009503746",
+      "GO-2022-0603.json": "49930ea2394a3538ccc6d855b5f1efef1d49f7a9d233e3b6e7c586d7796a033d",
+      "GO-2022-1059.json": "b682462a0c7d24750246ac8b2af740e2a672beb510731adcd2263a09022c30d7",
+      "GO-2023-1572.json": "331bfd49f3a39ac0ccc2fdc484037083619f71721b8daf4172d67e41f9f3fb09",
+      "GO-2024-3333.json": "d4107c3597189f219efcb4106f6cc5ac762fea0e5cfae2292cd9ca090ac5cff0",
+      "GO-2025-3525.json": "07381255cc0363e9cd16a7e13acf2189a550a2d235fe63371006d27afc7bc5bd",
+      "GO-2025-3553.json": "d5fa3347af1c941751e999918b8f0e9735dd0d200acaf790315a7178254aabab",
+      "GO-2025-4188.json": "674c7089ab893a20abc351a432be410befe5a0f89fa7b8a916d966f730bfe416",
+      "GO-2026-5320.json": "8f5dac8bc2c9e051a6dbb4719c7306d05ccad808a0c7a368aa2d37aef7da1b10"
+    }
+  },
+  "pinned_govulncheck": "v1.4.0",
+  "blind_spot_classes": [
+    "reflection",
+    "interface",
+    "funcvalue",
+    "unsafe"
+  ],
+  "advisories": [
+    {
+      "id": "GO-2020-0015",
+      "module": "golang.org/x/text",
+      "version": "v0.3.2",
+      "summary": "Infinite loop when decoding some inputs in golang.org/x/text",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2022-1059",
+      "module": "golang.org/x/text",
+      "version": "v0.3.7",
+      "summary": "Denial of service via crafted Accept-Language header in golang.org/x/text/language",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2020-0036",
+      "module": "gopkg.in/yaml.v2",
+      "version": "v2.2.7",
+      "summary": "Excessive resource consumption in YAML parsing in gopkg.in/yaml.v2",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2022-0603",
+      "module": "gopkg.in/yaml.v3",
+      "version": "v3.0.0-20210107192922-496545a6307b",
+      "summary": "Panic in gopkg.in/yaml.v3",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2021-0265",
+      "module": "github.com/tidwall/gjson",
+      "version": "v1.9.2",
+      "summary": "Denial of service via maliciously crafted path in github.com/tidwall/gjson",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2020-0017",
+      "module": "github.com/dgrijalva/jwt-go",
+      "version": "v3.2.0+incompatible",
+      "summary": "Authorization bypass in github.com/dgrijalva/jwt-go",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2025-3553",
+      "module": "github.com/golang-jwt/jwt/v5",
+      "version": "v5.2.1",
+      "summary": "Excessive memory allocation during header parsing in github.com/golang-jwt/jwt",
+      "modified": "2025-04-08T21:04:08Z"
+    },
+    {
+      "id": "GO-2020-0016",
+      "module": "github.com/ulikunitz/xz",
+      "version": "v0.5.7",
+      "summary": "Infinite loop in github.com/ulikunitz/xz",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2022-0411",
+      "module": "github.com/Masterminds/goutils",
+      "version": "v1.1.0",
+      "summary": "Insufficient randomness in github.com/Masterminds/goutils",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2022-0244",
+      "module": "github.com/satori/go.uuid",
+      "version": "v1.2.1-0.20180103161547-0ef6afb2f6cd",
+      "summary": "Insufficient randomness in UUIDs in github.com/satori/go.uuid",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2021-0057",
+      "module": "github.com/buger/jsonparser",
+      "version": "v1.1.0",
+      "summary": "Panic due to improper input validation in github.com/buger/jsonparser",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2023-1572",
+      "module": "golang.org/x/image",
+      "version": "v0.4.0",
+      "summary": "Denial of service via crafted TIFF image in golang.org/x/image/tiff",
+      "modified": "2024-05-20T16:03:47Z"
+    },
+    {
+      "id": "GO-2024-3333",
+      "module": "golang.org/x/net",
+      "version": "v0.32.0",
+      "summary": "Non-linear parsing of case-insensitive content in golang.org/x/net/html",
+      "modified": "2024-12-20T20:37:27Z"
+    },
+    {
+      "id": "GO-2025-3525",
+      "module": "github.com/expr-lang/expr",
+      "version": "v1.16.9",
+      "summary": "Memory Exhaustion in Expr Parser with Unrestricted Input in github.com/expr-lang/expr",
+      "modified": "2025-03-18T16:33:22Z"
+    },
+    {
+      "id": "GO-2025-4188",
+      "module": "github.com/sirupsen/logrus",
+      "version": "v1.9.0",
+      "summary": "Logrus is vulnerable to DoS when using Entry.writerScanner in github.com/sirupsen/logrus",
+      "modified": "2026-01-20T16:59:56Z"
+    },
+    {
+      "id": "GO-2026-5320",
+      "module": "github.com/yuin/goldmark",
+      "version": "v1.7.16",
+      "summary": "Cross-site Scripting (XSS) in github.com/yuin/goldmark",
+      "modified": "2026-07-07T16:52:19Z"
+    }
+  ],
+  "hosts": [
+    {
+      "name": "go-2020-0015-called",
+      "class": "called",
+      "advisory": "GO-2020-0015"
+    },
+    {
+      "name": "go-2020-0015-not-called",
+      "class": "not-called",
+      "advisory": "GO-2020-0015"
+    },
+    {
+      "name": "go-2022-1059-called",
+      "class": "called",
+      "advisory": "GO-2022-1059"
+    },
+    {
+      "name": "go-2022-1059-not-called",
+      "class": "not-called",
+      "advisory": "GO-2022-1059"
+    },
+    {
+      "name": "go-2020-0036-called",
+      "class": "called",
+      "advisory": "GO-2020-0036"
+    },
+    {
+      "name": "go-2020-0036-not-called",
+      "class": "not-called",
+      "advisory": "GO-2020-0036"
+    },
+    {
+      "name": "go-2022-0603-called",
+      "class": "called",
+      "advisory": "GO-2022-0603"
+    },
+    {
+      "name": "go-2022-0603-not-called",
+      "class": "not-called",
+      "advisory": "GO-2022-0603"
+    },
+    {
+      "name": "go-2021-0265-called",
+      "class": "called",
+      "advisory": "GO-2021-0265"
+    },
+    {
+      "name": "go-2021-0265-not-called",
+      "class": "not-called",
+      "advisory": "GO-2021-0265"
+    },
+    {
+      "name": "go-2020-0017-called",
+      "class": "called",
+      "advisory": "GO-2020-0017"
+    },
+    {
+      "name": "go-2020-0017-not-called",
+      "class": "not-called",
+      "advisory": "GO-2020-0017"
+    },
+    {
+      "name": "go-2025-3553-called",
+      "class": "called",
+      "advisory": "GO-2025-3553"
+    },
+    {
+      "name": "go-2025-3553-not-called",
+      "class": "not-called",
+      "advisory": "GO-2025-3553"
+    },
+    {
+      "name": "go-2020-0016-called",
+      "class": "called",
+      "advisory": "GO-2020-0016"
+    },
+    {
+      "name": "go-2020-0016-not-called",
+      "class": "not-called",
+      "advisory": "GO-2020-0016"
+    },
+    {
+      "name": "go-2022-0411-called",
+      "class": "called",
+      "advisory": "GO-2022-0411"
+    },
+    {
+      "name": "go-2022-0411-not-called",
+      "class": "not-called",
+      "advisory": "GO-2022-0411"
+    },
+    {
+      "name": "go-2022-0244-called",
+      "class": "called",
+      "advisory": "GO-2022-0244"
+    },
+    {
+      "name": "go-2022-0244-not-called",
+      "class": "not-called",
+      "advisory": "GO-2022-0244"
+    },
+    {
+      "name": "go-2021-0057-called",
+      "class": "called",
+      "advisory": "GO-2021-0057"
+    },
+    {
+      "name": "go-2021-0057-not-called",
+      "class": "not-called",
+      "advisory": "GO-2021-0057"
+    },
+    {
+      "name": "go-2023-1572-called",
+      "class": "called",
+      "advisory": "GO-2023-1572"
+    },
+    {
+      "name": "go-2023-1572-not-called",
+      "class": "not-called",
+      "advisory": "GO-2023-1572"
+    },
+    {
+      "name": "go-2024-3333-called",
+      "class": "called",
+      "advisory": "GO-2024-3333"
+    },
+    {
+      "name": "go-2024-3333-not-called",
+      "class": "not-called",
+      "advisory": "GO-2024-3333"
+    },
+    {
+      "name": "go-2025-3525-called",
+      "class": "called",
+      "advisory": "GO-2025-3525"
+    },
+    {
+      "name": "go-2025-3525-not-called",
+      "class": "not-called",
+      "advisory": "GO-2025-3525"
+    },
+    {
+      "name": "go-2025-4188-called",
+      "class": "called",
+      "advisory": "GO-2025-4188"
+    },
+    {
+      "name": "go-2025-4188-not-called",
+      "class": "not-called",
+      "advisory": "GO-2025-4188"
+    },
+    {
+      "name": "go-2026-5320-called",
+      "class": "called",
+      "advisory": "GO-2026-5320"
+    },
+    {
+      "name": "go-2026-5320-not-called",
+      "class": "not-called",
+      "advisory": "GO-2026-5320"
+    },
+    {
+      "name": "blind-reflection-jwt-go",
+      "class": "reflection",
+      "advisory": "GO-2020-0017"
+    },
+    {
+      "name": "blind-reflection-jwt-v5",
+      "class": "reflection",
+      "advisory": "GO-2025-3553"
+    },
+    {
+      "name": "blind-interface-x-text",
+      "class": "interface",
+      "advisory": "GO-2020-0015"
+    },
+    {
+      "name": "blind-interface-xz",
+      "class": "interface",
+      "advisory": "GO-2020-0016"
+    },
+    {
+      "name": "blind-funcvalue-yaml-v2",
+      "class": "funcvalue",
+      "advisory": "GO-2020-0036"
+    },
+    {
+      "name": "blind-funcvalue-gjson",
+      "class": "funcvalue",
+      "advisory": "GO-2021-0265"
+    },
+    {
+      "name": "blind-unsafe-linkname-goutils",
+      "class": "unsafe",
+      "advisory": "GO-2022-0411"
+    },
+    {
+      "name": "blind-unsafe-pointer-x-image",
+      "class": "unsafe",
+      "advisory": "GO-2023-1572"
+    }
+  ]
+}

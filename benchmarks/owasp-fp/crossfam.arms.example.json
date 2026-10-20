@@ -1,0 +1,19 @@
+{
+ "schema": "owasp-xfam-arms-v1",
+ "note": "Placeholders. Before a formal run the owner names two families, a primary and a peer model per family (the peer close in capability to the other family's primary), and a roster with the same ids.",
+ "refuter_runs": 3,
+ "models": {
+  "a1": {"family": "family-a"},
+  "a2": {"family": "family-a"},
+  "b1": {"family": "family-b"},
+  "b2": {"family": "family-b"}
+ },
+ "arms": [
+  {"id": "A>B", "finder": "a1", "refuter": "b1"},
+  {"id": "B>A", "finder": "b1", "refuter": "a1"},
+  {"id": "A>A2", "finder": "a1", "refuter": "a2"},
+  {"id": "B>B2", "finder": "b1", "refuter": "b2"},
+  {"id": "A>A=", "finder": "a1", "refuter": "a1"},
+  {"id": "B>B=", "finder": "b1", "refuter": "b1"}
+ ]
+}

@@ -539,6 +539,7 @@ async fn bounded_live_public_hunt_transport() {
         reaudit_known: true,
         per_dep_timeout: Duration::from_secs(30),
         dep_concurrency: 1,
+        ..Default::default()
     };
     let started = Instant::now();
     let result = tokio::time::timeout(

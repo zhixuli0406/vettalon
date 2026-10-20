@@ -166,6 +166,11 @@ class ResourceReportTests(unittest.TestCase):
         self.assertEqual(result['kind'], 'legacy-synthetic-twins-readonly')
         self.assertIsNone(result['metrics']['cpu_seconds'])
         self.assertIsNone(result['metrics']['peak_memory_bytes'])
+        # Every metrics rate is also reported with an interval and its n.
+        rates = result['uncertainty']['rates']
+        self.assertFalse(result['uncertainty']['normal_approximation_used'])
+        self.assertEqual(rates['detection_recall']['n'], result['metrics']['positive_denominator'])
+        self.assertEqual(rates['detection_recall']['point_bounds'], result['metrics']['detection_recall_bounds'])
 
 
 if __name__ == '__main__': unittest.main()

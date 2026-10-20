@@ -15,6 +15,8 @@ transport = runner.transport
 protocol = runner.protocol
 review = runner._load(HERE / 'review_v1.py', 'formal_report_review')
 cost = runner._load(HERE / 'cost_v1.py', 'formal_report_cost')
+# Shared interval reporting: every metrics rate also gets [lo, hi] and n.
+uncertainty = runner._load(HERE.parent / 'common' / 'report_schema.py', 'formal_report_uncertainty')
 RAW_CAP = 16 * 1024 * 1024
 ARTIFACT_CAP = 4 * 1024 * 1024
 ARTIFACT_TOTAL_CAP = 16 * 1024 * 1024
@@ -212,6 +214,8 @@ def _read_report(raw_path, denominator_path=None, *, include_worksheet=False, re
     else:
         raise ValueError('Only historical synthetic twins and formal-v1 are supported')
     _postcheck(snapshots)
+    if type(result.get('metrics')) is dict:
+        result = {**result, 'uncertainty': uncertainty.adjudication_uncertainty(result['metrics'])}
     return result
 
 

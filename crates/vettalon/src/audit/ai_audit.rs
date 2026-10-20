@@ -29,7 +29,7 @@ use vettalon_contract::strict_json::{self, Violation};
 use super::coverage::{DEFER_CANDIDATE_CAP, DEFER_ENGINE_UNAVAILABLE, DEFER_TIME_BUDGET};
 use super::intake::HotspotFile;
 use super::llm_util::{escape_xml_tag, extract_context_window, number_lines, slugify};
-use super::precheck::{self, DiskLines};
+use super::precheck::{self, DiskLines, LineOracle};
 use super::prompts::{
     ANCHORS_ZH_TW, ANTI_PATTERNS, LINE_NUMBER_INSTRUCTIONS, THREAT_MODEL_INSTRUCTIONS,
     TRACE_CONDITIONS_INSTRUCTIONS,
@@ -394,6 +394,11 @@ pub struct RawCandidate {
     pub trace: Vec<TraceStep>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// O9: optional proposed fix (dual-finder modules ask for it). Read
+    /// leniently: a malformed fix is dropped, it never voids the reply, since
+    /// it only feeds the dedupe ([`super::dual_finder::clean_fix`]).
+    #[serde(default)]
+    pub fix: Option<serde_json::Value>,
 }
 
 /// Parse an ai_audit reply with the strict contract: the whole reply must be
@@ -494,7 +499,14 @@ fn candidate_to_finding(
         .filter(|s| !s.is_empty())
         .unwrap_or(rc.file.as_str());
     f.root_fingerprint = compute_root_fingerprint(AI_AUDIT_ENGINE, &rule_id, &rc.file, scope);
-    f.cwe = rc.cwe.as_deref().and_then(crate::audit::cwe::normalize);
+    // A Discouraged/Prohibited id (Pillar, Category, CWE-20 …) gives way to
+    // a more specific child only when the model's own category names it.
+    let (cwe, cwe_replaced) = crate::audit::cwe::prefer_specific(
+        rc.cwe.as_deref().and_then(crate::audit::cwe::normalize),
+        &rc.kind,
+    );
+    f.cwe = cwe;
+    f.cwe_replaced = cwe_replaced;
     f.threat_model = Some(ThreatModel {
         principal: cap(&rc.threat_model.principal),
         input: cap(&rc.threat_model.input),
@@ -522,6 +534,11 @@ fn candidate_to_finding(
             description: cap(&c.description),
         })
         .collect();
+    f.proposed_fix = super::dual_finder::clean_fix(rc.fix.as_ref(), prompt_paths, |p| {
+        vettalon_contract::safe_path::SafeRepoPath::parse(p)
+            .ok()
+            .and_then(|safe| oracle.line_count(&safe))
+    });
     precheck::apply_precheck(&mut f, violations);
     f
 }
@@ -753,6 +770,7 @@ pub async fn run_ai_audit_capped<C: LlmCaller>(
             audited: &counter,
             total: modules.len() as u32,
             cross_check: &none,
+            ask_fix: &none,
             deadline: None,
             source_receipts: false,
         },
@@ -771,6 +789,9 @@ pub struct AuditProgress<'a> {
     pub total: u32,
     /// Modules this finder audits as the second, cross-check finder.
     pub cross_check: &'a std::collections::HashSet<String>,
+    /// O9 dual-finder modules: the prompt also asks for a proposed fix per
+    /// candidate (used only to dedupe the two families' candidates).
+    pub ask_fix: &'a std::collections::HashSet<String>,
     /// Scan-wide wall-clock deadline (`--time-budget`). Once past it, the
     /// remaining modules are deferred (`DEFER_TIME_BUDGET`) instead of audited.
     /// Shared by every finder, so they all stop together. `None` = no budget.
@@ -841,6 +862,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         audited,
         total,
         cross_check,
+        ask_fix,
         deadline,
         source_receipts,
     } = progress;
@@ -916,7 +938,10 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         }
 
         let started = std::time::Instant::now();
-        let mp = build_module_prompt_with_receipts(repo_root, module, source_receipts);
+        let mut mp = build_module_prompt_with_receipts(repo_root, module, source_receipts);
+        if ask_fix.contains(&module.module_path) {
+            mp.prompt.push_str(super::dual_finder::FIX_REQUEST);
+        }
         if mp.files.is_empty() {
             let reason =
                 "no readable text content in this module (binary files, unreadable, or all budget-excluded)"
@@ -1579,6 +1604,7 @@ pub(crate) mod tests {
                 audited: &counter,
                 total: modules.len() as u32,
                 cross_check: &none,
+                ask_fix: &none,
                 deadline: None,
                 source_receipts: true,
             },
@@ -1797,6 +1823,7 @@ pub(crate) mod tests {
                 audited: &counter,
                 total: 2,
                 cross_check: &none,
+                ask_fix: &none,
                 deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(20)),
                 source_receipts: false,
             },
@@ -2111,6 +2138,7 @@ pub(crate) mod tests {
                 audited: &counter,
                 total: 2,
                 cross_check: &none,
+                ask_fix: &none,
                 deadline: Some(std::time::Instant::now()),
                 source_receipts: false,
             },

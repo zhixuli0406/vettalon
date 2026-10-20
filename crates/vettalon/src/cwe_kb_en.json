@@ -1,0 +1,738 @@
+[
+  {
+    "id": "CWE-79",
+    "name": "Cross-site scripting (XSS)",
+    "summary": "The application writes user-controlled input into a web page without proper encoding, so an attacker can make malicious JavaScript run in other users' browsers.",
+    "mitigations": [
+      "Apply output encoding that matches the output context (HTML body, attribute, JavaScript, URL).",
+      "Prefer template engines or frontend frameworks that escape output by default, and avoid inserting raw HTML through innerHTML, dangerouslySetInnerHTML or similar APIs.",
+      "If HTML input must be accepted, filter it through a vetted sanitization library (such as DOMPurify) with an allowlist.",
+      "Set a Content-Security-Policy and mark cookies HttpOnly to limit the impact of a successful attack."
+    ],
+    "attack_scenario": "An attacker places a string containing a script tag or event attribute into a field that the page renders as-is: a comment, a display name, a search term, or a crafted link. When a victim loads the page, the script runs in the victim's browser, and the attacker can obtain cookies or session data or send requests as the victim. Stored XSS affects everyone who views the poisoned content; reflected XSS relies on luring a victim into clicking a link. This is often the first step toward account takeover.",
+    "capec": [
+      {"id": "CAPEC-63", "name": "Cross-Site Scripting (XSS)"},
+      {"id": "CAPEC-592", "name": "Stored XSS"},
+      {"id": "CAPEC-591", "name": "Reflected XSS"}
+    ]
+  },
+  {
+    "id": "CWE-89",
+    "name": "SQL injection",
+    "summary": "The application builds SQL statements from external input without handling special characters correctly, so an attacker can change the meaning of a query and read or modify the database directly.",
+    "mitigations": [
+      "Use parameterized queries (prepared statements) instead of building SQL through string concatenation.",
+      "When using an ORM or query builder, keep user input out of raw SQL fragments.",
+      "Map parts that cannot be parameterized, such as table names, column names and sort direction, against a fixed allowlist.",
+      "Grant the application's database account only the minimum privileges it needs."
+    ],
+    "attack_scenario": "An attacker probes any input that ends up in SQL: login forms, search boxes, URL parameters, even HTTP headers. A single quote that changes the response reveals the injection point; the attacker then rewrites the query, uses UNION to pull data from other tables, or uses boolean or time-based blind techniques to recover data character by character. Stolen database credentials or member records are often reused against other systems. In some configurations, database file or command features let the attacker reach the operating system.",
+    "capec": [
+      {"id": "CAPEC-66", "name": "SQL Injection"},
+      {"id": "CAPEC-7", "name": "Blind SQL Injection"}
+    ]
+  },
+  {
+    "id": "CWE-78",
+    "name": "OS command injection",
+    "summary": "The application builds operating system commands from external input without handling special characters correctly, so an attacker can run arbitrary commands on the server.",
+    "mitigations": [
+      "Prefer built-in library APIs of the programming language over calling external shell commands.",
+      "When an external program must run, pass arguments as an array (for example execve, or the list form of subprocess) so no shell parses them.",
+      "Validate input parameters against an allowlist of expected values or characters.",
+      "Run the related processes under a low-privilege account or in a sandbox (container, jail)."
+    ],
+    "attack_scenario": "An attacker targets features that pass input into system commands, such as ping tools, file converters or backup scripts. Using a semicolon, pipe, $() or backticks, the attacker appends a command, first runs something like whoami or sleep to confirm execution, then drops a webshell or moves laterally into the internal network. The attacker gains the privileges of the service account, which is root when the service is misconfigured.",
+    "capec": [
+      {"id": "CAPEC-88", "name": "OS Command Injection"}
+    ]
+  },
+  {
+    "id": "CWE-77",
+    "name": "Command injection",
+    "summary": "The application builds a command from external input for a downstream component to interpret, without handling special characters correctly, so an attacker can change what the command does.",
+    "mitigations": [
+      "Where possible, replace strings passed to an external interpreter with library calls.",
+      "Hard-code the command to run in the program and use external input only as validated arguments.",
+      "Validate every input value that reaches a command against an allowlist."
+    ],
+    "attack_scenario": "An attacker finds a place where input is assembled into a command for some execution or interpreter interface and inserts a separator followed by extra commands. Once execution is confirmed, the attacker escalates privileges step by step or plants a backdoor. The scope is not limited to the OS shell; it also covers custom command parsers inside the application.",
+    "capec": [
+      {"id": "CAPEC-248", "name": "Command Injection"}
+    ]
+  },
+  {
+    "id": "CWE-94",
+    "name": "Code injection",
+    "summary": "The application generates code from external input and then executes it, so an attacker can insert their own code and run it with the application's privileges.",
+    "mitigations": [
+      "Refactor the program to avoid generating and executing code at runtime.",
+      "If this cannot be avoided, validate input against a strict allowlist that permits only the expected format.",
+      "Run dynamic code in a sandbox or restricted environment."
+    ],
+    "attack_scenario": "An attacker gets the application to execute external input as code through eval, dynamic import, or template engine expressions. Once input reaches the interpreter, the attacker can run arbitrary logic, which amounts to remote code execution. Server-side template injection (SSTI) is the most common entry point in recent years.",
+    "capec": [
+      {"id": "CAPEC-242", "name": "Code Injection"}
+    ]
+  },
+  {
+    "id": "CWE-95",
+    "name": "Eval injection",
+    "summary": "The application passes external input to eval or a similar dynamic evaluation function without filtering code syntax, so an attacker can run arbitrary code.",
+    "mitigations": [
+      "Remove dynamic evaluation calls such as eval, Function() and exec, and use explicit data parsing logic instead.",
+      "When a data structure needs parsing, use a safe parser (such as JSON.parse or Python's ast.literal_eval).",
+      "Apply strict allowlist validation to any input that still reaches a dynamic evaluation call."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-1336",
+    "name": "Server-side template injection (SSTI)",
+    "summary": "The application passes external input to a template engine as template content, so an attacker can inject template syntax and often go on to execute code on the server.",
+    "mitigations": [
+      "Do not build templates from user input; pass user data only as template variables.",
+      "Choose a template engine that supports a sandbox or restricted mode, and enable it.",
+      "Limit the functions that templates can call and the objects they can access."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-90",
+    "name": "LDAP injection",
+    "summary": "The application builds LDAP queries from external input without escaping special characters, so an attacker can change the query conditions.",
+    "mitigations": [
+      "Use the escaping functions provided by the LDAP library for all input that goes into filters or DNs.",
+      "Validate input against an allowlist of expected characters.",
+      "Grant the account the application uses to bind to LDAP only the read-only permissions it needs."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-643",
+    "name": "XPath injection",
+    "summary": "The application builds XPath expressions from external input to query XML data, so an attacker can control the structure of the query.",
+    "mitigations": [
+      "Use parameterized XPath queries (for example XQuery variable binding) to keep data separate from query structure.",
+      "Validate input and escape XPath special characters such as quotes."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-917",
+    "name": "Expression language (EL) injection",
+    "summary": "The application builds expression language statements such as EL, OGNL or SpEL from external input, so an attacker can inject expressions and execute code on the server.",
+    "mitigations": [
+      "Keep user-controlled data out of expression interpreters.",
+      "Where this is unavoidable, validate input against an allowlist and escape expression syntax characters.",
+      "Turn off the framework's EL evaluation when it is not needed (for example isELIgnored in JSP)."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-22",
+    "name": "Path traversal",
+    "summary": "The application builds file paths from external input without handling sequences such as '../', so an attacker can access files outside the intended directory.",
+    "mitigations": [
+      "Canonicalize the path, then check that the result is still inside the allowed root directory.",
+      "Do not use user-supplied file names directly; map an ID to the actual file name on the server.",
+      "Restrict file names to an allowlist of characters and reject input containing '..', path separators or absolute paths."
+    ],
+    "attack_scenario": "An attacker inserts ../ into a file name or path parameter to climb out of the intended directory, aiming to read configuration files, keys or system password files, or to overwrite program files when writes are possible. Common variants include URL encoding, double encoding and absolute paths. Once database credentials or API keys are read from a configuration file, the exposure grows from a single file to the entire backend.",
+    "capec": [
+      {"id": "CAPEC-126", "name": "Path Traversal"}
+    ]
+  },
+  {
+    "id": "CWE-73",
+    "name": "External control of file name or path",
+    "summary": "The application lets user input control or influence the path or file name used in file system operations.",
+    "mitigations": [
+      "When the set of files is limited, map fixed IDs to actual file names and reject any other input.",
+      "Validate paths and file names against an allowlist.",
+      "Perform file operations inside a sandbox or restricted directory."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-434",
+    "name": "Unrestricted upload of dangerous file types",
+    "summary": "The application accepts uploads of file types that the system may process or execute automatically (such as .php or .jsp), so an attacker can run code on the server.",
+    "mitigations": [
+      "Restrict allowed file extensions with an allowlist and verify the file content format on the server.",
+      "Generate a new random file name for each upload instead of using the name the user supplied.",
+      "Store uploads outside the web root or in object storage, and configure them as non-executable.",
+      "Set correct Content-Type and Content-Disposition headers when serving downloads."
+    ],
+    "attack_scenario": "An attacker uploads an executable file disguised as an image or document, bypasses the extension or MIME check so it lands in a directory the web server executes, then requests it in a browser to obtain a webshell. A webshell gives the attacker an interactive foothold on the server.",
+    "capec": [
+      {"id": "CAPEC-650", "name": "Upload a Web Shell to a Web Server"}
+    ]
+  },
+  {
+    "id": "CWE-352",
+    "name": "Cross-site request forgery (CSRF)",
+    "summary": "The application cannot confirm that a request reflects the user's own intent, so an attacker can trick a logged-in user into sending a request without knowing it.",
+    "mitigations": [
+      "Verify an unpredictable CSRF token on every state-changing request, preferring the framework's built-in mechanism.",
+      "Set SameSite=Lax or Strict on session cookies.",
+      "Do not use the GET method for state-changing operations.",
+      "Require password re-entry or a second confirmation for high-risk operations."
+    ],
+    "attack_scenario": "An attacker hides an auto-submitting form or request on a page they control and lures a logged-in victim to visit it. The browser attaches the victim's cookies automatically; if the backend trusts the cookie without checking a token, it carries out a transfer, password change or email change as the victim. The victim never notices.",
+    "capec": [
+      {"id": "CAPEC-62", "name": "Cross Site Request Forgery"}
+    ]
+  },
+  {
+    "id": "CWE-918",
+    "name": "Server-side request forgery (SSRF)",
+    "summary": "The server sends requests to URLs supplied from outside without ensuring the destination is the expected one, so an attacker can make the server reach internal services or cloud metadata endpoints on the attacker's behalf.",
+    "mitigations": [
+      "Restrict allowed schemes, hosts and ports with an allowlist rather than relying on blocklists or regular expressions.",
+      "Validate the destination IP after DNS resolution, reject internal, loopback and link-local addresses, and guard against DNS rebinding.",
+      "Turn off automatic following of HTTP redirects and do not return the raw response to the user.",
+      "At the network layer, use default-deny rules to limit where the requesting service can connect."
+    ],
+    "attack_scenario": "An attacker makes the server send requests for them by pointing a URL-fetching feature (thumbnails, webhooks, imports) at an internal address or the cloud metadata endpoint 169.254.169.254. The goals are to obtain temporary cloud credentials, reach services that are only exposed behind the firewall, or scan the internal network. SSRF is often a stepping stone into the cloud account, and stolen metadata credentials put the whole cloud project at risk.",
+    "capec": [
+      {"id": "CAPEC-664", "name": "Server Side Request Forgery"}
+    ]
+  },
+  {
+    "id": "CWE-611",
+    "name": "XML external entity (XXE)",
+    "summary": "The XML parser resolves entities that point to external resources, so an attacker can read files on the server or make the server send requests to other hosts.",
+    "mitigations": [
+      "Configure the XML parser to disable DTD processing and external entity resolution.",
+      "Use parsing libraries that are secure by default and keep them up to date.",
+      "Where the data format allows, switch to a simpler format such as JSON."
+    ],
+    "attack_scenario": "An attacker defines an external entity in uploaded or received XML that points to a local file or an internal URL. If the parser expands external entities by default, the attacker can read files on the server, launch SSRF against the internal network, or exhaust memory through recursive entities. This often affects features that handle XML, SVG or DOCX files.",
+    "capec": [
+      {"id": "CAPEC-221", "name": "Data Serialization External Entities Blowup"}
+    ]
+  },
+  {
+    "id": "CWE-502",
+    "name": "Deserialization of untrusted data",
+    "summary": "The application deserializes untrusted data without making sure the result is valid, so an attacker can craft malicious objects that trigger unintended behavior, most often remote code execution.",
+    "mitigations": [
+      "Do not use native object serialization (such as Java Serializable, Python pickle or PHP unserialize) on untrusted sources.",
+      "Use a plain data format such as JSON and validate it against a schema before creating objects.",
+      "When deserialization is required, verify data integrity with a signature and restrict the allowed classes to an allowlist."
+    ],
+    "attack_scenario": "An attacker sends a malicious serialized object into any entry point that deserializes external data: cookies, caches, message queues. During deserialization, unexpected constructors or magic methods fire and chain into a gadget chain that reaches remote code execution. These flaws often require no authentication, and a working exploit gives direct control of the host.",
+    "capec": [
+      {"id": "CAPEC-586", "name": "Object Injection"}
+    ]
+  },
+  {
+    "id": "CWE-287",
+    "name": "Improper authentication",
+    "summary": "When a user claims an identity, the system does not prove, or does not adequately prove, that the claim is true, so an attacker can impersonate others.",
+    "mitigations": [
+      "Use a mature authentication framework or service instead of writing custom authentication logic.",
+      "Validate the session or token on the server for every request that requires identity, including signature, expiry and issuer.",
+      "Enable multi-factor authentication for privileged or sensitive operations."
+    ],
+    "attack_scenario": "An attacker targets weaknesses in the authentication flow: predictable tokens, JWTs whose signatures are not checked, multi-step verification that can be skipped, or steps the logic allows to be bypassed. The goal is to log in as someone else or become an administrator outright. Once authentication is bypassed, every authorization check that follows is meaningless.",
+    "capec": [
+      {"id": "CAPEC-115", "name": "Authentication Bypass"}
+    ]
+  },
+  {
+    "id": "CWE-306",
+    "name": "Missing authentication for critical function",
+    "summary": "A function that should confirm the user's identity, or that consumes significant resources, performs no authentication at all.",
+    "mitigations": [
+      "Inventory all endpoints, separate anonymous, regular user and administrator areas, and require authentication for every sensitive area.",
+      "Apply authentication centrally at the routing or middleware layer so individual endpoints are not missed.",
+      "Perform all authentication checks on the server rather than relying on the frontend alone."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-307",
+    "name": "Improper restriction of excessive authentication attempts",
+    "summary": "The system has no mechanism to prevent many failed login attempts in a short time, so an attacker can brute-force passwords or run credential stuffing.",
+    "mitigations": [
+      "Limit attempts per account and per source IP on login, OTP verification and similar endpoints.",
+      "Increase the wait time progressively or lock the account temporarily after repeated failures.",
+      "Require a CAPTCHA or multi-factor authentication when attempts look abnormal."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-384",
+    "name": "Session fixation",
+    "summary": "When a user logs in or a new session is created, the system does not invalidate the existing session ID, so an attacker can plant a known session ID in advance and take over the session after the victim logs in.",
+    "mitigations": [
+      "Always issue a new session ID and invalidate the old one after successful login or a privilege change.",
+      "Do not accept session IDs passed in URL parameters."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-613",
+    "name": "Insufficient session expiration",
+    "summary": "The system lets an attacker reuse old sessions or tokens for authorization because sessions stay valid too long or remain usable after logout.",
+    "mitigations": [
+      "Set an idle timeout and an absolute lifetime for sessions and tokens.",
+      "Revoke sessions and refresh tokens on the server at logout and on password change.",
+      "Give access tokens a short lifetime."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-640",
+    "name": "Weak password recovery mechanism",
+    "summary": "The system offers a way to reset a password without the old one, but the mechanism is not secure enough, so an attacker can use it to take over accounts.",
+    "mitigations": [
+      "Use strong random, single-use, short-lived tokens in reset links.",
+      "Do not use security questions whose answers are easy to guess or publicly available.",
+      "Limit the number of reset requests and failed verification attempts.",
+      "After a successful reset, revoke existing sessions and notify the account owner."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-521",
+    "name": "Weak password requirements",
+    "summary": "The system does not require users to choose strong enough passwords, so accounts are easy to guess or brute-force.",
+    "mitigations": [
+      "Require an adequate minimum password length (for example at least 8 characters, preferably longer).",
+      "Check new passwords at registration and password change against lists of common and breached passwords.",
+      "Offer multi-factor authentication so the password is not a single point of failure."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-862",
+    "name": "Missing authorization",
+    "summary": "When a user accesses a resource or performs an action, the system does not check at all whether the user has permission.",
+    "mitigations": [
+      "Perform server-side authorization checks on every endpoint that accesses a resource or performs an action.",
+      "Deny by default and apply authorization centrally at the routing or middleware layer.",
+      "Define permissions explicitly per role and write tests for privilege escalation cases."
+    ],
+    "attack_scenario": "An attacker logs in with a low-privilege account, then changes object IDs in the URL or request and calls APIs that never appear in the frontend, testing whether the backend actually checks if this user may touch this record. Without an authorization check, the attacker can view or modify other users' data (IDOR) or perform actions meant only for administrators.",
+    "capec": [
+      {"id": "CAPEC-1", "name": "Accessing Functionality Not Properly Constrained by ACLs"}
+    ]
+  },
+  {
+    "id": "CWE-863",
+    "name": "Incorrect authorization",
+    "summary": "The system performs an authorization check, but the check logic is wrong, so an attacker can bypass the restriction and access resources they should not.",
+    "mitigations": [
+      "Use a central, tested authorization mechanism instead of repeating decision logic in many places.",
+      "Base authorization decisions on server-side identity and resource ownership, and do not trust roles or flags sent by the client.",
+      "Write authorization tests for each role and for edge cases."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-639",
+    "name": "Authorization bypass through user-controlled key (IDOR)",
+    "summary": "The system looks up data using an identifier the user can change (such as an order number in the URL) without checking that the record belongs to the current user, so an attacker can see other users' data by changing the number.",
+    "mitigations": [
+      "On every data access, verify that the current user owns or is allowed to access the record.",
+      "Use the user identity from the session as a query condition instead of relying only on the ID sent by the client.",
+      "Unpredictable identifiers (such as UUIDs) can help, but they do not replace authorization checks."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-284",
+    "name": "Improper access control",
+    "summary": "The system does not restrict, or incorrectly restricts, access to a resource by unauthorized actors.",
+    "mitigations": [
+      "Define trust boundaries clearly and enforce all access control on the server.",
+      "Deny by default and assign permissions according to least privilege.",
+      "Review permission settings regularly and verify access control with tests."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-269",
+    "name": "Improper privilege management",
+    "summary": "The system does not correctly assign, change, track or check user privileges, so a user can do more than intended.",
+    "mitigations": [
+      "Assign privileges according to the principle of least privilege.",
+      "Allow privilege changes only through an authorized administrative process, and keep an audit trail.",
+      "Apply separation of privilege to high-risk operations so several conditions must be met before they run."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-915",
+    "name": "Mass assignment",
+    "summary": "The application sets several object attributes at once from external input without limiting which attributes may change, so an attacker can add fields such as isAdmin to alter values they should not control.",
+    "mitigations": [
+      "Use an allowlist (a DTO or the framework's permitted-fields setting) to specify exactly which fields users may set.",
+      "Do not bind request content directly to database model objects.",
+      "Always set sensitive fields such as permissions and ownership on the server."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-798",
+    "name": "Hard-coded credentials",
+    "summary": "The code contains credentials such as passwords, API keys or encryption keys, so anyone who obtains the code or binary can use them.",
+    "mitigations": [
+      "Move passwords and keys out of the code and supply them through environment variables or a secrets manager (such as GCP Secret Manager or Vault).",
+      "Treat any key committed to version control as leaked, and revoke and rotate it immediately.",
+      "Add secret scanning (such as gitleaks) to CI and pre-commit hooks.",
+      "Do not ship default credentials; force them to be set on first use."
+    ],
+    "attack_scenario": "An attacker who obtains the source code, decompiles the app or digs through git history can read hard-coded passwords, API keys and signing keys directly. These credentials usually carry broad permissions and are hard to rotate, so once leaked the attacker can log in to the backend or third-party services without breaking any defense. Public repositories are crawled, and leaked keys are often abused within minutes.",
+    "capec": [
+      {"id": "CAPEC-191", "name": "Read Sensitive Constants Within an Executable"}
+    ]
+  },
+  {
+    "id": "CWE-259",
+    "name": "Hard-coded password",
+    "summary": "The code contains a hard-coded password used for login authentication or for connecting to an external component.",
+    "mitigations": [
+      "Move the password to a protected configuration file, environment variable or secrets manager.",
+      "Do not ship a default password; force users to set one at first login.",
+      "Change any leaked password immediately and review the access logs."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-312",
+    "name": "Cleartext storage of sensitive information",
+    "summary": "The system stores sensitive information in cleartext in places others may be able to access (databases, files, cloud storage, browser storage).",
+    "mitigations": [
+      "Encrypt sensitive data with a vetted algorithm before storing it, and manage keys separately from the data.",
+      "Do not encrypt passwords; store them with a password hash such as Argon2 or bcrypt.",
+      "Turn on encryption in cloud storage services and restrict access permissions.",
+      "Assess whether the data needs to be kept at all, and do not store it if it does not."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-319",
+    "name": "Cleartext transmission of sensitive information",
+    "summary": "The system sends sensitive data in cleartext over a channel that can be eavesdropped on, for example over HTTP instead of HTTPS.",
+    "mitigations": [
+      "Use TLS (HTTPS) for every connection that carries sensitive data, keeping the whole session encrypted from login to logout.",
+      "Enable HSTS and redirect HTTP to HTTPS.",
+      "Use TLS or mTLS for connections between internal services as well."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-200",
+    "name": "Exposure of sensitive information to an unauthorized actor",
+    "summary": "The system exposes sensitive information to people who are not explicitly authorized to access it.",
+    "mitigations": [
+      "Return only the fields an API response needs instead of serializing entire database objects.",
+      "Partition data by trust boundary and keep sensitive data inside trusted zones.",
+      "Regularly check responses, error messages and public files for sensitive information."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-209",
+    "name": "Error message containing sensitive information",
+    "summary": "Error messages produced by the system include sensitive details about the environment, users or data, such as stack traces, SQL statements or internal paths.",
+    "mitigations": [
+      "Show users only generic error messages and record the details in server-side logs.",
+      "Turn off debug mode and detailed error pages in production.",
+      "Catch exceptions centrally so unhandled exceptions are never returned to the client."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-532",
+    "name": "Sensitive information in log files",
+    "summary": "The system writes sensitive information such as passwords, tokens or personal data into log files.",
+    "mitigations": [
+      "Do not log passwords, tokens, keys or full personal data; mask them where logging is necessary.",
+      "Filter sensitive fields centrally at the logging framework level.",
+      "Restrict access to log files and logging platforms.",
+      "Remove verbose debug logging settings before release."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-327",
+    "name": "Broken or risky cryptographic algorithm",
+    "summary": "The system uses cryptographic algorithms or protocols that are broken or not secure enough (such as DES, RC4 or ECB mode), so an attacker can decrypt or tamper with data.",
+    "mitigations": [
+      "Switch to algorithms currently accepted as secure (such as AES-GCM or ChaCha20-Poly1305), and do not design your own.",
+      "Use a mature cryptographic library (such as libsodium or the platform's built-in crypto API) rather than working with low-level primitives directly.",
+      "Design for algorithm agility so algorithms can be replaced later, and protect keys properly."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-328",
+    "name": "Weak hash",
+    "summary": "The system uses a hash algorithm that does not meet security needs (such as MD5 or SHA-1), so an attacker can find collisions or recover the original input.",
+    "mitigations": [
+      "Use SHA-256 or stronger for integrity and signature purposes.",
+      "Store passwords with a tunable-cost password hashing function such as Argon2id, bcrypt or scrypt, with a salt."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-330",
+    "name": "Insufficiently random values",
+    "summary": "In a security context that needs unpredictable values, the system generates values that are not random enough, so an attacker can predict them.",
+    "mitigations": [
+      "Always use the cryptographically secure random source provided by the operating system or language for security purposes.",
+      "Make tokens long enough (for example at least 128 bits).",
+      "Do not derive security-related values from timestamps, sequential counters or user information."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-338",
+    "name": "Cryptographically weak PRNG",
+    "summary": "The system uses a non-cryptographic PRNG (such as Math.random or java.util.Random) in a security context, so its output can be predicted.",
+    "mitigations": [
+      "Switch to a cryptographically secure random number generator (such as crypto.getRandomValues, SecureRandom or the Python secrets module).",
+      "Use code scanning rules to forbid general-purpose random functions in security-related code."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-295",
+    "name": "Improper certificate validation",
+    "summary": "The system does not validate TLS certificates, or validates them incorrectly (for example with verification turned off or no hostname check), so an attacker can mount a man-in-the-middle attack.",
+    "mitigations": [
+      "Keep TLS certificate validation on, and do not set options that skip it such as verify=False or InsecureSkipVerify.",
+      "Validate the certificate chain, validity period and hostname.",
+      "When using certificate pinning, validate all relevant certificate attributes.",
+      "For SSH connections, verify the host key before sending credentials: check known_hosts or a pinned fingerprint and abort before authentication if the key does not match. Checking only after the connection is established means the password has already gone to an unverified server."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-601",
+    "name": "Open redirect",
+    "summary": "The site accepts a user-controlled URL and redirects to it directly, so an attacker can use a link on a trusted domain to send victims to a phishing site.",
+    "mitigations": [
+      "Restrict allowed redirect URLs or domains with an allowlist.",
+      "Accept only relative paths within the site, or map an ID to a destination predefined on the server.",
+      "Show an interstitial page asking the user to confirm before redirecting to an external site."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-1321",
+    "name": "Prototype pollution",
+    "summary": "The application sets object properties from external input without blocking changes to the object prototype (such as __proto__ or constructor.prototype), which affects every object globally.",
+    "mitigations": [
+      "Reject keys such as __proto__, constructor and prototype when merging or setting object properties.",
+      "Validate untrusted object input against a schema.",
+      "Use Map or Object.create(null) when an object serves as a dictionary.",
+      "Consider freezing the prototype with Object.freeze(Object.prototype)."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-400",
+    "name": "Uncontrolled resource consumption",
+    "summary": "The system does not properly control how limited resources (CPU, memory, disk, connections) are allocated and maintained, so an attacker can exhaust them and disrupt the service.",
+    "mitigations": [
+      "Design throttling into the architecture to limit how much unauthenticated users can consume.",
+      "Set limits on request size, processing time and concurrency.",
+      "Make the system fall back to a safe state when resource allocation fails."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-770",
+    "name": "Allocation of resources without limits or throttling",
+    "summary": "When the system allocates resources on behalf of a user, it does not limit how many or how large they can be.",
+    "mitigations": [
+      "Set resource quotas and rate limits per user or per source.",
+      "Limit user-controlled parameters such as upload size, page size and batch count.",
+      "Validate the range of quantity and size parameters in input."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-362",
+    "name": "Race condition",
+    "summary": "Concurrently running code needs exclusive access to a shared resource, but a timing window lets another thread or request change the resource in between.",
+    "mitigations": [
+      "Protect critical sections on shared resources with locks, transactions or atomic operations.",
+      "At the database layer, use unique constraints, conditional updates or optimistic locking instead of read-then-write.",
+      "Minimize shared mutable state and use thread-safe functions."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-367",
+    "name": "Time-of-check time-of-use (TOCTOU) race condition",
+    "summary": "The system checks the state of a resource and then uses it, but the resource can change between the check and the use, which invalidates the check.",
+    "mitigations": [
+      "Combine the check and the use in a single atomic operation (for example, open the file with O_CREAT|O_EXCL and then check the file descriptor).",
+      "Check the already-open file descriptor rather than checking the path name again.",
+      "Where needed, use locks to stop several processes from accessing the same resource at once."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-20",
+    "name": "Improper input validation",
+    "summary": "The system receives input but does not validate, or incorrectly validates, that it has the format and properties needed for safe processing.",
+    "mitigations": [
+      "Validate the type, length, format and range of all external input against a schema at system boundaries.",
+      "Use an allowlist approach and reject input that does not match the specification.",
+      "Decode and normalize input before validating it.",
+      "Treat client-side validation only as a usability aid and repeat all validation on the server."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-276",
+    "name": "Incorrect default permissions",
+    "summary": "During installation, files are given permissions that let anyone modify them.",
+    "mitigations": [
+      "Set the strictest file permissions explicitly during installation and deployment, granting access only to accounts that need it.",
+      "Review file permission settings in installation scripts and container images."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-732",
+    "name": "Incorrect permission assignment for critical resource",
+    "summary": "The system assigns permissions on security-critical resources (configuration files, keys, logs) that let unintended users read or modify them.",
+    "mitigations": [
+      "Grant access to critical resources such as keys and configuration files only to the accounts that need it (for example, set private keys to 600).",
+      "Set the strictest umask at program startup and check permissions on critical files.",
+      "Check that resources such as cloud storage buckets and databases are not publicly accessible."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-59",
+    "name": "Link following",
+    "summary": "The system accesses a file by name without preventing that name from being a symbolic link or shortcut that points to an unintended resource.",
+    "mitigations": [
+      "Open files with options that do not follow symbolic links (such as O_NOFOLLOW), or check that the resolved path is inside an allowed directory.",
+      "Avoid creating files with fixed names in directories others can write to (such as /tmp).",
+      "Perform file operations with the least privilege needed."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-190",
+    "name": "Integer overflow or wraparound",
+    "summary": "A calculation exceeds the range of its integer type and overflows or wraps around while the program assumes the result is still correct, which can lead to wrong allocation sizes or boundary checks later.",
+    "mitigations": [
+      "Validate upper and lower bounds on numeric input.",
+      "Use overflow-checked arithmetic (such as Rust's checked_add or C's __builtin_add_overflow).",
+      "Choose types of an appropriate size and watch for conversions between signed and unsigned integers."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-787",
+    "name": "Out-of-bounds write",
+    "summary": "The program writes data past the end or before the start of a buffer, corrupting adjacent memory.",
+    "mitigations": [
+      "Prefer memory-safe languages or safe container types.",
+      "Check the size of the destination buffer before writing, and use length-bounded functions.",
+      "Enable compiler and system protections (such as stack protector, FORTIFY_SOURCE and ASLR).",
+      "Test boundary handling with fuzzing and AddressSanitizer."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-125",
+    "name": "Out-of-bounds read",
+    "summary": "The program reads data past the end or before the start of a buffer.",
+    "mitigations": [
+      "Verify that indexes and lengths fall within the buffer before reading.",
+      "Use languages or data structures that provide bounds checking."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-416",
+    "name": "Use after free",
+    "summary": "The program keeps using a pointer to memory after that memory has been freed, and the block may already have been reallocated for other data.",
+    "mitigations": [
+      "Prefer languages with automatic memory management or ownership checking.",
+      "Set pointers to NULL immediately after freeing them, and make object ownership clear.",
+      "Detect these issues with AddressSanitizer and fuzzing."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-476",
+    "name": "NULL pointer dereference",
+    "summary": "The program dereferences a pointer that it expects to be valid but that is actually NULL.",
+    "mitigations": [
+      "Check pointers that may be NULL before using them.",
+      "Check every function return value and handle failure or empty results.",
+      "Use types that can express absence, such as Option, so the compiler helps enforce the checks."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  },
+  {
+    "id": "CWE-1104",
+    "name": "Use of unmaintained third-party components",
+    "summary": "The system depends on third-party components that their original developers or a trusted maintainer no longer support, so no patches are available when vulnerabilities appear.",
+    "mitigations": [
+      "Keep an ongoing inventory of frontend and backend components and their dependencies, with versions and maintenance status.",
+      "Monitor CVEs and package maintenance status with software composition analysis (SCA) tools.",
+      "Remove unused dependencies and replace unmaintained components with maintained alternatives.",
+      "When replacement is not yet possible, reduce risk with virtual patching or additional protections."
+    ],
+    "attack_scenario": null,
+    "capec": []
+  }
+]

@@ -1,0 +1,29 @@
+{
+  "adapter": {
+    "error": "Cannot overwrite a value (at line 15, column 18)",
+    "status": "refused"
+  },
+  "case": "duplicate-key-lock",
+  "features": "default",
+  "lockfile_sha256": "efe89bf70c17b53c1586f279705253480503ae30c52b3716dfa99e38900064c1",
+  "metadata": {
+    "error": "  15 | version = \"9.9.9\" |      | ^^^^^^^ |   duplicate key",
+    "status": "error"
+  },
+  "precursor": {
+    "error": "  15 | version = \"9.9.9\" |      | ^^^^^^^ |   duplicate key",
+    "status": "error"
+  },
+  "schema": 1,
+  "syft": {
+    "duplicates": [],
+    "packages": {},
+    "status": "ok"
+  },
+  "syft_scope": "directory",
+  "target": "aarch64-apple-darwin",
+  "tools": {
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "syft": "1.34.2"
+  }
+}

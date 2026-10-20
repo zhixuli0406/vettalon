@@ -21,6 +21,11 @@ use vettalon_contract::fingerprint::Fingerprint;
 
 use super::intake::RepoProfile;
 
+pub use super::evidence_level::{
+    COUNTEREVIDENCE_MAX_BYTES, EvidenceLevel, POC_ORACLE_PREFIX, PocOracle, ProofGap,
+    REFUTER_CONSISTENT_PREFIX, VERIFY_ERROR_PREFIX, VERIFY_UNCERTAIN_PREFIX,
+};
+
 /// `schema_version` written by this pipeline. A report without the field is
 /// read as version 1 (the 2026-08 shape).
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -157,6 +162,45 @@ pub enum EvidenceKind {
     ///   (ai_audit findings now `refuted` / `needs_human`); no other summary
     ///   field changes.
     OperatorReview,
+    /// Repeated refuter runs disagreed (severity ≥ High, `--refuter-runs`),
+    /// so the finding stays `Candidate`. `detail` is exactly
+    /// `verify_uncertain: <k>/<n> plausible`. Caps the derived
+    /// [`EvidenceLevel`] at `refuter_survived` (uncertain never upgrades).
+    VerifyUncertain,
+    /// A harness-judged PoC oracle result. `detail` is the fixed machine
+    /// format parsed by [`PocOracle::parse`] (and written by
+    /// [`PocOracle::to_detail`]):
+    /// `poc_oracle: effect=<true|false> control=<true|false|none>
+    /// rerun=<true|false|none> nonce_bound=<true|false> rejected=<reason|none>`.
+    /// Anything else is ignored by the evidence-level derivation. Never sets a
+    /// status: an oracle result is evidence for a human, not a verdict.
+    PocOracle,
+    /// O19: the result of checking the finding's `suggested_fix`. `detail` is
+    /// the fixed machine format parsed by
+    /// [`super::fix_check::FixCheck::parse`] (and written by its
+    /// `to_detail`): `fix_check: outcome=<o> regression=<r> tests=<r>
+    /// inputs=<k>/<n> diff_sha256=<hex> reason=<token|none>`. The outcome
+    /// must equal the one derived from `regression` and `tests`, and the
+    /// result only applies to the diff whose SHA-256 it names; anything else
+    /// is ignored. Never sets a status.
+    FixCheck,
+    /// O10: one refuter run read the code with its comments, the others
+    /// without, and the verdict flipped. `detail` is
+    /// `comment_sensitivity: with_comments=<refuted|plausible>
+    /// without_comments=<refuted|plausible> (<k>/<k> stripped runs)`. The
+    /// flip also makes the runs disagree, so the finding stays `Candidate`
+    /// (`verify_uncertain`). Never sets a status by itself.
+    CommentSensitivity,
+    /// O11: the refuter's own preconditions give a different exploitability
+    /// tier from the finder's. `detail` is `tier_disagreement:
+    /// finder=<tier> refuter=<tier> effective=<tier>`; the effective tier is
+    /// the higher-friction one.
+    TierDisagreement,
+    /// O9 (`--dual-finder-top`): another finder family reported the same
+    /// root cause and its candidate was merged into this one. `detail` is
+    /// `dual_finder_merge: merged <id> from <model> (<family>)
+    /// dedupe_basis=<same_patch|location_cwe>`.
+    DualFinderMerge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +293,19 @@ pub enum ConditionKind {
 pub struct Condition {
     pub kind: ConditionKind,
     pub description: String,
+}
+
+/// O9: a finder's proposed fix as one line-range replacement in one file.
+/// Only used to tell whether two candidates share a root cause ("the same
+/// patch fixes both"); it is applied to an in-memory copy, never to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedFix {
+    pub file: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    /// The new text for lines `start_line..=end_line`.
+    pub replacement: String,
 }
 
 /// How a human could settle a `NeedsHuman` finding. At least one field is
@@ -346,7 +403,15 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// One finding. Serialized through its own `Serialize` impl (below), which
+/// appends the derived `evidence_level`, `proof_gaps` and
+/// `strongest_counterevidence` fields computed from the evidence at write
+/// time, plus `cwe_mapping` (bundled CWE List usage), `cve_refs` (CVE
+/// verification state) and, when a `suggested_fix` is present, `fix_check`.
+/// These are never read back: a report carrying them (old, stale or forged)
+/// deserializes the stored fields only and derives again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Finding {
     /// Deterministic id derived from `(source_engine, rule_id, file, line,
     /// snippet)` — locates this exact hit for the dashboard. Changes when
@@ -390,6 +455,18 @@ pub struct Finding {
     pub trace: Vec<TraceStep>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// O11: the preconditions the refuter itself listed on a `plausible`
+    /// verdict. `None` = the refuter gave none (older reports, scanners);
+    /// `Some([])` = it saw none. The exploitability tier shown everywhere is
+    /// the higher-friction of this and `conditions`
+    /// ([`crate::audit::exploitability::assess_finding`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refuter_conditions: Option<Vec<Condition>>,
+    /// O9: the finder's proposed fix, used only to dedupe two finder
+    /// families' candidates in this run. Model output, never applied to the
+    /// repository and never written to a report.
+    #[serde(skip)]
+    pub proposed_fix: Option<ProposedFix>,
     /// Non-empty exactly on `NeedsHuman` findings.
     #[serde(default)]
     pub blockers: Vec<String>,
@@ -415,13 +492,139 @@ pub struct Finding {
     /// may derive a fallback from `kind`, labelled as derived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwe: Option<String>,
-    /// CVE ids the finding maps to (dependency advisories' aliases).
+    /// The source's original CWE when vettalon replaced a Discouraged /
+    /// Prohibited id with a more specific Allowed child that the finding's
+    /// own category names (see `audit::cwe::prefer_specific`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwe_replaced: Option<String>,
+    /// CVE ids the finding maps to (dependency advisories' aliases), in the
+    /// CVE Record Format shape (`CVE-YYYY-` + 4–19 digits).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cve: Vec<String>,
-    /// Base score computed from a vector the SOURCE supplied (e.g. a RustSec
-    /// advisory). Never set from a model's own estimate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Score computed from a vector the SOURCE supplied (e.g. a RustSec
+    /// advisory; CVSS v3.x or v4.0). Never set from a model's own estimate.
+    /// Re-derived from the vector whenever a report is read: a stored score
+    /// is never trusted, and an unscorable vector is dropped.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::audit::cvss::deserialize_rescored"
+    )]
     pub cvss: Option<crate::audit::cvss::CvssScore>,
+    /// The resolved dependency a dependency-advisory finding is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageRef>,
+
+    // ── O19: suggested fix (optional, additive) ───────────────────────
+    /// A suggested fix as unified diff text, at most
+    /// [`super::fix_diff::SUGGESTED_FIX_MAX_BYTES`] bytes (a larger value is
+    /// refused when a report is read). Whether it was checked is derived from
+    /// `fix_check` evidence into the serialized `fix_check` field; the diff
+    /// itself is never treated as checked.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::fix_diff::deserialize_suggested_fix"
+    )]
+    pub suggested_fix: Option<String>,
+}
+
+/// A resolved dependency (`ecosystem` uses Package URL type names).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageRef {
+    /// Package URL type, e.g. `cargo`, `npm`, `pypi`, `golang`.
+    pub ecosystem: String,
+    pub name: String,
+    pub version: String,
+}
+
+impl PackageRef {
+    /// Package URL with version (`pkg:cargo/name@1.2.3`), percent-encoding
+    /// everything outside the PURL-safe set.
+    pub fn purl(&self) -> String {
+        fn enc(s: &str, keep_slash: bool) -> String {
+            let mut out = String::with_capacity(s.len());
+            for b in s.bytes() {
+                if b.is_ascii_alphanumeric()
+                    || matches!(b, b'.' | b'-' | b'_' | b'~')
+                    || (keep_slash && b == b'/')
+                {
+                    out.push(b as char);
+                } else {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
+            out
+        }
+        format!(
+            "pkg:{}/{}@{}",
+            enc(&self.ecosystem.to_ascii_lowercase(), false),
+            enc(&self.name, true),
+            enc(&self.version, false)
+        )
+    }
+}
+
+impl Finding {
+    /// Every referenced CVE with its state. A scan finding holds no OSV
+    /// data (its CVE ids come from the scanner's own advisory database), so
+    /// every id is `unverified`; a published state is never read back from a
+    /// stored report. Callers that hold OSV records use
+    /// [`crate::audit::cve::check_against_osv`].
+    pub fn cve_refs(&self) -> Vec<crate::audit::cve::CveRef> {
+        self.cve
+            .iter()
+            .filter_map(|raw| crate::audit::cve::normalize(raw))
+            .map(|id| crate::audit::cve::CveRef::unverified(&id))
+            .collect()
+    }
+
+    /// MITRE mapping guidance for this finding's CWE (bundled CWE List).
+    pub fn cwe_mapping(&self) -> Option<crate::audit::cwe::CweMapping> {
+        self.cwe.as_deref().and_then(crate::audit::cwe::mapping)
+    }
+}
+
+impl Serialize for Finding {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct Stored<'a>(&'a Finding);
+        impl Serialize for Stored<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                Finding::serialize(self.0, s)
+            }
+        }
+        #[derive(Serialize)]
+        struct WithDerived<'a> {
+            #[serde(flatten)]
+            stored: Stored<'a>,
+            evidence_level: EvidenceLevel,
+            proof_gaps: Vec<ProofGap>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            strongest_counterevidence: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cwe_mapping: Option<crate::audit::cwe::CweMapping>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            cve_refs: Vec<crate::audit::cve::CveRef>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fix_check: Option<super::fix_check::FixCheckSummary>,
+        }
+        WithDerived {
+            stored: Stored(self),
+            evidence_level: self.evidence_level(),
+            proof_gaps: self.proof_gaps(),
+            strongest_counterevidence: self.strongest_counterevidence(),
+            cwe_mapping: self.cwe_mapping(),
+            cve_refs: self.cve_refs(),
+            fix_check: self.fix_check(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Finding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Finding::deserialize(deserializer)
+    }
 }
 
 /// Outcome of one verifier's review of one finding.
@@ -476,6 +679,18 @@ pub struct EnsembleInfo {
     /// back to the heuristic order.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rank_degraded: bool,
+    /// `--prescreen cheap-model`: the cheap model's calls, bytes, time and
+    /// per-unit scores. Absent when the prescreen was off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prescreen: Option<crate::audit::prescreen::PrescreenRecord>,
+    /// The time budget and per-role caps that applied, and which caps cut
+    /// work short. Absent when no budget flag was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::budget::ScanBudgetRecord>,
+    /// O9 `--dual-finder-top`: per-family unique root causes and what the
+    /// added finder family yielded per call. Absent when the flag is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual_finder: Option<crate::audit::DualFinderReport>,
 }
 
 impl Finding {
@@ -528,14 +743,19 @@ impl Finding {
             threat_model: None,
             trace: Vec::new(),
             conditions: Vec::new(),
+            refuter_conditions: None,
+            proposed_fix: None,
             blockers: Vec::new(),
             validation_plan: None,
             precheck: None,
             found_by: Vec::new(),
             verification: Vec::new(),
             cwe: None,
+            cwe_replaced: None,
             cve: Vec::new(),
             cvss: None,
+            package: None,
+            suggested_fix: None,
         }
     }
 
@@ -739,6 +959,12 @@ pub const PRECHECK_PREFIX: &str = "precheck:";
 pub const VERIFIER_CORRECTED_PREFIX: &str = "verifier_corrected:";
 /// Evidence `detail` prefix for a verifier "plausible" verdict.
 pub const PLAUSIBLE_PREFIX: &str = "plausible:";
+/// Evidence `detail` prefix of an [`EvidenceKind::CommentSensitivity`] item.
+pub const COMMENT_SENSITIVITY_PREFIX: &str = "comment_sensitivity:";
+/// Evidence `detail` prefix of an [`EvidenceKind::TierDisagreement`] item.
+pub const TIER_DISAGREEMENT_PREFIX: &str = "tier_disagreement:";
+/// Evidence `detail` prefix of an [`EvidenceKind::DualFinderMerge`] item.
+pub const DUAL_FINDER_MERGE_PREFIX: &str = "dual_finder_merge:";
 
 /// Whether a finding carries an operator decision from the dashboard.
 pub fn has_operator_review(f: &Finding) -> bool {
@@ -819,9 +1045,11 @@ pub enum ModuleCoverageStatus {
     /// Reviewed, at least one candidate (including ones the pre-check
     /// refuted).
     Candidate,
-    /// Not reviewed: outside `--max-modules` (reason `max_modules`), the
-    /// run-wide candidate cap was already reached (`candidate_cap`), or the
-    /// engine became unavailable before this module (`engine_unavailable`).
+    /// Not reviewed: outside `--max-modules` (reason `max_modules`), below
+    /// the `--prescreen` cut (`prescreen_cut`), the run-wide candidate cap
+    /// was already reached (`candidate_cap`), the time budget ran out
+    /// (`time_budget`), or the engine became unavailable before this module
+    /// (`engine_unavailable`).
     Deferred,
     /// Attempted; no readable text content.
     Unreadable,

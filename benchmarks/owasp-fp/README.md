@@ -20,8 +20,27 @@ git clone --depth 1 https://github.com/OWASP-Benchmark/BenchmarkJava.git
 # 2. 建樣本並掃描（見 sample.py / run.py，依你的環境改路徑與 roster）
 python3 sample.py   # 讀 expectedresults-1.2.csv，分層抽樣，每個 case 複製成單檔目錄
 python3 run.py      # 對每個 case 跑 vettalon scan --profile deep，聚合召回/誤報
+# 不掃描、不呼叫模型，只重算已存的結果
+python3 run.py --summarize reports/results-claude-codex.json
 ```
+
+每個比率都印成 `k/n` 加 95% 區間（Wilson；0/n 與 n/n 用精確界）。單模型與跨家族在同一批 case 上做題目層級配對比較（符號檢定加 bootstrap），並依預先登錄的 20%→30% 效果量標出是否 underpowered。規則見 [../common/README.md](../common/README.md)。
+
+`RESULTS-2026-10.md` 寫的「0/80 上界 ≤ 3.8%」是單側 95% 上界；`--summarize` 印的雙側精確區間上限是 4.5%，兩者都對，引用時要寫明是哪一種。
 
 `roster.example.toml` 示範「claude 找洞、codex 跨家族覆核」與「本機 qwen 找洞、claude 覆核」兩種配置。
 
 結果見 [RESULTS-2026-10.md](RESULTS-2026-10.md)。
+
+## 跨家族 2×2（O13）
+
+量「換家族」和「多看一次」各自值多少：finder 家族 × refuter 家族的 2×2（對角線是同家族的另一個模型），加上同模型 fresh session，共六臂、每臂同一批 160 題。每臂報召回、誤報率、uncertain 率、翻案率與翻案正確率，臂間報錯誤重疊（Jaccard）、方向性與固定 finder 的題目層級配對差，比率都附 95% 區間。統計共用 `../common/stats.py`。
+
+```bash
+python3 crossfam_run.py reanalyze                    # 重算既有兩份結果，0 次模型呼叫
+python3 crossfam_run.py plan                         # 每臂呼叫數、輸出 token 與牆鐘上限
+python3 crossfam_run.py dry-run --out-dir /tmp/xfam  # fake model 跑完整矩陣，0 次真呼叫
+python3 -m unittest test_crossfam                    # 離線測試
+```
+
+正式跑分（`execute`）在擁有者依 D01 核准、且 roster 每個模型都能強制 1,024 輸出 token 之前一律拒絕。設計、重分析結果與跑分計畫見 [CROSS-FAMILY-2026-10.md](CROSS-FAMILY-2026-10.md)。

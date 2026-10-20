@@ -354,11 +354,11 @@ mod tests {
     #[test]
     fn parse_osv_response_extracts_ids_and_aliases() {
         let body =
-            r#"{"vulns":[{"id":"GHSA-aaaa","aliases":["CVE-2020-0001"]},{"id":"GHSA-bbbb"}]}"#;
+            r#"{"vulns":[{"id":"GHSA-aaaa","aliases":["CVE-1900-0001"]},{"id":"GHSA-bbbb"}]}"#;
         let v = parse_osv_response(body).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].id, "GHSA-aaaa");
-        assert_eq!(v[0].aliases, vec!["CVE-2020-0001"]);
+        assert_eq!(v[0].aliases, vec!["CVE-1900-0001"]);
         assert!(v[1].aliases.is_empty());
     }
 

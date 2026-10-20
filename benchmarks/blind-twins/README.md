@@ -13,7 +13,7 @@
 - dev 與 holdout 的家族、合成 repo、snapshot 日期皆不交叉；此設計檢驗 pipeline，不能證明沒有預訓練污染。
 - `protocol.py canonical`：逐 specimen 建全新 Docker container，在受限環境編譯／執行 function 和隱藏 canonical oracle。先查安全效果與正常 control，再凍結分母。exit 0 本身不能通過。
 - `run.py`：finder-only／samefamily／crossfamily 實驗 arms、嚴格 JSON、lineage、固定分母、超時與預算。samefamily 只在此實驗存在；跨家族須不同 family。
-- `aggregate.py`：不呼叫模型，從 raw 重新計算 metrics；拒絕來源／分母不符。
+- `aggregate.py`：不呼叫模型，從 raw 重新計算 metrics；拒絕來源／分母不符。`adjudication-aware-v3` 報告另附 `uncertainty` 區塊，每個比率都有 95% 區間與 n（[../common/README.md](../common/README.md)），原 metrics 不變。
 - `measurement.py`：僅量 runner process 的 CPU interval 與 process-lifetime RSS observation；不量模型服務、子程序或 GPU。
 - `ledger.py`：只讀固定 D01 排程及既有 formal-transport 持久扣額的跨輪對帳；同一匿名檢視只有 15 輪、250 個 slot、256,000 個預留輸出 token。
 - `transport.py`：將既有 `benchmarks/formal-transport/` 的 capability gate 與可重算報表接到 twins；本目錄不另造 provider sender。

@@ -104,6 +104,64 @@ Wrong identity, issuer, source, missing proof or modified archive must fail. No
 or local JSON-only verification is accepted. Use GitHub's documented bundle and
 trusted-root process for disconnected verification; this wrapper uses GitHub online.
 
+## How accurate is the Cargo inventory?
+
+The release BOM lists every package in `Cargo.lock`. That is more than the build
+uses: locks keep optional and platform-specific packages. A differential test
+([`sbom_diff.py`](../scripts/trust/sbom_diff.py)) measures the gap against two
+oracles: `cargo metadata --locked --offline --filter-platform <target>` (normal
+and build edges from the workspace members, default features) and, as a test
+oracle only, the nightly-only Cargo SBOM precursor (`-Zsbom`). Neither oracle
+feeds the release BOM.
+
+Component precision and recall are on exact name@version. Version accuracy is
+per package name present on both sides. License accuracy is reported separately,
+only over matched packages whose manifest declares a license.
+
+| Case (aarch64-apple-darwin, 2026-10-20) | Oracle size | Syft size | Precision | Recall | Version accuracy | License accuracy: raw Syft / adapter |
+|---|---|---|---|---|---|---|
+| `fixtures/sbom/rust` vs `cargo metadata` | 7 | 12 | 0.58 | 1.00 | 1.00 | 0/7 / 6/7 |
+| `fixtures/sbom/rust` vs precursor | 7 | 12 | 0.58 | 1.00 | 1.00 | not in precursor |
+| Public workspace lock vs `cargo metadata` | 179 | 225 | 0.80 | 1.00 | 0.99 | 0/179 / 177/179 |
+| Public workspace lock vs precursor | 169 | 225 | 0.75 | 1.00 | 0.99 | not in precursor |
+
+The public-workspace row uses a working-tree export stage (lock SHA-256
+`a560c05f…`), Syft scanning only the manifests and lock. Its 46 extra packages
+are platform or optional entries (Windows, wasm, Android and similar crates).
+`cpufeatures` and `syn` appear in the lock at two versions while the build uses
+one, which is the version-accuracy miss. `cargo metadata` lists 10 packages the
+nightly build did not compile (the `quinn` and `rand` 0.10 families, `chacha20`,
+`foldhash`, `lru-slab`, `rustc-hash`), so the two oracles disagree there too.
+
+The five extra fixture packages (`serde_derive`, `syn`, `quote`, `proc-macro2`,
+`unicode-ident`) sit behind a `cfg(any())` dependency that never builds. The
+adapter's missing license is the local root crate, which it does not enrich.
+Raw Syft 1.34.2 output carries no Cargo licenses; the adapter adds them only from
+checksum-verified registry archives in the local Cargo cache, so license accuracy
+depends on that cache.
+
+Parser-confusion fixtures (`fixtures/sbom/confusion/`) check that a crafted tree
+cannot change the inventory without the adapter noticing:
+
+| Case | Cargo `--locked` | Raw Syft 1.34.2 | Vettalon adapter |
+|---|---|---|---|
+| dependency in a comment | ok | matches | matches |
+| package table inside a multi-line string | ok | matches | matches |
+| stray CycloneDX file in the tree | ok | matches | matches |
+| duplicate key in `Cargo.lock` | rejects | exit 0, empty inventory | refuses |
+| duplicate key in `Cargo.toml` | rejects | lists the lock packages | refuses |
+| unrelated nested project with its own lock | ok | merges 3 extra packages | refuses |
+| stale lock (manifest dropped a dependency) | rejects | lists the stale package | **accepts (known limitation)** |
+
+The stale-lock case is a known limitation: the adapter compares the BOM with the
+lock graph and root identities, not with each manifest's dependency tables. Its
+test is marked as an expected failure until that check exists. Run Cargo with
+`--locked` in the release build to catch it.
+
+Output remains CycloneDX 1.6, aligned with the minimum format version named in
+BSI TR-03183-2 v2.1.0 (CycloneDX 1.6 or later). This document does not assess the
+other fields of that guideline.
+
 ## Build or inspect a local trust pack
 
 See [tool how-to](../scripts/trust/README.md) for Syft setup, public-tree staging,

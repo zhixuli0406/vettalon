@@ -124,6 +124,20 @@ impl DockerSandbox {
     /// The `docker run` argument vector for one PoC. Pure, so the isolation
     /// flags are unit-tested.
     pub fn run_args(&self, name: &str, workspace: &Path, cmd: &[String]) -> Vec<String> {
+        self.run_args_mounted(name, &[(workspace, "/workspace")], "/tmp", cmd)
+    }
+
+    /// [`run_args`](Self::run_args) with several read-only bind mounts and a
+    /// chosen working directory. Every isolation flag is identical; only the
+    /// mounts (all `readonly`) and `--workdir` differ. The suggested-fix check
+    /// uses it to mount a temporary copy of the scanned tree.
+    pub fn run_args_mounted(
+        &self,
+        name: &str,
+        mounts: &[(&Path, &str)],
+        workdir: &str,
+        cmd: &[String],
+    ) -> Vec<String> {
         let owner_label = format!("{POC_OWNER_KEY}={}", std::process::id());
         let mut args: Vec<String> = [
             "run",
@@ -154,16 +168,18 @@ impl DockerSandbox {
             "--env",
             "HOME=/tmp",
             "--workdir",
-            "/tmp",
+            workdir,
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
-        args.push("--mount".to_string());
-        args.push(format!(
-            "type=bind,source={},target=/workspace,readonly",
-            workspace.display()
-        ));
+        for (source, target) in mounts {
+            args.push("--mount".to_string());
+            args.push(format!(
+                "type=bind,source={},target={target},readonly",
+                source.display()
+            ));
+        }
         args.push(self.image.clone());
         // In-container hard limit too, so the PoC dies even if vettalon is
         // killed before its own timeout fires.
@@ -195,24 +211,76 @@ impl DockerSandbox {
             ),
             other => return Err(format!("unsupported PoC language {other:?}")),
         };
-        let scratch = tempfile::Builder::new()
-            .prefix("vettalon-poc-")
-            .tempdir()
-            .map_err(|e| format!("cannot create temp workspace: {e}"))?;
-        let path = scratch.path().join(file);
-        std::fs::write(&path, script).map_err(|e| format!("cannot write poc script: {e}"))?;
-        // The container runs as nobody; the mounted dir and script must be
-        // world-readable (they hold only the generated PoC).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755));
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
-        }
+        self.run_workspace(&[(file, script)], &cmd, timeout).await
+    }
 
+    /// Run a multi-file workspace: each `(name, contents)` pair is written into
+    /// a fresh scratch dir mounted read-only at `/workspace`, then `cmd` runs
+    /// inside the same isolated container as [`run_script`]. The PoC-oracle
+    /// harness uses this to mount a harness-authored runner next to the
+    /// model-authored PoC. Same isolation, same hard `timeout`, same host rule:
+    /// any failure to get a real container returns `Err`.
+    pub async fn run_workspace(
+        &self,
+        files: &[(&str, &str)],
+        cmd: &[String],
+        timeout: Duration,
+    ) -> Result<(i64, String), String> {
+        let scratch = write_scratch(files, false)?;
+        self.run_mounted(&[(scratch.path(), "/workspace")], "/tmp", cmd, timeout)
+            .await
+    }
+
+    /// O19: [`run_workspace`](Self::run_workspace) plus a prepared directory
+    /// (a temporary copy of the scanned tree, never the user's own files)
+    /// mounted read-only at `/workspace/tree`. Same isolation, same timeout.
+    pub async fn run_workspace_with_tree(
+        &self,
+        files: &[(&str, &str)],
+        tree: &Path,
+        cmd: &[String],
+        timeout: Duration,
+    ) -> Result<(i64, String), String> {
+        let scratch = write_scratch(files, true)?;
+        self.run_mounted(
+            &[(scratch.path(), "/workspace"), (tree, "/workspace/tree")],
+            "/tmp",
+            cmd,
+            timeout,
+        )
+        .await
+    }
+
+    /// O19: run `cmd` with a prepared directory (a temporary copy of the
+    /// scanned tree) mounted read-only at `/workspace` as the working
+    /// directory. Same isolation, same timeout: only `/tmp` is writable.
+    pub async fn run_in_tree(
+        &self,
+        tree: &Path,
+        cmd: &[String],
+        timeout: Duration,
+    ) -> Result<(i64, String), String> {
+        self.run_mounted(&[(tree, "/workspace")], "/workspace", cmd, timeout)
+            .await
+    }
+
+    async fn run_mounted(
+        &self,
+        mounts: &[(&Path, &str)],
+        workdir: &str,
+        cmd: &[String],
+        timeout: Duration,
+    ) -> Result<(i64, String), String> {
+        // `--mount` is comma-separated key=value: a source path holding a
+        // comma could smuggle extra mount options.
+        if let Some((bad, _)) = mounts
+            .iter()
+            .find(|(p, _)| p.to_string_lossy().contains(','))
+        {
+            return Err(format!("unsupported mount path {}", bad.display()));
+        }
         let name = format!("vettalon-poc-{}", uuid::Uuid::new_v4().simple());
-        let args = self.run_args(&name, scratch.path(), &cmd);
+        let args = self.run_args_mounted(&name, mounts, workdir, cmd);
         let mut child = Command::new(&self.docker_bin)
             .args(&args)
             .stdin(Stdio::null())
@@ -267,6 +335,51 @@ impl DockerSandbox {
             }
         }
     }
+}
+
+/// Write each `(name, contents)` pair into a fresh, world-readable scratch
+/// dir. With `tree_mountpoint`, also create an empty `tree/` directory so a
+/// read-only bind mount can be placed on it.
+fn write_scratch(
+    files: &[(&str, &str)],
+    tree_mountpoint: bool,
+) -> Result<tempfile::TempDir, String> {
+    let scratch = tempfile::Builder::new()
+        .prefix("vettalon-poc-")
+        .tempdir()
+        .map_err(|e| format!("cannot create temp workspace: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755));
+    }
+    for (name, contents) in files {
+        // Files are harness/model PoC text only; a bare basename is all the
+        // caller ever passes. Refuse anything with a separator so a crafted
+        // name can never escape the scratch dir (`tree` is the mountpoint).
+        if name.contains('/') || name.contains('\\') || name.is_empty() || *name == "tree" {
+            return Err(format!("invalid workspace file name {name:?}"));
+        }
+        let path = scratch.path().join(name);
+        std::fs::write(&path, contents).map_err(|e| format!("cannot write poc file: {e}"))?;
+        // The container runs as nobody; the mounted dir and files must be
+        // world-readable (they hold only generated PoC text).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+    if tree_mountpoint {
+        let dir = scratch.path().join("tree");
+        std::fs::create_dir(&dir).map_err(|e| format!("cannot create tree mountpoint: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    Ok(scratch)
 }
 
 /// Removes a PoC container when dropped while still armed, i.e. when the run
@@ -458,6 +571,60 @@ ghi789 notapid
     }
 
     #[test]
+    fn mounted_run_args_keep_every_flag_and_mount_read_only() {
+        let sb = DockerSandbox {
+            docker_bin: "docker".into(),
+            image: "img".into(),
+        };
+        let a = sb.run_args_mounted(
+            "n",
+            &[
+                (Path::new("/tmp/h"), "/workspace"),
+                (Path::new("/tmp/t"), "/workspace/tree"),
+            ],
+            "/workspace",
+            &["sh".into(), "-c".into(), "pytest".into()],
+        );
+        let base = sb.run_args("n", Path::new("/tmp/h"), &["sh".into()]);
+        for flag in base.iter().take_while(|f| *f != "--workdir") {
+            assert!(a.contains(flag), "missing {flag}");
+        }
+        assert!(
+            a.iter()
+                .any(|x| x == "type=bind,source=/tmp/t,target=/workspace/tree,readonly")
+        );
+        assert!(
+            a.iter()
+                .filter(|x| x.starts_with("type=bind"))
+                .all(|x| x.ends_with(",readonly"))
+        );
+        let wd = a.iter().position(|x| x == "--workdir").unwrap();
+        assert_eq!(a[wd + 1], "/workspace");
+    }
+
+    #[tokio::test]
+    async fn tree_mount_refuses_a_comma_path_and_the_tree_file_name() {
+        let sb = DockerSandbox {
+            docker_bin: "/nonexistent/docker".into(),
+            image: "img".into(),
+        };
+        let e = sb
+            .run_in_tree(
+                Path::new("/tmp/a,b"),
+                &["true".into()],
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.contains("unsupported mount path"), "{e}");
+        let e = sb
+            .run_workspace(&[("tree", "x")], &["true".into()], Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(e.contains("invalid workspace file name"), "{e}");
+    }
+
+    #[test]
     fn script_exit_127_is_the_scripts_own_result() {
         assert!(is_docker_failure(125, ""));
         assert!(!is_docker_failure(127, "bash: curl: command not found"));
@@ -466,6 +633,25 @@ ghi789 notapid
             "docker: Error response from daemon: OCI runtime create failed"
         ));
         assert!(!is_docker_failure(1, "OCI runtime"));
+    }
+
+    #[tokio::test]
+    async fn run_workspace_refuses_file_names_with_separators() {
+        let sb = DockerSandbox {
+            docker_bin: "/nonexistent/docker".into(),
+            image: "img".into(),
+        };
+        for bad in ["../escape.py", "sub/dir.py", "a\\b.py", ""] {
+            let e = sb
+                .run_workspace(
+                    &[(bad, "print(1)")],
+                    &["python3".into()],
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap_err();
+            assert!(e.contains("invalid workspace file name"), "{bad}: {e}");
+        }
     }
 
     #[tokio::test]
