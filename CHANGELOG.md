@@ -9,6 +9,7 @@
 - OpenSSF Scorecard workflow（`.github/workflows/scorecard.yml`）：每週、push 到 main 時執行，結果公開到 Scorecard API 並上傳 code scanning；使用預設 `GITHUB_TOKEN`，所有 action 釘選 commit SHA。
 - Claude Code plugin 可從 GitHub 安裝：repo 根目錄新增 `.claude-plugin/marketplace.json`（名稱 `vettalon`），用 `/plugin marketplace add zhixuli0406/vettalon` 加入後 `/plugin install vettalon@vettalon`。原本的 `vettalon-local` 本機開發流程不變。
 - `.bestpractices.json`：OpenSSF Best Practices passing 等級的自評答案（66 條有答案：60 Met、4 N/A、2 Unmet，Unmet 都是 SUGGESTED），在 bestpractices.dev 建立專案時會自動帶入，送出前仍由維護者逐條確認。
+- README 加上 OpenSSF Best Practices badge：專案 15717 於 2026-10-20 達到 passing 等級（自我認證）。
 
 ### Changed
 - README 註明 Pro 桌面 App 支援的平台（Apple Silicon Mac、Windows x64、Linux x86_64，不支援 Intel Mac）並連到官網下載頁；開源 CLI 的支援平台不變。
