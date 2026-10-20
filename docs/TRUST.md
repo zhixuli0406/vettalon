@@ -43,6 +43,11 @@ fails before building/signing. Checkout resolves the same reviewed tag.
 Historical releases may lack these artifacts; do not claim they have passed the
 new trust gate. The desktop application uses a separate release/signing workflow;
 this CLI trust pack does not prove Windows signatures or Apple notarization.
+Desktop updater payloads use the application's embedded Minisign public key,
+while installer digests, macOS notarization, and native installation need their
+own checks. A valid Desktop updater signature is not a CLI Cosign signature,
+GitHub attestation, or CycloneDX BOM. A draft release remains a candidate until
+its own version-specific readback and native acceptance are complete.
 
 ## Verify a downloaded CLI archive
 

@@ -6,6 +6,12 @@
 
 ### Added
 - Deep scan 加入 opt-in `--source-receipts`，在 JSON／SARIF module coverage 記錄來源快照、實際提交前綴及本機提示 SHA-256；模型回覆與未知傳輸分開標記。這不代表模型已讀、理解或提升召回。
+- OpenSSF Scorecard workflow（`.github/workflows/scorecard.yml`）：每週、push 到 main 時執行，結果公開到 Scorecard API 並上傳 code scanning；使用預設 `GITHUB_TOKEN`，所有 action 釘選 commit SHA。
+- Claude Code plugin 可從 GitHub 安裝：repo 根目錄新增 `.claude-plugin/marketplace.json`（名稱 `vettalon`），用 `/plugin marketplace add zhixuli0406/vettalon` 加入後 `/plugin install vettalon@vettalon`。原本的 `vettalon-local` 本機開發流程不變。
+
+### Changed
+- README 註明 Pro 桌面 App 支援的平台（Apple Silicon Mac、Windows x64、Linux x86_64，不支援 Intel Mac）並連到官網下載頁；開源 CLI 的支援平台不變。
+- 貢獻指南要求新功能與修 bug 在同一個 PR 附自動化測試，PR 範本加上對應勾選項。
 
 ### Fixed
 - Release verifier 改用單一 exact certificate identity，避免新版 GitHub CLI 拒絕同時指定 `--cert-identity` 與 `--signer-workflow`；workflow／tag、issuer、來源 SHA 與 hosted runner 限制保留。此修正不改已發布的 binary 或版本 tag。

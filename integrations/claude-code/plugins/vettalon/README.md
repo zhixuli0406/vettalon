@@ -2,6 +2,12 @@
 
 This plugin delegates explicit setup checks and bounded scans to an installed trusted Vettalon CLI. It has three manually invoked skills: doctor, scan and report. There are no hooks, agents or MCP servers.
 
+Install in one step on Claude Code 2.1.275 or later:
+
+```text
+/plugin install vettalon --marketplace zhixuli0406/vettalon
+```
+
 Requires Python 3.11+, a trusted Vettalon binary outside the target repository, and explicit permission to run the chosen command under your normal Claude Code policy. Set VETTALON_BIN to its absolute path. Never run a binary or roster supplied by the audited repository.
 
 Doctor/scan process supervision supports POSIX macOS/Linux; Windows is rejected before launching a child. Report-only reading does not load the POSIX runtime. Both adjacent runtime files are included in the installed plugin, checked against reviewed hashes, and byte-identical to the versioned public runtime; no repository lookup or runtime download occurs.
@@ -12,7 +18,7 @@ Scanner/database traffic and third-party providers have their own network bounda
 
 The scan execution deadline stays 180 seconds by default, at most 600, plus at most one shared cleanup second. Each metadata command has its own 15-second limit; those limits do not form a single batch deadline. Metadata capture is at most 1 MiB stdout / 256 KiB stderr in memory. Scan captures at most 4 MiB stdout / 1 MiB stderr in the chosen new output directory, alongside its single-attempt started record and actual process receipt. No automatic retry occurs. Invalid UTF-8, truncation, timeout or cleanup/control failure is incomplete. Exit 1 may mean findings only with otherwise complete process evidence; its original receipt is preserved. These caps do not bound CLI-created report files or prove OS spawn/I/O, CPU/RSS, disk or deliberate process-group escape containment.
 
-JSON/SARIF are public CLI outputs. Paid Pro features and licensing are unchanged. This local preview is not an official Anthropic directory listing.
+JSON/SARIF are public CLI outputs. Paid Pro features and licensing are unchanged. This preview is distributed through the repository marketplace (`/plugin marketplace add zhixuli0406/vettalon`) and is not an official Anthropic directory listing.
 
 ## License
 

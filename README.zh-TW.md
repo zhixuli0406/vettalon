@@ -69,6 +69,8 @@ steps:
   - uses: zhixuli0406/vettalon-action@v1
 ```
 
+在 Claude Code 裡掃描，可以裝 plugin（預覽版，仍需要上面安裝的 CLI）：`/plugin install vettalon --marketplace zhixuli0406/vettalon`，說明見 [integrations/claude-code](integrations/claude-code/README.md)。
+
 ## 使用
 
 ```bash
@@ -297,7 +299,7 @@ cargo clippy --all-targets
 
 另有付費的 Vettalon Pro，提供桌面 App、本機 dashboard（可設時間預算、隨時取消掃描，並有檢視供應鏈獵捕結果、產生上游揭露草稿的「供應鏈」分頁），以及對齊台灣資安檢測報告慣例的企業報告產生器（PDF／Word／HTML）。Pro 讀的是同一份 `scan --report` JSON，核心不依賴 Pro。
 
-Pro 需要授權金鑰，詳見 [官網](https://vettalon.dudustudio.monster/#editions)。開源核心不需要授權，也不會檢查授權。
+Pro 需要授權金鑰，詳見 [官網](https://vettalon.dudustudio.monster/#editions)。桌面 App 支援 Apple Silicon Mac、Windows 10／11（x64）與 Linux（x86_64），不支援 Intel Mac，安裝檔在[下載頁](https://vettalon.dudustudio.monster/download/)。開源核心不需要授權，也不會檢查授權；上面的 CLI 在 Intel Mac 上照常可用。
 
 ## Coverage 與證據紀錄（下版預覽）
 

@@ -1,0 +1,16 @@
+{
+  "name": "vettalon",
+  "owner": {
+    "name": "Dudu Technology Ltd."
+  },
+  "description": "Vettalon for Claude Code: explicit setup checks, bounded CLI scans and JSON/SARIF report reading.",
+  "plugins": [
+    {
+      "name": "vettalon",
+      "source": "./integrations/claude-code/plugins/vettalon",
+      "description": "Bounded, explicit Vettalon CLI scans and local SARIF reports (preview).",
+      "homepage": "https://github.com/zhixuli0406/vettalon/tree/main/integrations/claude-code",
+      "license": "Apache-2.0"
+    }
+  ]
+}
