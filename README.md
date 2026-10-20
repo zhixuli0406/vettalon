@@ -12,6 +12,7 @@
 
 [![CI](https://github.com/zhixuli0406/vettalon/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/vettalon/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15717/badge)](https://www.bestpractices.dev/projects/15717)
 
 Vettalon finds security vulnerabilities in your own code: AI models from several vendors split up the review, then a model from a different vendor tries to refute each finding, and only the findings it can't refute are kept.
 
