@@ -404,12 +404,12 @@ mod tests {
     fn bundled_ruleset_is_syntactically_valid_yaml() {
         // Sanity check only — this does NOT confirm semgrep accepts the
         // rule schema (that needs a live semgrep run, out of scope here).
-        let parsed: serde_yaml::Value = serde_yaml::from_str(BUNDLED_RULES_YAML)
+        let docs = yaml_rust2::YamlLoader::load_from_str(BUNDLED_RULES_YAML)
             .expect("bundled semgrep ruleset must be valid YAML");
-        let rules = parsed
-            .get("rules")
-            .expect("must have a top-level `rules` key");
-        assert!(rules.as_sequence().is_some_and(|s| !s.is_empty()));
+        assert_eq!(docs.len(), 1, "bundled ruleset must be a single document");
+        let rules = &docs[0]["rules"];
+        assert!(!rules.is_badvalue(), "must have a top-level `rules` key");
+        assert!(rules.as_vec().is_some_and(|s| !s.is_empty()));
     }
 
     #[test]
