@@ -4,7 +4,13 @@
 
 Please report vulnerabilities in vettalon itself through GitHub's private
 vulnerability reporting: open the repository's **Security** tab and choose
-**Report a vulnerability**. Do not open a public issue for a security bug.
+**Report a vulnerability**, or go straight to
+<https://github.com/zhixuli0406/vettalon/security/advisories/new>. Do not open
+a public issue for a security bug.
+
+If you cannot use GitHub, email <info@dudustudio.monster>. The same contacts
+are published in
+<https://vettalon.dudustudio.monster/.well-known/security.txt>.
 
 Useful things to include: the vettalon version (`vettalon --version`), the
 command you ran, the model backends in your roster (no keys), and the

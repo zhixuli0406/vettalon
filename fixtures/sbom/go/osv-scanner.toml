@@ -1,0 +1,6 @@
+# OSV-Scanner / OpenSSF Scorecard: these advisories are expected in this frozen
+# test fixture. It is never built into or shipped with Vettalon.
+
+[[IgnoredVulns]]
+id = "GO-2026-5024"
+reason = "SBOM fixture: frozen go.mod/go.sum snapshot used to check BOM output byte for byte; not shipped."

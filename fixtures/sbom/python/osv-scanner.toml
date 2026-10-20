@@ -1,0 +1,46 @@
+# OSV-Scanner / OpenSSF Scorecard: these advisories are expected in this frozen
+# test fixture. It is never built into or shipped with Vettalon.
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-1872"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-2275"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-215"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-141"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-1994"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-1996"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-1997"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-1998"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-1999"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-4175"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-4177"
+reason = "SBOM fixture: frozen requests 2.32.3 closure used to check BOM output byte for byte; not installed or shipped."

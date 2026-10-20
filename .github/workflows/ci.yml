@@ -22,8 +22,8 @@ jobs:
   fmt:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -36,16 +36,16 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-latest]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy ${{ env.CORE }} --all-targets -- -D warnings
       - run: cargo test ${{ env.CORE }}
       - name: Set up Python for macOS query contracts
         if: matrix.os == 'macos-latest'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
       - name: Query refinement public V2 offline contracts
@@ -56,11 +56,11 @@ jobs:
     name: trust tools (no signing or publishing)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
-      - run: python -m pip install -r scripts/trust/requirements.txt
+      - run: python -m pip install --require-hashes -r scripts/trust/requirements.txt
       - run: python -m unittest discover -s scripts/trust/tests -p 'test_*.py'
       - run: python -B -I -S -m unittest discover -s reports/evidence-acceptance/cli-v020-public-trust-readback-20261019 -p 'test_*.py'
       - run: bash -n scripts/trust/verify-release.sh scripts/trust/scorecard.sh
@@ -70,11 +70,11 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Record native toolchain and runner
         shell: pwsh
         run: |
