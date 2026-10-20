@@ -7,6 +7,11 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes `audit::fuzzing` (doc-hidden re-exports of private parsers) for the
+# cargo-fuzz targets in the repository's `fuzz/` directory. Not for normal use.
+fuzzing = []
+
 [[bin]]
 name = "vettalon"
 path = "src/main.rs"
@@ -39,7 +44,7 @@ unicode-segmentation = "1.12"
 yaml-rust2 = { version = "0.13", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.190"
+libc = "=0.2.191"
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "=10.0.1", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }

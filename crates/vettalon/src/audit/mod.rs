@@ -59,6 +59,19 @@ pub mod schema;
 pub mod triage;
 mod validator;
 
+/// Entry points for the cargo-fuzz targets in `fuzz/` (feature `fuzzing`).
+/// Not a stable API: it re-exports the model-reply contract parsers and the
+/// deterministic pre-check so fuzz targets can drive them without a network,
+/// a model or a repository on disk. Never enabled in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use super::adversarial::{VerifierReply, centered_window, parse_verdict};
+    pub use super::ai_audit::{RawCandidate, parse_ai_candidates};
+    pub use super::llm_util::{extract_context_window, numbered_context_window};
+    pub use super::precheck::{LineOracle, check_candidate, check_file_and_line};
+}
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 

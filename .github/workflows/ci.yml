@@ -95,3 +95,44 @@ jobs:
         run: |
           cargo test --locked -p vettalon --lib audit::scanners::exec::windows::tests -- --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Windows scanner tests failed: $LASTEXITCODE" }
+
+  fuzz:
+    name: fuzz (cargo-fuzz, bounded run per target)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # Dated nightly (cargo-fuzz needs -Zsanitizer); bump deliberately.
+      FUZZ_TOOLCHAIN: nightly-2026-10-01
+      FUZZ_SECONDS: '45'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: nightly-2026-10-01
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo +"$FUZZ_TOOLCHAIN" install cargo-fuzz --version 0.13.2 --locked
+      - name: Build fuzz targets
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz build
+      - name: Run every target for a fixed time
+        run: |
+          for target in $(cargo +"$FUZZ_TOOLCHAIN" fuzz list); do
+            echo "::group::fuzz $target"
+            mkdir -p "fuzz/corpus/$target"
+            cargo +"$FUZZ_TOOLCHAIN" fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" \
+              -- -max_total_time="$FUZZ_SECONDS" -print_final_stats=1
+            echo "::endgroup::"
+          done
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

@@ -167,22 +167,30 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      # npm trusted publishing: the job's OIDC token is exchanged for a
+      # short-lived publish credential. No long-lived NPM_TOKEN is used.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          # Node 24 bundles npm 11; trusted publishing needs npm >= 11.5.1.
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+      - name: Require an npm that supports trusted publishing
+        run: |
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number);if(a<11||(a===11&&(b<5||(b===5&&c<1)))){console.error("npm "+process.argv[1]+" < 11.5.1");process.exit(1)}' "$(npm --version)"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           merge-multiple: true
           path: artifacts
-      - name: Publish to npm
+      # Stage only: the trusted publisher on npmjs.com allows `npm stage publish`
+      # and nothing else. Each staged version goes live only after a maintainer
+      # runs `npm stage approve <id>` with 2FA (see docs/TRUST.md).
+      - name: Stage packages on npm
         env:
-          # secrets can't be used in `if:`, so gate at runtime instead.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           ARTIFACTS_DIR: ./artifacts
+          NPM_PUBLISH_MODE: stage
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "no NPM_TOKEN, skipping npm publish"; exit 0; fi
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           ./npm/scripts/publish.sh "${TAG#v}"

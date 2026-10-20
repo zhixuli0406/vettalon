@@ -2,10 +2,15 @@
 set -euo pipefail
 # Publish vettalon to npm. Usage: ./npm/scripts/publish.sh <version> [--dry-run]
 # Prereqs: GitHub release artifacts in ./artifacts/, npm auth with @vettalon access.
+# NPM_PUBLISH_MODE=stage (CI default) runs `npm stage publish`: the version is
+# held until a maintainer approves it with 2FA (`npm stage approve <id>`).
+# NPM_PUBLISH_MODE=publish keeps the old direct publish for a manual fallback.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NPM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERSION="${1:?Usage: publish.sh <version> [--dry-run]}"
 DRY_RUN="${2:-}"
+MODE="${NPM_PUBLISH_MODE:-stage}"
+case "$MODE" in stage|publish) ;; *) echo "NPM_PUBLISH_MODE must be stage or publish" >&2; exit 2;; esac
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-./artifacts}"
 
 declare -A PLATFORM_MAP=(
@@ -39,11 +44,15 @@ done
 already_published() { [ -z "${DRY_RUN}" ] || return 1; [ "$(npm view "$1@$2" version 2>/dev/null || true)" = "$2" ]; }
 publish_pkg() {
   if already_published "$1" "$VERSION"; then echo "  SKIP: $1@$VERSION already on registry"; return 0; fi
-  echo "  Publishing $1..."; npm publish "$2" --access public ${DRY_RUN}
+  if [ "$MODE" = stage ]; then
+    echo "  Staging $1 (needs 'npm stage approve' with 2FA)..."; npm stage publish "$2" --access public ${DRY_RUN}
+  else
+    echo "  Publishing $1..."; npm publish "$2" --access public ${DRY_RUN}
+  fi
 }
 
 for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
   [ -f "${NPM_DIR}/${dir}/bin/vettalon" ] && publish_pkg "@vettalon/${dir}" "${NPM_DIR}/${dir}" || echo "  SKIP: ${dir} (no binary)"
 done
 publish_pkg "vettalon" "${NPM_DIR}/vettalon"
-echo "=== Done === npm install -g vettalon"
+if [ "$MODE" = stage ]; then echo "=== Staged === approve: npm stage list; npm stage approve <id> (platform packages first, then vettalon)"; else echo "=== Done === npm install -g vettalon"; fi
