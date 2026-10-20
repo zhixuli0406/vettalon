@@ -8,6 +8,7 @@
 - Deep scan 加入 opt-in `--source-receipts`，在 JSON／SARIF module coverage 記錄來源快照、實際提交前綴及本機提示 SHA-256；模型回覆與未知傳輸分開標記。這不代表模型已讀、理解或提升召回。
 - OpenSSF Scorecard workflow（`.github/workflows/scorecard.yml`）：每週、push 到 main 時執行，結果公開到 Scorecard API 並上傳 code scanning；使用預設 `GITHUB_TOKEN`，所有 action 釘選 commit SHA。
 - Claude Code plugin 可從 GitHub 安裝：repo 根目錄新增 `.claude-plugin/marketplace.json`（名稱 `vettalon`），用 `/plugin marketplace add zhixuli0406/vettalon` 加入後 `/plugin install vettalon@vettalon`。原本的 `vettalon-local` 本機開發流程不變。
+- `.bestpractices.json`：OpenSSF Best Practices passing 等級的自評答案（66 條有答案：60 Met、4 N/A、2 Unmet，Unmet 都是 SUGGESTED），在 bestpractices.dev 建立專案時會自動帶入，送出前仍由維護者逐條確認。
 
 ### Changed
 - README 註明 Pro 桌面 App 支援的平台（Apple Silicon Mac、Windows x64、Linux x86_64，不支援 Intel Mac）並連到官網下載頁；開源 CLI 的支援平台不變。
@@ -15,6 +16,14 @@
 
 ### Fixed
 - Release verifier 改用單一 exact certificate identity，避免新版 GitHub CLI 拒絕同時指定 `--cert-identity` 與 `--signer-workflow`；workflow／tag、issuer、來源 SHA 與 hosted runner 限制保留。此修正不改已發布的 binary 或版本 tag。
+
+## [0.2.1] - 2026-10-20
+
+只更新相依套件的安全修補版，從 0.2.0 分出，不含 main 上尚未發布的變更。
+
+### Security
+- rustls 升到 0.23.46，修補 RUSTSEC-2026-0346～0349（`Debug` 輸出可能洩漏 TLS 金鑰、ECH 被拒後緩衝資料送往外層伺服器、brotli 憑證解壓在驗證前可配置到 1 GiB、未驗證的 ServerHello 可讓之後的連線降級為傳統金鑰交換）。CLI 不輸出 TLS session 的 `Debug`，也沒有用 ECH 或 brotli 憑證壓縮；第四項是否有影響取決於加密提供者是否啟用後量子混合金鑰交換，未逐一驗證。
+- zip 2.4.2 的 RUSTSEC-2026-0367～0369 只影響 `extract`。`vettalon hunt` 解壓相依原始碼時逐檔讀取並用 `enclosed_name` 限制路徑，沒有呼叫 `extract`，因此這版未升級（修正版需 zip 9.x 大版本）。
 
 ## [0.2.0] - 2026-10-17
 
