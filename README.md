@@ -81,6 +81,8 @@ steps:
   - uses: zhixuli0406/vettalon-action@v1
 ```
 
+To run scans from Claude Code, install the plugin (preview; it still needs the CLI above): `/plugin install vettalon --marketplace zhixuli0406/vettalon`. See [integrations/claude-code](integrations/claude-code/README.md).
+
 ## Usage
 
 ```bash
@@ -313,7 +315,7 @@ This repo is the open-source core of Vettalon. Everything listed above (scanning
 
 There is also a paid Vettalon Pro. It provides a desktop app, a local dashboard (set a time budget, cancel a scan at any time, plus a "Supply chain" tab for viewing hunt results and generating upstream disclosure drafts), and an enterprise report generator that follows the conventions of Taiwanese security assessment reports (PDF/Word/HTML). Pro reads the same `scan --report` JSON, and the core does not depend on Pro.
 
-Pro needs a license key; see the [website](https://vettalon.dudustudio.monster/#editions). The open-source core needs no license and never checks for one.
+Pro needs a license key; see the [website](https://vettalon.dudustudio.monster/#editions). The desktop app runs on Apple Silicon Macs, Windows 10/11 (x64) and Linux (x86_64); Intel Macs are not supported. Installers are on the [download page](https://vettalon.dudustudio.monster/en/download/). The open-source core needs no license and never checks for one; the CLI above still runs on Intel Macs.
 
 ## Coverage and proof records (next-release preview)
 

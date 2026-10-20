@@ -2,11 +2,22 @@
 
 This local plugin helps you run a bounded Vettalon scan and inspect its JSON/SARIF report from Claude Code. It delegates analysis to the existing CLI; it installs no hooks and starts no scan on its own.
 
-This is next-release work, not an official directory listing. Python 3.11+, a separately installed trusted Vettalon binary, and Claude Code are required. Deep scans additionally require an explicitly selected trusted roster outside the scanned repository; cloud providers receive source excerpts. Docker and prebuilt agent images are required by sandboxed CLI providers. Authentication is not verified by doctor.
+It is distributed through the marketplace at the root of this repository and is not yet listed in Anthropic's plugin directory. Python 3.11+, a separately installed trusted Vettalon binary, and Claude Code are required. Deep scans additionally require an explicitly selected trusted roster outside the scanned repository; cloud providers receive source excerpts. Docker and prebuilt agent images are required by sandboxed CLI providers. Authentication is not verified by doctor.
 
 ## Install
 
-Review this directory first. These commands change your Claude Code user settings:
+Review this directory first. Installing changes your Claude Code user settings.
+
+From GitHub (inside Claude Code):
+
+```text
+/plugin marketplace add zhixuli0406/vettalon
+/plugin install vettalon@vettalon
+```
+
+or from a shell: `claude plugin marketplace add zhixuli0406/vettalon`, then `claude plugin install vettalon@vettalon`. Update with `claude plugin marketplace update vettalon` and `claude plugin update vettalon@vettalon`; remove with `claude plugin marketplace remove vettalon`. Without an SSH key for GitHub, set `CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1`.
+
+From a local checkout (development), using the `vettalon-local` marketplace in this directory:
 
 ```bash
 claude plugin validate /absolute/path/to/integrations/claude-code
