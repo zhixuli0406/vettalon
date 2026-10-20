@@ -71,7 +71,7 @@ pub trait RegistryProbe: Send + Sync {
 
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(data))
+    hex::encode(Sha256::digest(data))
 }
 
 fn parse_time(s: &str) -> Option<DateTime<Utc>> {
@@ -722,6 +722,14 @@ impl<H: HttpGet, F: SourceFetcher> RegistryProbe for LiveRegistryProbe<H, F> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn sha256_hex_is_pinned() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     pub(crate) fn npm_packument() -> serde_json::Value {
         // Modelled on the 2025 npm worm pattern: a patch release adds a

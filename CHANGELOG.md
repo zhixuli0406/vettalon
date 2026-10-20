@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-20
+
 ### Added
 - `scan --prescreen cheap-model --prescreen-model <id>`（預設 `off`，只在 `--profile deep`）：兩段式排序。排序（heuristic 或 Jev）之後，用模型清單裡指定的便宜模型替前 `--prescreen-pool` 個審查單元（預設 40，上限 200）各打 1–5 分（訂閱制 CLI 拿不到 logprob，所以是序數分數），深審只拿前 `--prescreen-top` 百分比（預設 20%），仍受 `--max-modules` 限制；其餘單元在 coverage 記 `deferred`／`prescreen_cut`。每個單元一次呼叫，prompt 上限 6 KiB，含單元路徑、最多 20 個檔案路徑與一個檔案的前 60 行（≤2 KiB），機密檔不取片段；含對 AI 審查者下指令文字的單元不送出、直接給 5 分。失敗、逾時（每次 120 秒）或拒答的單元以 3 分計，沒有任何分數、有單元因時間預算未開始、或超過一半的呼叫沒拿到分數時，維持原排序、不裁切（`degraded`）。沒有 finder 模型時不跑預篩。報告新增 `ensemble.prescreen`（呼叫數、成功／失敗／拒答／強制數、送出與收到的位元組、耗時、每個單元的分數與是否入選），`--trace` 記為 step `prescreen`。效益尚未用真模型量過。
 - `scan --finder-budget`／`--refuter-budget`／`--poc-budget <秒>`：各角色從自己的步驟開始計時的上限。finder 上限與 `--time-budget` 取早者，到期的模組 deferred；refuter 上限到期後不再開始新的覆核，未覆核的發現記 `verify_error: refuter budget exhausted` 並以 `critic_budget_exhausted` 標成 incomplete；PoC 上限到期後不再開始新的 PoC，符合條件的發現記 `poc_skipped`，整次標成 incomplete（`time_budget_exhausted`）。啟動時驗證所有預算旗標，0、低於 60 秒（一次模型呼叫的下限）或角色上限大於 `--time-budget` 都在任何掃描器或模型執行前以 exit 2 結束並說明原因；有設定時在 stderr 印出實際預算表。報告新增 `ensemble.budget`（各上限與哪個上限實際截斷了工作）。
@@ -62,6 +64,9 @@
 - **SARIF 的 `security-severity` 不再由定性嚴重度換算成 9.5／8.0／5.5／3.0。** 只有同一條 rule 的每筆發現都有來源 CVSS 向量時才設定（取最高分），否則省略；rule 一律帶 `vettalon.security_severity_basis`（`cvss_max`／`omitted_no_cvss`／`omitted_partial_cvss`／`omitted_cvss_zero`，GitHub 不收 0.0），有分數時另帶 `vettalon.cvss_version`、`vettalon.cvss_vector`，v4.0 再加 `vettalon.cvss_nomenclature`。影響：沒有 CVSS 的結果在 GitHub code scanning 不再顯示 Critical／High 等安全嚴重度，改依 SARIF `level`（error／warning／note）；用 security severity 設定的篩選或 code scanning 保護規則需要改用 level。
 - SARIF `$schema` 改為 OASIS SARIF 2.1.0 Errata 01 的官方 schema URL。
 - CVE 編號依 CVE Record Format 5.2.0 驗證（`CVE-YYYY-` 加 4～19 位數字），不合格式的 alias 丟棄，重複的去掉；測試範例改用 `CVE-1900-` 前綴（CNA Operational Rules 5.4.1）。
+- `vettalon agents build` 建置的 agent 映像（codex、grok 在容器內執行時用）基底從 `node:22-bookworm-slim` 改為 `node:26-bookworm-slim`（釘選 digest，建置時為 Node 26.12.0）；codex 0.162.1、grok 1.0.50 不變。映像標籤綁 vettalon 版本，升級後需重跑 `vettalon agents build`。
+- 相依套件 toml 從 0.8 升到 1.1（TOML 1.1 規格）。設定檔（`~/.vettalon/config.toml`）與 hunt 讀取的 Cargo.toml／Cargo.lock 現在也接受 TOML 1.1 語法（例如跨行、結尾帶逗號的 inline table）；設定檔寫回的內容不變，解析錯誤訊息的文字有些不同（例如重複鍵只寫 `duplicate key`，不再列出鍵名）。
+- 相依套件 sha2 從 0.10 升到 0.11。報告、證據與收據裡的 SHA-256 值、finding id 與 fingerprint 都不變；新增測試以 FIPS 180-2／RFC 4231 測試向量和獨立算出的值鎖住輸出，並在 0.10 與 0.11 下各跑一次確認一致。
 
 ### Fixed
 - hunt 讀 lockfile 時，名稱或版本是空字串的項目不再變成目標（go.sum 只有 `/go.mod` 欄位、package-lock.json 或 Cargo.lock 的空 `name`／`version`）。由新加的 fuzz target 找到；go.sum 與 npm 的正式 intake 原本就會濾掉，Cargo.lock 的空值則會一路成為目標，下載時打到不存在的 crates.io 網址。

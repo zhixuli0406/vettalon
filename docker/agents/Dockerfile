@@ -1,7 +1,7 @@
 # Agent CLIs that cannot fully disable their own tools (codex, grok) run
 # in this image, so their tools see only an empty workspace and a copy of
 # one auth file. Versions are pinned; bump them deliberately.
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
+FROM node:26-bookworm-slim@sha256:298992629d69bbd5b2b03ad57094d8e4fcb3a8eeb7c4e25d29de656519568913
 
 ARG CODEX_VERSION=0.162.1
 ARG GROK_VERSION=1.0.50

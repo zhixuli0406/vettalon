@@ -420,7 +420,7 @@ pub async fn collect(
     record.block_bytes = block.len();
     if !block.is_empty() {
         use sha2::{Digest, Sha256};
-        record.block_sha256 = Some(format!("{:x}", Sha256::digest(block.as_bytes())));
+        record.block_sha256 = Some(hex::encode(Sha256::digest(block.as_bytes())));
     }
     SeedContext { record, block }
 }

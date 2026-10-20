@@ -556,7 +556,7 @@ fn read_intake_source(
     };
     use sha2::{Digest, Sha256};
     source.bytes = Some(raw.len().min(u64::MAX as usize) as u64);
-    source.sha256 = Some(format!("{:x}", Sha256::digest(&raw)));
+    source.sha256 = Some(hex::encode(Sha256::digest(&raw)));
     match String::from_utf8(raw) {
         Ok(text) => {
             source.status = IntakeSourceStatus::Parsed;

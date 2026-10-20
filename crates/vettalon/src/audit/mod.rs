@@ -2183,14 +2183,14 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
         let attempt = &report["coverage"][0]["attempts"][0];
         let source = std::fs::read(dir.path().join("a/main.rs")).unwrap();
-        let source_hash = format!("{:x}", Sha256::digest(&source));
+        let source_hash = hex::encode(Sha256::digest(&source));
         assert_eq!(attempt["files"][0]["source_sha256"], source_hash);
         assert_eq!(attempt["files"][0]["submitted_sha256"], source_hash);
         let prompts = script.prompts.lock().unwrap().clone();
         assert_eq!(prompts.len(), 1);
         assert_eq!(
             attempt["source_receipt"]["calls"][0]["prompt_sha256"],
-            format!("{:x}", Sha256::digest(prompts[0].as_bytes()))
+            hex::encode(Sha256::digest(prompts[0].as_bytes()))
         );
         assert_eq!(attempt["source_receipt"]["calls"][0]["valid_reply"], true);
         let sarif: serde_json::Value =
