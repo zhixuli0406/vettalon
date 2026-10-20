@@ -555,7 +555,7 @@ struct ModulePrompt {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -1192,6 +1192,14 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_is_pinned_lowercase_hex() {
+        assert_eq!(
+            sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     // ── module_key / rank_modules ────────────────────────────────────
 

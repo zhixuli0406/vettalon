@@ -400,7 +400,7 @@ pub struct ProofEvidence {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// One finding. Serialized through its own `Serialize` impl (below), which
@@ -1534,6 +1534,46 @@ pub struct AuditReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Pinned outputs (FIPS 180-2 vectors; ids computed with Python hashlib)
+    // so a sha2 upgrade cannot silently change evidence digests or ids.
+    #[test]
+    fn sha256_hex_matches_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn compute_finding_id_is_pinned() {
+        assert_eq!(
+            compute_finding_id(
+                "semgrep",
+                "rules.sqli",
+                "src/db.rs",
+                Some(42),
+                "query(&input)"
+            ),
+            "semgrep-838fe8684df9a762"
+        );
+        assert_eq!(
+            compute_finding_id("semgrep", "rules.sqli", "src/db.rs", None, "query(&input)"),
+            "semgrep-6732fa44c8123e55"
+        );
+    }
 
     #[test]
     fn severity_ordering_matches_intuitive_ranking() {

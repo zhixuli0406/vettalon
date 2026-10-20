@@ -231,7 +231,7 @@ fn index_path(dir: &Path, osv_ecosystem: &str) -> PathBuf {
 
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(data))
+    hex::encode(Sha256::digest(data))
 }
 
 /// Save `index` and its `.sha256` sidecar (private files).
@@ -327,7 +327,7 @@ pub async fn download(url: &str, dest: &Path) -> Result<(String, u64), String> {
         file.write_all(&chunk)
             .map_err(|e| format!("write {}: {e}", dest.display()))?;
     }
-    Ok((format!("{:x}", hasher.finalize()), total))
+    Ok((hex::encode(hasher.finalize()), total))
 }
 
 /// Hash a local archive (for `--from-file`).
@@ -349,7 +349,7 @@ pub fn hash_file(path: &Path) -> Result<(String, u64), String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok((format!("{:x}", hasher.finalize()), total))
+    Ok((hex::encode(hasher.finalize()), total))
 }
 
 /// Verify an optional pinned hash, then build and save the index.
@@ -390,6 +390,27 @@ pub fn install(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    // Pinned FIPS 180-2 vectors: the sidecar and `--expect-sha256` compare
+    // these lowercase hex strings, so they must not change across sha2 bumps.
+    #[test]
+    fn hashes_are_pinned_lowercase_hex() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        // Spans many read-buffer chunks.
+        f.write_all(&vec![b'a'; 1_000_000]).unwrap();
+        f.flush().unwrap();
+        assert_eq!(
+            hash_file(f.path()).unwrap(),
+            (
+                "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0".to_string(),
+                1_000_000
+            )
+        );
+    }
 
     fn record(id: &str, name: &str, versions: &[&str], ranged: bool) -> String {
         serde_json::json!({

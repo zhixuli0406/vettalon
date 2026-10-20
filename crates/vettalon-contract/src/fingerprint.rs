@@ -279,6 +279,16 @@ mod tests {
     }
 
     #[test]
+    fn derive_is_pinned() {
+        // Computed with Python hashlib; guards cross-run matching against
+        // hash library upgrades.
+        assert_eq!(
+            Fingerprint::derive(&["semgrep", "sqli", "src/a.rs"]).as_str(),
+            "semgrep/sqli/src/a.rs@80183f2e95f4247f"
+        );
+    }
+
+    #[test]
     fn derive_differs_for_different_parts() {
         let a = Fingerprint::derive(&["semgrep", "sqli", "src/a.rs"]);
         assert_ne!(a, Fingerprint::derive(&["semgrep", "sqli", "src/b.rs"]));
