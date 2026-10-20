@@ -30,7 +30,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 unicode-normalization = "0.1"
 unicode-script = "0.5"
 unicode-segmentation = "1.12"
