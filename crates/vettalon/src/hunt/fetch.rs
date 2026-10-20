@@ -201,7 +201,11 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<ExtractStats, String> {
         let mut file = ar.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
         // enclosed_name is None for an unsafe (escaping) path.
         let Some(path) = file.enclosed_name() else {
-            return Err(format!("unsafe path in archive: {}", file.name()));
+            // zip >= 9 decodes names on demand, so name() is fallible too.
+            let name = file
+                .name()
+                .map_or_else(|_| "<undecodable name>".into(), |n| n.into_owned());
+            return Err(format!("unsafe path in archive: {name}"));
         };
         if file.is_dir() {
             let _ = std::fs::create_dir_all(dest.join(&path));
@@ -536,8 +540,8 @@ mod tests {
 
     fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opts: zip::write::FileOptions<()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         for (name, data) in entries {
             w.start_file(*name, opts).unwrap();
             w.write_all(data).unwrap();

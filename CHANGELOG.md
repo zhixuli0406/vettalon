@@ -20,6 +20,10 @@
 ### Fixed
 - Release verifier 改用單一 exact certificate identity，避免新版 GitHub CLI 拒絕同時指定 `--cert-identity` 與 `--signer-workflow`；workflow／tag、issuer、來源 SHA 與 hosted runner 限制保留。此修正不改已發布的 binary 或版本 tag。
 
+### Security
+- 相依套件 zip 從 2.4.2 升到 9.0.5，修補 RUSTSEC-2026-0367～0369：解壓時保留 SUID/SGID 位元、`extract` 建立指向目標目錄外的符號連結、權限經由符號連結套用到目錄外。三項都在 `extract` 裡，Vettalon 從未呼叫它：hunt 來源逐檔讀取，用 `enclosed_name` 拒絕跳出目錄的路徑並限制檔案數與大小，這些行為不變。
+- 開發相依的 serde_yaml（已棄用）改為 yaml-rust2，只用在檢查內建 semgrep 規則 YAML 語法的測試；不再帶入已無人維護的 unsafe-libyaml（RUSTSEC-2024-0449）。不影響發布的二進位檔。
+
 ## [0.2.1] - 2026-10-20
 
 只更新相依套件的安全修補版，從 0.2.0 分出，不含 main 上尚未發布的變更。
