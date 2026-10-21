@@ -240,9 +240,10 @@ cosign v2 checks the image signature; cosign v3 may report the provenance
 attestation bundle instead (same workflow identity, same digest), and either
 passes the identity check. `vettalon agents pull` runs the same `cosign verify`
 (identity, issuer and repository), checks that every signature names this repository and a single
-digest, then pulls that digest and tags it locally. Without `cosign` on `PATH`
-it refuses (cosign is taken from `PATH`, so whoever controls `PATH` controls
-the check). `--no-verify` pulls the tag unchecked and is insecure. Scans never
+digest, then pulls that digest and tags it locally. Without `cosign` it
+refuses. cosign is looked up on `PATH`, then in `~/.local/bin`,
+`/opt/homebrew/bin`, `/usr/local/bin` and a few other user install directories,
+so whoever can write there controls the check. `--no-verify` pulls the tag unchecked and is insecure. Scans never
 pull: agent containers start with `--pull=never`.
 
 In the base image, `/usr/share/licenses/INVENTORY.txt` lists every component

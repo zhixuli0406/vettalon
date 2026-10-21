@@ -1,8 +1,9 @@
 # Local layer of the agents image: the grok CLI on top of the published,
 # grok-free base. grok is proprietary, so it is downloaded from x.ai by the
 # machine that builds this layer and never published. `vettalon agents
-# build|pull` passes BASE_IMAGE (the verified base, by digest when pulled).
-ARG BASE_IMAGE
+# build|pull` always passes BASE_IMAGE (the verified base, by digest when
+# pulled); the default only keeps BuildKit's InvalidDefaultArgInFrom check quiet.
+ARG BASE_IMAGE=vettalon-agents-base
 FROM ${BASE_IMAGE}
 
 ARG GROK_VERSION=1.0.50
