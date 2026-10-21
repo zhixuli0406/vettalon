@@ -140,6 +140,8 @@ fn opts(repo: &Path, rank: crate::audit::RankStrategy) -> crate::audit::ScanOpti
         source_receipts: false,
         time_budget: Some(Duration::from_secs(5)),
         refuter_runs: 1,
+        finder_parse_retries: crate::audit::DEFAULT_FINDER_PARSE_RETRIES,
+        verifier_parse_retries: crate::audit::DEFAULT_VERIFIER_PARSE_RETRIES,
         prescreen: None,
         role_caps: Default::default(),
         fix_test_command: None,

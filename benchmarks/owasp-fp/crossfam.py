@@ -359,8 +359,9 @@ def directionality(arms, metrics):
     return {'cells': rows, 'note': 'unpaired across finders: descriptive, no significance claim'}
 
 
-def analyze(arms_cfg, records):
-    """Full matrix analysis over records from crossfam_run (dry or real)."""
+def analyze(arms_cfg, records, contrasts=None):
+    """Full matrix analysis over records from crossfam_run (dry or real).
+    `contrasts` overrides the v1 pre-registered contrasts (v2 passes its own)."""
     arms = arms_cfg['arms']
     by_arm = {a['id']: [r for r in records if r['arm'] == a['id']] for a in arms}
     unknown = {r['arm'] for r in records} - set(by_arm)
@@ -375,7 +376,8 @@ def analyze(arms_cfg, records):
         raise ValueError('arms cover different case sets; a run must keep every case in every arm')
     metrics = {aid: arm_metrics(recs) for aid, recs in by_arm.items()}
     overlaps = {f'{x}|{y}': pair_overlap(by_arm[x], by_arm[y]) for x, y in combinations(sorted(by_arm), 2)}
-    contrasts = [dict(c, result=paired_contrast(by_arm[c['a']], by_arm[c['b']])) for c in planned_contrasts(arms)]
+    planned = planned_contrasts(arms) if contrasts is None else contrasts
+    contrasts = [dict(c, result=paired_contrast(by_arm[c['a']], by_arm[c['b']])) for c in planned]
     return {'arms': {a['id']: {'kind': a['kind'], 'finder': a['finder'], 'refuter': a['refuter'],
                                'metrics': metrics[a['id']]} for a in arms},
             'overlap': overlaps, 'directionality': directionality(arms, metrics),

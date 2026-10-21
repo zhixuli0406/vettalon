@@ -37,6 +37,10 @@ const REFUSAL_MARKERS: &[&str] = &[
     "无法协助",
     "抱歉，我",
     "很抱歉",
+    // Provider-side safety filters that answer in place of the model
+    // (seen 2026-10-20 from Gemini through the agy CLI).
+    "blocked by gemini's filters",
+    "this request was blocked by",
 ];
 
 /// `true` when `reply` is not a JSON value and contains a refusal marker
@@ -77,6 +81,9 @@ mod tests {
             "我不會只回傳指定的那一行 JSON。請直接說明你想完成的事。"
         ));
         assert!(looks_like_refusal("很抱歉，這個請求我無法協助。"));
+        assert!(looks_like_refusal(
+            "This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries."
+        ));
     }
 
     #[test]

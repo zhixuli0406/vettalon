@@ -156,3 +156,7 @@ python3 -m unittest test_crossfam                    # 離線測試
 python3 crossfam_run.py execute --arms ARMS.json --roster ROSTER.toml --approval APPROVAL.json \
   --cases-dir cases --out-dir runs/xfam --vettalon-bin "$(command -v vettalon)"
 ```
+
+## 8. 2026-10-20 修訂（v2，共用 finder）
+
+擁有者核准真實跑分：Claude 找洞，grok 與 agy 跨家族覆核。上面的 2×2 需要兩個 finder 家族，所以另立 v2 計畫，本節以上的 v1 計畫與其 SHA-256 不動。v2 每題只跑一次 finder，四臂 refuter 判同一份候選；reflector 改為 0 次、`vettalon verify` 補上只覆核的入口、CLI 也能強制輸出上限，表中前三個擋住事項因此解除，能力不對等仍是已接受的限制。逾時改 180 秒（grok 實測 70–90 秒）；agy 的 Gemini 把 5 個覆核 prompt 全部擋掉，agy 臂改用同一個 CLI 上的 GPT-OSS 120B。完整修訂與理由見 [`reports/crossfam-plan-amendment-2026-10-20.json`](reports/crossfam-plan-amendment-2026-10-20.json)，執行方式見 README 的「修訂設計 v2」。

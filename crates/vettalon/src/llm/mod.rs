@@ -96,6 +96,11 @@ pub struct TraceEvent {
     pub latency_ms: u64,
     /// `"ok"` | `"refused"` | `"error"`.
     pub outcome: String,
+    /// On `"error"`: the error text, secret-masked and cut to 200 bytes, so a
+    /// benchmark harness can tell a rate limit from a crash. Never the
+    /// prompt or reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Shared, append-only LLM-call trace for one run (P2-1). The default is
@@ -172,10 +177,17 @@ impl LlmCaller for StepCaller {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let started = std::time::Instant::now();
         let r = self.model.caller.complete(prompt).await;
-        let (outcome, reply_bytes) = match &r {
-            Ok(s) => ("ok", s.len()),
-            Err(LlmError::Refused(_)) => ("refused", 0),
-            Err(LlmError::Executor(_)) => ("error", 0),
+        let (outcome, reply_bytes, error) = match &r {
+            Ok(s) => ("ok", s.len(), None),
+            Err(LlmError::Refused(_)) => ("refused", 0, None),
+            Err(LlmError::Executor(e)) => (
+                "error",
+                0,
+                Some(
+                    crate::util::truncate_bytes(&crate::util::mask_sensitive_text(e), 200)
+                        .to_string(),
+                ),
+            ),
         };
         self.trace.push(TraceEvent {
             step: self.step.to_string(),
@@ -185,6 +197,7 @@ impl LlmCaller for StepCaller {
             reply_bytes,
             latency_ms: started.elapsed().as_millis() as u64,
             outcome: outcome.to_string(),
+            error,
         });
         if let Err(LlmError::Refused(excerpt)) = &r {
             self.log.push(RefusalEvent {

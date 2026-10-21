@@ -33,7 +33,9 @@
 //! incomplete (`model_refused`), so the gap is visible to the operator.
 
 mod adversarial;
-pub use adversarial::{DEFAULT_REFUTER_RUNS, MAX_REFUTER_RUNS};
+pub use adversarial::{DEFAULT_REFUTER_RUNS, DEFAULT_VERIFIER_PARSE_RETRIES, MAX_REFUTER_RUNS};
+/// Default and maximum for `--finder-parse-retries`.
+pub const DEFAULT_FINDER_PARSE_RETRIES: usize = ai_audit::AI_AUDIT_PARSE_RETRIES;
 mod ai_audit;
 mod assign;
 mod comment_strip;
@@ -77,6 +79,7 @@ pub use scanners::{SubprocessLimits, SubprocessOutcome, run_bounded_subprocess};
 pub mod schema;
 pub mod triage;
 mod validator;
+pub mod verify_only;
 
 /// Entry points for the cargo-fuzz targets in `fuzz/` (feature `fuzzing`).
 /// Not a stable API: it re-exports the model-reply contract parsers and the
@@ -165,6 +168,15 @@ pub struct ScanOptions {
     /// agree to settle the finding; disagreement leaves it `Candidate` with
     /// `verify_uncertain`.
     pub refuter_runs: usize,
+    /// `--finder-parse-retries`: reflector corrections when a finder reply
+    /// breaks the JSON contract (0 or 1; default
+    /// [`ai_audit::AI_AUDIT_PARSE_RETRIES`]). Benchmarks with a zero-retry
+    /// rule set 0.
+    pub finder_parse_retries: usize,
+    /// `--verifier-parse-retries`: correction calls when a refuter reply
+    /// breaks the reply contract (0 or 1; default
+    /// [`DEFAULT_VERIFIER_PARSE_RETRIES`]).
+    pub verifier_parse_retries: usize,
     /// `--prescreen cheap-model`: score the top of the ranked pool with a
     /// cheap model and give the deep audit only the top fraction. `None` =
     /// off (the default; no prescreen call is made).
@@ -1204,6 +1216,7 @@ async fn run_audit_step(
                             ask_fix,
                             deadline,
                             source_receipts: opts.source_receipts,
+                            parse_retries: opts.finder_parse_retries,
                         },
                     )
                     .await;
@@ -1501,6 +1514,7 @@ async fn review_step(
                 let plan = adversarial::ReviewPlan {
                     runs: adversarial::runs_for(&f, opts.refuter_runs),
                     deadline: limits.extra_runs_deadline,
+                    parse_retries: opts.verifier_parse_retries,
                 };
                 let votes = match adversarial::review_with(repo_root, &mut f, &caller, plan).await {
                     adversarial::ReviewOutcome::ZeroLlm => Vec::new(),
@@ -1817,6 +1831,8 @@ mod tests {
             source_receipts: false,
             time_budget: None,
             refuter_runs: 1,
+            finder_parse_retries: DEFAULT_FINDER_PARSE_RETRIES,
+            verifier_parse_retries: DEFAULT_VERIFIER_PARSE_RETRIES,
             prescreen: None,
             role_caps: Default::default(),
             fix_test_command: None,

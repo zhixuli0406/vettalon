@@ -435,11 +435,7 @@ impl LlmCaller for ContainerCliCaller {
             .spawn()
             .map_err(|e| LlmError::Executor(format!("cannot start docker: {e}")))?;
 
-        let feed: Vec<u8> = if self.spec.prompt_via == PromptVia::Stdin {
-            prompt.as_bytes().to_vec()
-        } else {
-            Vec::new()
-        };
+        let feed: Vec<u8> = self.spec.stdin_payload(prompt);
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -484,8 +480,9 @@ impl LlmCaller for ContainerCliCaller {
             )));
         }
         let stdout_text = String::from_utf8_lossy(&out).to_string();
-        match &self.spec.output {
+        let reply = match &self.spec.output {
             OutputMode::Stdout => Ok(stdout_text),
+            OutputMode::AgyStreamJson => super::cli::parse_agy_stream(&stdout_text),
             OutputMode::File => {
                 let p = work.join(WORK_OUT_FILE);
                 let len = std::fs::metadata(&p)
@@ -513,7 +510,9 @@ impl LlmCaller for ContainerCliCaller {
                         LlmError::Executor(format!("CLI JSON envelope has no {field:?} string"))
                     })
             }
-        }
+        }?;
+        self.spec.check_output_cap(&reply)?;
+        Ok(reply)
     }
 }
 
