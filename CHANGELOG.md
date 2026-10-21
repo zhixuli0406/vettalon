@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Added
+- 每日 registry 警報（`.github/workflows/registry-alert.yml`、`scripts/trust/registry_alert.py`）：五個 npm 套件從 0.3.0 起的每個版本，都要有 `v<版本>` tag 與已發布的 GitHub release、該 tag commit 上至少一次成功的 `release.yml` run，以及指向本 repo `release.yml`、同一 tag 與 commit、GitHub 託管 runner、上述 run、且 tarball 摘要相符的 npm provenance。不符就讓 job 失敗，另一個只有 `issues: write` 的 job 開或留言「Registry version without a matching release run」issue；檢查 job 只有 `contents: read`、`actions: read`，只用 `GITHUB_TOKEN`。0.2.1 以前（含 `0.0.0-stage` 佔位版）是 trusted publishing 之前手動或用 token 發的，沒有 provenance，列為不檢查；這份清單寫死在腳本裡，之後若出現其他低於 0.3.0 的版本一律算不符。2026-10-21 實跑：0.3.0、0.3.1 全數通過；0.3.0 四個平台套件的 provenance 來自 run 39410338641 第 4 次 attempt（該次重跑 npm-publish 時主套件已上線而失敗），同一 run 第 3 次成功，報告附註說明。
+
+### Changed
+- `scan` 終端摘要裡每筆發現的證據改成縮排一致的區塊：發現 id 底下依序列出證據等級、還缺哪些證明、實證紀錄，用一般用語取代 `proof_level=`、`proof_gaps=` 這類鍵值與內部術語（證據等級仍附上 JSON 用的鍵，例如 `static_only`）。「結束碼 0、連結或檔案雜湊不能證明漏洞存在」的說明只在區塊後印一次，`Result:`／`結論：` 前面多一行空行。只動終端文字，JSON 報告、SARIF（含 `vettalon.proof_limits`）、CycloneDX 與 `vettalon evidence attach` 的輸出都不變。
+
+### Security
+- 發版工作流的 cosign 從 v2.5.2 升到 v2.6.5（2026-08-06，v2 最後一版，含 GHSA-whqx-f9j3-ch6m、GHSA-w6c6-c85g-mmv6、GHSA-fx35-mq7g-6g98 修補）。簽章指令與輸出檔（`.sig`、`.pem`、`.sigstore.json` bundle v0.3）不變；`verify-release.sh` 的 `cosign verify-blob` 已用 v2.5.2、v2.6.5、v3.1.3 對 v0.3.1 封包實測通過，錯的 tag 身分與改過的封包三版都拒絕。`docs/TRUST.md` 建議驗證端用 v2.6.5 以上或 v3。
+- 公開 repo 啟用 immutable releases（2026-10-21 起，v0.3.2 以後的 release 發布後 tag 與檔案鎖定並附 GitHub release attestation；v0.3.1 以前不受保護）。`release` job 本來就是先建草稿、上傳、再發布，相容；發布後重跑 `release` job 會失敗，npm-publish 失敗時改用「Re-run failed jobs」。驗證方式寫在 `docs/TRUST.md`。
+- `release.yml` 收緊：checkout 一律 `persist-credentials: false`，tag 改經環境變數傳入 minisign 與 npm stage 步驟（不在 shell 內展開 `${{ }}`），發布 job 的 `setup-node` 關閉套件快取。
+
 ## [0.3.1] - 2026-10-21
 
 ### Added

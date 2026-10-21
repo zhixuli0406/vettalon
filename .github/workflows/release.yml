@@ -50,6 +50,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           targets: ${{ matrix.target }}
@@ -64,10 +65,13 @@ jobs:
           else
             cargo build --locked --release -p vettalon --target ${{ matrix.target }}
           fi
+      # cosign v2.6.5 (2026-08-06): last v2 line, carries the GHSA-whqx-f9j3-ch6m,
+      # GHSA-w6c6-c85g-mmv6 and GHSA-fx35-mq7g-6g98 fixes. The installer verifies
+      # the binary against cosign's release key before use.
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v2.5.2
+          cosign-release: v2.6.5
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -122,6 +126,7 @@ jobs:
         with:
           path: trust-source
           ref: ${{ github.event.inputs.tag || github.ref_name }}
+          persist-credentials: false
       - name: Validate merged assets before publication
         run: |
           python3 -m venv "$RUNNER_TEMP/trust-venv"
@@ -137,11 +142,11 @@ jobs:
       - name: Sign with minisign (optional)
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           [ -z "$MINISIGN_SECRET_KEY" ] && { echo "no MINISIGN_SECRET_KEY, skipping"; exit 0; }
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/mk.key
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
           for f in vettalon-*.tar.gz vettalon-*.zip; do
             [ -f "$f" ] && minisign -S -s /tmp/mk.key -m "$f" -t "vettalon $TAG $f" -x "$f.minisig"
           done
@@ -172,11 +177,15 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # Node 24 bundles npm 11; trusted publishing needs npm >= 11.5.1.
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+          # No dependency cache in a publishing job (cache poisoning).
+          package-manager-cache: false
       - name: Require an npm that supports trusted publishing
         run: |
           node -e 'const [a,b,c]=process.argv[1].split(".").map(Number);if(a<11||(a===11&&(b<5||(b===5&&c<1)))){console.error("npm "+process.argv[1]+" < 11.5.1");process.exit(1)}' "$(npm --version)"
@@ -191,6 +200,6 @@ jobs:
         env:
           ARTIFACTS_DIR: ./artifacts
           NPM_PUBLISH_MODE: stage
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
           ./npm/scripts/publish.sh "${TAG#v}"

@@ -216,6 +216,18 @@ credentials, bounds execution to 180 seconds and does not publish. Missing token
 rate limiting or timeout is not a successful assessment. See
 [Best Practices evidence/gaps](../../docs/TRUST-BEST-PRACTICES.md).
 
+Registry alert: `registry_alert.py` checks that every npm version from 0.3.0 on
+has a release, a successful `release.yml` run and provenance naming that run
+(read-only; GitHub token sent to api.github.com only). The daily workflow is
+`registry-alert.yml`; checks and scope are in
+[TRUST.md](../../docs/TRUST.md#registry-alert). Its tests replay a recorded
+fixture offline:
+
+```bash
+GH_TOKEN=$(gh auth token) python3 scripts/trust/registry_alert.py
+python3 -B -I -S -m unittest discover -s scripts/trust/tests -p 'test_registry_alert.py'
+```
+
 ## Cargo SBOM differential test
 
 `sbom_diff.py collect` records one case; `report` recomputes metrics offline.

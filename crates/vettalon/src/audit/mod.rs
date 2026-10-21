@@ -67,6 +67,7 @@ mod prior_run;
 mod prompts;
 pub mod rank_snapshot;
 mod report;
+mod report_evidence;
 pub mod sarif;
 mod scanners;
 /// Bounded subprocess capture and owned-process cleanup, shared with local renderers.

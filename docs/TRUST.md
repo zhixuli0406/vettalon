@@ -71,6 +71,37 @@ that installs it, or on the package page on npmjs.com. Provenance shows which
 workflow run built the package; it does not prove the source is safe, and a
 compromised workflow could still produce valid provenance.
 
+### Registry alert
+
+[`registry-alert.yml`](../.github/workflows/registry-alert.yml) runs daily (and on
+manual dispatch) on the public repository. Its script,
+[`registry_alert.py`](../scripts/trust/registry_alert.py), lists every published
+version of the five packages and, for each version 0.3.0 or later, requires:
+
+1. a tag `v<version>` and a published GitHub release for it;
+2. a `release.yml` run for that tag, at the tag commit, with a successful attempt;
+3. npm SLSA provenance naming this repository, `.github/workflows/release.yml`,
+   that tag and commit, a GitHub-hosted runner, a run from step 2, and the exact
+   tarball digest the registry serves.
+
+On any mismatch the job fails and a second job, the only one with
+`issues: write`, opens or comments on the issue "Registry version without a
+matching release run". The check job has `contents: read` and `actions: read`
+and uses only `GITHUB_TOKEN`. Run it locally with
+`GH_TOKEN=$(gh auth token) python3 scripts/trust/registry_alert.py` (exit 0
+matched, 1 mismatch, 2 could not check).
+
+Versions before 0.3.0 (0.1.0 through 0.2.1 and the `0.0.0-stage` placeholder)
+were published by hand or with a token before trusted publishing, so they have
+no provenance to match; the report lists them as not checked. That list is
+fixed in the script: any other version below 0.3.0 that appears is a mismatch. The script reads
+the provenance statement but does not verify its Sigstore signature: npm
+verifies provenance when it accepts a publish, and `npm audit signatures`
+re-checks it. A provenance statement from a later attempt of a run whose earlier
+attempt succeeded passes with a note: re-running `npm-publish` stages the
+packages that are not live yet, then fails on the one that already is (this is
+what happened to the 0.3.0 platform packages).
+
 ## Verify a downloaded CLI archive
 
 Install `cosign`, GitHub CLI (`gh` with attestation support), Python 3.11+ and the
@@ -103,6 +134,38 @@ Wrong identity, issuer, source, missing proof or modified archive must fail. No
 `--insecure-ignore-tlog`, wildcard identity, hand-authored provenance substitute,
 or local JSON-only verification is accepted. Use GitHub's documented bundle and
 trusted-root process for disconnected verification; this wrapper uses GitHub online.
+
+Releases after v0.3.1 are signed with cosign v2.6.5; v0.3.1 and earlier were
+signed with v2.5.2. Both write the same Sigstore bundle (`.sigstore.json`,
+bundle v0.3) plus `.sig` and `.pem`, so the commands above do not change. On
+2026-10-21 the `cosign verify-blob` call in `verify-release.sh` passed for the
+v0.3.1 `linux-x64` archive with cosign v2.5.2, v2.6.5 and v3.1.3, and each
+version rejected a wrong tag identity and a modified archive. Verify with cosign
+v2.6.5 or later, or v3.x: earlier versions are affected by verification
+advisories GHSA-whqx-f9j3-ch6m, GHSA-w6c6-c85g-mmv6 and GHSA-fx35-mq7g-6g98.
+
+## Immutable releases
+
+Immutable releases are enabled on `zhixuli0406/vettalon` (since 2026-10-21).
+Once a release is published, GitHub locks its tag and assets and attaches a
+release attestation. The setting covers releases published after it was turned
+on: v0.3.2 and later. v0.1.0 through v0.3.1 stay mutable.
+
+The `release` job is compatible: `softprops/action-gh-release` v3.0.3 creates the
+release as a draft, uploads every asset, then publishes it, and nothing edits
+assets after that. Consequences:
+
+- Re-running the `release` job for a tag that is already published is expected
+  to fail, because the assets cannot be replaced. If only `npm-publish` failed, use "Re-run failed
+  jobs" so the published release is left alone.
+- A wrong release cannot be fixed in place. Publish a new version instead.
+
+Check a release and an asset against GitHub's release attestation:
+
+```bash
+gh release verify v0.3.2 -R zhixuli0406/vettalon
+gh release verify-asset v0.3.2 vettalon-linux-x64.tar.gz -R zhixuli0406/vettalon
+```
 
 ## How accurate is the Cargo inventory?
 
@@ -174,6 +237,7 @@ customer BOMs, private raw findings, credentials or source to a public evidence 
 Report vulnerabilities according to [SECURITY.md](../SECURITY.md).
 
 References: [Sigstore blob verification](https://docs.sigstore.dev/cosign/verifying/verify_blob/),
+[GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases),
 [GitHub attestation verification](https://cli.github.com/manual/gh_attestation_verify),
 [CycloneDX specification](https://github.com/CycloneDX/specification/tree/1.6),
 [Syft output formats](https://oss.anchore.com/docs/guides/sbom/formats/).
