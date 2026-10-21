@@ -63,7 +63,11 @@
 //! - unsafe path, unreadable file, or `line` out of range → zero-LLM
 //!   `Refuted` with evidence.
 //! - LLM call fails, or the reply violates the contract → `verify_error`
-//!   evidence, status stays `Candidate` (unknown).
+//!   evidence, status stays `Candidate` (unknown). A contract violation is
+//!   first re-asked once with the violation named (verifier reflector,
+//!   `--verifier-parse-retries`); a malformed reply is never a refutation,
+//!   and in a multi-run review it counts as a missing run (incomplete),
+//!   not as a disagreement.
 //! - `"refuted"` → `Refuted`.
 //! - `"plausible"` with non-empty `blockers` and at least one
 //!   `validation_plan` field → `NeedsHuman`, blockers and plan copied onto
@@ -122,6 +126,13 @@ pub const MAX_REFUTER_RUNS: usize = 5;
 pub const MULTI_RUN_MIN_SEVERITY: Severity = Severity::High;
 /// `verify_error` text when a guard-based refutation fails its citation check.
 pub const GUARD_CITATION_ERROR: &str = "refutation cites missing guard";
+/// Default `--verifier-parse-retries`: a reply that breaks the verifier
+/// contract (not JSON, unknown fields, `plausible` without blockers or plan,
+/// `refuted` without `refute_basis`, ...) is re-asked once with a correction
+/// naming what it broke. 1 is also the maximum.
+pub const DEFAULT_VERIFIER_PARSE_RETRIES: usize = 1;
+/// Evidence prefix when a run needed a correction call.
+pub const VERIFIER_REFLECTOR_PREFIX: &str = "verifier_reflector:";
 
 /// Byte budget for the main file window shown to the verifier.
 pub const VERIFIER_FILE_BUDGET_BYTES: usize = 24 * 1024;
@@ -423,7 +434,15 @@ unknowns in blockers. When the claim lists conditions (preconditions), weigh the
 of reachability: a precondition the excerpt shows is already satisfied does not block, but \
 one you cannot confirm from the code is a BLOCKER on a plausible finding, never grounds to \
 refute on its own. Skepticism means demanding the dangerous pattern be visible in the \
-code, not demanding proof of the production environment. A wrong line number is NOT a \
+code, not demanding proof of the production environment. A guard or sanitizer makes the \
+code safe only if it stops every form of the input that reaches this sink: nested or \
+alternate operators, other encodings, other branches or callers in the excerpts. When the \
+guard visibly covers only some of them, the code is not safe: answer \"plausible\" and put \
+the uncovered form in blockers. When the flow into the sink is visible but the one fact \
+that would make it safe lives in code that is not in the excerpts (a definition, a callee, \
+where a value comes from), that missing code is a BLOCKER on a plausible finding, not \
+grounds to refute; a claim that shows no flow at all is still refuted. \
+A wrong line number is NOT a \
 reason to refute: when the root cause is real but the claimed line or a trace step's \
 location is off, answer \"plausible\" and give the real locations in corrected_line / \
 corrected_trace, copying the numbers shown at the start of each excerpt line. Refute only \
@@ -796,7 +815,13 @@ pub enum RunVerdict {
         reason: String,
     },
     Plausible(Box<PlausibleRun>),
-    /// The reply broke the contract or failed a check: the text that follows
+    /// The reply broke the reply contract (shape or required fields). Not a
+    /// verdict: it may be re-asked once, and in a multi-run review it counts
+    /// as a missing run, never as a disagreement or a refutation. The text
+    /// follows `verify_error: `.
+    Malformed(String),
+    /// The reply was well-formed but failed a check against the real files
+    /// (guard citation, correction pre-check): the text that follows
     /// `verify_error: `.
     Invalid(String),
     /// The call itself failed.
@@ -813,7 +838,9 @@ impl RunVerdict {
         match self {
             RunVerdict::Refuted { .. } => Some(VoteVerdict::Refuted),
             RunVerdict::Plausible(_) => Some(VoteVerdict::Plausible),
-            RunVerdict::Invalid(_) | RunVerdict::CallFailed { .. } => Some(VoteVerdict::NoVerdict),
+            RunVerdict::Malformed(_) | RunVerdict::Invalid(_) | RunVerdict::CallFailed { .. } => {
+                Some(VoteVerdict::NoVerdict)
+            }
             RunVerdict::NotRun(_) => None,
         }
     }
@@ -823,7 +850,7 @@ impl RunVerdict {
         match self {
             RunVerdict::Refuted { reason } => format!("refuted: {reason}"),
             RunVerdict::Plausible(p) => format!("{PLAUSIBLE_PREFIX} {}", p.reason),
-            RunVerdict::Invalid(d) => format!("verify_error: {d}"),
+            RunVerdict::Malformed(d) | RunVerdict::Invalid(d) => format!("verify_error: {d}"),
             RunVerdict::CallFailed { error, .. } => {
                 format!("verify_error: llm call failed: {error}")
             }
@@ -861,14 +888,14 @@ pub fn evaluate_reply(repo_root: &Path, finding: &Finding, reply: VerifierReply)
     let cites_guard = reply.refute_basis == Some(RefuteBasis::Guarded) || reply.guard.is_some();
     let has_conditions = reply.conditions.as_ref().is_some_and(|c| !c.is_empty());
     match reply.verdict {
-        Verdict::Refuted if has_corrections => RunVerdict::Invalid(format!(
+        Verdict::Refuted if has_corrections => RunVerdict::Malformed(format!(
             "corrections are only allowed with plausible (reason: {reason})"
         )),
-        Verdict::Refuted if has_conditions => RunVerdict::Invalid(format!(
+        Verdict::Refuted if has_conditions => RunVerdict::Malformed(format!(
             "conditions are only allowed with plausible (reason: {reason})"
         )),
         Verdict::Refuted if reply.refute_basis.is_none() => {
-            RunVerdict::Invalid(format!("refuted without refute_basis (reason: {reason})"))
+            RunVerdict::Malformed(format!("refuted without refute_basis (reason: {reason})"))
         }
         Verdict::Refuted if cites_guard => {
             match check_guard(finding, reply.guard.as_ref(), &DiskLines::new(repo_root)) {
@@ -881,7 +908,7 @@ pub fn evaluate_reply(repo_root: &Path, finding: &Finding, reply: VerifierReply)
         }
         Verdict::Refuted => RunVerdict::Refuted { reason },
         Verdict::Plausible if reply.refute_basis.is_some() || reply.guard.is_some() => {
-            RunVerdict::Invalid(format!(
+            RunVerdict::Malformed(format!(
                 "refute_basis / guard are only allowed with refuted (reason: {reason})"
             ))
         }
@@ -889,7 +916,7 @@ pub fn evaluate_reply(repo_root: &Path, finding: &Finding, reply: VerifierReply)
             let blockers = clean_blockers(&reply.blockers);
             let plan = clean_plan(&reply.validation_plan);
             if blockers.is_empty() || plan.is_empty() {
-                return RunVerdict::Invalid(format!(
+                return RunVerdict::Malformed(format!(
                     "plausible without blockers (reason: {reason})"
                 ));
             }
@@ -1087,12 +1114,15 @@ pub fn settle_runs(
             finding,
             format!("verify_error: no usable verdict in {n} refuter runs"),
         );
-    } else if runs
-        .iter()
-        .any(|r| matches!(r, RunVerdict::NotRun(_) | RunVerdict::CallFailed { .. }))
-    {
-        // A cut-short review (failed call, refusal, time budget) is not a
-        // disagreement: it stays unverified and the run is incomplete.
+    } else if runs.iter().any(|r| {
+        matches!(
+            r,
+            RunVerdict::NotRun(_) | RunVerdict::CallFailed { .. } | RunVerdict::Malformed(_)
+        )
+    }) {
+        // A cut-short review (failed call, refusal, time budget) or a run
+        // whose reply never met the contract is not a disagreement: it stays
+        // unverified and the run is incomplete.
         push_evidence(
             finding,
             format!(
@@ -1161,8 +1191,11 @@ pub enum ReviewOutcome {
 pub struct ReviewPlan {
     pub runs: usize,
     /// Scan-wide `--time-budget` deadline. Run 1 always happens; runs 2..n
-    /// are not started after it.
+    /// are not started after it, and no correction call starts after it.
     pub deadline: Option<Instant>,
+    /// Correction calls per run when a reply breaks the contract
+    /// (`--verifier-parse-retries`, 0..=[`DEFAULT_VERIFIER_PARSE_RETRIES`]).
+    pub parse_retries: usize,
 }
 
 impl ReviewPlan {
@@ -1171,8 +1204,22 @@ impl ReviewPlan {
         ReviewPlan {
             runs: 1,
             deadline: None,
+            parse_retries: DEFAULT_VERIFIER_PARSE_RETRIES,
         }
     }
+}
+
+/// The verifier prompt again, plus what the discarded reply broke. The
+/// verdict itself is left to the model; only the format is asked for.
+pub fn build_verifier_reflector_prompt(base_prompt: &str, violation: &str) -> String {
+    format!(
+        "{base_prompt}\n\n--- Format correction ---\n\
+Your previous reply was discarded because it broke the reply contract: {}\n\
+Answer again with ONLY the one JSON object described above. A \"plausible\" verdict needs a \
+non-empty blockers array and at least one validation_plan field; a \"refuted\" verdict needs \
+refute_basis and no corrections or conditions. Decide the verdict from the excerpts as before.\n",
+        crate::util::truncate_bytes(violation, 500)
+    )
 }
 
 /// One refuter run (the single-verdict mapping). See [`review_with`].
@@ -1227,6 +1274,9 @@ pub async fn review_with<C: LlmCaller>(
         with_comments.map(|_| build_adversarial_prompt(finding, &set.with_comments));
     let mut runs: Vec<RunVerdict> = Vec::with_capacity(n);
     let (mut answered, mut call_failed, mut refused) = (false, false, false);
+    let (mut reasked, mut recovered) = (0usize, 0usize);
+    // One line per re-ask: why it happened and how the second reply ended.
+    let mut reask_log: Vec<String> = Vec::new();
     for i in 0..n {
         if call_failed {
             runs.push(RunVerdict::NotRun("an earlier call failed"));
@@ -1240,7 +1290,7 @@ pub async fn review_with<C: LlmCaller>(
             Some(p) if with_comments == Some(i) => p,
             _ => &prompt,
         };
-        let run = match caller.complete(this_prompt).await {
+        let mut run = match caller.complete(this_prompt).await {
             // Fail-closed toward "don't know": never auto-Confirm, never
             // silently Refuted either.
             Err(e) => {
@@ -1252,21 +1302,79 @@ pub async fn review_with<C: LlmCaller>(
             }
             Ok(raw) => {
                 answered = true;
-                match parse_verdict(&raw) {
-                    Err(e) => RunVerdict::Invalid(e),
-                    Ok(reply) => evaluate_reply(repo_root, finding, reply),
-                }
+                judge(repo_root, finding, &raw)
             }
         };
+        // Verifier reflector: a reply that broke the contract is not a
+        // verdict; ask once more with the violation named.
+        let mut retries = 0usize;
+        while let RunVerdict::Malformed(violation) = &run {
+            if retries >= plan.parse_retries.min(DEFAULT_VERIFIER_PARSE_RETRIES)
+                || plan.deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                break;
+            }
+            retries += 1;
+            reasked += 1;
+            let first_reason = crate::util::truncate_bytes(violation, 160).to_string();
+            let correction = build_verifier_reflector_prompt(this_prompt, violation);
+            run = match caller.complete(&correction).await {
+                Err(e) => {
+                    call_failed = true;
+                    refused = matches!(e, crate::llm::LlmError::Refused(_));
+                    RunVerdict::CallFailed {
+                        error: e.to_string(),
+                    }
+                }
+                Ok(raw) => judge(repo_root, finding, &raw),
+            };
+            if !matches!(
+                run,
+                RunVerdict::Malformed(_) | RunVerdict::CallFailed { .. }
+            ) {
+                recovered += 1;
+            }
+            let second = match &run {
+                RunVerdict::Refuted { .. } => "refuted",
+                RunVerdict::Plausible(_) => "plausible",
+                RunVerdict::Malformed(_) => "contract break",
+                RunVerdict::Invalid(_) => "failed check",
+                RunVerdict::CallFailed { .. } => "call failed",
+                RunVerdict::NotRun(_) => "not run",
+            };
+            reask_log.push(format!(
+                "{VERIFIER_REFLECTOR_PREFIX} run {}/{n} re-asked after contract break ({first_reason}); second reply: {second}",
+                i + 1
+            ));
+        }
         runs.push(run);
     }
     let votes = runs.iter().filter_map(RunVerdict::vote).collect();
     settle_runs(repo_root, finding, &runs, with_comments);
+    for line in reask_log {
+        push_evidence(finding, line);
+    }
+    if reasked > 0 {
+        push_evidence(
+            finding,
+            format!(
+                "{VERIFIER_REFLECTOR_PREFIX} {reasked} reply(ies) broke the contract and were re-asked, {recovered} recovered"
+            ),
+        );
+    }
     ReviewOutcome::Reviewed {
         votes,
         answered,
         call_failed,
         refused,
+    }
+}
+
+/// One reply, parsed and checked: a contract break is [`RunVerdict::Malformed`].
+fn judge(repo_root: &Path, finding: &Finding, raw: &str) -> RunVerdict {
+    match parse_verdict(raw) {
+        Err(e) => RunVerdict::Malformed(e),
+        Ok(reply) => evaluate_reply(repo_root, finding, reply),
     }
 }
 
@@ -1463,6 +1571,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prompt_limits_guard_and_unseen_code_refutations() {
+        let f = sample_finding();
+        let prompt = build_adversarial_prompt(&f, &[]);
+        assert!(prompt.contains("stops every form of the input that reaches this sink"));
+        assert!(prompt.contains("covers only some of them, the code is not safe"));
+        assert!(prompt.contains("lives in code that is not in the excerpts"));
+        assert!(prompt.contains("a claim that shows no flow at all is still refuted"));
+        // The refute-by-default rule is unchanged.
+        assert!(prompt.contains("the default verdict is \"refuted\""));
+    }
+
+    #[test]
     fn build_adversarial_prompt_includes_claim_context_anchors_and_excerpts() {
         let f = sample_finding();
         let ex = vec![Excerpt {
@@ -1599,12 +1719,16 @@ pub(crate) mod tests {
     async fn review_one_unparseable_reply_stays_candidate_with_verify_error() {
         let dir = repo_with_db();
         let mut f = sample_finding();
-        let caller = StubCaller(std::sync::Mutex::new(Some(Ok(
-            "garbage, not json".to_string()
-        ))));
+        // The reply and its one correction are both garbage.
+        let caller = SeqCaller::new(vec![ok("garbage, not json"), ok("still garbage")]);
         review_one(dir.path(), &mut f, &caller).await;
+        assert_eq!(caller.calls(), 2);
         assert_eq!(f.status, FindingStatus::Candidate);
-        assert!(f.evidence.last().unwrap().detail.contains("verify_error"));
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.detail.starts_with("verify_error: reply violated"))
+        );
     }
 
     #[test]
@@ -1850,6 +1974,7 @@ pub(crate) mod tests {
         ReviewPlan {
             runs,
             deadline: None,
+            parse_retries: DEFAULT_VERIFIER_PARSE_RETRIES,
         }
     }
 
@@ -1965,15 +2090,149 @@ pub(crate) mod tests {
     async fn no_usable_verdict_in_any_run_is_verify_error() {
         let dir = repo_with_db();
         let mut f = sample_finding();
-        let caller = SeqCaller::new(vec![ok("junk"), ok("junk"), ok("junk")]);
+        let caller = SeqCaller::new(vec![ok("junk"); 6]);
         let out = review_with(dir.path(), &mut f, &caller, plan(3)).await;
+        assert_eq!(caller.calls(), 6, "each run re-asked once");
         assert_eq!(f.status, FindingStatus::Candidate);
         assert_eq!(votes_of(&out), vec![VoteVerdict::NoVerdict; 3]);
-        assert_eq!(
-            f.evidence.last().unwrap().detail,
-            "verify_error: no usable verdict in 3 refuter runs"
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.detail == "verify_error: no usable verdict in 3 refuter runs")
         );
         assert!(!is_uncertain(&f));
+    }
+
+    // ── verifier reflector (malformed replies are not verdicts) ─────────
+
+    const NO_BLOCKERS: &str = r#"{"verdict":"plausible","reason":"input reaches the sink","blockers":[],"validation_plan":{"local":null,"deployment":null}}"#;
+
+    fn reflector_note(f: &Finding) -> Option<String> {
+        f.evidence
+            .iter()
+            .find(|e| e.detail.starts_with(VERIFIER_REFLECTOR_PREFIX))
+            .map(|e| e.detail.clone())
+    }
+
+    #[tokio::test]
+    async fn valid_replies_need_no_correction_call() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        let caller = SeqCaller::new(vec![ok(REFUTED)]);
+        review_with(dir.path(), &mut f, &caller, plan(1)).await;
+        assert_eq!((caller.calls(), f.status), (1, FindingStatus::Refuted));
+        let mut g = sample_finding();
+        let caller = SeqCaller::new(vec![ok(PLAUSIBLE)]);
+        review_with(dir.path(), &mut g, &caller, plan(1)).await;
+        assert_eq!((caller.calls(), g.status), (1, FindingStatus::NeedsHuman));
+        assert!(reflector_note(&f).is_none() && reflector_note(&g).is_none());
+    }
+
+    #[tokio::test]
+    async fn plausible_without_blockers_is_re_asked_and_the_valid_answer_counts() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        let caller = SeqCaller::new(vec![ok(NO_BLOCKERS), ok(PLAUSIBLE)]);
+        let out = review_with(dir.path(), &mut f, &caller, plan(1)).await;
+        assert_eq!(caller.calls(), 2);
+        assert_eq!(votes_of(&out), vec![VoteVerdict::Plausible]);
+        assert_eq!(f.status, FindingStatus::NeedsHuman);
+        let prompts = caller.prompts.lock().unwrap();
+        assert!(
+            prompts[1].starts_with(&prompts[0]),
+            "the correction repeats the prompt"
+        );
+        assert!(prompts[1].contains("plausible without blockers"));
+        drop(prompts);
+        assert!(
+            reflector_note(&f)
+                .unwrap()
+                .contains("run 1/1 re-asked after contract break")
+        );
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.detail.ends_with("second reply: plausible"))
+        );
+        assert!(f.evidence.iter().any(|e| e.detail.contains("1 recovered")));
+    }
+
+    #[tokio::test]
+    async fn plausible_without_blockers_twice_is_a_verify_error_never_a_refutation() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        let caller = SeqCaller::new(vec![ok(NO_BLOCKERS), ok(NO_BLOCKERS)]);
+        let out = review_with(dir.path(), &mut f, &caller, plan(1)).await;
+        assert_eq!(caller.calls(), 2);
+        assert_eq!(votes_of(&out), vec![VoteVerdict::NoVerdict]);
+        assert_eq!(f.status, FindingStatus::Candidate);
+        assert!(f.evidence.iter().any(|e| {
+            e.detail
+                .starts_with("verify_error: plausible without blockers")
+        }));
+        assert!(f.evidence.iter().any(|e| e.detail.contains("0 recovered")));
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.detail.ends_with("second reply: contract break"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_run_among_valid_ones_is_incomplete_not_uncertain() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        let caller = SeqCaller::new(vec![
+            ok(PLAUSIBLE),
+            ok(NO_BLOCKERS),
+            ok(NO_BLOCKERS),
+            ok(PLAUSIBLE),
+        ]);
+        let out = review_with(dir.path(), &mut f, &caller, plan(3)).await;
+        assert_eq!(caller.calls(), 4);
+        assert_eq!(f.status, FindingStatus::Candidate);
+        assert!(!is_uncertain(&f), "a broken reply is not a disagreement");
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.detail == "verify_error: incomplete refuter runs (2 usable of 3)")
+        );
+        assert_eq!(
+            votes_of(&out)
+                .iter()
+                .filter(|v| **v == VoteVerdict::NoVerdict)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_verifier_retries_makes_no_correction_call() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        let caller = SeqCaller::new(vec![ok(NO_BLOCKERS), ok(PLAUSIBLE)]);
+        let no_retry = ReviewPlan {
+            runs: 1,
+            deadline: None,
+            parse_retries: 0,
+        };
+        review_with(dir.path(), &mut f, &caller, no_retry).await;
+        assert_eq!(caller.calls(), 1);
+        assert_eq!(f.status, FindingStatus::Candidate);
+    }
+
+    #[tokio::test]
+    async fn a_failed_guard_citation_is_not_re_asked() {
+        let (dir, mut f) = repo_with_shifted_eval();
+        let raw = REFUTED.replace("\"unreachable\"", "\"guarded\"");
+        let caller = SeqCaller::new(vec![ok(&raw), ok(PLAUSIBLE)]);
+        review_with(dir.path(), &mut f, &caller, plan(1)).await;
+        assert_eq!(
+            caller.calls(),
+            1,
+            "a citation check failure is a check, not a format break"
+        );
+        assert!(guard_error(&f), "{:?}", f.evidence);
     }
 
     #[tokio::test]
@@ -2020,6 +2279,7 @@ pub(crate) mod tests {
         let past = ReviewPlan {
             runs: 3,
             deadline: Some(Instant::now()),
+            parse_retries: DEFAULT_VERIFIER_PARSE_RETRIES,
         };
         let out = review_with(dir.path(), &mut f, &caller, past).await;
         assert_eq!(caller.calls(), 1, "run 1 always happens, 2..n do not");

@@ -122,6 +122,19 @@ struct ScanArgs {
     /// stays candidate with verify_uncertain. Lower severities get one run.
     #[arg(long, default_value_t = audit::DEFAULT_REFUTER_RUNS, value_parser = parse_refuter_runs)]
     refuter_runs: usize,
+    /// Correction calls (the reflector) when a finder reply breaks the JSON
+    /// contract: 0 or 1 (default 1). 0 records the module as a parse
+    /// failure with no second call, for runs that allow no automatic retry.
+    #[arg(long, default_value_t = audit::DEFAULT_FINDER_PARSE_RETRIES as u64,
+          value_parser = clap::value_parser!(u64).range(0..=audit::DEFAULT_FINDER_PARSE_RETRIES as u64))]
+    finder_parse_retries: u64,
+    /// Correction calls when a refuter reply breaks the reply contract
+    /// (not JSON, plausible without blockers, refuted without a basis...):
+    /// 0 or 1 (default 1). A reply that still breaks it is a verify error
+    /// for that run, never a refutation.
+    #[arg(long, default_value_t = audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64,
+          value_parser = clap::value_parser!(u64).range(0..=audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64))]
+    verifier_parse_retries: u64,
     /// Module ranker for the deep audit: `heuristic` (default, local ranking)
     /// or `jev` (TypeSafe Jev, metadata-only; requires a `[jev]` config
     /// block). Cloud models and scanner database updates may also use the network.
@@ -158,6 +171,41 @@ struct ScanArgs {
     /// it. At least 60, not above --time-budget.
     #[arg(long, value_name = "SECS")]
     poc_budget: Option<u64>,
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// Repository root the findings point into.
+    path: PathBuf,
+    /// Scan report or claims file to verify.
+    #[arg(long)]
+    input: PathBuf,
+    /// Roster model id that reviews (exactly one).
+    #[arg(long)]
+    verifier: String,
+    /// Model roster (default: ~/.vettalon/config.toml, else the claude CLI).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Independent refuter runs for High and above (1-5); lower severities
+    /// get one.
+    #[arg(long, default_value_t = audit::DEFAULT_REFUTER_RUNS, value_parser = parse_refuter_runs)]
+    refuter_runs: usize,
+    /// Correction calls when a refuter reply breaks the reply contract
+    /// (not JSON, plausible without blockers, refuted without a basis...):
+    /// 0 or 1 (default 1). A reply that still breaks it is a verify error
+    /// for that run, never a refutation.
+    #[arg(long, default_value_t = audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64,
+          value_parser = clap::value_parser!(u64).range(0..=audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64))]
+    verifier_parse_retries: u64,
+    /// Write the result JSON (vettalon.verify/1) here.
+    #[arg(long)]
+    out: PathBuf,
+    /// Per-call trace (JSON Lines), as `scan --trace`.
+    #[arg(long)]
+    trace: Option<PathBuf>,
+    /// No extra refuter run starts after this many seconds (at least 60).
+    #[arg(long, value_name = "SECS")]
+    time_budget: Option<u64>,
 }
 
 /// Drafting options shared by `disclose` and `hunt --disclose-dir`.
@@ -246,6 +294,10 @@ enum Command {
     Scan(ScanArgs),
     /// Validate a saved JSON report.
     Validate { report: PathBuf },
+    /// Run the refuter on findings that already exist, with no finder call:
+    /// a `scan --report` file (its unreviewed AI candidates) or a claims file
+    /// (`{"schema": "vettalon.claims/1", "claims": [...]}`) from another tool.
+    Verify(VerifyArgs),
     /// Attach local proof artifact references; no commands run and no verdict changes.
     Evidence {
         #[command(subcommand)]
@@ -607,6 +659,101 @@ fn parse_refuter_runs(s: &str) -> Result<usize, String> {
     }
 }
 
+async fn cmd_verify(a: VerifyArgs) -> i32 {
+    use vettalon::audit::verify_only;
+    let fail = |msg: String| {
+        eprintln!("[vettalon] {msg}");
+        2
+    };
+    if a.time_budget.is_some_and(|s| s < 60) {
+        return fail("--time-budget must be at least 60 seconds".into());
+    }
+    let repo = match a.path.canonicalize() {
+        Ok(p) if p.is_dir() => p,
+        _ => return fail(format!("{} is not a directory", a.path.display())),
+    };
+    let input = match std::fs::read_to_string(&a.input)
+        .map_err(|e| format!("cannot read {}: {e}", a.input.display()))
+        .and_then(|t| verify_only::VerifyInput::parse(&t))
+    {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    let (cfg, source) = match load_config(a.config.as_deref(), Some(&repo)) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let all = match cfg.handles() {
+        Ok(h) => h,
+        Err(e) => return fail(e),
+    };
+    let Some(verifier) = all
+        .iter()
+        .find(|(m, _)| m.id == a.verifier)
+        .map(|(m, _)| m.clone())
+    else {
+        return fail(format!(
+            "--verifier {:?} is not in the model roster ({source})",
+            a.verifier
+        ));
+    };
+    let families: std::collections::HashMap<String, String> = all
+        .iter()
+        .map(|(m, _)| (m.id.clone(), m.family.clone()))
+        .collect();
+    let trace = if a.trace.is_some() {
+        vettalon::llm::TraceLog::recording()
+    } else {
+        vettalon::llm::TraceLog::default()
+    };
+    let deadline = a
+        .time_budget
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    let out = verify_only::run_verify(
+        &repo,
+        input,
+        verify_only::VerifyOptions {
+            verifier,
+            families: &families,
+            refuter_runs: a.refuter_runs,
+            deadline,
+            parse_retries: a.verifier_parse_retries as usize,
+            trace: trace.clone(),
+        },
+    )
+    .await;
+    let json = match serde_json::to_string_pretty(&out) {
+        Ok(j) => j,
+        Err(e) => return fail(format!("cannot serialize the result: {e}")),
+    };
+    if let Err(e) = vettalon::util::write_private(&a.out, json.as_bytes()) {
+        return fail(format!("cannot write {}: {e}", a.out.display()));
+    }
+    // The result is already on disk; a trace that cannot be written only warns.
+    if let Some(path) = &a.trace {
+        let mut lines = String::new();
+        for e in trace.snapshot() {
+            if let Ok(l) = serde_json::to_string(&e) {
+                lines.push_str(&l);
+                lines.push('\n');
+            }
+        }
+        if let Err(e) = vettalon::util::write_private(path, lines.as_bytes()) {
+            eprintln!("[vettalon] cannot write {}: {e}", path.display());
+        }
+    }
+    eprintln!(
+        "[vettalon] verify: {} reviewed, {} settled without a call, {} unverified, {} passed through, {} model call(s) -> {}",
+        out.reviewed,
+        out.zero_llm,
+        out.unverified,
+        out.passed_through,
+        out.calls,
+        a.out.display()
+    );
+    0
+}
+
 async fn cmd_scan(args: ScanArgs) -> i32 {
     let ScanArgs {
         path,
@@ -632,6 +779,8 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         source_receipts,
         time_budget,
         refuter_runs,
+        finder_parse_retries,
+        verifier_parse_retries,
         rank,
         prescreen,
         prescreen_model,
@@ -906,6 +1055,8 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         source_receipts,
         time_budget: budget.total,
         refuter_runs,
+        finder_parse_retries: finder_parse_retries as usize,
+        verifier_parse_retries: verifier_parse_retries as usize,
         prescreen,
         role_caps: budget.caps,
         fix_test_command,
@@ -1886,6 +2037,7 @@ async fn main() -> ExitCode {
     let code = match cli.command {
         Command::Scan(args) => cmd_scan(args).await,
         Command::Validate { report } => audit::cmd_validate(&report).await,
+        Command::Verify(args) => cmd_verify(args).await,
         Command::Evidence {
             action:
                 EvidenceAction::Attach {

@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-21
+
+### Added
+- `scan --verifier-parse-retries 0|1`、`verify --verifier-parse-retries 0|1`（預設 1）：refuter 回覆違反回覆合約（不是 JSON、`plausible` 沒有 blockers 或驗證計畫、`refuted` 沒有 `refute_basis`、推翻時帶修正或前置條件、`plausible` 帶防護引用）時，把違反原因寫進修正 prompt 再問同一次覆核一次，與 finder 的 reflector 同一個模式。修正呼叫另計一次呼叫，證據記 `verifier_reflector: N reply(ies) ... re-asked, M recovered`。防護引用檢查與修正位置檢查不是格式問題，不會重問。
+- `agy`（Google Antigravity CLI 1.4.3）CLI preset：prompt 以 stream-json 從 stdin 送入（不進 argv），每次在空的暫存目錄執行，環境變數照白名單過濾，並停用 slash command、加 `--sandbox`。agy 沒有關閉工具的旗標：headless 模式會自動拒絕需要授權的工具（2026-10-20 實測：要求在工作目錄建檔或讀外部檔案都被拒，沒有檔案被建立或讀到），但 `search_web` 不需授權；因此串流裡只要出現任何工具步驟、被拒動作、非 SUCCESS 狀態或空回覆，整個回覆就丟棄並記為錯誤，prompt 前面另加一行不用工具的說明（agy 會讀使用者的 `~/.gemini/GEMINI.md`，無法關閉）。沒有容器映像檔，所以必須設 `allow_agent_tools = true` 才能用。家族只有 Gemini 模型自動帶 `google`，其他模型（agy 也提供 Claude、GPT-OSS）要自己填 `family`。
+- `vettalon verify <repo> --input FILE --verifier ID --out FILE [--trace FILE] [--refuter-runs N]`：只跑反駁覆核、不呼叫 finder。輸入可以是 `scan --report` 的報告（只覆核還沒覆核過的 AI 候選，與 scan 用同一套 prompt、摘錄、前置檢查、多次覆核與結算），或其他工具的 `vettalon.claims/1` 檔（每筆主張轉成候選後覆核，`found_by` 記 `external:<source>`，投票的 `cross_family` 一律為 false）。輸出 `vettalon.verify/1` JSON（每筆發現、覆核數、零呼叫結算數、未覆核數、呼叫數）；第一次呼叫就連不上模型時其餘不再嘗試，記 `verify_error` 並標成 incomplete。
+- `scan --finder-parse-retries 0|1`（預設 1）：finder 回覆違反 JSON 合約時要不要用修正 prompt 再問一次。0 時直接記為解析失敗，給有零自動重試規定的評測用。
+- CLI 模型也吃 `max_tokens`：回覆超過 `max_tokens` × 4 位元組就算錯誤（不截斷後使用），`claude` 另外透過 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 在每次請求帶上限；其他 CLI 看不到的推理 token 不受限。
+- `--trace` 的每筆失敗呼叫多一個 `error` 欄位（遮罩後最多 200 位元組，不含 prompt 與回覆），評測 harness 用來分辨限流與一般錯誤。
+- 評測共用 `benchmarks/common/live_guard.py`：真實模型呼叫的斷路器。硬上限是核准數加 10%（呼叫前就拒絕越界），任何連續 50 次呼叫中錯誤或拒答超過 20% 就停，限流持續 15 分鐘也停；不重試模型呼叫。`benchmarks/ranking` 的 `prescreen --prescreen-scorer claude` 改為必須帶 `--approved-calls N`，並記錄 CLI 回報的模型 id。
+- `benchmarks/owasp-fp/crossfam_live.py`（O13 修訂設計 v2）：finder 每題只跑一次（Claude，無 reflector），同一批候選交給各臂的 refuter（`vettalon verify`），各臂判的主張完全相同。修訂紀錄與理由在 `reports/crossfam-plan-amendment-2026-10-20.json`，原凍結計畫（c6075d0b…）不動。
+- `benchmarks/sastbench/run_live.py`：代表樣本 100 題的真實跑分。每題從 `adapter.model_input`（無標籤）轉成一筆 claim，只從 raw.githubusercontent.com 抓各位置指到的檔案到 repo 外的快取，交給 `vettalon verify` 覆核一次；標籤只在 `score` 才接上。
+
+### Changed
+- 每次重問都多記一筆證據 `verifier_reflector: run k/n re-asked after contract break (原因); second reply: refuted|plausible|...`，看得出重問的原因與第二次回覆的結果，用來檢查重問是否把模型教成能過檢查的推翻。不影響狀態與 `evidence_level`。
+- refuter prompt 收緊兩種推翻：防護或消毒只擋住部分輸入形式（巢狀運算子、其他編碼、其他分支）時不算安全，要回 `plausible` 並把缺口列為 blocker；流向看得到、但決定是否安全的程式碼不在摘錄裡時，缺的程式碼是 blocker，不是推翻的理由。完全看不到流向的主張照舊推翻，refute-by-default 不變。依據是 SastBench 代表樣本 17 個被關掉的真告警的逐題分類（`benchmarks/sastbench/reports/`）。**結果可能和 0.3.0 不同**：有部分防護的發現可能從 `refuted` 變成 `needs_human`。
+- **覆核結果可能和 0.3.0 不同**：違反合約的 refuter 回覆不再被當成一個意見。多次覆核中只要有一次在重問後仍違約，該發現記 `verify_error: incomplete refuter runs`（整次 incomplete），不再是 `verify_uncertain`；先前因一次違約而落到 `verify_uncertain` 的發現，現在可能在重問後得到一致結論（`needs_human` 或 `refuted`），或改記 `verify_error`。違約回覆從來不會被記成推翻，這點不變。Rust API：`ReviewPlan` 新增 `parse_retries`，`RunVerdict` 新增 `Malformed`，`ScanOptions` 新增 `verifier_parse_retries`，`verify_only::VerifyOptions` 新增 `parse_retries`。
+- Rust API：`ScanOptions` 新增 `finder_parse_retries`（預設 `audit::DEFAULT_FINDER_PARSE_RETRIES`）、`CliSpec` 新增 `max_output_tokens`、`output_cap_env`，`PromptVia`／`OutputMode` 新增 `AgyStreamJson`，`TraceEvent` 新增 `error`；struct literal 與窮舉 match 需補上。新增 `audit::verify_only`。
+- 拒答偵測多認得供應商過濾器的回覆（「This request was blocked by Gemini's filters」），這類回覆記為拒答，不再算成違反合約的回覆。
+
+### Fixed
+- npm 發布腳本：平台套件（`@vettalon/*`）發布或 staging 失敗時直接中止，不再被誤報成「SKIP (no binary)」後繼續跑（0.3.0 的 npm job 是因為最後的 `vettalon` 也失敗才變紅；若只有平台套件失敗，job 會顯示成功）。
+
 ## [0.3.0] - 2026-10-20
 
 ### Added

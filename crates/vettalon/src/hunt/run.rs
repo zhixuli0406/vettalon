@@ -364,6 +364,8 @@ impl EngineAuditor {
             source_receipts: false,
             time_budget: None,
             refuter_runs: crate::audit::DEFAULT_REFUTER_RUNS,
+            finder_parse_retries: crate::audit::DEFAULT_FINDER_PARSE_RETRIES,
+            verifier_parse_retries: crate::audit::DEFAULT_VERIFIER_PARSE_RETRIES,
             prescreen: None,
             role_caps: Default::default(),
             fix_test_command: None,

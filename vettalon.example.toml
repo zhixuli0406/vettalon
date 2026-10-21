@@ -32,6 +32,18 @@ backend = "cli"
 preset = "grok"            # family defaults to xai; container by default
 timeout_secs = 1200
 
+# agy (Google Antigravity CLI) has no "no tools" flag and no container image,
+# so it runs on the host only and needs the opt-in. vettalon discards any
+# reply in which agy used a tool. Gemini's provider filter refused vettalon's
+# refuter prompts in a 2026-10-20 test; other models agy serves need `family`.
+# [[model]]
+# id = "agy"
+# backend = "cli"
+# preset = "agy"             # family defaults to google for Gemini models
+# allow_agent_tools = true
+# model = "gpt-oss-120b-medium"
+# family = "openai"
+
 # ── OpenAI-compatible APIs ─────────────────────────────────────────
 # [[model]]
 # id = "deepseek"

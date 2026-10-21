@@ -12,9 +12,18 @@
 //!   memories are switched off.
 //! - `grok`: `--tools ""` does NOT remove its tools; it can read files and
 //!   run commands on the host.
+//! - `agy` (Google Antigravity CLI, checked 2026-10-20 against 1.4.3): there
+//!   is no flag that removes tools. Headless print mode auto-denies every
+//!   tool that needs a permission (commands, file reads outside the empty
+//!   workspace, file writes; tested: nothing was created or read), but
+//!   `search_web` ran without one. The reply is discarded when the stream
+//!   shows any tool step, so a verdict never rests on tool output. agy also
+//!   loads the user's own rules (`~/.gemini/GEMINI.md`) and keeps its own
+//!   conversation history; neither can be switched off.
 //!
 //! So [`TOOL_CAPABLE_PRESETS`] are refused unless the operator opts in with
-//! `allow_agent_tools = true` (see `config.rs`).
+//! `allow_agent_tools = true` (see `config.rs`); [`HOST_ONLY_PRESETS`] have
+//! no container image and always need that opt-in.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -43,6 +52,24 @@ const OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 /// Presets whose model keeps tool access that can reach the host even with
 /// the flags below. Using them needs an explicit opt-in.
 pub const TOOL_CAPABLE_PRESETS: &[&str] = &["codex", "grok"];
+
+/// Presets that keep tools AND have no container image (their login cannot
+/// be copied into one), so they run on the host only, with the opt-in.
+pub const HOST_ONLY_PRESETS: &[&str] = &["agy"];
+
+/// Every built-in preset name.
+pub const PRESETS: &[&str] = &["claude", "codex", "grok", "agy"];
+
+/// Visible-reply budget per output token when a CLI cannot be told its
+/// output cap: a reply longer than `max_output_tokens * 4` bytes is an
+/// error, never truncated and used.
+pub const CLI_REPLY_BYTES_PER_TOKEN: usize = 4;
+
+/// Put in front of every agy prompt. agy has no switch to skip the user's
+/// own rules, and without this a rule such as "first read the README" makes
+/// it reach for a (denied) tool and return nothing.
+pub const AGY_HEADLESS_PREAMBLE: &str = "This is a headless one-shot call with no workspace: do \
+not call any tools and do not read any files; answer only from this message.";
 
 /// Environment passed to every CLI; everything else is dropped so a model
 /// that runs `env` cannot read the operator's other keys.
@@ -83,6 +110,8 @@ fn preset_env(name: &str) -> &'static [&'static str] {
         ],
         "codex" => &["OPENAI_API_KEY", "CODEX_HOME"],
         "grok" => &["XAI_API_KEY", "GROK_HOME"],
+        // Subscription login lives under HOME; no key variable exists.
+        "agy" => &[],
         _ => &[],
     }
 }
@@ -93,6 +122,10 @@ pub enum PromptVia {
     Stdin,
     Arg,
     File,
+    /// stdin carries one agy stream-json user message
+    /// (`{"event":"user","message":{"content":...}}`), so the prompt stays
+    /// out of argv.
+    AgyStreamJson,
 }
 
 /// Where the reply text comes from.
@@ -105,6 +138,10 @@ pub enum OutputMode {
     JsonField(String),
     /// The CLI writes its final message to `{output_file}`.
     File,
+    /// agy `--output-format stream-json`: the reply is the final `result`
+    /// event's `response`; any tool step, denied action or non-SUCCESS
+    /// status makes the call an error.
+    AgyStreamJson,
 }
 
 #[derive(Debug, Clone)]
@@ -117,11 +154,18 @@ pub struct CliSpec {
     pub timeout: Duration,
     /// Extra environment variable names passed through on top of [`BASE_ENV`].
     pub env_passthrough: Vec<String>,
+    /// Output cap per call (`max_tokens` in the roster). The visible reply
+    /// may be at most `max_output_tokens * CLI_REPLY_BYTES_PER_TOKEN` bytes;
+    /// a longer one is an error. Where the CLI reads a cap from the
+    /// environment (`output_cap_env`), it is also set there.
+    pub max_output_tokens: Option<u32>,
+    /// Environment variable the CLI reads its per-request output cap from.
+    pub output_cap_env: Option<String>,
 }
 
 impl CliSpec {
     /// Built-in presets. Flags were checked against claude 2.1.285,
-    /// codex-cli 0.162.1 and grok 1.0.50.
+    /// codex-cli 0.162.1, grok 1.0.50 and agy 1.4.3.
     pub fn preset(name: &str, model: Option<String>, timeout: Duration) -> Option<CliSpec> {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let (program, args, prompt_via, output) = match name {
@@ -193,6 +237,23 @@ impl CliSpec {
                 PromptVia::File,
                 OutputMode::JsonField("text".into()),
             ),
+            "agy" => (
+                "agy",
+                s(&[
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                    "--disable-slash-commands",
+                    "--sandbox",
+                    "--model",
+                    MODEL_PLACEHOLDER,
+                    // Print mode; the prompt arrives on stdin, never in argv.
+                    "-p=",
+                ]),
+                PromptVia::AgyStreamJson,
+                OutputMode::AgyStreamJson,
+            ),
             _ => return None,
         };
         Some(CliSpec {
@@ -203,7 +264,34 @@ impl CliSpec {
             model,
             timeout,
             env_passthrough: preset_env(name).iter().map(|v| v.to_string()).collect(),
+            max_output_tokens: None,
+            output_cap_env: (name == "claude").then(|| "CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string()),
         })
+    }
+
+    /// What goes to the CLI's stdin for `prompt`.
+    pub fn stdin_payload(&self, prompt: &str) -> Vec<u8> {
+        match self.prompt_via {
+            PromptVia::Stdin => prompt.as_bytes().to_vec(),
+            PromptVia::AgyStreamJson => agy_stream_message(prompt),
+            PromptVia::Arg | PromptVia::File => Vec::new(),
+        }
+    }
+
+    /// Error when a reply is longer than the output cap allows.
+    pub fn check_output_cap(&self, reply: &str) -> Result<()> {
+        let Some(cap) = self.max_output_tokens else {
+            return Ok(());
+        };
+        let limit = cap as usize * CLI_REPLY_BYTES_PER_TOKEN;
+        if reply.len() > limit {
+            return Err(LlmError::Executor(format!(
+                "{} reply is {} bytes, over the output cap ({cap} tokens = {limit} bytes)",
+                self.program,
+                reply.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Final argv (without the program). Pure, for tests.
@@ -283,6 +371,9 @@ impl LlmCaller for CliCaller {
                 cmd.env(name, v);
             }
         }
+        if let (Some(cap), Some(var)) = (self.spec.max_output_tokens, &self.spec.output_cap_env) {
+            cmd.env(var, cap.to_string());
+        }
         // Own process group, so a timeout kills the CLI's children too.
         #[cfg(unix)]
         cmd.process_group(0);
@@ -297,11 +388,7 @@ impl LlmCaller for CliCaller {
 
         let pid = child.id();
         let mut stdin = child.stdin.take().expect("piped stdin");
-        let to_send = if self.spec.prompt_via == PromptVia::Stdin {
-            prompt.as_bytes().to_vec()
-        } else {
-            Vec::new()
-        };
+        let to_send = self.spec.stdin_payload(prompt);
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
 
@@ -348,8 +435,78 @@ impl LlmCaller for CliCaller {
                 crate::util::truncate_bytes(&tail, 400)
             )));
         }
-        extract_reply(&self.spec.output, &stdout_text, &out_file)
+        let reply = extract_reply(&self.spec.output, &stdout_text, &out_file)?;
+        self.spec.check_output_cap(&reply)?;
+        Ok(reply)
     }
+}
+
+/// One agy stream-json user message holding `prompt` (with
+/// [`AGY_HEADLESS_PREAMBLE`] in front), newline-terminated.
+pub fn agy_stream_message(prompt: &str) -> Vec<u8> {
+    let content = format!("{AGY_HEADLESS_PREAMBLE}\n\n{prompt}");
+    let mut line = serde_json::json!({"event": "user", "message": {"content": content}})
+        .to_string()
+        .into_bytes();
+    line.push(b'\n');
+    line
+}
+
+/// The reply in an agy stream-json transcript. Fails closed: a tool step
+/// (even one the CLI allowed), a denied action, a non-SUCCESS status or an
+/// empty response is an error, never a verdict.
+pub fn parse_agy_stream(stdout: &str) -> Result<String> {
+    let mut result: Option<serde_json::Value> = None;
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("event").and_then(|e| e.as_str()) {
+            Some("step_update") => {
+                let step = &v["step_update"];
+                if step.get("step_type").and_then(|t| t.as_str()) == Some("tool") {
+                    let tool = step
+                        .get("tool_name")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("unknown");
+                    return Err(LlmError::Executor(format!(
+                        "agy used a tool ({tool}); reply discarded"
+                    )));
+                }
+            }
+            Some("result") => result = Some(v["result"].clone()),
+            _ => {}
+        }
+    }
+    let r = result.ok_or_else(|| LlmError::Executor("agy stream has no result event".into()))?;
+    let status = r.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if status != "SUCCESS" {
+        let err = r
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("no error text");
+        return Err(LlmError::Executor(format!(
+            "agy status {status:?}: {}",
+            crate::util::truncate_bytes(&crate::util::mask_sensitive_text(err), 300)
+        )));
+    }
+    if let Some(denied) = r.get("denied_actions").and_then(|d| d.as_array())
+        && !denied.is_empty()
+    {
+        let names: Vec<&str> = denied
+            .iter()
+            .filter_map(|d| d.get("action").and_then(|a| a.as_str()))
+            .collect();
+        return Err(LlmError::Executor(format!(
+            "agy tried a denied tool ({}); no reply",
+            names.join(", ")
+        )));
+    }
+    let response = r.get("response").and_then(|x| x.as_str()).unwrap_or("");
+    if response.trim().is_empty() {
+        return Err(LlmError::Executor("agy returned an empty response".into()));
+    }
+    Ok(response.to_string())
 }
 
 /// SIGKILL the whole process group of a timed-out CLI.
@@ -370,6 +527,7 @@ fn kill_group(pid: Option<u32>) {
 fn extract_reply(mode: &OutputMode, stdout: &str, out_file: &std::path::Path) -> Result<String> {
     match mode {
         OutputMode::Stdout => Ok(stdout.to_string()),
+        OutputMode::AgyStreamJson => parse_agy_stream(stdout),
         OutputMode::File => {
             let len = std::fs::metadata(out_file)
                 .map_err(|e| LlmError::Executor(format!("CLI wrote no final message: {e}")))?
@@ -402,7 +560,7 @@ mod tests {
 
     #[test]
     fn presets_exist_and_drop_the_model_flag_when_unset() {
-        for name in ["claude", "codex", "grok"] {
+        for name in PRESETS {
             let spec = CliSpec::preset(name, None, Duration::from_secs(1)).unwrap();
             let args = spec.render_args("P", "/o");
             assert!(
@@ -454,6 +612,126 @@ mod tests {
     }
 
     #[test]
+    fn agy_preset_sends_the_prompt_on_stdin_as_stream_json() {
+        let spec = CliSpec::preset("agy", Some("gemini-x".into()), Duration::from_secs(1)).unwrap();
+        assert_eq!(spec.prompt_via, PromptVia::AgyStreamJson);
+        assert_eq!(spec.output, OutputMode::AgyStreamJson);
+        let a = spec.render_args_with("secret code", "/o", "/p");
+        assert!(!a.iter().any(|x| x.contains("secret code")), "{a:?}");
+        for flag in ["--disable-slash-commands", "--sandbox"] {
+            assert!(a.iter().any(|x| x == flag), "{flag}: {a:?}");
+        }
+        let f = a.iter().position(|x| x == "--input-format").unwrap();
+        assert_eq!(a[f + 1], "stream-json");
+        // `-p=` must come last: agy would take the next flag as the prompt.
+        assert_eq!(a.last().unwrap(), "-p=");
+        let m = a.iter().position(|x| x == "--model").unwrap();
+        assert_eq!(a[m + 1], "gemini-x");
+        let line = spec.stdin_payload("secret code\n\"quoted\"");
+        assert_eq!(*line.last().unwrap(), b'\n');
+        let v: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(v["event"], "user");
+        let content = v["message"]["content"].as_str().unwrap();
+        assert!(content.starts_with(AGY_HEADLESS_PREAMBLE));
+        assert!(content.ends_with("secret code\n\"quoted\""));
+        assert!(TOOL_CAPABLE_PRESETS.iter().all(|p| *p != "agy"));
+        assert!(HOST_ONLY_PRESETS.contains(&"agy"));
+    }
+
+    fn agy_stream(steps: &[&str], result: &str) -> String {
+        let mut out = String::from("{\"event\":\"init\",\"init\":{\"tools\":[\"run_command\"]}}\n");
+        for s in steps {
+            out.push_str(s);
+            out.push('\n');
+        }
+        out.push_str(result);
+        out.push('\n');
+        out
+    }
+
+    #[test]
+    fn agy_stream_reply_and_fail_closed_cases() {
+        let ok = agy_stream(
+            &[
+                r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"x"}}"#,
+            ],
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"{\"verdict\":\"refuted\"}\n"}}"#,
+        );
+        assert_eq!(
+            parse_agy_stream(&ok).unwrap(),
+            "{\"verdict\":\"refuted\"}\n"
+        );
+        // A tool step discards the reply even when the tool was allowed.
+        let tool = agy_stream(
+            &[
+                r#"{"event":"step_update","step_update":{"step_type":"tool","tool_name":"search_web","state":"DONE"}}"#,
+            ],
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"looks fine"}}"#,
+        );
+        assert!(
+            parse_agy_stream(&tool)
+                .unwrap_err()
+                .to_string()
+                .contains("search_web")
+        );
+        let denied = agy_stream(
+            &[],
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"","denied_actions":[{"action":"command"}]}}"#,
+        );
+        assert!(
+            parse_agy_stream(&denied)
+                .unwrap_err()
+                .to_string()
+                .contains("command")
+        );
+        let failed = agy_stream(
+            &[],
+            r#"{"event":"result","result":{"status":"ERROR","error":"authentication failed","response":""}}"#,
+        );
+        assert!(
+            parse_agy_stream(&failed)
+                .unwrap_err()
+                .to_string()
+                .contains("authentication")
+        );
+        let empty = agy_stream(
+            &[],
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"  "}}"#,
+        );
+        assert!(parse_agy_stream(&empty).is_err());
+        assert!(parse_agy_stream("not json at all").is_err());
+    }
+
+    #[tokio::test]
+    async fn output_cap_rejects_long_replies_and_reaches_the_cli_env() {
+        let mut spec = CliSpec {
+            program: "cat".into(),
+            args: vec![],
+            prompt_via: PromptVia::Stdin,
+            output: OutputMode::Stdout,
+            model: None,
+            timeout: Duration::from_secs(5),
+            env_passthrough: vec![],
+            max_output_tokens: Some(2),
+            output_cap_env: None,
+        };
+        let c = CliCaller { spec: spec.clone() };
+        assert_eq!(c.complete("12345678").await.unwrap(), "12345678");
+        let err = c.complete("123456789").await.unwrap_err().to_string();
+        assert!(err.contains("output cap"), "{err}");
+        spec.program = "env".into();
+        spec.max_output_tokens = Some(4000);
+        spec.output_cap_env = Some("VETTALON_TEST_CAP_VAR".into());
+        let out = CliCaller { spec }.complete("").await.unwrap();
+        assert!(out.contains("VETTALON_TEST_CAP_VAR=4000"), "{out}");
+        let claude = CliSpec::preset("claude", None, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            claude.output_cap_env.as_deref(),
+            Some("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        );
+    }
+
+    #[test]
     fn codex_preset_drops_user_config_and_extensions() {
         let a = CliSpec::preset("codex", None, Duration::from_secs(1))
             .unwrap()
@@ -481,6 +759,8 @@ mod tests {
                 model: None,
                 timeout: Duration::from_secs(5),
                 env_passthrough: vec![],
+                max_output_tokens: None,
+                output_cap_env: None,
             },
         };
         let out = c.complete("").await.unwrap();
@@ -518,6 +798,8 @@ mod tests {
                 model: None,
                 timeout: Duration::from_secs(1),
                 env_passthrough: vec![],
+                max_output_tokens: None,
+                output_cap_env: None,
             },
         };
         assert!(matches!(c.complete("p").await, Err(LlmError::Executor(_))));
@@ -534,6 +816,8 @@ mod tests {
                 model: None,
                 timeout: Duration::from_secs(5),
                 env_passthrough: vec![],
+                max_output_tokens: None,
+                output_cap_env: None,
             },
         };
         assert_eq!(c.complete("中文 prompt").await.unwrap(), "中文 prompt");
@@ -591,6 +875,8 @@ print('[]')
                     model: None,
                     timeout: Duration::from_secs(5),
                     env_passthrough: vec![],
+                    max_output_tokens: None,
+                    output_cap_env: None,
                 },
             };
             assert_eq!(caller.complete(&prompt).await.unwrap().trim(), "[]");

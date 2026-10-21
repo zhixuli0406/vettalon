@@ -44,3 +44,17 @@ python3 -m unittest test_crossfam                    # 離線測試
 ```
 
 正式跑分（`execute`）在擁有者依 D01 核准、且 roster 每個模型都能強制 1,024 輸出 token 之前一律拒絕。設計、重分析結果與跑分計畫見 [CROSS-FAMILY-2026-10.md](CROSS-FAMILY-2026-10.md)。
+
+### 修訂設計 v2：共用 finder（2026-10-20 真實跑分）
+
+擁有者核准的配置是 Claude 找洞、grok 與 agy 跨家族覆核，只有一個 finder 家族，所以改用 `crossfam_live.py`：每題 finder 只跑一次（`scan`、無 verifier、`--finder-parse-retries 0`），同一份報告交給四臂的 refuter（`vettalon verify`）：claude>grok、claude>agy（跨家族）、claude>另一個 claude 模型（同家族）、claude>同一個 claude（fresh session）。各臂判的是完全相同的主張，finder 的雜訊不會進到臂間比較。修訂內容與理由在 [`reports/crossfam-plan-amendment-2026-10-20.json`](reports/crossfam-plan-amendment-2026-10-20.json)，計畫在 `reports/crossfam-plan-v2.json`，原凍結計畫 `crossfam-plan.json` 不動。
+
+```bash
+python3 crossfam_live.py plan                                  # v2 計畫與 SHA-256，0 次呼叫
+python3 crossfam_live.py dry-run --out-dir /tmp/xfam2          # fake vettalon，0 次呼叫
+python3 crossfam_live.py execute --stage pilot --roster ROSTER.toml --approval reports/crossfam-approval-v2.json \
+  --cases-dir cases --out-dir runs/xfam-pilot --vettalon-bin "$(command -v vettalon)"
+python3 -m unittest test_crossfam_live
+```
+
+每題開跑前帳本先保留一整排上限（finder 1 + 4 臂 × 8 候選 × 3 次 = 97 次），放不下就停；另有 `benchmarks/common/live_guard.py` 守硬上限（核准數加 10%）、錯誤率（任何 50 次呼叫中超過 20%）與限流（15 分鐘）。先導 16 題跑完、呼叫錯誤率 ≤ 10% 且逐題紀錄有效，才跑全量。2026-10-20 的結果見 [CROSS-FAMILY-LIVE-2026-10.md](CROSS-FAMILY-LIVE-2026-10.md)。

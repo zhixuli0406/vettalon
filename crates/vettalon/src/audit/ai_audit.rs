@@ -773,6 +773,7 @@ pub async fn run_ai_audit_capped<C: LlmCaller>(
             ask_fix: &none,
             deadline: None,
             source_receipts: false,
+            parse_retries: AI_AUDIT_PARSE_RETRIES,
         },
     )
     .await
@@ -798,6 +799,10 @@ pub struct AuditProgress<'a> {
     pub deadline: Option<std::time::Instant>,
     /// Store content-free source and prompt hashes for this run.
     pub source_receipts: bool,
+    /// Reflector corrections per module (`--finder-parse-retries`, 0..=
+    /// [`AI_AUDIT_PARSE_RETRIES`]). 0 = a reply that breaks the JSON
+    /// contract is recorded as `ParseFailed` with no second call.
+    pub parse_retries: usize,
 }
 
 fn record_source_call(
@@ -865,7 +870,9 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         ask_fix,
         deadline,
         source_receipts,
+        parse_retries,
     } = progress;
+    let parse_retries = parse_retries.min(AI_AUDIT_PARSE_RETRIES);
     if modules.is_empty() {
         return AiAuditOutcome::Unavailable {
             reason: "no candidate modules found (empty repo, or no readable files under it)"
@@ -1041,7 +1048,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         let mut parsed = parse_ai_candidates(&raw);
         let mut retries_used = 0usize;
         let mut retry_note: Option<String> = None;
-        while parsed.is_err() && retries_used < AI_AUDIT_PARSE_RETRIES {
+        while parsed.is_err() && retries_used < parse_retries {
             let violation = match parsed.as_ref() {
                 Err(v) => v.to_string(),
                 Ok(_) => break,
@@ -1615,6 +1622,7 @@ pub(crate) mod tests {
                 ask_fix: &none,
                 deadline: None,
                 source_receipts: true,
+                parse_retries: AI_AUDIT_PARSE_RETRIES,
             },
         )
         .await
@@ -1834,6 +1842,7 @@ pub(crate) mod tests {
                 ask_fix: &none,
                 deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(20)),
                 source_receipts: false,
+                parse_retries: AI_AUDIT_PARSE_RETRIES,
             },
         )
         .await;
@@ -2013,6 +2022,50 @@ pub(crate) mod tests {
         assert!(caller.replies.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn zero_parse_retries_makes_no_correction_call() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn main(){}")]);
+        let modules = vec![ModuleTarget {
+            module_path: "a".to_string(),
+            score: 1,
+            high_risk: false,
+            files: vec!["a/main.rs".to_string()],
+        }];
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Ok("not json".to_string()), Ok("[]".to_string())]),
+        };
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let none = HashSet::new();
+        let outcome = run_ai_audit_progress(
+            dir.path(),
+            &modules,
+            &caller,
+            MAX_TOTAL_AI_CANDIDATES,
+            AuditProgress {
+                sink: &crate::audit::NoProgress,
+                label: "",
+                audited: &counter,
+                total: 1,
+                cross_check: &none,
+                ask_fix: &none,
+                deadline: None,
+                source_receipts: false,
+                parse_retries: 0,
+            },
+        )
+        .await;
+        match outcome {
+            AiAuditOutcome::Ran { module_reports, .. } => assert!(
+                matches!(module_reports[0].outcome, ModuleOutcome::ParseFailed { .. }),
+                "{:?}",
+                module_reports[0].outcome
+            ),
+            AiAuditOutcome::Unavailable { reason, .. } => panic!("expected Ran: {reason}"),
+        }
+        // Only the first reply was consumed: no reflector call.
+        assert_eq!(caller.replies.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn repo_housekeeping_files_are_not_audit_targets() {
         for meta in [
@@ -2149,6 +2202,7 @@ pub(crate) mod tests {
                 ask_fix: &none,
                 deadline: Some(std::time::Instant::now()),
                 source_receipts: false,
+                parse_retries: AI_AUDIT_PARSE_RETRIES,
             },
         )
         .await;

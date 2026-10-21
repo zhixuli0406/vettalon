@@ -52,7 +52,12 @@ publish_pkg() {
 }
 
 for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
-  [ -f "${NPM_DIR}/${dir}/bin/vettalon" ] && publish_pkg "@vettalon/${dir}" "${NPM_DIR}/${dir}" || echo "  SKIP: ${dir} (no binary)"
+  # A failed publish must stop the run; only a missing binary is a skip.
+  if [ -f "${NPM_DIR}/${dir}/bin/vettalon" ]; then
+    publish_pkg "@vettalon/${dir}" "${NPM_DIR}/${dir}"
+  else
+    echo "  SKIP: ${dir} (no binary)"
+  fi
 done
 publish_pkg "vettalon" "${NPM_DIR}/vettalon"
 if [ "$MODE" = stage ]; then echo "=== Staged === approve: npm stage list; npm stage approve <id> (platform packages first, then vettalon)"; else echo "=== Done === npm install -g vettalon"; fi

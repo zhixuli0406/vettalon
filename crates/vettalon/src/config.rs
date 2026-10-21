@@ -211,6 +211,9 @@ fn preset_family(preset: &str) -> Option<&'static str> {
         "claude" => Some("anthropic"),
         "codex" => Some("openai"),
         "grok" => Some("xai"),
+        // agy also serves non-Google models; `ModelConfig::family` only
+        // takes this default for a Gemini model (or the CLI's default).
+        "agy" => Some("google"),
         _ => None,
     }
 }
@@ -233,6 +236,7 @@ impl Config {
     pub fn autodetect() -> (Config, Vec<&'static str>) {
         let skipped: Vec<&'static str> = crate::llm::cli::TOOL_CAPABLE_PRESETS
             .iter()
+            .chain(crate::llm::cli::HOST_ONLY_PRESETS)
             .copied()
             .filter(|p| crate::util::which_cli(p).is_some())
             .collect();
@@ -323,7 +327,17 @@ impl Config {
                         && CliSpec::preset(p, None, Duration::from_secs(1)).is_none()
                     {
                         return Err(format!(
-                            "model {:?}: unknown preset {p:?} (claude | codex | grok)",
+                            "model {:?}: unknown preset {p:?} (claude | codex | grok | agy)",
+                            m.id
+                        ));
+                    }
+                    if let Some(p) = &m.preset
+                        && crate::llm::cli::HOST_ONLY_PRESETS.contains(&p.as_str())
+                        && !m.allow_agent_tools
+                    {
+                        return Err(format!(
+                            "model {:?}: the {p} CLI keeps tools that cannot be switched off and has no \
+                             container image; set `allow_agent_tools = true` to run it on the host and accept that risk",
                             m.id
                         ));
                     }
@@ -619,10 +633,11 @@ fn parse_output_mode(s: &str) -> Result<OutputMode, String> {
     match s {
         "stdout" => Ok(OutputMode::Stdout),
         "file" => Ok(OutputMode::File),
+        "agy_stream_json" => Ok(OutputMode::AgyStreamJson),
         other => match other.strip_prefix("json:") {
             Some(f) if !f.is_empty() => Ok(OutputMode::JsonField(f.to_string())),
             _ => Err(format!(
-                "output {other:?} must be stdout | file | json:<field>"
+                "output {other:?} must be stdout | file | agy_stream_json | json:<field>"
             )),
         },
     }
@@ -635,6 +650,17 @@ impl ModelConfig {
                 return Err(format!("model {:?}: empty family", self.id));
             }
             return Ok(f.trim().to_lowercase());
+        }
+        // agy also serves Claude and GPT-OSS models: only a Gemini model
+        // (or the CLI's default, Gemini) may take the google default.
+        if self.preset.as_deref() == Some("agy")
+            && let Some(m) = &self.model
+            && !m.to_ascii_lowercase().starts_with("gemini")
+        {
+            return Err(format!(
+                "model {:?}: agy model {m:?} is not a Gemini model; set `family` explicitly",
+                self.id
+            ));
         }
         self.preset
             .as_deref()
@@ -691,8 +717,11 @@ impl ModelConfig {
                         model: self.model.clone(),
                         timeout: self.timeout(),
                         env_passthrough: Vec::new(),
+                        max_output_tokens: None,
+                        output_cap_env: None,
                     },
                 };
+                spec.max_output_tokens = self.max_tokens;
                 spec.env_passthrough
                     .extend(self.env_passthrough.iter().cloned());
                 if let Some(p) = &self.program {
@@ -945,6 +974,29 @@ api_key = "sk-123"
         let tools = "[[model]]\nid='g'\nbackend='cli'\npreset='grok'\n";
         assert!(Config::parse(tools).is_ok());
         assert!(Config::parse(&format!("{tools}allow_agent_tools = true\n")).is_ok());
+        // agy has no container image: host only, and only with the opt-in.
+        let agy = "[[model]]\nid='g'\nbackend='cli'\npreset='agy'\n";
+        assert!(
+            Config::parse(agy)
+                .unwrap_err()
+                .contains("allow_agent_tools")
+        );
+        let agy_ok = Config::parse(&format!("{agy}allow_agent_tools = true\n")).unwrap();
+        assert_eq!(agy_ok.models[0].family().unwrap(), "google");
+        let gemini = format!("{agy}allow_agent_tools = true\nmodel = 'gemini-3.8-flash-high'\n");
+        assert_eq!(
+            Config::parse(&gemini).unwrap().models[0].family().unwrap(),
+            "google"
+        );
+        // agy can also serve Claude models: no google default for those.
+        let claude_via_agy =
+            format!("{agy}allow_agent_tools = true\nmodel = 'claude-sonnet-4-6'\n");
+        assert!(
+            Config::parse(&claude_via_agy)
+                .unwrap_err()
+                .contains("family")
+        );
+        assert!(Config::parse(&format!("{claude_via_agy}family = 'anthropic'\n")).is_ok());
         // A custom program can only run on the host, and needs the opt-in.
         let prog = "[[model]]\nid='g'\nbackend='cli'\nfamily='x'\nprogram='/usr/bin/foo'\n";
         assert!(
