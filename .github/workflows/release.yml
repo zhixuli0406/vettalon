@@ -127,6 +127,13 @@ jobs:
           path: trust-source
           ref: ${{ github.event.inputs.tag || github.ref_name }}
           persist-credentials: false
+      # Release body = the tag's "升級須知 / Upgrade notes" from CHANGELOG.md
+      # (if any) + a link to its CHANGELOG entry; GitHub's generated PR list is
+      # appended after it. Fails when the CHANGELOG has no section for the tag.
+      - name: Release notes from CHANGELOG
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: python3 trust-source/scripts/trust/release_notes.py trust-source/CHANGELOG.md "$TAG" --out "$RUNNER_TEMP/release-notes.md"
       - name: Validate merged assets before publication
         run: |
           python3 -m venv "$RUNNER_TEMP/trust-venv"
@@ -155,6 +162,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
           files: |
             vettalon-*.tar.gz
@@ -165,6 +173,19 @@ jobs:
             vettalon-*.cdx.json
             vettalon-*.build-record.json
             vettalon-*.sigstore.json
+
+  # Container images for `vettalon agents pull` (grok-free base and egress
+  # proxy). A tag that already exists for an unchanged definition is reused,
+  # never rebuilt or overwritten.
+  images:
+    needs: release
+    if: github.repository == 'zhixuli0406/vettalon'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/images.yml
 
   npm-publish:
     needs: release

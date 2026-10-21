@@ -1,6 +1,7 @@
 //! Carry-over from a prior report. On by default; `--no-prior` turns it off.
 //!
-//! The prior report is the newest file under `<home>/reports/`
+//! The prior report is the newest file under `<home>/reports/` (by the UTC
+//! timestamp in its name, see `report::saved_report_sort_key`)
 //! whose `repo` equals the current canonical repo path and whose
 //! `schema_version >= 2`. Unparsable files and older-schema reports for the
 //! same repo are skipped with one stderr line each; the search continues
@@ -90,9 +91,12 @@ pub fn load_prior(home_dir: &Path, canonical_repo: &str) -> Option<PriorIndex> {
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
         .filter(|n| n.ends_with(".json"))
         .collect();
-    // `<UTC-ISO8601-basic>.json` sorts lexically = chronologically.
-    names.sort();
-    names.reverse();
+    // Newest first. Saved names are UTC timestamps (with or without
+    // sub-second precision and a collision suffix); the key orders both the
+    // current and the older form chronologically.
+    names.sort_by(|a, b| {
+        super::report::saved_report_sort_key(b).cmp(&super::report::saved_report_sort_key(a))
+    });
     for name in names {
         let path = dir.join(&name);
         let too_big = std::fs::metadata(&path)
@@ -195,7 +199,7 @@ pub fn decide(current_hash: Option<&str>, prior: &[PriorEntry]) -> CarryDecision
 }
 
 /// P2-2: distinct prior statuses at one fingerprint, in a stable order, as a
-/// short zh-TW list for the episodic note (e.g. `confirmed、refuted`).
+/// comma-separated list for the episodic note (e.g. `confirmed, refuted`).
 fn prior_status_summary(entries: &[PriorEntry]) -> String {
     let mut seen: Vec<FindingStatus> = Vec::new();
     for e in entries {
@@ -206,7 +210,7 @@ fn prior_status_summary(entries: &[PriorEntry]) -> String {
     seen.iter()
         .map(|s| status_word(*s))
         .collect::<Vec<_>>()
-        .join("、")
+        .join(", ")
 }
 
 fn status_word(s: FindingStatus) -> &'static str {
@@ -251,7 +255,7 @@ pub fn apply_prior(findings: &mut [Finding], prior: &PriorIndex) -> PriorRunInfo
                 push_prior_evidence(
                     f,
                     format!(
-                        "{PRIOR_CHANGED_PREFIX}: {} 先前在此根因曾判定為 {}，但來源已變動，判定未沿用，建議重新研判",
+                        "{PRIOR_CHANGED_PREFIX}: {} judged this root cause as {} before; the source has changed, so the verdict is not carried over (re-assess)",
                         prior.report_file,
                         prior_status_summary(entries),
                     ),
@@ -475,6 +479,20 @@ mod tests {
             "changed-source finding should carry an episodic note: {:?}",
             current[3].evidence
         );
+        // Stored evidence is report data: English whatever the terminal says.
+        let note = current[3]
+            .evidence
+            .iter()
+            .find(|e| e.detail.starts_with(PRIOR_CHANGED_PREFIX))
+            .unwrap();
+        assert!(
+            !note
+                .detail
+                .chars()
+                .any(|c| matches!(c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF)),
+            "{}",
+            note.detail
+        );
         // The genuinely-new finding (no prior fingerprint) carries nothing.
         assert!(current[4].evidence.is_empty());
         assert_eq!(
@@ -537,6 +555,34 @@ mod tests {
         )
         .unwrap();
         assert!(load_prior(home.path(), "/repo").is_none());
+    }
+
+    /// Newest is chronological across the older second-precision names and
+    /// the current microsecond names with collision suffixes (plain lexical
+    /// order would rank `…061029Z.json` above `…061029.100000Z-10.json`,
+    /// and `-2` above `-10`).
+    #[test]
+    fn load_prior_picks_the_newest_across_old_and_new_names() {
+        let home = tempfile::tempdir().unwrap();
+        let r = report("/repo", 2, vec![]);
+        for name in [
+            "20261021T061027.999999Z.json",
+            "20261021T061028Z.json",
+            "20261021T061029Z.json",
+            "20261021T061029.100000Z.json",
+            "20261021T061029.100000Z-2.json",
+            "20261021T061029.100000Z-10.json",
+        ] {
+            write(home.path(), name, &r);
+        }
+        let idx = load_prior(home.path(), "/repo").unwrap();
+        assert_eq!(idx.report_file, "20261021T061029.100000Z-10.json");
+
+        let home = tempfile::tempdir().unwrap();
+        write(home.path(), "20261021T061027.999999Z.json", &r);
+        write(home.path(), "20261021T061028Z.json", &r);
+        let idx = load_prior(home.path(), "/repo").unwrap();
+        assert_eq!(idx.report_file, "20261021T061028Z.json");
     }
 
     #[test]

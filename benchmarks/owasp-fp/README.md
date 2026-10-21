@@ -58,3 +58,15 @@ python3 -m unittest test_crossfam_live
 ```
 
 每題開跑前帳本先保留一整排上限（finder 1 + 4 臂 × 8 候選 × 3 次 = 97 次），放不下就停；另有 `benchmarks/common/live_guard.py` 守硬上限（核准數加 10%）、錯誤率（任何 50 次呼叫中超過 20%）與限流（15 分鐘）。先導 16 題跑完、呼叫錯誤率 ≤ 10% 且逐題紀錄有效，才跑全量。2026-10-20 的結果見 [CROSS-FAMILY-LIVE-2026-10.md](CROSS-FAMILY-LIVE-2026-10.md)。
+
+### 檢定力補強跑分（2026-10-21 事先登錄）
+
+`power_live.py` 用同樣的四臂，但 finder 開著產品預設的 reflector（`--finder-parse-retries 1`），題目照固定種子的順序跑（`reports/power-sample-2026-10-21.json`：前 160 題是 `sample.json`，之後每格再加到 74 題，共 592 題），跑到下一題放不進擁有者的上限就停。每題先確認放得下 finder 的 2 次，finder 跑完再確認放得下精確的覆核上限（候選數 × 3 次 × 2 × 4 臂）。檢定與 holdout 說明規則寫在 [docs/EVAL-PROTOCOL.md](../../docs/EVAL-PROTOCOL.md) 第 3 節，`analyze` 照那裡的定義計算，不呼叫模型。
+
+```bash
+python3 power_live.py sample --bench-dir BenchmarkJava            # 重建順序檔，0 次呼叫
+python3 power_live.py stage --bench-dir BenchmarkJava --cases-dir CASES
+python3 power_live.py dry-run --out-dir /tmp/xfam-power           # fake vettalon，0 次呼叫
+python3 power_live.py execute --roster ROSTER.toml --cases-dir CASES --out-dir DIR --vettalon-bin BIN [--resume]
+python3 power_live.py analyze --out-dir DIR --out RESULT.json
+```

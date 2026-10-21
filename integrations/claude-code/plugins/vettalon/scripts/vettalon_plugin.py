@@ -50,11 +50,17 @@ def run_command(command, timeout, *, stdout_cap=4 * 1024 * 1024, stderr_cap=1024
                           stdout_cap=stdout_cap, stderr_cap=stderr_cap, timeout_ceiling_seconds=600)
 
 
+# Nonzero scan exits that still come with complete process evidence and reports:
+# 1 = a finding or gate condition failed; 4 = deep scan in which no AI engine
+# could run (CLI releases after 0.3.1; earlier ones exited 0 and only the report said so).
+SCAN_EXITS = {1: 'finding-exit', 4: 'ai-engines-unavailable'}
+
+
 def process_accepted(run, runtime, *, findings_exit=False):
     if runtime.successful_run(run):
         return True
     if (findings_exit and isinstance(run, dict) and type(run.get('returncode')) is int
-            and run['returncode'] == 1 and run.get('error') == 'nonzero-exit'):
+            and run['returncode'] in SCAN_EXITS and run.get('error') == 'nonzero-exit'):
         # Predicate-only view: never persist it or change the actual invocation receipt.
         validation_view = dict(run, returncode=0, error=None)
         return runtime.successful_run(validation_view)
@@ -136,12 +142,18 @@ def roster(config, scope, executable):
                     raise SetupError('Docker missing; sandboxed providers need Docker and a prebuilt agent image. No auto-install/build.')
                 if not process_accepted(run_command([docker, 'info'], 15, stdout_cap=1024 * 1024, stderr_cap=256 * 1024), load_runtime()):
                     raise SetupError('Docker daemon unavailable; no model call started.')
-                version = metadata([executable, '--version']).strip().split()[-1]
-                if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?', version):
-                    raise SetupError('Cannot determine core image version; inspect the trusted binary manually.')
-                for image in [f'vettalon-agents:{version}', f'vettalon-egress:{version}']:
+                # Tags follow the image definitions, not the CLI version; the core reports them.
+                try:
+                    images = metadata([executable, 'agents', 'images']).split()
+                except SetupError:
+                    raise SetupError('Cannot determine core sandbox image tags; update the trusted CLI.') from None
+                # Lines: agents image, egress proxy, published agents base. Scans run only the first two.
+                expected = ('vettalon-agents', 'vettalon-egress', 'vettalon-agents-base')
+                if len(images) != 3 or not all(re.fullmatch(re.escape(repo) + r':[0-9a-f]{12}', image) for repo, image in zip(expected, images)):
+                    raise SetupError('Cannot determine core sandbox image tags; inspect the trusted binary manually.')
+                for image in images[:2]:
                     if not process_accepted(run_command([docker, 'image', 'inspect', image], 15, stdout_cap=1024 * 1024, stderr_cap=256 * 1024), load_runtime()):
-                        raise SetupError(f'Missing sandbox image {image}; explicitly review core agents build. No automatic build/pull.')
+                        raise SetupError(f'Missing sandbox image {image}; explicitly review core agents pull or agents build. No automatic build/pull.')
     return path
 
 
@@ -189,7 +201,7 @@ def run_scan(args, scope, executable):
     runtime = load_runtime()
     run = run_command(command, args.wall_seconds)
     accepted = process_accepted(run, runtime, findings_exit=True)
-    classification = 'finding-exit' if accepted and run['returncode'] == 1 else 'complete-process' if accepted else 'incomplete-process'
+    classification = SCAN_EXITS.get(run['returncode'], 'complete-process') if accepted else 'incomplete-process'
     receipt = {'run': run, 'classification': classification, 'attempts': 1, 'automatic_retry': 0,
                'requested_timeout_seconds': args.wall_seconds, 'effective_timeout_seconds': min(args.wall_seconds, 600),
                'cleanup_seconds': 1, 'capture_write_error': None,
@@ -215,6 +227,10 @@ def run_scan(args, scope, executable):
     for name in ['report.json', 'report.sarif']:
         if not (output / name).is_file():
             raise SetupError('Scan returned without required JSON/SARIF; inspect local logs. Not a successful scan.')
+    if code == 4:
+        print('Deep scan incomplete: no AI engine could run, so no module got an AI review (exit 4). '
+              'The reports list the reason under engines_missing (ai_audit). Run doctor, fix the engine '
+              '(codex/grok containers: `vettalon agents build`), then scan again.', file=sys.stderr)
     print(f'Scan process exit: {code}; this is not a clean-security claim. Inspect reports with the report command.')
     return code
 

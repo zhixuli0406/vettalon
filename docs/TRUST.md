@@ -160,11 +160,126 @@ assets after that. Consequences:
   jobs" so the published release is left alone.
 - A wrong release cannot be fixed in place. Publish a new version instead.
 
+### Release notes
+
+The release body is built from the tagged `CHANGELOG.md` by
+`scripts/trust/release_notes.py`: the version's `### 升級須知 / Upgrade notes`
+subsection (when it has one), then a link to the full CHANGELOG entry, then
+GitHub's generated pull-request list. Steps users must take after upgrading
+(rebuild an image, a changed exit code) go in that subsection, so they appear on
+the release page without anyone editing it by hand. The step runs before the
+release is created and fails when the CHANGELOG has no `## [X.Y.Z]` section for the
+tag: cut the CHANGELOG in the release PR before tagging. Preview the body
+locally with `python3 scripts/trust/release_notes.py CHANGELOG.md vX.Y.Z`.
+
 Check a release and an asset against GitHub's release attestation:
 
 ```bash
 gh release verify v0.3.2 -R zhixuli0406/vettalon
 gh release verify-asset v0.3.2 vettalon-linux-x64.tar.gz -R zhixuli0406/vettalon
+```
+
+## Container images
+
+`vettalon agents pull` fetches two images from GHCR, each for linux/amd64 and
+linux/arm64:
+
+- `ghcr.io/zhixuli0406/vettalon-egress:<tag>`: the egress proxy (Alpine and
+  tinyproxy).
+- `ghcr.io/zhixuli0406/vettalon-agents-base:<tag>`: Node and the codex CLI.
+
+Neither contains grok. xAI's terms of service grant no right to redistribute
+it, so the CLI downloads grok from x.ai on your machine and builds the final
+`vettalon-agents:<tag>` image locally on top of the verified base.
+`vettalon agents build` builds all three images from the definitions in the
+binary instead and pulls nothing from GHCR.
+
+`<tag>` is the first 12 hex digits of a SHA-256 over the image definition under
+`docker/`, computed by the CLI. `vettalon agents images` prints the agents,
+egress and base tags, in that order. The publishing workflow,
+`.github/workflows/images.yml`, takes its tags from that same command, so the
+registry and the CLI agree. It runs for every release tag (called from
+`release.yml`) and by hand from `main`. A tag is written once: if it already
+exists and this workflow signed it, the run reuses it; if it exists with any
+other signer, the run fails. The image tag is set only after the image's
+source artifact (below) is published; a `<tag>-source` left by a run that
+failed before tagging its image is replaced by the next run. Runs are
+serialized; GitHub drops a queued run when a newer one queues, so re-run a
+dropped release publish by hand.
+
+The tag names the definition, not exact bytes: the base installs codex from
+npm and packages from Debian at build time, so two builds of one definition
+differ. That is why a published tag is never rebuilt. The signature proves the
+image came from this workflow on `main` or a release tag, so it is only as
+strong as who can push to `main` and create `v*` tags in the public repo.
+
+Each image is signed by digest with keyless cosign v2.6.5, has a GitHub build
+provenance attestation, and carries BuildKit SLSA provenance (`mode=max`) and
+an SPDX SBOM in its index.
+
+### Verify an image by hand
+
+```bash
+TAG=$(vettalon agents images | sed -n 2p | cut -d: -f2)   # egress; line 3 is the base
+IMAGE=ghcr.io/zhixuli0406/vettalon-egress:$TAG
+
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/zhixuli0406/vettalon/\.github/workflows/images\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-repository zhixuli0406/vettalon \
+  "$IMAGE"
+
+gh attestation verify "oci://$IMAGE" -R zhixuli0406/vettalon \
+  --signer-workflow zhixuli0406/vettalon/.github/workflows/images.yml
+
+docker buildx imagetools inspect "$IMAGE" --format '{{ json .Provenance }}'
+docker buildx imagetools inspect "$IMAGE" --format '{{ json .SBOM }}'
+```
+
+`vettalon agents pull` runs the same `cosign verify` (identity, issuer and
+repository), checks that every signature names this repository and a single
+digest, then pulls that digest and tags it locally. Without `cosign` on `PATH`
+it refuses (cosign is taken from `PATH`, so whoever controls `PATH` controls
+the check). `--no-verify` pulls the tag unchecked and is insecure. Scans never
+pull: agent containers start with `--pull=never`.
+
+In the base image, `/usr/share/licenses/INVENTORY.txt` lists every component
+(Debian packages, npm packages, Node, and the programs bundled in the codex
+package) with its license. `/usr/share/licenses/` also has the license texts
+the upstream packages leave out: codex's Apache-2.0 LICENSE and NOTICE, Node's
+LICENSE, bubblewrap's LGPL and zsh's licence.
+
+### Get the source of an image
+
+Every published image digest has a source artifact. It is tagged
+`<tag>-source` in the same repository, attached to the image as an OCI
+referrer, and signed like the image. It holds `SOURCES.json` (each component,
+its exact version, and where each file came from, with checksums) and
+`sources.tar`:
+
+- egress: for every Alpine package, the aports directory at the commit the
+  package was built from, plus every file its APKBUILD lists, checked against
+  the APKBUILD's sha512sums (upstream URL first, then Alpine's distfiles
+  mirror).
+- agents-base: every Debian source package installed in the image, at its
+  exact version (from deb.debian.org or snapshot.debian.org, checked against
+  snapshot's SHA-1 and the `.dsc`); the codex source tree at the commit the
+  codex release was built from (bubblewrap, the voice build scripts); and the
+  upstream archives codex's `voice/sources.json` lists (GStreamer, GLib and
+  the rest), checked against its SHA-256.
+
+If any file cannot be fetched and checked, the workflow fails and the image is
+never tagged.
+
+```bash
+oras discover "$IMAGE"                              # shows the source referrer
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/zhixuli0406/vettalon/\.github/workflows/images\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$IMAGE-source"
+oras manifest fetch "$IMAGE-source" | jq .subject   # the image digest it belongs to
+oras pull "$IMAGE-source" -o source/
+tar -xf source/sources.tar -C source/
 ```
 
 ## How accurate is the Cargo inventory?

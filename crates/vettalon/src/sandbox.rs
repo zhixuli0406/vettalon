@@ -667,14 +667,16 @@ ghi789 notapid
         assert!(e.contains("unsupported"));
     }
 
-    /// Real Docker: offline, non-root. Needs the default image pulled.
+    /// Real Docker: offline, non-root, read-only root and workspace, a
+    /// writable but `noexec` `/tmp`, no capabilities. Needs the default
+    /// image pulled.
     #[tokio::test]
     #[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
     async fn docker_sandbox_runs_python_offline_as_non_root() {
         let sb = DockerSandbox::detect(DEFAULT_POC_IMAGE)
             .await
             .expect("docker + image");
-        let script = r#"import os, socket
+        let script = r#"import os, socket, subprocess
 print('SANDBOX_OK', 6 * 7)
 print('UID', os.getuid())
 try:
@@ -682,15 +684,37 @@ try:
     print('NET_OPEN')
 except OSError:
     print('NET_BLOCKED')
+for path in ('/vtl_probe', '/workspace/vtl_probe'):
+    try:
+        open(path, 'w').close()
+        print('WRITABLE', path)
+    except OSError:
+        print('READONLY', path)
+open('/tmp/vtl_probe.sh', 'w').write('#!/bin/sh\necho EXEC_RAN\n')
+os.chmod('/tmp/vtl_probe.sh', 0o755)
+try:
+    subprocess.run(['/tmp/vtl_probe.sh'], check=True)
+except (OSError, subprocess.CalledProcessError):
+    print('TMP_NOEXEC')
+for line in open('/proc/self/status'):
+    if line.startswith(('CapEff', 'NoNewPrivs')):
+        print(line.split()[0], line.split()[1])
 "#;
         let (code, out) = sb
             .run_script(script, "python", Duration::from_secs(60))
             .await
             .unwrap();
+        eprintln!("{out}");
         assert_eq!(code, 0, "{out}");
         assert!(out.contains("SANDBOX_OK 42"), "{out}");
         assert!(out.contains("NET_BLOCKED"), "{out}");
-        assert!(!out.contains("UID 0\n"), "{out}");
+        assert!(out.contains("UID 65534\n"), "{out}");
+        assert!(out.contains("READONLY /vtl_probe\n"), "{out}");
+        assert!(out.contains("READONLY /workspace/vtl_probe\n"), "{out}");
+        assert!(out.contains("TMP_NOEXEC"), "{out}");
+        assert!(!out.contains("EXEC_RAN"), "{out}");
+        assert!(out.contains("CapEff: 0000000000000000\n"), "{out}");
+        assert!(out.contains("NoNewPrivs: 1\n"), "{out}");
     }
 
     #[cfg(unix)]

@@ -17,8 +17,9 @@ preset = "claude"          # family defaults to anthropic
 
 # codex and grok keep tools that can READ files on this machine even with
 # their "no tools" flags (checked 2026-10-12); grok can also run commands.
-# They run in the agents container by default — build it once with
-# `vettalon agents build`. Add `allow_agent_tools = true` to a model to run
+# They run in the agents container by default — get it once with
+# `vettalon agents pull` (verified images from GHCR, grok added locally) or
+# build it with `vettalon agents build`. Add `allow_agent_tools = true` to a model to run
 # it on the host instead (faster, but a prompt injection in the audited code
 # could then read local files). Custom `program` CLIs can only run on host.
 [[model]]

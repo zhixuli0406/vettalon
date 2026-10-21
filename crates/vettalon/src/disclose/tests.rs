@@ -55,7 +55,7 @@ fn finding(status: FindingStatus) -> Finding {
 }
 
 /// A finding a human confirmed (eligible by default).
-fn confirmed() -> Finding {
+pub(super) fn confirmed() -> Finding {
     let mut f = finding(FindingStatus::Confirmed);
     f.evidence.push(EvidenceItem {
         kind: EvidenceKind::OperatorReview,
@@ -93,12 +93,12 @@ fn repo() -> tempfile::TempDir {
     d
 }
 
-fn opts(dir: &Path) -> DraftOptions {
+pub(super) fn opts(dir: &Path) -> DraftOptions {
     let reviewer = Reviewer::resolve(Some("night-owl"), None, None, day()).unwrap();
     DraftOptions::new(reviewer, dir)
 }
 
-fn pkg(
+pub(super) fn pkg(
     f: &Finding,
     meta: ProjectMeta,
     channel: Option<Channel>,

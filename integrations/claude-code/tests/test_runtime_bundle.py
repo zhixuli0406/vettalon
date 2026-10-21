@@ -37,6 +37,12 @@ class RuntimeBundleTests(unittest.TestCase):
         original = copy.deepcopy(run)
         self.assertTrue(plugin.process_accepted(run, runtime, findings_exit=True))
         self.assertEqual(run, original)
+        # Exit 4 (deep scan, no AI engine could run) is accepted the same way;
+        # other nonzero exits are not.
+        for code, accepted in [(4, True), (2, False), (3, False), (5, False)]:
+            other = dict(copy.deepcopy(run), returncode=code)
+            self.assertEqual(plugin.process_accepted(other, runtime, findings_exit=True), accepted, code)
+            self.assertFalse(plugin.process_accepted(other, runtime, findings_exit=False))
         self.assertFalse(plugin.process_accepted(run, runtime, findings_exit=False))
         for key,value in [('returncode',True),('control_complete',False),('timed_out',True),('cleanup_error','cleanup-deadline'),('error','timeout')]:
             bad=copy.deepcopy(run);bad[key]=value
@@ -87,6 +93,15 @@ class RuntimeBundleTests(unittest.TestCase):
             self.assertEqual(receipt['run']['error'],'nonzero-exit')
             self.assertEqual(receipt['effective_timeout_seconds'],180)
             self.assertEqual(call('report','--path',str(output/'report.json')).returncode,0)
+            # A CLI that exits 4 (deep scan, no AI engine could run) keeps its own outcome.
+            fake.write_text(fake.read_text().replace('"units_failed"','"engine_unavailable"').replace('sys.exit(1)','sys.exit(4)'))
+            output=root/'output-ai';result=call('scan','--scope',str(scope),'--output-dir',str(output))
+            self.assertEqual(result.returncode,4,result.stderr)
+            self.assertIn('no AI engine could run',result.stderr)
+            receipt=json.loads((output/'process-receipt.json').read_text())
+            self.assertEqual(receipt['classification'],'ai-engines-unavailable');self.assertEqual(receipt['run']['returncode'],4)
+            report=call('report','--path',str(output/'report.json'))
+            self.assertEqual(report.returncode,0);self.assertIn('Reason: engine_unavailable',report.stdout)
             runtime=installed/'scripts/runtime/process_capture_v2.py';runtime.write_text(runtime.read_text()+'\n# tamper\n')
             result=call('doctor','--scope',str(scope));self.assertEqual(result.returncode,2)
             self.assertIn('runtime',result.stderr)

@@ -69,6 +69,11 @@ struct ScanArgs {
     /// Also count needs_human findings toward --fail-on.
     #[arg(long)]
     fail_on_needs_human: bool,
+    /// Deep only: exit on the --fail-on/--gate result (0 or 1) even when no
+    /// AI engine could run. Without it such a scan exits 4, so CI cannot
+    /// mistake it for a clean deep scan. The report is the same either way.
+    #[arg(long)]
+    allow_incomplete: bool,
     /// Also give the top N ranked modules a second, different-family finder.
     /// High-risk modules (git security hotspots, entry points) and modules
     /// with injection text are always cross-checked regardless of this.
@@ -413,10 +418,23 @@ enum LedgerAction {
 
 #[derive(Subcommand)]
 enum AgentsAction {
-    /// Build the agent and egress-proxy images (needs network access).
+    /// Build every image locally from the definitions in this binary (needs
+    /// network access; nothing is pulled from GHCR).
     Build,
+    /// Pull the egress proxy and the grok-free base from GHCR, verify their
+    /// cosign signatures, pin them by digest, then add grok locally.
+    Pull {
+        /// Skip the signature check (insecure: trusts whatever the registry
+        /// serves). Without cosign installed, pull refuses unless this is set.
+        #[arg(long)]
+        no_verify: bool,
+    },
     /// Remove the egress proxy and the internal network.
     Stop,
+    /// Print the expected image tags, one per line (no Docker call): the
+    /// agents image, the egress proxy, then the published agents base.
+    /// Tags follow the image definitions, not the vettalon version.
+    Images,
 }
 
 #[derive(clap::Args)]
@@ -550,9 +568,9 @@ fn load_config(
             "[vettalon] {}",
             vettalon::tr!(
                 "提示：偵測到 {}，但這些 CLI 的工具無法完全關閉（可能讀取本機檔案），沒有設定檔時不會使用。\
-要使用請在 ~/.vettalon/config.toml 加入；預設會在容器沙箱執行（先跑 `vettalon agents build`），或設 allow_agent_tools = true 直接在本機跑。",
+要使用請在 ~/.vettalon/config.toml 加入；預設會在容器沙箱執行（先跑 `vettalon agents pull` 或 `vettalon agents build`），或設 allow_agent_tools = true 直接在本機跑。",
                 "note: found {}, but their tools cannot be fully disabled (they may read local files), so they are not used without a config file. \
-Add them to ~/.vettalon/config.toml: by default they run in the container sandbox (run `vettalon agents build` first), or set allow_agent_tools = true to run them directly.",
+Add them to ~/.vettalon/config.toml: by default they run in the container sandbox (run `vettalon agents pull` or `vettalon agents build` first), or set allow_agent_tools = true to run them directly.",
                 skipped.join(vettalon::lang::pick("、", ", "))
             )
         );
@@ -770,6 +788,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         fail_on,
         gates,
         fail_on_needs_human,
+        allow_incomplete,
         poc,
         poc_image,
         fix_test_command,
@@ -1065,7 +1084,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         poc_models,
         roster,
     };
-    audit::cmd_scan(&home_dir(), opts).await
+    audit::cmd_scan_with(&home_dir(), opts, allow_incomplete).await
 }
 
 struct DiscloseCmd {
@@ -2105,7 +2124,19 @@ async fn main() -> ExitCode {
         Command::Agents { action } => {
             let r = match action {
                 AgentsAction::Build => vettalon::llm::container::build_images().await,
+                AgentsAction::Pull { no_verify } => {
+                    vettalon::llm::container::pull_images(!no_verify).await
+                }
                 AgentsAction::Stop => vettalon::llm::container::teardown().await,
+                AgentsAction::Images => {
+                    // Machine-readable: tags only, no "Done" line. The
+                    // first two are what scans run; the third is the
+                    // published base the agents image is built on.
+                    println!("{}", vettalon::llm::container::agents_image());
+                    println!("{}", vettalon::llm::container::egress_image());
+                    println!("{}", vettalon::llm::container::agents_base_image());
+                    return ExitCode::SUCCESS;
+                }
             };
             match r {
                 Ok(()) => {

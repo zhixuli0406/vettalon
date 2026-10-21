@@ -343,3 +343,97 @@ def power_label(n_per_arm, p1, p2, alpha=0.05, power=0.8):
             'achieved_power': achieved, 'powered': powered,
             'label': POWERED_LABEL if powered else UNDERPOWERED_LABEL,
             'design': 'unpaired two-proportion bound; paired designs may need fewer items'}
+
+
+def two_proportion_power_unequal(p1, p2, n1, n2, alpha=0.05):
+    """Approximate power of the two-sided two-proportion z test with n1 and n2 items."""
+    if type(n1) is not int or type(n2) is not int or n1 <= 0 or n2 <= 0:
+        raise ValueError('group sizes must be positive integers')
+    za = _z(1 - alpha)
+    pbar = (p1 * n1 + p2 * n2) / (n1 + n2)
+    se0 = math.sqrt(pbar * (1 - pbar) * (1 / n1 + 1 / n2))
+    se1 = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
+    return NormalDist().cdf((abs(p1 - p2) - za * se0) / se1)
+
+
+def mcnemar_exact_power(n, p_b_only, p_a_only, alpha=0.05):
+    """Exact power of the two-sided exact sign test (exact McNemar) at level alpha.
+
+    n paired items; each item favours b with probability p_b_only, favours a
+    with p_a_only and is tied otherwise. Sums the probability of every
+    (discordant, b-only) outcome whose sign-test p is <= alpha.
+    """
+    if type(n) is not int or n < 0:
+        raise ValueError('n must be a non-negative integer')
+    if p_b_only < 0 or p_a_only < 0 or p_b_only + p_a_only > 1:
+        raise ValueError('discordance probabilities must be >= 0 and sum to <= 1')
+    p_disc = p_b_only + p_a_only
+    if p_disc == 0 or n == 0:
+        return 0.0
+    q = p_b_only / p_disc
+    total = 0.0
+    for d in range(n + 1):
+        w = math.exp(_log_binom_pmf(d, n, p_disc))
+        if w < 1e-15:
+            continue
+        for b in range(d + 1):
+            if exact_sign_test(d - b, b) <= alpha:
+                total += w * math.exp(_log_binom_pmf(b, d, q))
+    return min(1.0, total)
+
+
+def _log_hypergeom(x, n1, n2, total_k):
+    def log_comb(a, b):
+        return math.lgamma(a + 1) - math.lgamma(b + 1) - math.lgamma(a - b + 1)
+    return log_comb(n1, x) + log_comb(n2, total_k - x) - log_comb(n1 + n2, total_k)
+
+
+def fisher_exact(k1, n1, k2, n2):
+    """Two-sided Fisher exact test for k1/n1 vs k2/n2 (independent groups).
+
+    p = sum of the probabilities of every table with the same margins that is
+    no more likely than the observed one.
+    """
+    _check_counts(k1, n1)
+    _check_counts(k2, n2)
+    total_k = k1 + k2
+    lo, hi = max(0, total_k - n2), min(total_k, n1)
+    if lo == hi:
+        return 1.0
+    observed = _log_hypergeom(k1, n1, n2, total_k)
+    p = sum(math.exp(lp) for lp in (_log_hypergeom(x, n1, n2, total_k) for x in range(lo, hi + 1))
+            if lp <= observed + 1e-7)
+    return min(1.0, p)
+
+
+def newcombe_difference(k1, n1, k2, n2, confidence=CONFIDENCE):
+    """p2 - p1 for two independent proportions with Newcombe's hybrid score
+    interval (Newcombe 1998, method 10: built from the two Wilson intervals)."""
+    _check_counts(k1, n1)
+    _check_counts(k2, n2)
+    if n1 == 0 or n2 == 0:
+        raise ValueError('both groups need n > 0')
+    p1, p2 = k1 / n1, k2 / n2
+    l1, u1 = wilson(k1, n1, confidence)
+    l2, u2 = wilson(k2, n2, confidence)
+    d = p2 - p1
+    return {'difference': d,
+            'interval': [d - math.sqrt((p2 - l2) ** 2 + (u1 - p1) ** 2),
+                         d + math.sqrt((u2 - p2) ** 2 + (p1 - l1) ** 2)],
+            'confidence': confidence, 'method': 'newcombe-hybrid-score (wilson)'}
+
+
+def holm(pvalues):
+    """Holm step-down adjusted p values for a {name: p} family (FWER control)."""
+    if type(pvalues) is not dict or not pvalues:
+        raise ValueError('holm needs a non-empty {name: p} map')
+    for p in pvalues.values():
+        if not 0 <= p <= 1:
+            raise ValueError('p values must be in [0, 1]')
+    m = len(pvalues)
+    ordered = sorted(pvalues.items(), key=lambda kv: (kv[1], kv[0]))
+    out, running = {}, 0.0
+    for i, (name, p) in enumerate(ordered):
+        running = max(running, min(1.0, (m - i) * p))
+        out[name] = running
+    return out
