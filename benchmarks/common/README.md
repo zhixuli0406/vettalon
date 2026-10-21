@@ -14,6 +14,7 @@
 - 同一批題目上的兩個配置用題目層級的配對差：不一致題目做精確符號檢定，再加上固定種子的題目 bootstrap 區間（`paired_difference`）。
 - 同一題重跑多次時按題目分群（`clustered_mean`），不把重跑當成獨立樣本。
 - `power_label` 依預先登錄的效果量算每臂所需 n。20%→30%、α=0.05、power=0.8 需要每臂約 294 題；不到就標 `underpowered: descriptive only`，只能描述，不能下比較結論。
+- 事先登錄的檢定用的工具：`mcnemar_exact_power`（配對精確符號檢定在給定不一致比例下的檢定力）、`two_proportion_power_unequal`（兩組題數不同時的非配對檢定力）、`fisher_exact`（兩個獨立比例的雙尾精確檢定）、`newcombe_difference`（兩個獨立比例差的 Newcombe 區間）、`holm`（同一族多個檢定的 Holm 校正）。
 
 ## `report_schema.py` 的規則
 

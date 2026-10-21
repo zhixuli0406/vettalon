@@ -2,13 +2,15 @@
 //!
 //! Mirrors the usual CI-gate convention: a human-readable summary is
 //! always printed; `--report <path>` additionally writes the full JSON
-//! report to disk. Exit code follows the task spec exactly: `0` when no
-//! finding meets `--fail-on` (this also covers the "zero findings at all"
-//! and "all scanners missing" cases — see `cmd_secaudit`'s dogfood
-//! requirement), `1` when at least one does, `2` reserved for infra errors
-//! that prevent `secaudit` itself from completing (invalid repo path,
-//! `--report` file write failure) — never for "a scanner was unavailable",
-//! which is an ordinary, honestly-reported outcome.
+//! report to disk. Exit code: `0` when no finding meets `--fail-on` (this
+//! also covers the "zero findings at all" and "all scanners missing" cases
+//! — see `cmd_secaudit`'s dogfood requirement), `1` when at least one does,
+//! `2` reserved for infra errors that prevent the scan itself from
+//! completing (invalid repo path, `--report` file write failure), and
+//! [`AI_UNAVAILABLE_EXIT`] (`4`) when a deep scan's AI audit could not run
+//! at all. A missing OSS scanner is still an ordinary, honestly-reported
+//! outcome; a deep scan that reviewed nothing with AI is not, because CI
+//! would otherwise read it as a clean deep scan.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +45,60 @@ pub fn exit_code_with(report: &AuditReport, fail_on: Option<Severity>) -> i32 {
         1
     } else {
         0
+    }
+}
+
+/// Exit code of a deep scan whose AI audit could not run at all (see
+/// [`ai_audit_unavailable`]). `3` is not used because the Vettalon Pro CLI already
+/// exits 3 for "license required"; keeping the codes disjoint lets a script
+/// that calls both binaries tell them apart.
+pub const AI_UNAVAILABLE_EXIT: i32 = 4;
+
+/// A deep scan in which no AI finder engine produced a single review: every
+/// configured finder failed before reaching its model (container image
+/// missing, CLI not found, provider unreachable), or no finder was
+/// configured although there were modules to audit. The report then says
+/// `incomplete` / `engine_unavailable` and has no `ai_audit` engine run.
+/// When at least one finder ran, the run is partial instead (still
+/// `engine_unavailable`, with the missing finders under `engines_missing`)
+/// and this is false. Pure: derived from the report alone.
+pub fn ai_audit_unavailable(report: &AuditReport) -> bool {
+    report.profile.mode == ProfileMode::Deep
+        && report.run_status == RunStatus::Incomplete
+        && report.incomplete_reason
+            == Some(vettalon_contract::coverage::IncompleteReason::EngineUnavailable)
+        && !report
+            .engines_run
+            .iter()
+            .any(|r| r.engine.starts_with(AI_AUDIT_ENGINE))
+}
+
+/// AI finder engines listed under `engines_missing` (`ai_audit[<model>]`,
+/// or `ai_audit` when no finder was configured).
+fn missing_ai_engines(report: &AuditReport) -> usize {
+    report
+        .engines_missing
+        .iter()
+        .filter(|m| m.engine.starts_with(AI_AUDIT_ENGINE))
+        .count()
+}
+
+const AI_AUDIT_ENGINE: &str = "ai_audit";
+
+/// `vettalon scan`'s exit code: [`AI_UNAVAILABLE_EXIT`] when the deep AI
+/// audit could not run at all (unless `allow_incomplete`), else
+/// [`exit_code_with`]. It takes precedence over `1`: a gate verdict over a
+/// deep scan that reviewed nothing with AI is not the result that was asked
+/// for, and the summary still prints the gate result.
+pub fn scan_exit_code(
+    report: &AuditReport,
+    fail_on: Option<Severity>,
+    allow_incomplete: bool,
+) -> i32 {
+    if !allow_incomplete && ai_audit_unavailable(report) {
+        AI_UNAVAILABLE_EXIT
+    } else {
+        exit_code_with(report, fail_on)
     }
 }
 
@@ -190,10 +246,7 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
         out.push_str(&tr!(
             "  執行狀態：未完成（{}）\n",
             "  Run status: incomplete ({})\n",
-            report
-                .incomplete_reason
-                .map(incomplete_reason)
-                .unwrap_or_else(|| pick("原因未記錄", "reason not recorded"))
+            run_status_reason(report)
         ));
     }
 
@@ -301,7 +354,12 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
         )),
     }
     let failed = policy_failed || severity_hits.is_some_and(|(_, n)| n > 0);
-    if !failed && report.run_status == RunStatus::Incomplete {
+    if ai_audit_unavailable(report) {
+        out.push_str(pick(
+            "注意：沒有任何 AI 引擎能執行，深度審查沒有做；這次結果只涵蓋 OSS 掃描器（上方 [略過] ai_audit 列有原因）。\n",
+            "Note: no AI engine could run, so the deep audit did not happen; this result covers the OSS scanners only (the [skipped] ai_audit lines above say why).\n",
+        ));
+    } else if !failed && report.run_status == RunStatus::Incomplete {
         out.push_str(pick(
             "注意：本次掃描不完整，通過只代表「已審查的部分」沒有達到門檻，不代表沒有問題。\n",
             "Note: this scan is incomplete. A pass only means the reviewed part stayed under the threshold, not that there are no problems.\n",
@@ -333,6 +391,29 @@ fn severity_row(c: &SeverityCounts) -> String {
         "Critical: {}  High: {}  Medium: {}  Low: {}  Info: {}",
         c.critical, c.high, c.medium, c.low, c.info
     )
+}
+
+/// The "Run status: incomplete (...)" text. `engine_unavailable` is split
+/// into "no AI engine ran" and "some did not", which the reason code alone
+/// cannot tell apart.
+fn run_status_reason(report: &AuditReport) -> String {
+    use vettalon_contract::coverage::IncompleteReason as R;
+    match report.incomplete_reason {
+        Some(R::EngineUnavailable) if ai_audit_unavailable(report) => pick(
+            "沒有任何 AI 引擎能執行，AI 審查一個模組都沒有審",
+            "no AI engine could run, so the AI audit reviewed no module",
+        )
+        .to_string(),
+        Some(R::EngineUnavailable) if missing_ai_engines(report) > 0 => {
+            let n = missing_ai_engines(report);
+            tr!(
+                "{n} 個 AI 引擎無法使用，分給它的模組沒有審查；其他引擎照常執行",
+                "{n} AI engine(s) were unavailable and the modules assigned to them were not reviewed; the other engines ran"
+            )
+        }
+        Some(r) => incomplete_reason(r).to_string(),
+        None => pick("原因未記錄", "reason not recorded").to_string(),
+    }
 }
 
 fn incomplete_reason(r: vettalon_contract::coverage::IncompleteReason) -> &'static str {
@@ -583,21 +664,110 @@ pub fn write_json_report(report: &AuditReport, path: &Path) -> std::io::Result<(
     crate::util::write_private(path, (json + "\n").as_bytes())
 }
 
-/// UTC ISO 8601 "basic" form (no separators — filesystem-safe, sorts
-/// lexically = chronologically), e.g. `20260818T093000Z`. `prior_run`
-/// relies on this ordering to find the newest report.
-pub fn save_timestamp_basic(now: chrono::DateTime<chrono::Utc>) -> String {
-    now.format("%Y%m%dT%H%M%SZ").to_string()
+/// Names `--save` tries for one timestamp before giving up (the first plus
+/// `-1` … `-99`). Only reached when other runs saved in the same
+/// microsecond.
+const SAVE_NAME_ATTEMPTS: u32 = 100;
+
+/// File name of a `--save` copy: UTC ISO 8601 "basic" form with
+/// microseconds (no separators, filesystem-safe), e.g.
+/// `20260818T093000.123456Z.json`; `attempt` > 0 appends `-<attempt>` when
+/// that name is already taken. Older versions saved
+/// `20260818T093000Z.json`; [`saved_report_sort_key`] orders both forms.
+pub fn saved_report_filename(now: chrono::DateTime<chrono::Utc>, attempt: u32) -> String {
+    let stem = now.format("%Y%m%dT%H%M%S%.6fZ");
+    if attempt == 0 {
+        format!("{stem}.json")
+    } else {
+        format!("{stem}-{attempt}.json")
+    }
+}
+
+/// Sort key for a file name under `<home>/reports/`: ascending = older to
+/// newer. Saved names (`<YYYYMMDD>T<HHMMSS>[.<fraction>]Z[-<n>].json`) order
+/// by second, then fraction, then collision suffix; an older name without
+/// a fraction counts as the start of its second. Any other name keeps plain
+/// lexical order against the timestamp part, as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SavedReportKey<'a> {
+    second: &'a str,
+    nanos: u32,
+    seq: u32,
+    name: &'a str,
+}
+
+pub fn saved_report_sort_key(name: &str) -> SavedReportKey<'_> {
+    parse_saved_report_name(name).unwrap_or(SavedReportKey {
+        second: name,
+        nanos: 0,
+        seq: 0,
+        name,
+    })
+}
+
+fn parse_saved_report_name(name: &str) -> Option<SavedReportKey<'_>> {
+    let stem = name.strip_suffix(".json")?;
+    let second = stem.get(..15)?;
+    let all_digits = |s: &[u8]| !s.is_empty() && s.iter().all(u8::is_ascii_digit);
+    let b = second.as_bytes();
+    if !(all_digits(&b[..8]) && b[8] == b'T' && all_digits(&b[9..])) {
+        return None;
+    }
+    let rest = &stem[15..];
+    let (fraction, rest) = match rest.strip_prefix('.') {
+        Some(r) => {
+            let end = r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len());
+            if end == 0 || end > 9 {
+                return None;
+            }
+            (&r[..end], &r[end..])
+        }
+        None => ("", rest),
+    };
+    let rest = rest.strip_prefix('Z')?;
+    let seq = if rest.is_empty() {
+        0
+    } else {
+        let n = rest.strip_prefix('-')?;
+        if !all_digits(n.as_bytes()) {
+            return None;
+        }
+        n.parse().ok()?
+    };
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        format!("{fraction:0<9}").parse().ok()?
+    };
+    Some(SavedReportKey {
+        second,
+        nanos,
+        seq,
+        name,
+    })
 }
 
 /// `--save`: write a copy of the report to
-/// `<home>/reports/<UTC-ISO8601-basic>.json`, creating the directory if
-/// needed, with owner-only (0600) permissions. Same JSON as `--report`
-/// (this calls [`write_json_report`] at a different path). Returns the path
-/// written.
+/// `<home>/reports/<UTC-ISO8601-basic>.json` (see [`saved_report_filename`]),
+/// creating the directory if needed, with owner-only (0600) permissions.
+/// Same JSON as `--report`. An existing saved report is never overwritten:
+/// the copy is written to a temporary file in the same directory and moved
+/// to its final name only if that name is free (otherwise the next suffix
+/// is tried), so runs that finish in the same instant, also in separate
+/// processes, each keep their own file and nobody reads a half-written one.
+/// Returns the path written.
 pub fn save_report(home_dir: &Path, report: &AuditReport) -> std::io::Result<PathBuf> {
-    // Validate before creating anything (write_json_report validates again;
-    // this keeps a bad report from leaving an empty reports directory).
+    save_report_at(home_dir, report, chrono::Utc::now())
+}
+
+fn save_report_at(
+    home_dir: &Path,
+    report: &AuditReport,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    // Validate before creating anything, so a bad report never leaves an
+    // empty reports directory.
     let violations = validate_report(report);
     if !violations.is_empty() {
         let lines: Vec<String> = violations.iter().map(|v| v.to_string()).collect();
@@ -606,15 +776,39 @@ pub fn save_report(home_dir: &Path, report: &AuditReport) -> std::io::Result<Pat
             format!("report failed validation:\n{}", lines.join("\n")),
         ));
     }
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|e| std::io::Error::other(format!("serialize report: {e}")))?;
     let dir = home_dir.join("reports");
     std::fs::create_dir_all(&dir)?;
-    let filename = format!("{}.json", save_timestamp_basic(chrono::Utc::now()));
-    let path = dir.join(filename);
-    write_json_report(report, &path)?;
-    // Best-effort: a permission-set failure shouldn't un-write an
-    // already-saved report (the write already succeeded above).
-    let _ = crate::util::set_owner_only(&path);
-    Ok(path)
+    // Not `.json`, so `prior_run` never picks up a temporary file. Created
+    // 0600 on Unix and removed on drop if it is never persisted.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".save-")
+        .suffix(".tmp")
+        .tempfile_in(&dir)?;
+    tmp.write_all(json.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file().sync_all()?;
+    for attempt in 0..SAVE_NAME_ATTEMPTS {
+        let path = dir.join(saved_report_filename(now, attempt));
+        match tmp.persist_noclobber(&path) {
+            Ok(_) => {
+                // Best-effort: the copy is already saved.
+                let _ = crate::util::set_owner_only(&path);
+                return Ok(path);
+            }
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => tmp = e.file,
+            Err(e) => return Err(e.error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "{SAVE_NAME_ATTEMPTS} saved-report names for {} are already taken in {}",
+            saved_report_filename(now, 0),
+            dir.display()
+        ),
+    ))
 }
 
 /// O9 `--dual-finder-top`: per-family unique root causes and the marginal
@@ -1020,14 +1214,129 @@ mod tests {
         }
     }
 
-    // ── save_timestamp_basic / save_report ───────────────────────────
+    // ── saved_report_filename / saved_report_sort_key / save_report ──
+
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
 
     #[test]
-    fn save_timestamp_basic_has_no_separators() {
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:00Z")
+    fn saved_report_filename_is_basic_utc_with_micros_and_suffix() {
+        let ts = at("2026-08-18T09:30:00.123456789Z");
+        assert_eq!(saved_report_filename(ts, 0), "20260818T093000.123456Z.json");
+        assert_eq!(
+            saved_report_filename(ts, 3),
+            "20260818T093000.123456Z-3.json"
+        );
+        assert_eq!(
+            saved_report_filename(at("2026-08-18T09:30:00Z"), 0),
+            "20260818T093000.000000Z.json"
+        );
+    }
+
+    #[test]
+    fn saved_report_sort_key_orders_old_and_new_names_chronologically() {
+        let expected = [
+            "20261021T061028.999999Z-3.json",
+            "20261021T061029Z.json", // older form: start of its second
+            "20261021T061029.000001Z.json",
+            "20261021T061029.497741Z.json",
+            "20261021T061029.497741Z-1.json",
+            "20261021T061029.497741Z-2.json",
+            "20261021T061029.497741Z-10.json",
+            "20261021T061029.5Z.json",
+            "20261021T061030Z.json",
+            "notes.json", // not a saved name: plain lexical order, as before
+        ];
+        let mut names = expected.to_vec();
+        names.reverse();
+        names.sort_by_key(|n| saved_report_sort_key(n));
+        assert_eq!(names, expected);
+        // Malformed timestamp-like names are not parsed as saved names.
+        for bad in [
+            "20261021T061029.json",
+            "20261021T061029.Z.json",
+            "20261021T061029.1234567890Z.json",
+            "20261021T061029Z-.json",
+            "20261021T061029Z-x.json",
+            "20261021X061029Z.json",
+        ] {
+            assert_eq!(saved_report_sort_key(bad).nanos, 0, "{bad}");
+            assert_eq!(saved_report_sort_key(bad).second, bad, "{bad}");
+        }
+    }
+
+    fn report_started(started_at: &str) -> AuditReport {
+        let mut r = base_report(vec![]);
+        r.started_at = started_at.to_string();
+        r
+    }
+
+    fn saved_started_at(path: &Path) -> String {
+        let raw = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str::<AuditReport>(&raw)
             .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert_eq!(save_timestamp_basic(ts), "20260818T093000Z");
+            .started_at
+    }
+
+    /// Two runs that save in the same instant (the 2026-10-21 report: two
+    /// `scan --save` runs in one second left one file) each keep their copy;
+    /// a name someone else already holds is left untouched.
+    #[test]
+    fn save_report_never_overwrites_a_saved_report() {
+        let home = tempfile::tempdir().unwrap();
+        let now = at("2026-10-21T06:10:29.497741Z");
+        let first = save_report_at(home.path(), &report_started("first"), now).unwrap();
+        let second = save_report_at(home.path(), &report_started("second"), now).unwrap();
+        assert_eq!(first.file_name().unwrap(), "20261021T061029.497741Z.json");
+        assert_eq!(
+            second.file_name().unwrap(),
+            "20261021T061029.497741Z-1.json"
+        );
+        let dir = home.path().join("reports");
+        std::fs::write(dir.join("20261021T061029.497741Z-2.json"), "keep").unwrap();
+        let third = save_report_at(home.path(), &report_started("third"), now).unwrap();
+        assert_eq!(third.file_name().unwrap(), "20261021T061029.497741Z-3.json");
+        assert_eq!(saved_started_at(&first), "first");
+        assert_eq!(saved_started_at(&second), "second");
+        assert_eq!(saved_started_at(&third), "third");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("20261021T061029.497741Z-2.json")).unwrap(),
+            "keep"
+        );
+        // No temporary file is left behind.
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.iter().all(|n| n.ends_with(".json")), "{names:?}");
+    }
+
+    #[test]
+    fn save_report_gives_up_when_every_name_is_taken() {
+        let home = tempfile::tempdir().unwrap();
+        let now = at("2026-10-21T06:10:29.497741Z");
+        let dir = home.path().join("reports");
+        std::fs::create_dir_all(&dir).unwrap();
+        for attempt in 0..SAVE_NAME_ATTEMPTS {
+            std::fs::write(dir.join(saved_report_filename(now, attempt)), "x").unwrap();
+        }
+        let err = save_report_at(home.path(), &report_started("late"), now).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(
+            entries.len(),
+            SAVE_NAME_ATTEMPTS as usize,
+            "temp file removed"
+        );
+        for attempt in 0..SAVE_NAME_ATTEMPTS {
+            let kept = std::fs::read_to_string(dir.join(saved_report_filename(now, attempt)));
+            assert_eq!(kept.unwrap(), "x");
+        }
     }
 
     #[test]
@@ -1158,6 +1467,116 @@ mod tests {
             Some(vettalon_contract::coverage::IncompleteReason::EngineUnavailable);
         let text = render_summary(&report, Severity::High);
         assert!(text.contains("執行狀態：未完成（AI 引擎無法使用）"));
+    }
+
+    // ── deep scan with no AI engine (exit 4) ──────────────────────────
+
+    /// A deep report whose finders are `ran` (engine runs recorded) and
+    /// `missing` (listed under engines_missing).
+    fn deep_report(ran: &[&str], missing: &[&str], findings: Vec<Finding>) -> AuditReport {
+        let mut r = base_report(findings);
+        r.profile.mode = ProfileMode::Deep;
+        r.engines_run.extend(ran.iter().map(|m| EngineRun {
+            engine: format!("ai_audit[{m}]:src"),
+            findings_count: 0,
+            duration_ms: 5,
+            parse_error: None,
+            timed_out: false,
+        }));
+        r.engines_missing
+            .extend(missing.iter().map(|m| EngineMissing {
+                engine: format!("ai_audit[{m}]"),
+                reason: "LLM call failed: container image vettalon-agents:x is missing".into(),
+            }));
+        if !missing.is_empty() {
+            r.run_status = RunStatus::Incomplete;
+            r.incomplete_reason =
+                Some(vettalon_contract::coverage::IncompleteReason::EngineUnavailable);
+        }
+        r
+    }
+
+    fn high_candidate() -> Finding {
+        Finding::candidate(
+            "gitleaks",
+            FindingKind::Other,
+            Severity::High,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        )
+    }
+
+    #[test]
+    fn deep_scan_with_every_ai_engine_unavailable_exits_4() {
+        let report = deep_report(&[], &["codex", "grok"], vec![]);
+        assert!(ai_audit_unavailable(&report));
+        assert_eq!(scan_exit_code(&report, Some(Severity::High), false), 4);
+        // Opt-out: the 0.3.x behaviour.
+        assert_eq!(scan_exit_code(&report, Some(Severity::High), true), 0);
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("執行狀態：未完成（沒有任何 AI 引擎能執行"));
+        assert!(text.contains("深度審查沒有做"));
+        assert!(!text.contains("本次掃描不完整"), "one note, not two");
+    }
+
+    #[test]
+    fn no_finder_configured_is_also_unavailable() {
+        let mut report = deep_report(&[], &[], vec![]);
+        report.engines_missing.push(EngineMissing {
+            engine: "ai_audit".into(),
+            reason: "no finder model configured".into(),
+        });
+        report.run_status = RunStatus::Incomplete;
+        report.incomplete_reason =
+            Some(vettalon_contract::coverage::IncompleteReason::EngineUnavailable);
+        assert_eq!(scan_exit_code(&report, Some(Severity::High), false), 4);
+    }
+
+    #[test]
+    fn exit_4_wins_over_a_failed_gate_unless_allowed() {
+        let mut report = deep_report(&[], &["codex"], vec![high_candidate()]);
+        report.summary = Summary::from_findings(&report.findings, 1, 2, GatePolicy::default(), &[]);
+        assert_eq!(exit_code_with(&report, Some(Severity::High)), 1);
+        assert_eq!(scan_exit_code(&report, Some(Severity::High), false), 4);
+        assert_eq!(scan_exit_code(&report, Some(Severity::High), true), 1);
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("未通過"), "the gate result is still shown");
+        assert!(text.contains("深度審查沒有做"));
+    }
+
+    #[test]
+    fn partial_ai_engine_loss_keeps_the_old_exit_and_says_so() {
+        let report = deep_report(&["claude"], &["codex"], vec![]);
+        assert!(!ai_audit_unavailable(&report));
+        assert_eq!(scan_exit_code(&report, Some(Severity::High), false), 0);
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("1 個 AI 引擎無法使用，分給它的模組沒有審查"));
+        assert!(text.contains("本次掃描不完整"));
+    }
+
+    #[test]
+    fn quick_and_complete_deep_scans_are_unaffected() {
+        // Quick never runs AI, whatever the report says about engines.
+        let mut quick = base_report(vec![]);
+        quick.run_status = RunStatus::Incomplete;
+        quick.incomplete_reason =
+            Some(vettalon_contract::coverage::IncompleteReason::EngineUnavailable);
+        assert!(!ai_audit_unavailable(&quick));
+        assert_eq!(scan_exit_code(&quick, Some(Severity::High), false), 0);
+        let deep = deep_report(&["claude"], &[], vec![]);
+        assert_eq!(deep.run_status, RunStatus::Complete);
+        assert_eq!(scan_exit_code(&deep, Some(Severity::High), false), 0);
+        // Another incomplete reason with no AI run (time budget before the
+        // first call) is not "engine unavailable".
+        let mut budget = deep_report(&[], &[], vec![]);
+        budget.run_status = RunStatus::Incomplete;
+        budget.incomplete_reason =
+            Some(vettalon_contract::coverage::IncompleteReason::TimeBudgetExhausted);
+        assert_eq!(scan_exit_code(&budget, Some(Severity::High), false), 0);
     }
 
     #[test]

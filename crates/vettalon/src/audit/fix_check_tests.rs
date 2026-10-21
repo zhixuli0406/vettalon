@@ -703,8 +703,10 @@ fn test_command_validation() {
 // ── live Docker (gated) ───────────────────────────────────────────────
 
 /// Real Docker end to end on a tiny python project: a correct fix is
-/// verified with a real test command, a no-op fix is rejected. Needs the
-/// default image pulled.
+/// verified with a real test command, a no-op fix is rejected because the
+/// fixed copy still shows the effect, and a fix that "blocks" the attack by
+/// breaking the function is rejected by the benign control. Zero model
+/// calls. Needs the default image pulled.
 #[tokio::test]
 #[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
 async fn live_fix_check_verifies_a_real_fix_and_rejects_a_no_op() {
@@ -724,19 +726,62 @@ async fn live_fix_check_verifies_a_real_fix_and_rejects_a_no_op() {
     .unwrap();
     let fix = correct_fix();
     let noop = "--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n+# reviewed\n import os\n";
-    for (diff, want) in [
-        (fix.as_str(), FixOutcome::FixVerified),
-        (noop, FixOutcome::FixRejected),
-    ] {
+    let breaks = sink_diff("    raise RuntimeError('disabled')");
+    // (diff, outcome, regression, tests, inputs blocked, reason, container runs)
+    let cases = [
+        // A: attack (orig + fixed) + benign (orig + fixed); B: tests (orig + fixed).
+        (
+            fix.as_str(),
+            FixOutcome::FixVerified,
+            CheckResult::Pass,
+            CheckResult::Pass,
+            1,
+            None,
+            6,
+        ),
+        // Stops at the first fixed-copy effect; B never runs.
+        (
+            noop,
+            FixOutcome::FixRejected,
+            CheckResult::Fail,
+            CheckResult::NotRun,
+            0,
+            Some("fixed_copy_shows_effect"),
+            2,
+        ),
+        // The attack input is blocked, but only because the call now raises.
+        (
+            breaks.as_str(),
+            FixOutcome::FixRejected,
+            CheckResult::Fail,
+            CheckResult::NotRun,
+            1,
+            Some("fix_breaks_benign_input"),
+            4,
+        ),
+    ];
+    for (diff, want, regression, tests, blocked, reason, runs) in cases {
         let req = FixCheckRequest {
             class: OracleClass::CommandInjection,
             adapter: ADAPTER,
             diff,
             test_command: Some("python3 test_app.py"),
         };
+        let before = budget.remaining();
         let run = check_fix(r.path(), &req, &sandbox).await;
-        assert_eq!(run.check.outcome(), want, "{:?} {:?}", run.check, run.note);
+        let c = &run.check;
+        eprintln!("{} runs={}", c.to_detail(), before - budget.remaining());
+        assert_eq!(c.outcome(), want, "{c:?} {:?}", run.note);
+        assert_eq!((c.regression, c.tests), (regression, tests), "{c:?}");
+        assert_eq!((c.inputs_blocked, c.inputs_total), (blocked, 1), "{c:?}");
+        assert_eq!(c.reason.as_deref(), reason, "{c:?} {:?}", run.note);
+        assert_eq!(before - budget.remaining(), runs, "{c:?}");
     }
+    // The checks ran on temporary copies; the scanned tree is untouched.
+    assert_eq!(
+        std::fs::read_to_string(r.path().join("app.py")).unwrap(),
+        APP
+    );
 }
 
 #[test]

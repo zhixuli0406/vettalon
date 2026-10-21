@@ -145,16 +145,24 @@ fn poc(f: &Finding) -> Option<String> {
         .map(|e| e.detail.trim().to_string())
 }
 
-pub(super) fn affected(meta: &ProjectMeta) -> String {
-    let mut s = meta
-        .name
-        .clone()
-        .unwrap_or_else(|| "【產品／專案名稱】".into());
+/// Product, version and commit, in the draft language.
+pub(super) fn affected(meta: &ProjectMeta, zh: bool) -> String {
+    let mut s = meta.name.clone().unwrap_or_else(|| {
+        if zh {
+            "【產品／專案名稱】".into()
+        } else {
+            "[product / project name]".into()
+        }
+    });
     if let Some(v) = &meta.version {
         s.push_str(&format!(" {v}"));
     }
     if let Some(c) = &meta.commit {
-        s.push_str(&format!("（commit {c}）"));
+        s.push_str(&if zh {
+            format!("（commit {c}）")
+        } else {
+            format!(" (commit {c})")
+        });
     }
     s
 }
@@ -268,9 +276,18 @@ pub(super) fn render(
             None => id.clone(),
         })
         .unwrap_or_else(|| "【請填寫弱點類型】".into());
+    // Mitigation text follows the draft language: zh-TW only for the zh-TW
+    // forms; English drafts read the English KB and fall back to the
+    // placeholder, never to the zh-TW text.
     let fixes: Vec<String> = cwe
         .as_ref()
-        .and_then(|(_, e)| e.map(|e| e.mitigations_zh.clone()))
+        .and_then(|(id, e)| {
+            if t.zh() {
+                e.map(|e| e.mitigations_zh.clone())
+            } else {
+                kb::localized(id, "en").map(|l| l.mitigations.clone())
+            }
+        })
         .unwrap_or_default();
     // Severity: only a human-set value is filled in.
     let human_sev = ctx.severity.human_severity.is_some();
@@ -288,13 +305,14 @@ pub(super) fn render(
         (Some(c), true) => format!("CVSS {} {}", c.cvss_version, c.cvss_vector),
         _ => "DRAFT, human must review: compute the vector with the FIRST calculator".into(),
     };
-    let impact = f
-        .threat_model
-        .as_ref()
-        .map(|t| format!("{}（受影響：{}）", t.result.trim(), t.affected.trim()))
-        .unwrap_or_else(|| "【請描述攻擊者可達成的影響】".into());
+    let impact = match (&f.threat_model, t.zh()) {
+        (Some(m), true) => format!("{}（受影響：{}）", m.result.trim(), m.affected.trim()),
+        (Some(m), false) => format!("{} (affected: {})", m.result.trim(), m.affected.trim()),
+        (None, true) => "【請描述攻擊者可達成的影響】".into(),
+        (None, false) => "[describe what an attacker can achieve]".into(),
+    };
     let analysis = analysis(f);
-    let affected = affected(meta);
+    let affected = affected(meta, t.zh());
     let loc = location(f);
     let poc_md = poc(f).map(|p| {
         format!("\n\nSandbox PoC transcript (check it holds no sensitive data):\n```\n{p}\n```")

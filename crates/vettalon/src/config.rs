@@ -4,7 +4,7 @@
 //! auto-detected from the CLIs on `PATH` whose tools can be fully disabled
 //! (today: claude). CLIs that keep host access (codex, grok; see
 //! `llm::cli`) are added through a config file; they run in the agents
-//! container by default (`vettalon agents build`), or on the host with
+//! container by default (`vettalon agents pull` or `build`), or on the host with
 //! `allow_agent_tools = true`. API keys are never stored in the file: a
 //! model names the environment variable that holds its key (`api_key_env`).
 //!
@@ -695,7 +695,7 @@ impl ModelConfig {
                     .map(|rel| (home.join(&rel), rel))
                     .collect();
                 Isolation::Container(ContainerSpec {
-                    image: container::AGENTS_IMAGE.to_string(),
+                    image: container::agents_image().to_string(),
                     auth_files,
                 })
             }
@@ -883,6 +883,7 @@ roles = ["finder", "verifier"]
         if let Isolation::Container(c) = grok.isolation() {
             assert_eq!(c.auth_files.len(), 1);
             assert!(c.auth_files[0].1.ends_with("auth.json"));
+            assert_eq!(c.image, crate::llm::container::agents_image());
         }
     }
 

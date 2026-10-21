@@ -55,7 +55,10 @@ pub fn apply(
 ) -> Result<(), String> {
     let reason = reason.trim();
     if reason.is_empty() {
-        return Err("請填寫判定理由（會寫進報告的誤判清單／排除清單）".into());
+        return Err(crate::tr!(
+            "請填寫判定理由（會寫進報告的誤判清單／排除清單）",
+            "Enter a reason for the decision (it goes into the report's false-positive / exclusion list)"
+        ));
     }
     let reason =
         crate::util::mask_sensitive_text(crate::util::truncate_bytes(reason, REASON_MAX_BYTES));
@@ -64,7 +67,7 @@ pub fn apply(
         .findings
         .iter_mut()
         .find(|f| f.id == finding_id)
-        .ok_or_else(|| format!("找不到 finding {finding_id}"))?;
+        .ok_or_else(|| crate::tr!("找不到 finding {finding_id}", "no finding {finding_id}"))?;
     f.evidence.push(EvidenceItem {
         kind: EvidenceKind::OperatorReview,
         source: "dashboard".into(),
@@ -88,7 +91,10 @@ pub fn apply(
     next.summary.policy = super::gate::reevaluate(&report.summary.policy, &next.findings);
     let errors = super::validation_errors(&next);
     if let Some(first) = errors.first() {
-        return Err(format!("判定後報告不一致，未套用：{first}"));
+        return Err(crate::tr!(
+            "判定後報告不一致，未套用：{first}",
+            "the report would be inconsistent after this decision, so nothing was applied: {first}"
+        ));
     }
     *report = next;
     Ok(())
@@ -104,7 +110,7 @@ pub fn apply_many(
     reason: &str,
 ) -> Result<usize, String> {
     if finding_ids.is_empty() {
-        return Err("沒有選取任何發現".into());
+        return Err(crate::tr!("沒有選取任何發現", "no findings selected"));
     }
     let mut next = report.clone();
     let mut seen = std::collections::HashSet::new();
@@ -116,7 +122,10 @@ pub fn apply_many(
                 .find(|f| &f.id == id)
                 .map(|f| f.title.as_str())
                 .unwrap_or(id.as_str());
-            return Err(format!("「{title}」無法套用，整批未變更：{e}"));
+            return Err(crate::tr!(
+                "「{title}」無法套用，整批未變更：{e}",
+                "cannot apply to \"{title}\", so the batch was left unchanged: {e}"
+            ));
         }
     }
     *report = next;
@@ -221,6 +230,32 @@ mod tests {
             before,
             "a failed decision leaves the report untouched"
         );
+    }
+
+    /// The dashboard shows these errors; they follow the UI language.
+    #[test]
+    fn errors_follow_the_language() {
+        use crate::lang::{Lang, with};
+        let errors = || {
+            let mut r = report();
+            [
+                apply(&mut r, "f1", Decision::Suppressed, " ").unwrap_err(),
+                apply(&mut r, "nope", Decision::Suppressed, "x").unwrap_err(),
+                apply_many(&mut r, &[], Decision::Suppressed, "x").unwrap_err(),
+                apply_many(&mut r, &["nope".into()], Decision::Suppressed, "x").unwrap_err(),
+            ]
+        };
+        let zh = with(Lang::ZhTw, errors);
+        assert!(zh[0].starts_with("請填寫判定理由"), "{zh:?}");
+        assert_eq!(zh[1], "找不到 finding nope");
+        let en = with(Lang::En, errors);
+        assert!(
+            en.iter()
+                .all(|e| !e.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))),
+            "{en:?}"
+        );
+        assert_eq!(en[2], "no findings selected");
+        assert!(en[3].contains("\"nope\""), "{en:?}");
     }
 
     #[test]

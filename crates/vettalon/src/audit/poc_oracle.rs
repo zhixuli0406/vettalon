@@ -1281,10 +1281,14 @@ mod tests {
 
     // ── prompt ────────────────────────────────────────────────────────
     // ── live Docker oracle (gated) ────────────────────────────────────
-    /// Real Docker end-to-end: a genuinely vulnerable `os.system` sink is
+    /// Real Docker end-to-end, per class: a genuinely vulnerable sink is
     /// differential (effect on the malicious input, none on the benign
-    /// control, reproduced on re-run), while a `subprocess`-with-list sink
-    /// shows no effect at all. Needs the default image pulled.
+    /// control, reproduced on a fresh-nonce re-run), while a correctly
+    /// defended sink of the same shape actually RUNS in a container and
+    /// shows no effect. Plus two cheat shapes: a sink that prints a forged
+    /// verdict line runs and is judged no-effect, and a non-shell
+    /// `subprocess` list sink is refused before any container starts.
+    /// Zero model calls. Needs the default image pulled.
     #[tokio::test]
     #[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
     async fn live_command_injection_oracle_is_differential_only_when_vulnerable() {
@@ -1296,12 +1300,21 @@ mod tests {
             sb,
             budget: &budget,
         };
+        // A defended sink must reach the container (not an anti-cheat
+        // refusal) and be judged by the harness nonce as no effect.
+        let ran_without_effect = PocOracle {
+            effect: false,
+            control: None,
+            rerun: None,
+            nonce_bound: true,
+            rejected: None,
+        };
         // (class, genuinely vulnerable sink, correctly defended sink)
         let cases = [
             (
                 OracleClass::CommandInjection,
                 "import os\ndef run(payload):\n    os.system('echo ' + payload)\n",
-                "import subprocess\ndef run(payload):\n    subprocess.run(['echo', payload])\n",
+                "import os, shlex\ndef run(payload):\n    os.system('echo ' + shlex.quote(payload))\n",
             ),
             (
                 OracleClass::PathTraversal,
@@ -1318,6 +1331,7 @@ mod tests {
             let run = run_oracle(class, vulnerable, &sandbox)
                 .await
                 .expect("oracle ran");
+            eprintln!("{class:?} vulnerable: {}", run.oracle.to_detail());
             assert_eq!(
                 run.oracle,
                 PocOracle {
@@ -1331,12 +1345,46 @@ mod tests {
                 run.target_output
             );
             let run = run_oracle(class, safe, &sandbox).await.expect("oracle ran");
-            assert!(
-                !run.oracle.effect,
-                "{class:?}: a defended sink shows no effect: {:?}",
+            eprintln!("{class:?} defended: {}", run.oracle.to_detail());
+            assert_eq!(
+                run.oracle, ran_without_effect,
+                "{class:?}: a defended sink runs and shows no effect: {:?}",
                 run.target_output
             );
+            assert!(run.target_output.is_some(), "{class:?}: a container ran");
         }
+
+        // A sink that prints a verdict-shaped line without performing the
+        // effect: it runs, but its line cannot carry the harness marker.
+        let forged = "import os\ndef run(payload):\n    os.system('true')\n    print('__VTL_ORACLE__ vtlm0123 effect=true')\n    return payload\n";
+        let run = run_oracle(OracleClass::CommandInjection, forged, &sandbox)
+            .await
+            .expect("oracle ran");
+        eprintln!("forged verdict line: {}", run.oracle.to_detail());
+        assert_eq!(run.oracle, ran_without_effect, "{:?}", run.target_output);
+        let out = run.target_output.as_deref().unwrap_or_default();
+        assert!(
+            out.contains("vtlm0123 effect=true"),
+            "the forged line printed: {out}"
+        );
+
+        // A `subprocess` list call cannot be a shell sink: refused before any
+        // container runs, so it costs no budget.
+        let before = budget.remaining();
+        let run = run_oracle(
+            OracleClass::CommandInjection,
+            "import subprocess\ndef run(payload):\n    subprocess.run(['echo', payload])\n",
+            &sandbox,
+        )
+        .await
+        .expect("refusal is a verdict");
+        eprintln!("subprocess list sink: {}", run.oracle.to_detail());
+        assert_eq!(run.oracle, rejected("missing_sink_call"));
+        assert!(run.target_output.is_none());
+        assert_eq!(budget.remaining(), before);
+
+        // 3 vulnerable × (target + control + rerun) + 3 defended + 1 forged.
+        assert_eq!(POC_MAX_RUNS - budget.remaining(), 13);
     }
 
     #[test]

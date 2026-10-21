@@ -22,6 +22,8 @@ updates:
     schedule:
       interval: weekly
   - package-ecosystem: docker
-    directories: [/docker/agents, /docker/egress]
+    # docker/agents only has `FROM ${BASE_IMAGE}`; a base bump also needs
+    # docker/agents-base/licenses/node/VERSION and LICENSE refreshed.
+    directories: [/docker/agents-base, /docker/egress]
     schedule:
       interval: weekly

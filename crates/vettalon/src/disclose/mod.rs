@@ -5,7 +5,8 @@
 //! contacts anyone. Submitting, talking to the vendor and deciding the
 //! disclosure date are the human's job (coordinated vulnerability disclosure
 //! ethics, and the reporter's legal safety). Channel detection is local: the
-//! repo's git remote, SECURITY.md and package manifest. The only network use
+//! repo's git remote (without one, the repository URL in the package
+//! metadata, as untrusted data), SECURITY.md and package manifest. The only network use
 //! is the optional pre-send duplicate check ([`dedupe`]), and only when the
 //! operator asks for it.
 //!
@@ -34,13 +35,15 @@ pub mod eligibility;
 mod formats;
 pub mod ledger;
 pub mod policy;
+mod upstream;
 
 pub use crate::audit::evidence_level::{EvidenceLevel, ProofGap};
 pub use ai_use::{AiUseStatement, Reviewer};
 pub use dedupe::{DedupeReport, DedupeSource};
-pub use detect::{detect_project, github_slug, recommend};
+pub use detect::{detect_project, detect_project_as, github_slug, recommend};
 pub use eligibility::{Eligibility, draft_eligibility};
 pub use ledger::ThrottleStatus;
+pub use upstream::{UpstreamOrigin, go_module_url, normalize_github};
 
 /// Where a report can be filed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,8 +121,14 @@ pub struct ProjectMeta {
     pub version: Option<String>,
     /// GitHub advisory ecosystem: Rust | npm | pip | Go.
     pub ecosystem: Option<String>,
-    /// `owner/repo` when the origin remote is on github.com.
+    /// `owner/repo` of the upstream on github.com: the origin remote, or
+    /// (with no GitHub remote) the repository URL in the package metadata.
     pub github: Option<String>,
+    /// Where `github` came from (git remote vs. a package metadata field).
+    pub github_source: Option<UpstreamOrigin>,
+    /// A metadata repository URL that is not a github.com repo, recorded as
+    /// `<host> (<file> <field>)`; no GitHub advisory channel follows from it.
+    pub non_github_upstream: Option<String>,
     pub commit: Option<String>,
     pub security_policy: Option<String>,
     pub security_emails: Vec<String>,
@@ -284,6 +293,28 @@ pub const CHECKLIST: &[&str] = &[
     "已刪除草稿開頭的審閱備註區塊，並把引用的模型分析改寫成自己的話",
 ];
 
+/// [`CHECKLIST`] for an English terminal (same items, same order).
+pub const CHECKLIST_EN: &[&str] = &[
+    "Independent human review is done and confirms exploitability and impact; automated analysis or a generated draft is not human confirmation",
+    "The target and source identity (version, commit or digest) and the sandbox reproduction record are saved, and the results and limits were checked",
+    "All testing stayed within the authorized scope, with no unauthorized access to anyone else's production systems",
+    "The draft holds no real credentials, keys, personal data or customer data",
+    "The maintainer's current policy, scope, correct reporting channel and known advisories were checked; nobody's consent to publication was assumed",
+    "Approval for this private report is obtained and the approver, content and attribution are recorded; publication needs separate approval, and reaching a suggested date or deadline does not authorize it",
+    "The reviewer pseudonym, review date and \"manually reproduced\" statement in the AI use statement are true; the pseudonym will be public",
+    "Every duplicate-check result was reviewed (items marked NOT CHECKED were checked by hand), and severity is filled in only after a human rated it",
+    "The reviewer notes block at the top of the draft is deleted and the quoted model analysis is rewritten in your own words",
+];
+
+/// The pre-send checklist in the terminal language (`crate::lang`).
+pub fn checklist() -> Vec<String> {
+    let items = match crate::lang::get() {
+        crate::lang::Lang::ZhTw => CHECKLIST,
+        crate::lang::Lang::En => CHECKLIST_EN,
+    };
+    items.iter().map(|s| s.to_string()).collect()
+}
+
 /// Operator choices for drafting. A reviewer is required by construction.
 #[derive(Debug, Clone)]
 pub struct DraftOptions {
@@ -409,6 +440,43 @@ struct Notes<'a> {
     warnings: &'a [String],
 }
 
+/// Where the upstream repository came from, for the reviewer. A value read
+/// from package metadata was written by the package author: confirm it.
+fn upstream_note(meta: &ProjectMeta, zh: bool) -> Option<String> {
+    match (&meta.github, &meta.github_source, &meta.non_github_upstream) {
+        (Some(slug), Some(src @ UpstreamOrigin::PackageMetadata { .. }), _) => Some(if zh {
+            format!(
+                "上游儲存庫：github.com/{slug}，來源：{}。此值由套件作者填寫，送出前請確認它是真正的上游。",
+                src.render(true)
+            )
+        } else {
+            format!(
+                "Upstream repository: github.com/{slug}, from {}. The package author wrote this value; confirm it is the real upstream before sending.",
+                src.render(false)
+            )
+        }),
+        (Some(slug), Some(src), _) => Some(if zh {
+            format!(
+                "上游儲存庫：github.com/{slug}，來源：{}。",
+                src.render(true)
+            )
+        } else {
+            format!(
+                "Upstream repository: github.com/{slug}, from {}.",
+                src.render(false)
+            )
+        }),
+        (None, _, Some(other)) => Some(if zh {
+            format!("上游儲存庫不是可用的 github.com 儲存庫：{other}；不提供 GitHub 安全公告管道。")
+        } else {
+            format!(
+                "Upstream repository is not a usable github.com repository: {other}; no GitHub advisory channel."
+            )
+        }),
+        _ => None,
+    }
+}
+
 fn reviewer_notes(n: &Notes<'_>, zh: bool) -> String {
     let mut out = vec![if zh { NOTES_START_ZH } else { NOTES_START_EN }.to_string()];
     if n.eligibility.unproven {
@@ -437,6 +505,9 @@ fn reviewer_notes(n: &Notes<'_>, zh: bool) -> String {
             }
         }
     });
+    if let Some(line) = upstream_note(n.meta, zh) {
+        out.push(defang_markers(&line));
+    }
     out.push(if zh {
         "送出前重複檢查：".to_string()
     } else {
@@ -592,7 +663,7 @@ pub fn package_for(
         project,
         channels,
         draft,
-        checklist: CHECKLIST.iter().map(|s| s.to_string()).collect(),
+        checklist: checklist(),
         evidence_level: eligibility.level,
         proof_gaps: f.proof_gaps(),
         strongest_counterevidence: f.strongest_counterevidence().map(|c| defang_markers(&c)),
@@ -630,7 +701,7 @@ pub async fn prepare(
         .findings
         .iter()
         .find(|f| f.id == finding_id)
-        .ok_or_else(|| format!("找不到 finding {finding_id}"))?;
+        .ok_or_else(|| crate::tr!("找不到 finding {finding_id}", "no finding {finding_id}"))?;
     // Gate before any network use.
     draft_eligibility(f, opts.allow_unproven)?;
     let project = detect_project(Path::new(&report.repo));
@@ -658,3 +729,5 @@ pub async fn prepare(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod upstream_tests;

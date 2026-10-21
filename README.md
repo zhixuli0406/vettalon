@@ -54,7 +54,7 @@ Requirements:
 - macOS or Linux (container isolation, the PoC sandbox and 0600 file permissions rely on Unix-only mechanisms; Windows isn't supported yet)
 - Rust 1.88 or later (`cargo`)
 - For deep mode, at least one model, any of:
-  - a logged-in `claude` (Claude Code). `codex` and `grok` also work; by default they run inside a container sandbox (needs Docker; run `vettalon agents build` once first). `agy` (Google Antigravity CLI) works on the host only, with `allow_agent_tools = true`. Details in "Security boundaries" below.
+  - a logged-in `claude` (Claude Code). `codex` and `grok` also work; by default they run inside a container sandbox (needs Docker; run `vettalon agents pull` or `vettalon agents build` once first). `agy` (Google Antigravity CLI) works on the host only, with `allow_agent_tools = true`. Details in "Security boundaries" below.
   - an API key for an OpenAI-compatible API (kept in an environment variable)
   - a local Ollama
 - Optional: `semgrep`, `gitleaks`, `cargo-audit` (each runs only if installed)
@@ -154,6 +154,10 @@ vettalon scan . --profile deep --source-receipts --report report.json
 vettalon scan . --profile deep \
   --gate 'severity>=high status=confirmed,needs_human cross_family count>0'
 
+# A deep scan in which no AI engine could run exits 4 (see "Exit codes");
+# --allow-incomplete exits on the gate result instead, as 0.3.1 and earlier did.
+vettalon scan . --profile deep --allow-incomplete --report report.json
+
 # Disclosure drafts: first list the findings that can be submitted, then generate a draft for one of them
 # (drafts only, never submitted for you; a human reviewer pseudonym is required and appears in the draft)
 vettalon disclose report.json
@@ -198,6 +202,9 @@ The paid Vettalon Pro can also turn a hunt report into an enterprise supply-chai
 
 `vettalon disclose` uses local repository metadata (git remote, SECURITY.md and package metadata) to suggest a reporting channel and generate an unapproved local draft. Formats: `--format ghsa | minimal | kernel | email` (default: the channel's own form; TWCERT/CC and HITCON ZeroDay keep their forms). Rules every draft follows:
 
+- Upstream repository: the `origin` remote when it is on github.com; otherwise (an unpacked crates.io `.crate`, PyPI sdist or npm tarball has no `.git`) the repository URL in `Cargo.toml`, `package.json`, `pyproject.toml`, `setup.cfg`, `PKG-INFO` or `go.mod`. Metadata is untrusted: only a well-formed `github.com/<owner>/<repo>` URL is used, and the reviewer notes say which file and field it came from. Other hosts are recorded but get no GitHub advisory channel.
+- Language: the `ghsa`, `minimal`, `kernel` and `email` drafts are English throughout, including the CWE fix suggestions; only the TWCERT/CC and HITCON ZeroDay forms are zh-TW.
+
 - Evidence gate: by default only findings with a harness-judged PoC or a human confirmation are drafted. `--allow-unproven` also drafts refuter-only findings, with a loud UNPROVEN banner. Scanner-only findings are never drafted.
 - AI use statement: tool and version, which models found, verified and wrote PoCs, and the human reviewer pseudonym plus review date (`--reviewer` / `--review-date`, or `[disclosure] reviewer` in the config). No reviewer, no draft. The pseudonym is public.
 - Severity is never filled in by the tool unless a human set it; the model's suggestion is kept apart in the reviewer notes.
@@ -221,7 +228,20 @@ Before sending, document independent human review and sandbox reproduction tied 
 
 With `--gate` and no `--fail-on`, `--fail-on` is treated as `none`; with both, failing either one fails the run. Human verdicts added to the report later recompute the gate result. `summary.policy` only proves that the result is consistent with the conditions stored in the report, not that those conditions weren't changed; the exit code at scan time is what counts.
 
-Exit codes: `0` the `--fail-on` threshold wasn't reached and every `--gate` condition passed; `1` failed; `2` the scan itself couldn't finish (bad path, malformed gate condition, report couldn't be written, and so on).
+### Exit codes
+
+`vettalon scan`:
+
+| Code | Meaning |
+|---|---|
+| `0` | The `--fail-on` threshold wasn't reached and every `--gate` condition passed. An incomplete run can still exit 0 (time budget, a refusal, one of several AI engines down); read `run_status` and `incomplete_reason` in the report. |
+| `1` | A finding reached `--fail-on`, or a `--gate` condition failed. |
+| `2` | The scan itself couldn't finish: bad path, bad flag or budget value, malformed gate condition, a report that couldn't be written, and so on. |
+| `4` | `--profile deep` only: no AI engine could run (container image missing, CLI not found, provider unreachable), so no module got an AI review. The report is still written (`run_status: incomplete`, `incomplete_reason: engine_unavailable`, the reason under `engines_missing`). Takes precedence over `1`; the summary still shows the gate result. `--allow-incomplete` exits `0`/`1` as before. Up to 0.3.1 this case exited 0. |
+
+`3` is not used by `vettalon`; the Vettalon Pro CLI uses it for "license required". When only some AI engines fail, the run is incomplete with `engine_unavailable`, the terminal names how many were unavailable, and the exit code follows the gate. Quick scans never exit 4.
+
+`vettalon verify` exits `0` once it has written its output, even when the verifier was unreachable (read `incomplete` and `unverified` in the output), and `2` when it can't run (bad input, unknown verifier, output not writable).
 
 ### Module ranking (`--rank`)
 
@@ -317,7 +337,8 @@ The code under review is untrusted data and may hide instructions written for th
 
 So codex and grok **run in a container sandbox by default**:
 
-- Run `vettalon agents build` once to build the image (pinned versions of codex and grok, plus an egress proxy).
+- Run `vettalon agents pull` once. It downloads two images from GHCR, the egress proxy and a base image with codex but no grok, checks their cosign signatures (they must come from this repo's `images.yml` workflow on `main` or a release tag), pins them by digest, and then downloads grok from x.ai on your machine and adds it on top. grok's license doesn't allow redistribution, so no published image contains it. If `cosign` isn't installed, `pull` stops and tells you to install it or to use `vettalon agents build` instead, which builds all three images locally from the definitions inside the binary and pulls nothing from GHCR. `--no-verify` skips the signature check; it is insecure. Scans never pull images (`docker run --pull=never`).
+- Image tags come from the image definitions, not from the vettalon version, so after upgrading vettalon you only pull or rebuild when the release changed those definitions. **Upgrading from 0.3.1 or earlier needs one more `vettalon agents pull` (or `vettalon agents build`)**: the old images are tagged with the version number, so the new tags (`<repo>:<first 12 hex characters of the SHA-256 of the definition>`) don't exist yet. If it did, the scan reports `container image vettalon-agents:<tag> is missing` together with the command to run. `vettalon agents images` prints the tags the installed binary expects: the agents image, the egress proxy, then the published base. To check the images by hand or download their source code, see [verifying the container images](docs/TRUST.md#container-images).
 - Each call starts a fresh container that holds only a copied-in auth file and an empty working directory; it can't see the host's filesystem or environment variables.
 - The container is attached to an `--internal` Docker network with no outbound route. The only way out is the proxy, which allows only the model vendors' domains and refuses everything else.
 - Tested: grok inside the container, asked to read a host file, replied that the file doesn't exist.
@@ -328,7 +349,7 @@ If you are sure you only audit code you trust and want to skip the extra time th
 
 `agy` has no container image (its login can't be copied into one), so it always needs `allow_agent_tools = true` and runs on the host. vettalon sends the prompt on stdin (never in argv), prepends a "no tools, answer from this message" line, and throws a reply away when the CLI's stream shows any tool step, a denied action or an empty answer. What it can't switch off: agy loads your own rules from `~/.gemini/GEMINI.md` (they can change the reply language) and keeps its own conversation history, which contains the audited code. In a 2026-10-20 test, Gemini's provider filter answered every vettalon refuter prompt with "This request was blocked by Gemini's filters" (5 of 5, three Flash tiers); vettalon records that as a refusal. GPT-OSS 120B through agy answered normally.
 
-Managing containers: `vettalon agents build` builds the image, and `vettalon agents stop` shuts down the proxy and the internal network.
+Managing containers: `vettalon agents pull` fetches and verifies the published images, `vettalon agents build` builds every image locally, `vettalon agents images` prints the expected image tags, and `vettalon agents stop` shuts down the proxy and the internal network.
 
 ## How it works
 

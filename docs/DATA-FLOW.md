@@ -121,7 +121,10 @@ OS sandbox or a network policy.
 
 `--fail-on none` can return exit 0 for an incomplete report: automation must read
 `run_status`, `incomplete_reason` and engine records rather than treating process
-success or empty findings as complete coverage. `cargo-audit --no-fetch` prevents
+success or empty findings as complete coverage. The one incomplete case with its
+own exit code is a deep scan in which no AI engine could run (exit 4, unless
+`--allow-incomplete`); a partial engine loss, a time budget or a refusal still
+exits on the gate result. `cargo-audit --no-fetch` prevents
 the advisory DB's git fetch; it does not establish an up-to-date DB or a successful
 yanked-package/index check. The local cached-DB acceptance covers advisory lookup,
 with missing index/yank diagnostics retained separately in private test evidence.

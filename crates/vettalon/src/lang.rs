@@ -6,8 +6,9 @@
 //! report means the same thing whichever language produced it.
 //!
 //! The library default is Traditional Chinese, which keeps the behaviour of
-//! embedders that never call [`set`] (the Pro dashboard and desktop app). The
-//! `vettalon` CLI calls [`set`] once at startup with [`detect`].
+//! embedders that never call [`set`]. The `vettalon` CLI calls [`set`] once
+//! at startup with [`detect`]; the Pro dashboard and desktop app call it
+//! whenever their UI language changes (Japanese maps to English).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 

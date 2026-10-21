@@ -43,6 +43,23 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy ${{ env.CORE }} --all-targets -- -D warnings
       - run: cargo test ${{ env.CORE }}
+      # The three Docker live tests (PoC sandbox flags, O2 oracle, O19 fix
+      # check). No model calls, no secrets; the image is pinned by digest.
+      - name: Docker PoC sandbox, oracle and fix-check live tests (no model calls)
+        if: matrix.os == 'ubuntu-24.04'
+        timeout-minutes: 10
+        env:
+          POC_IMAGE: python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+          LIVE_TESTS: >-
+            sandbox::tests::docker_sandbox_runs_python_offline_as_non_root
+            audit::poc_oracle::tests::live_command_injection_oracle_is_differential_only_when_vulnerable
+            audit::fix_check::tests::live_fix_check_verifies_a_real_fix_and_rejects_a_no_op
+        run: |
+          docker pull "$POC_IMAGE"
+          docker tag "$POC_IMAGE" python:3.12-slim
+          found=$(cargo test ${{ env.CORE }} --lib -- --ignored --list --exact $LIVE_TESTS | grep -c ': test$')
+          test "$found" -eq 3 || { echo "expected 3 live Docker tests, found $found"; exit 1; }
+          cargo test ${{ env.CORE }} --lib -- --ignored --exact $LIVE_TESTS --nocapture --test-threads=1
       - name: Set up Python for macOS query contracts
         if: matrix.os == 'macos-latest'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -64,6 +81,7 @@ jobs:
       - run: python -m unittest discover -s scripts/trust/tests -p 'test_*.py'
       - run: python -B -I -S -m unittest discover -s reports/evidence-acceptance/cli-v020-public-trust-readback-20261019 -p 'test_*.py'
       - run: bash -n scripts/trust/verify-release.sh scripts/trust/scorecard.sh
+      - run: python -B -I -S -m unittest discover -s scripts/images -p 'test_*.py'
 
   scanner-windows:
     name: scanner process limits (Windows native)

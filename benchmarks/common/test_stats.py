@@ -119,5 +119,47 @@ class PowerTests(unittest.TestCase):
         self.assertTrue(math.isfinite(stats.two_proportion_power(0.5, 0.6, 1)))
 
 
+class PreRegisteredTestTests(unittest.TestCase):
+    def test_fisher_exact_matches_the_textbook_example(self):
+        # 1/12 vs 9/12 (the dieting example): two-sided p = 0.002759
+        self.assertAlmostEqual(stats.fisher_exact(1, 12, 9, 12), 0.002759, places=5)
+        self.assertEqual(stats.fisher_exact(0, 5, 0, 5), 1.0)
+        self.assertAlmostEqual(stats.fisher_exact(3, 10, 3, 10), 1.0)
+
+    def test_newcombe_matches_the_published_example(self):
+        # Newcombe 1998: 56/70 vs 48/80, difference 0.2, method 10 [0.0524, 0.3339]
+        r = stats.newcombe_difference(48, 80, 56, 70)
+        self.assertAlmostEqual(r['difference'], 0.2)
+        self.assertAlmostEqual(r['interval'][0], 0.0524, places=3)
+        self.assertAlmostEqual(r['interval'][1], 0.3339, places=3)
+        with self.assertRaises(ValueError):
+            stats.newcombe_difference(0, 0, 1, 2)
+
+    def test_holm_is_step_down_and_monotone(self):
+        adj = stats.holm({'a': 0.01, 'b': 0.04, 'c': 0.03})
+        self.assertAlmostEqual(adj['a'], 0.03)
+        self.assertAlmostEqual(adj['c'], 0.06)
+        self.assertAlmostEqual(adj['b'], 0.06)
+        self.assertEqual(stats.holm({'x': 0.7}), {'x': 0.7})
+        with self.assertRaises(ValueError):
+            stats.holm({})
+
+    def test_exact_mcnemar_power(self):
+        # No net effect in the true model: power stays at or below alpha.
+        self.assertLessEqual(stats.mcnemar_exact_power(100, 0.05, 0.05), 0.05)
+        self.assertEqual(stats.mcnemar_exact_power(100, 0.0, 0.0), 0.0)
+        self.assertLess(stats.mcnemar_exact_power(100, 0.15, 0.05), stats.mcnemar_exact_power(200, 0.15, 0.05))
+        self.assertGreater(stats.mcnemar_exact_power(100, 0.10, 0.0), 0.9)
+        self.assertLess(stats.mcnemar_exact_power(100, 0.10, 0.0, alpha=0.00625),
+                        stats.mcnemar_exact_power(100, 0.10, 0.0))
+        with self.assertRaises(ValueError):
+            stats.mcnemar_exact_power(10, 0.7, 0.5)
+
+    def test_unequal_group_power_reduces_to_the_equal_case(self):
+        self.assertAlmostEqual(stats.two_proportion_power_unequal(0.2, 0.3, 294, 294),
+                               stats.two_proportion_power(0.2, 0.3, 294), places=6)
+        self.assertLess(stats.two_proportion_power_unequal(0.2, 0.3, 259, 294), 0.8)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,9 +1,12 @@
 //! Local project detection and channel ranking (no network): the repo's git
-//! remote, SECURITY.md and package manifest.
+//! remote (or, without a GitHub one, the repository URL the package metadata
+//! declares), SECURITY.md and package manifest.
 
 use std::path::Path;
 
+use super::upstream::{MetadataUpstream, UpstreamOrigin, pkg_info_field};
 use super::{Channel, ChannelOption, ProjectMeta};
+use crate::lang::pick;
 
 const META_MAX_BYTES: u64 = 256 * 1024;
 
@@ -16,23 +19,10 @@ fn read_small(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// `owner/repo` from a GitHub remote URL (https or scp-style ssh).
+/// `owner/repo` from a GitHub repository URL (https, ssh, scp-style,
+/// `git+` forms); see [`super::upstream::normalize_github`].
 pub fn github_slug(url: &str) -> Option<String> {
-    let u = url.trim();
-    let rest = u
-        .strip_prefix("https://github.com/")
-        .or_else(|| u.strip_prefix("http://github.com/"))
-        .or_else(|| u.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| u.strip_prefix("git@github.com:"))?;
-    let rest = rest.trim_end_matches('/').trim_end_matches(".git");
-    let mut parts = rest.split('/');
-    let (owner, repo) = (parts.next()?, parts.next()?);
-    let ok = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-    };
-    (ok(owner) && ok(repo) && parts.next().is_none()).then(|| format!("{owner}/{repo}"))
+    super::upstream::normalize_github(url)
 }
 
 fn origin_url(git_config: &str) -> Option<String> {
@@ -92,6 +82,14 @@ fn toml_field(text: &str, section: &str, key: &str) -> Option<String> {
 
 /// Everything the repo says about where to report (local reads only).
 pub fn detect_project(repo: &Path) -> ProjectMeta {
+    detect_project_as(repo, None)
+}
+
+/// [`detect_project`] for a package whose ecosystem is already known
+/// (`Rust` | `npm` | `pip` | `Go`, e.g. a fetched dependency): that
+/// ecosystem's metadata files are read first for the upstream repository,
+/// whatever other manifests the package ships.
+pub fn detect_project_as(repo: &Path, ecosystem: Option<&str>) -> ProjectMeta {
     let mut m = ProjectMeta::default();
     if !repo.is_dir() {
         return m;
@@ -99,6 +97,9 @@ pub fn detect_project(repo: &Path) -> ProjectMeta {
     let git = repo.join(".git");
     if let Some(cfg) = read_small(&git.join("config")) {
         m.github = origin_url(&cfg).as_deref().and_then(github_slug);
+        if m.github.is_some() {
+            m.github_source = Some(UpstreamOrigin::GitRemote);
+        }
     }
     m.commit = head_commit(&git);
     for rel in [
@@ -115,6 +116,28 @@ pub fn detect_project(repo: &Path) -> ProjectMeta {
             break;
         }
     }
+    read_manifest(repo, &mut m);
+    // No GitHub origin remote (an unpacked registry tarball has no `.git`):
+    // fall back to the repository URL the package metadata declares.
+    if m.github.is_none() {
+        let eco = ecosystem.or(m.ecosystem.as_deref());
+        match super::upstream::from_metadata(repo, eco, read_small) {
+            MetadataUpstream::Github { slug, origin } => {
+                m.github = Some(slug);
+                m.github_source = Some(origin);
+            }
+            MetadataUpstream::NonGithub(desc) => m.non_github_upstream = Some(desc),
+            MetadataUpstream::None => {}
+        }
+    }
+    if m.name.is_none() {
+        m.name = repo.file_name().map(|n| n.to_string_lossy().to_string());
+    }
+    m
+}
+
+/// Name, version and ecosystem from the package manifest.
+fn read_manifest(repo: &Path, m: &mut ProjectMeta) {
     if let Some(t) = read_small(&repo.join("Cargo.toml")) {
         m.name = toml_field(&t, "package", "name");
         m.version = toml_field(&t, "package", "version");
@@ -140,32 +163,65 @@ pub fn detect_project(repo: &Path) -> ProjectMeta {
             .find_map(|l| l.trim().strip_prefix("module "))
             .map(|s| s.trim().to_string());
         m.ecosystem = Some("Go".into());
+    } else if read_small(&repo.join("PKG-INFO")).is_some() {
+        // A legacy sdist (setup.py, no pyproject). A bare setup.cfg is not
+        // enough: many non-Python repos keep tool settings in one.
+        m.ecosystem = Some("pip".into());
     }
-    if m.name.is_none() {
-        m.name = repo.file_name().map(|n| n.to_string_lossy().to_string());
+    // An sdist's PKG-INFO carries the resolved name and version (pyproject
+    // often leaves the version dynamic).
+    if m.ecosystem.as_deref() == Some("pip")
+        && let Some(t) = read_small(&repo.join("PKG-INFO"))
+    {
+        m.name = m.name.take().or_else(|| pkg_info_field(&t, "Name"));
+        m.version = m.version.take().or_else(|| pkg_info_field(&t, "Version"));
     }
-    m
 }
 
 /// Ranked channel options for this project.
 pub fn recommend(meta: &ProjectMeta) -> Vec<ChannelOption> {
     let mut out = Vec::new();
+    // Terminal/dashboard text: follows `crate::lang` (the library default is
+    // zh-TW; the CLI switches to English for an English locale).
     if let Some(slug) = &meta.github {
+        let from_metadata = matches!(
+            meta.github_source,
+            Some(UpstreamOrigin::PackageMetadata { .. })
+        );
+        let reason = if from_metadata {
+            crate::tr!(
+                "套件中繼資料指出上游在 GitHub（{slug}，送出前請確認），可優先核對維護者的私密回報設定與安全政策，經核准後私下通報。",
+                "The package metadata names a GitHub upstream ({slug}; confirm it before sending). Check the maintainers' private reporting settings and security policy first, and report privately once approved.",
+            )
+        } else {
+            crate::tr!(
+                "專案託管於 GitHub（{slug}），可優先核對維護者的私密回報設定與安全政策，經核准後私下通報。",
+                "Hosted on GitHub ({slug}). Check the maintainers' private reporting settings and security policy first, and report privately once approved.",
+            )
+        };
         out.push(ChannelOption {
             channel: Channel::GithubAdvisory,
-            label: "GitHub 私密漏洞回報".into(),
-            reason: format!("專案託管於 GitHub（{slug}），可優先核對維護者的私密回報設定與安全政策，經核准後私下通報。"),
+            label: pick(
+                "GitHub 私密漏洞回報",
+                "GitHub private vulnerability reporting",
+            )
+            .into(),
+            reason,
             submit: Some(format!("https://github.com/{slug}/security/advisories/new")),
             window_days: Channel::GithubAdvisory.window_days(),
         });
     }
     if let Some(email) = meta.security_emails.first() {
+        let file = meta
+            .security_policy
+            .as_deref()
+            .unwrap_or(pick("專案文件", "the project files"));
         out.push(ChannelOption {
             channel: Channel::VendorEmail,
-            label: "專案安全聯絡窗口".into(),
-            reason: format!(
-                "{} 指定的安全聯絡信箱。",
-                meta.security_policy.as_deref().unwrap_or("專案文件")
+            label: pick("專案安全聯絡窗口", "Project security contact").into(),
+            reason: crate::tr!(
+                "{file} 指定的安全聯絡信箱。",
+                "Security contact address given in {file}."
             ),
             submit: Some(format!("mailto:{email}")),
             window_days: Channel::VendorEmail.window_days(),
@@ -173,15 +229,31 @@ pub fn recommend(meta: &ProjectMeta) -> Vec<ChannelOption> {
     }
     out.push(ChannelOption {
         channel: Channel::Twcert,
-        label: "TWCERT/CC（台灣漏洞通報，可申請 CVE）".into(),
-        reason: "軟體／韌體產品漏洞的協調管道候選；送出前須核對受理範圍、現行政策與聯絡方式。建議日期不代表公開授權。".into(),
+        label: pick(
+            "TWCERT/CC（台灣漏洞通報，可申請 CVE）",
+            "TWCERT/CC (Taiwan vulnerability coordination, can assign CVEs)",
+        )
+        .into(),
+        reason: pick(
+            "軟體／韌體產品漏洞的協調管道候選；送出前須核對受理範圍、現行政策與聯絡方式。建議日期不代表公開授權。",
+            "Candidate coordination channel for software / firmware product vulnerabilities; check its scope, current policy and contact details before sending. A suggested date does not authorize publication.",
+        )
+        .into(),
         submit: Some("mailto:cve@cert.org.tw".into()),
         window_days: Channel::Twcert.window_days(),
     });
     out.push(ChannelOption {
         channel: Channel::HitconZeroday,
-        label: "HITCON ZeroDay（網站／服務漏洞）".into(),
-        reason: "網站與線上服務的協調管道候選；送出前須核對受理範圍、現行政策與公開設定。建議日期不代表公開授權。".into(),
+        label: pick(
+            "HITCON ZeroDay（網站／服務漏洞）",
+            "HITCON ZeroDay (websites / online services)",
+        )
+        .into(),
+        reason: pick(
+            "網站與線上服務的協調管道候選；送出前須核對受理範圍、現行政策與公開設定。建議日期不代表公開授權。",
+            "Candidate coordination channel for websites and online services; check its scope, current policy and publication settings before sending. A suggested date does not authorize publication.",
+        )
+        .into(),
         submit: Some("https://zeroday.hitcon.org/".into()),
         window_days: Channel::HitconZeroday.window_days(),
     });

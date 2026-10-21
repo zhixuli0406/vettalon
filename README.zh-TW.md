@@ -42,7 +42,7 @@ AI 深度審計／對抗式覆核／PoC（deep profile）：
 - macOS 或 Linux（容器隔離、PoC 沙箱與 0600 權限用的是 Unix 專屬機制；暫不支援 Windows）
 - Rust 1.88 以上（`cargo`）
 - deep 模式至少要有一個模型，下列擇一：
-  - 已登入的 `claude`（Claude Code）；`codex`、`grok` 也能用，預設會在容器沙箱裡跑（需要 Docker，先跑一次 `vettalon agents build`）；`agy`（Google Antigravity CLI）只能在 host 上跑，要設 `allow_agent_tools = true`。細節見下面的「安全邊界」
+  - 已登入的 `claude`（Claude Code）；`codex`、`grok` 也能用，預設會在容器沙箱裡跑（需要 Docker，先跑一次 `vettalon agents pull` 或 `vettalon agents build`）；`agy`（Google Antigravity CLI）只能在 host 上跑，要設 `allow_agent_tools = true`。細節見下面的「安全邊界」
   - OpenAI 相容 API 的金鑰（放在環境變數裡）
   - 本機 Ollama
 - 選用：`semgrep`、`gitleaks`、`cargo-audit`（有裝才會跑）
@@ -137,6 +137,10 @@ vettalon scan . --profile deep --source-receipts --report report.json
 vettalon scan . --profile deep \
   --gate 'severity>=high status=confirmed,needs_human cross_family count>0'
 
+# deep 掃描沒有任何 AI 引擎能執行時結束碼是 4（見「結束碼」）；
+# 加 --allow-incomplete 改以門檻結果結束，跟 0.3.1 以前一樣
+vettalon scan . --profile deep --allow-incomplete --report report.json
+
 # 漏洞提交草稿：先列出可提交的項目，再為其中一項產生草稿
 # （只產生草稿，不會替你送出；必須給人工審閱者化名，化名會出現在草稿中）
 vettalon disclose report.json
@@ -181,6 +185,9 @@ vettalon rule-draft hunt.json --finding <id>  # 從人工確認的 finding 產 S
 
 `vettalon disclose` 依本機 repo 資訊（git remote、SECURITY.md、套件設定）建議管道並產生未核准的本機草稿。格式用 `--format ghsa | minimal | kernel | email`（預設依管道；TWCERT/CC 與 HITCON ZeroDay 維持原表單）。每份草稿都遵守這些規則：
 
+- 上游儲存庫：`origin` remote 在 github.com 就用它；沒有的話（直接解開的 crates.io `.crate`、PyPI sdist、npm tarball 都沒有 `.git`）改讀 `Cargo.toml`、`package.json`、`pyproject.toml`、`setup.cfg`、`PKG-INFO` 或 `go.mod` 裡的儲存庫網址。中繼資料當資料看，只採用格式正確的 `github.com/<owner>/<repo>`，審閱備註會寫出來自哪個檔案的哪個欄位。其他主機只記錄，不提供 GitHub 安全公告管道。
+- 語言：`ghsa`、`minimal`、`kernel`、`email` 草稿全文英文，CWE 修補建議也是；只有 TWCERT/CC 與 HITCON ZeroDay 表單用 zh-TW。
+
 - 證據門檻：預設只為有執行框架判定 PoC、或已人工確認的項目產生草稿。`--allow-unproven` 也會為只過了覆核的項目產生，並在開頭標示「未證實」。只有掃描器命中的項目一律不產生。
 - AI 使用聲明：工具與版本、哪些模型負責發現、覆核與寫 PoC，以及人工審閱者化名與審閱日期（`--reviewer`／`--review-date`，或設定檔 `[disclosure] reviewer`）。沒有審閱者就不產生，化名會公開。
 - 嚴重度不由工具自填，除非是人工設定的；模型建議另記在審閱備註供日後對照。
@@ -204,7 +211,20 @@ vettalon rule-draft hunt.json --finding <id>  # 從人工確認的 finding 產 S
 
 沒給 `--fail-on` 又有 `--gate` 時，`--fail-on` 視為 `none`；兩者都給時任一不通過即失敗。報告後續的人工判定會重算門檻結果。`summary.policy` 只證明「結果與報告內的條件一致」，不證明條件沒被改過；以掃描當下的結束碼為準。
 
-結束碼：`0` 沒有達到 `--fail-on` 門檻、`--gate` 條件全部通過；`1` 未通過；`2` 掃描本身沒能完成（路徑錯誤、門檻條件寫錯、報告寫不出來等等）。
+### 結束碼
+
+`vettalon scan`：
+
+| 結束碼 | 意思 |
+|---|---|
+| `0` | 沒有達到 `--fail-on` 門檻，`--gate` 條件全部通過。未完成的掃描也可能是 0（時間預算用完、模型拒答、幾個 AI 引擎中有一個掛掉），要看報告的 `run_status` 與 `incomplete_reason`。 |
+| `1` | 有發現達到 `--fail-on`，或 `--gate` 條件不通過。 |
+| `2` | 掃描本身沒能完成：路徑錯誤、旗標或預算值不合理、門檻條件寫錯、報告寫不出來等等。 |
+| `4` | 只在 `--profile deep`：沒有任何 AI 引擎能執行（容器映像檔不存在、找不到 CLI、連不上供應商），沒有模組經過 AI 審查。報告照樣寫出（`run_status: incomplete`、`incomplete_reason: engine_unavailable`，原因在 `engines_missing`）。優先於 `1`，終端摘要仍會顯示門檻結果。加 `--allow-incomplete` 就照舊以 `0`／`1` 結束。0.3.1 以前這種情況是 0。 |
+
+`vettalon` 不用 `3`，Vettalon Pro 的 CLI 用它表示「需要授權」。只有部分 AI 引擎無法使用時，整次標為未完成（`engine_unavailable`），終端會寫出幾個引擎沒跑，結束碼照門檻結果。quick 掃描不會出現 4。
+
+`vettalon verify` 只要輸出檔寫出就是 `0`，覆核模型連不上也一樣（看輸出的 `incomplete` 與 `unverified`）；沒辦法執行（輸入檔有誤、模型清單沒有這個 verifier、輸出檔寫不出來）時是 `2`。
 
 ### 模組排序（`--rank`）
 
@@ -300,7 +320,8 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 
 所以 codex、grok **預設在容器沙箱裡跑**：
 
-- 先跑一次 `vettalon agents build` 建好映像檔（固定版本的 codex、grok，加一個 egress proxy）。
+- 先跑一次 `vettalon agents pull`。它從 GHCR 下載兩個映像檔：egress proxy，以及裝好 codex、沒有 grok 的基底映像檔。下載前先用 cosign 驗證簽章（必須是這個 repo 的 `images.yml` workflow 在 `main` 或發版 tag 上簽的），驗過才用 digest 釘住，最後在你的機器上從 x.ai 下載 grok，疊在基底上面。grok 的授權不允許轉散布，所以公開的映像檔裡都沒有它。沒裝 `cosign` 時 `pull` 會停下來，請你安裝 cosign，或改用 `vettalon agents build`：它用執行檔內建的定義在本機建出全部三個映像檔，完全不從 GHCR 拉。`--no-verify` 會略過簽章檢查，不安全。掃描本身從不拉映像檔（`docker run --pull=never`）。
+- 標籤取自映像檔定義，跟 vettalon 版本號無關，所以升級 vettalon 後，只有新版改了這些定義才要重新 pull 或重建。**從 0.3.1 以前升級時要再跑一次 `vettalon agents pull`（或 `vettalon agents build`）**：舊映像檔的標籤是版本號，新標籤（`<repo>:<定義內容 SHA-256 的前 12 個十六進位字元>`）的映像檔還不存在。需要時，掃描會回報 `container image vettalon-agents:<tag> is missing`，並附上要跑的指令。`vettalon agents images` 依序印出 agents 映像檔、egress proxy、公開基底的標籤。想自己動手驗證映像檔或下載它們的原始碼，見[容器映像檔驗證](docs/TRUST.md#container-images)。
 - 每次呼叫都開一個全新容器，裡面只有一份複製進去的 auth 檔和一個空的工作目錄，看不到 host 的檔案系統和環境變數。
 - 容器接在 `--internal` 的 Docker 網路上，沒有對外路由；唯一的出口是 proxy，只放行模型廠商的網域，其他一律拒絕。
 - 實測：容器裡的 grok 被要求讀 host 檔案時回「不存在」。
@@ -311,7 +332,7 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 
 `agy` 沒有容器映像檔（登入資訊沒辦法複製進容器），所以一定要設 `allow_agent_tools = true`，在 host 上跑。vettalon 從 stdin 送 prompt（不放在 argv），在前面加一行「不要用工具，只依這則訊息回答」，CLI 的串流裡只要出現任何工具步驟、被拒的動作或空回覆，就把整個回覆丟掉。關不掉的部分：agy 會讀你自己的 `~/.gemini/GEMINI.md`（可能改變回覆語言），也會保留自己的對話紀錄，裡面有被審的程式碼。2026-10-20 實測時，Gemini 的供應商過濾器把 vettalon 每一個覆核 prompt 都回成「This request was blocked by Gemini's filters」（三個 Flash 等級共 5 次、5 次都被擋），vettalon 會記成拒答；同一個 CLI 換用 GPT-OSS 120B 則正常回答。
 
-管理容器：`vettalon agents build` 建映像檔、`vettalon agents stop` 收掉 proxy 和內網。
+管理容器：`vettalon agents pull` 下載並驗證公開映像檔、`vettalon agents build` 在本機建出全部映像檔、`vettalon agents images` 印出應有的映像檔標籤、`vettalon agents stop` 收掉 proxy 和內網。
 
 ## 怎麼運作
 

@@ -1,30 +1,32 @@
-# Agent CLIs that cannot fully disable their own tools (codex, grok) run
-# in this image, so their tools see only an empty workspace and a copy of
-# one auth file. Versions are pinned; bump them deliberately.
-FROM node:26-bookworm-slim@sha256:298992629d69bbd5b2b03ad57094d8e4fcb3a8eeb7c4e25d29de656519568913
+# Local layer of the agents image: the grok CLI on top of the published,
+# grok-free base. grok is proprietary, so it is downloaded from x.ai by the
+# machine that builds this layer and never published. `vettalon agents
+# build|pull` passes BASE_IMAGE (the verified base, by digest when pulled).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
-ARG CODEX_VERSION=0.162.1
 ARG GROK_VERSION=1.0.50
 ARG TARGETARCH
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
- && rm -rf /var/lib/apt/lists/*
-
-RUN npm install -g "@openai/codex@${CODEX_VERSION}" && npm cache clean --force
-
+USER root
+# node's fetch instead of curl, so the base needs no download tool.
 RUN case "${TARGETARCH:-$(uname -m)}" in \
       arm64|aarch64) arch=aarch64 ;; \
       amd64|x86_64) arch=x86_64 ;; \
       *) echo "unsupported arch" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /usr/local/bin/grok "https://x.ai/cli/grok-${GROK_VERSION}-linux-${arch}" \
- && chmod 0755 /usr/local/bin/grok \
+ && node -e ' \
+      const fs = require("fs"); \
+      const { Readable } = require("stream"); \
+      const { pipeline } = require("stream/promises"); \
+      const [url, dest] = process.argv.slice(1); \
+      (async () => { \
+        const r = await fetch(url); \
+        if (!r.ok) throw new Error(`GET ${url}: HTTP ${r.status}`); \
+        await pipeline(Readable.fromWeb(r.body), fs.createWriteStream(dest, { mode: 0o755 })); \
+      })().catch((e) => { console.error(e.message); process.exit(1); });' \
+      "https://x.ai/cli/grok-${GROK_VERSION}-linux-${arch}" /usr/local/bin/grok \
  && /usr/local/bin/grok --version
 
-# curl is only needed at build time.
-RUN apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
-
-RUN useradd --create-home --uid 10001 agent
 USER agent
 WORKDIR /work

@@ -212,27 +212,44 @@ pub enum ScanError {
     ReportInvalid(Vec<String>),
 }
 
-impl std::fmt::Display for ScanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ScanError {
+    /// The message in `lang`. Terminal output follows the process language
+    /// (`Display`); text stored in an artifact (a hunt report's per-dependency
+    /// `error`) uses [`ScanError::english`] so the artifact reads the same
+    /// whichever language produced it.
+    pub fn message(&self, lang: crate::lang::Lang) -> String {
+        let zh = lang == crate::lang::Lang::ZhTw;
         match self {
-            ScanError::BadProfile(e) => f.write_str(&crate::tr!(
-                "無效的 --profile：{e}",
-                "invalid --profile: {e}"
-            )),
-            ScanError::UnresolvablePath { path, detail } => f.write_str(&crate::tr!(
-                "無法解析掃描目標路徑 {path}：{detail}",
-                "cannot resolve the target path {path}: {detail}"
-            )),
-            ScanError::NotADirectory(p) => f.write_str(&crate::tr!(
-                "掃描目標不是資料夾：{p}",
-                "the target is not a directory: {p}"
-            )),
-            ScanError::ReportInvalid(vs) => f.write_str(&crate::tr!(
+            ScanError::BadProfile(e) if zh => format!("無效的 --profile：{e}"),
+            ScanError::BadProfile(e) => format!("invalid --profile: {e}"),
+            ScanError::UnresolvablePath { path, detail } if zh => {
+                format!("無法解析掃描目標路徑 {path}：{detail}")
+            }
+            ScanError::UnresolvablePath { path, detail } => {
+                format!("cannot resolve the target path {path}: {detail}")
+            }
+            ScanError::NotADirectory(p) if zh => format!("掃描目標不是資料夾：{p}"),
+            ScanError::NotADirectory(p) => format!("the target is not a directory: {p}"),
+            ScanError::ReportInvalid(vs) if zh => format!(
                 "報告未通過內部驗證（這是 vettalon 本身的錯誤）：{}",
+                vs.join("; ")
+            ),
+            ScanError::ReportInvalid(vs) => format!(
                 "the report failed internal validation (a bug in vettalon itself): {}",
                 vs.join("; ")
-            )),
+            ),
         }
+    }
+
+    /// Language-neutral (English) message for stored artifacts.
+    pub fn english(&self) -> String {
+        self.message(crate::lang::Lang::En)
+    }
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message(crate::lang::get()))
     }
 }
 
@@ -687,8 +704,18 @@ fn write_trace_jsonl(path: &Path, events: &[crate::llm::TraceEvent]) -> std::io:
 
 /// `vettalon scan`: run the audit, print the summary, write the requested
 /// outputs, and return the process exit code (`0` clean, `1` a gated finding
-/// at/above `--fail-on`, `2` the scan could not complete).
+/// at/above `--fail-on`, `2` the scan could not complete,
+/// [`report::AI_UNAVAILABLE_EXIT`] a deep scan whose AI audit could not run
+/// at all, unless `allow_incomplete`). Every output is written first, so the
+/// report is there to read whatever the exit code.
 pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
+    cmd_scan_with(home_dir, opts, false).await
+}
+
+/// [`cmd_scan`] with `--allow-incomplete`: a deep scan whose AI audit could
+/// not run exits on the gate result instead of
+/// [`report::AI_UNAVAILABLE_EXIT`].
+pub async fn cmd_scan_with(home_dir: &Path, opts: ScanOptions, allow_incomplete: bool) -> i32 {
     let fail_on: Option<Severity> = if opts.fail_on.eq_ignore_ascii_case("none") {
         None
     } else {
@@ -797,7 +824,25 @@ pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
         }
     }
 
-    report::exit_code_with(&audit_report, fail_on)
+    if report::ai_audit_unavailable(&audit_report) {
+        eprintln!(
+            "[vettalon] {}",
+            if allow_incomplete {
+                crate::lang::pick(
+                    "沒有任何 AI 引擎能執行，深度審查沒有做；因為有 --allow-incomplete，結束碼照門檻結果決定。",
+                    "no AI engine could run, so the deep audit did not happen; --allow-incomplete is set, so the exit code follows the gate result.",
+                )
+                .to_string()
+            } else {
+                crate::tr!(
+                    "沒有任何 AI 引擎能執行，深度審查沒有做，結束碼 {}。先修好上面 [略過] ai_audit 列的問題（例如 `vettalon agents pull`、確認 CLI 路徑或供應商連線）再掃一次；要照舊以門檻結果結束，加 --allow-incomplete。",
+                    "no AI engine could run, so the deep audit did not happen: exit {}. Fix what the [skipped] ai_audit lines above report (for example `vettalon agents pull`, the CLI path or the provider connection) and scan again, or pass --allow-incomplete to exit on the gate result as before.",
+                    report::AI_UNAVAILABLE_EXIT
+                )
+            }
+        );
+    }
+    report::scan_exit_code(&audit_report, fail_on, allow_incomplete)
 }
 
 /// Fields that are identifiers or fixed vocabulary, never free text.
@@ -2032,19 +2077,58 @@ mod tests {
         );
     }
 
+    /// Several `--save` runs finishing together (same second, same home)
+    /// each keep their own report, and the next run's prior is the newest.
+    #[tokio::test]
+    async fn concurrent_save_runs_keep_every_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let run = || {
+            let mut o = opts(dir.path().to_path_buf());
+            o.save = true;
+            cmd_scan(home.path(), o)
+        };
+        let codes = tokio::join!(run(), run(), run(), run());
+        assert_eq!(codes, (0, 0, 0, 0));
+        let mut names: Vec<String> = std::fs::read_dir(home.path().join("reports"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        for n in &names {
+            let raw = std::fs::read_to_string(home.path().join("reports").join(n)).unwrap();
+            serde_json::from_str::<schema::AuditReport>(&raw).unwrap();
+        }
+        names.sort_by(|a, b| {
+            report::saved_report_sort_key(a).cmp(&report::saved_report_sort_key(b))
+        });
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let prior = prior_run::load_prior(home.path(), &canonical.to_string_lossy()).unwrap();
+        assert_eq!(&prior.report_file, names.last().unwrap());
+    }
+
     #[tokio::test]
     async fn deep_with_no_finder_is_incomplete_not_silent() {
         let dir = repo_with_module();
         let home = tempfile::tempdir().unwrap();
         let report_path = dir.path().join("r.json");
-        let mut o = opts(dir.path().to_path_buf());
-        o.profile = "deep".into();
-        o.report = Some(report_path.clone());
-        assert_eq!(cmd_scan(home.path(), o).await, 0);
+        let deep = || {
+            let mut o = opts(dir.path().to_path_buf());
+            o.profile = "deep".into();
+            o.report = Some(report_path.clone());
+            o
+        };
+        // Fail closed: no finder means no AI review at all (exit 4), unless
+        // --allow-incomplete asks for the gate exit.
+        assert_eq!(
+            cmd_scan(home.path(), deep()).await,
+            report::AI_UNAVAILABLE_EXIT
+        );
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
         assert_eq!(v["run_status"], "incomplete");
         assert_eq!(v["incomplete_reason"], "engine_unavailable");
+        assert_eq!(cmd_scan_with(home.path(), deep(), true).await, 0);
     }
 
     /// Finder (anthropic) finds one candidate; the only verifiers are the
@@ -2694,6 +2778,57 @@ mod tests {
         assert_eq!(ai.len(), 2);
         assert!(ai.iter().all(|f| f["status"] == "candidate"));
         assert_eq!(cmd_validate(&report_path).await, 0);
+    }
+
+    /// A deep scan whose finders all fail before reaching a model exits
+    /// [`report::AI_UNAVAILABLE_EXIT`] with the report written;
+    /// `--allow-incomplete` restores the gate exit. One reachable finder
+    /// makes it a partial run that keeps the gate exit.
+    #[tokio::test]
+    async fn every_finder_unavailable_exits_4_unless_allowed() {
+        let dir = repo_with_modules(&["a", "b"]);
+        let home = tempfile::tempdir().unwrap();
+        let dead = |id: &str, family: &str| {
+            model(
+                id,
+                family,
+                vec![Err(LlmError::Executor(
+                    "container image vettalon-agents:x is missing".into(),
+                ))],
+            )
+            .0
+        };
+        let report_path = dir.path().join("r.json");
+        let run = |finders: Vec<ModelHandle>, allow: bool| {
+            let mut o = opts(dir.path().to_path_buf());
+            o.profile = "deep".into();
+            o.max_modules = 2;
+            o.report = Some(report_path.clone());
+            o.roster = info(&finders.iter().collect::<Vec<_>>());
+            o.verifiers = finders.clone();
+            o.finders = finders;
+            cmd_scan_with(home.path(), o, allow)
+        };
+
+        let both_dead = vec![dead("codex", "openai"), dead("grok", "xai")];
+        assert_eq!(
+            run(both_dead.clone(), false).await,
+            report::AI_UNAVAILABLE_EXIT
+        );
+        let v = read_report(&report_path);
+        assert_eq!(v["run_status"], "incomplete");
+        assert_eq!(v["incomplete_reason"], "engine_unavailable");
+        assert_eq!(cmd_validate(&report_path).await, 0);
+        assert_eq!(run(both_dead, true).await, 0);
+
+        let (alive, _) = model(
+            "claude",
+            "anthropic",
+            vec![Ok("[]".into()), Ok("[]".into())],
+        );
+        assert_eq!(run(vec![alive, dead("codex", "openai")], false).await, 0);
+        let v = read_report(&report_path);
+        assert_eq!(v["incomplete_reason"], "engine_unavailable");
     }
 
     /// Review H3: no verifier configured ⇒ not_run + incomplete, never

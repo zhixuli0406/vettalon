@@ -23,6 +23,13 @@ use tokio::process::Command;
 use super::cli::{CliSpec, OutputMode, PromptVia};
 use super::{LlmCaller, LlmError};
 
+mod images;
+use images::missing_image_error;
+pub use images::{
+    REGISTRY_PREFIX, SIGNER_IDENTITY_REGEXP, SIGNER_ISSUER, agents_base_image, agents_image,
+    build_images, egress_image, pull_images,
+};
+
 /// The prompt file and final-message file, as seen inside the container.
 const CONTAINER_PROMPT_FILE: &str = "/home/agent/work/prompt.txt";
 const CONTAINER_OUT_FILE: &str = "/home/agent/work/last-message.txt";
@@ -32,9 +39,6 @@ const WORK_OUT_FILE: &str = "last-message.txt";
 /// Cap on output read back from a container run.
 const OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 
-/// Image tags are tied to the vettalon version so a rebuild is explicit.
-pub const AGENTS_IMAGE: &str = concat!("vettalon-agents:", env!("CARGO_PKG_VERSION"));
-pub const EGRESS_IMAGE: &str = concat!("vettalon-egress:", env!("CARGO_PKG_VERSION"));
 pub const NETWORK: &str = "vettalon-int";
 pub const EGRESS_CONTAINER: &str = "vettalon-egress";
 pub const PROXY_URL: &str = "http://vettalon-egress:8888";
@@ -43,11 +47,6 @@ pub const CONTAINER_HOME: &str = "/home/agent";
 pub const CONTAINER_WORK: &str = "/home/agent/work";
 /// Label on every agent container, for cleanup.
 pub const AGENT_LABEL: &str = "vettalon.agent=1";
-
-const AGENTS_DOCKERFILE: &str = include_str!("../../../../docker/agents/Dockerfile");
-const EGRESS_DOCKERFILE: &str = include_str!("../../../../docker/egress/Dockerfile");
-const EGRESS_CONF: &str = include_str!("../../../../docker/egress/tinyproxy.conf");
-const EGRESS_ALLOWLIST: &str = include_str!("../../../../docker/egress/allowlist");
 
 const DOCKER_CALL_LIMIT: Duration = Duration::from_secs(60);
 
@@ -213,21 +212,26 @@ async fn image_present(docker_bin: &str, image: &str) -> bool {
 /// Whether the agent image exists locally (for auto-detection).
 pub async fn agents_image_present() -> bool {
     match docker_bin() {
-        Ok(bin) => image_present(&bin, AGENTS_IMAGE).await,
+        Ok(bin) => image_present(&bin, agents_image()).await,
         Err(_) => false,
     }
+}
+
+/// Both images this binary needs exist locally. Only `docker image
+/// inspect` runs here, so a missing image stops a call before any container.
+async fn check_images(docker_bin: &str) -> Result<(), String> {
+    for image in [agents_image(), egress_image()] {
+        if !image_present(docker_bin, image).await {
+            return Err(missing_image_error(image));
+        }
+    }
+    Ok(())
 }
 
 /// Make sure the internal network and the egress proxy are up. Idempotent.
 pub async fn ensure_infra() -> Result<(), String> {
     let bin = docker_bin()?;
-    for image in [AGENTS_IMAGE, EGRESS_IMAGE] {
-        if !image_present(&bin, image).await {
-            return Err(format!(
-                "container image {image} is missing; run `vettalon agents build` once"
-            ));
-        }
-    }
+    check_images(&bin).await?;
     let net = docker(
         &bin,
         &["network", "inspect", "--format", "{{.Internal}}", NETWORK],
@@ -276,7 +280,7 @@ pub async fn ensure_infra() -> Result<(), String> {
             "--security-opt=no-new-privileges",
             "--memory=128m",
             "--pids-limit=64",
-            EGRESS_IMAGE,
+            egress_image(),
         ],
     )
     .await?;
@@ -312,42 +316,6 @@ pub async fn force_remove(name: &str) {
     if let Ok(bin) = docker_bin() {
         let _ = docker(&bin, &["rm", "-f", name]).await;
     }
-}
-
-/// `vettalon agents build`: build both images from the definitions
-/// embedded in this binary. Needs network access (package downloads).
-pub async fn build_images() -> Result<(), String> {
-    let bin = docker_bin()?;
-    let ctx = tempfile::Builder::new()
-        .prefix("vettalon-build-")
-        .tempdir()
-        .map_err(|e| format!("cannot create build dir: {e}"))?;
-    let write = |rel: &str, body: &str| -> Result<(), String> {
-        let p = ctx.path().join(rel);
-        std::fs::create_dir_all(p.parent().expect("has parent")).map_err(|e| e.to_string())?;
-        std::fs::write(&p, body).map_err(|e| e.to_string())
-    };
-    write("agents/Dockerfile", AGENTS_DOCKERFILE)?;
-    write("egress/Dockerfile", EGRESS_DOCKERFILE)?;
-    write("egress/tinyproxy.conf", EGRESS_CONF)?;
-    write("egress/allowlist", EGRESS_ALLOWLIST)?;
-    for (tag, dir) in [(EGRESS_IMAGE, "egress"), (AGENTS_IMAGE, "agents")] {
-        eprintln!(
-            "[vettalon] {}",
-            crate::tr!("建置 {tag}…", "building {tag}…")
-        );
-        let status = Command::new(&bin)
-            .args(["build", "-t", tag])
-            .arg(ctx.path().join(dir))
-            .stdin(Stdio::null())
-            .status()
-            .await
-            .map_err(|e| format!("cannot run docker build: {e}"))?;
-        if !status.success() {
-            return Err(format!("docker build {tag} failed"));
-        }
-    }
-    Ok(())
 }
 
 /// `vettalon agents stop`: remove the proxy and the network.
@@ -596,7 +564,7 @@ mod tests {
     fn codex_container_spec() -> (CliSpec, ContainerSpec) {
         let spec = CliSpec::preset("codex", None, Duration::from_secs(60)).unwrap();
         let cspec = ContainerSpec {
-            image: AGENTS_IMAGE.to_string(),
+            image: agents_image().to_string(),
             auth_files: vec![(
                 PathBuf::from("/host/.codex/auth.json"),
                 ".codex/auth.json".into(),
@@ -645,10 +613,27 @@ mod tests {
         assert!(e.to_string().contains("prompt_via = arg"));
     }
 
-    #[test]
-    fn embedded_definitions_are_the_repo_files() {
-        assert!(AGENTS_DOCKERFILE.contains("@openai/codex"));
-        assert!(EGRESS_CONF.contains("FilterDefaultDeny Yes"));
-        assert!(EGRESS_ALLOWLIST.lines().all(|l| l.ends_with('$')));
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_image_fails_before_any_container_starts() {
+        // A fake `docker` that records its argv and reports every image as
+        // absent: ensure_infra must stop at `image inspect`, never `run`.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let fake = dir.path().join("docker");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", log.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = check_images(fake.to_str().unwrap()).await.unwrap_err();
+        assert_eq!(e, missing_image_error(agents_image()));
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("image inspect")),
+            "{calls}"
+        );
     }
 }

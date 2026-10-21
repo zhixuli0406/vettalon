@@ -115,6 +115,10 @@ pub struct UpstreamInfo {
     /// as DATA for human confirmation (never acted on).
     #[serde(default)]
     pub policy_requirements: Vec<String>,
+    /// Where `github` came from (package metadata file and field, or the Go
+    /// module path). Absent in reports written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_source: Option<crate::disclose::UpstreamOrigin>,
 }
 
 /// Stage evidence is unknown for reports written before this ledger existed.
@@ -376,7 +380,7 @@ impl EngineAuditor {
         };
         let report = crate::audit::run_scan(&self.home, &opts)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.english())?;
         Ok(DirAuditResult {
             findings: report.findings,
             evidence: DependencyAuditEvidence {
@@ -1268,6 +1272,8 @@ fn project_meta_for(dep: &DependencyHunt) -> crate::disclose::ProjectMeta {
         version: Some(dep.target.version.clone()),
         ecosystem: Some(ecosystem.to_string()),
         github: dep.upstream.github.clone(),
+        github_source: dep.upstream.github_source.clone(),
+        non_github_upstream: None,
         commit: None,
         security_policy: None,
         security_emails: dep.upstream.security_emails.clone(),
@@ -1463,53 +1469,40 @@ fn package_root(extracted: &Path) -> std::path::PathBuf {
 }
 
 /// Derive the upstream disclosure target from a fetched dependency's source:
-/// reuse `disclose::detect_project` (SECURITY.md, manifests), and fill the
-/// GitHub slug from the manifest `repository` field (the extracted source has
-/// no `.git`, so detect_project cannot).
+/// reuse `disclose::detect_project_as` (SECURITY.md, manifests, and the
+/// repository URL in the package's own metadata first, since the extracted
+/// source has no `.git`). For Go the module path the registry served names
+/// the repository and wins over any other manifest in the tree.
 fn detect_upstream(extracted: &Path, target: &DependencyTarget) -> UpstreamInfo {
     let root = package_root(extracted);
-    let meta = crate::disclose::detect_project(&root);
-    let github = meta.github.clone().or_else(|| {
-        manifest_repository(&root, target)
-            .as_deref()
-            .and_then(crate::disclose::github_slug)
-    });
+    let eco = match target.ecosystem {
+        Ecosystem::Cargo => "Rust",
+        Ecosystem::Npm => "npm",
+        Ecosystem::PyPi => "pip",
+        Ecosystem::Go => "Go",
+    };
+    let meta = crate::disclose::detect_project_as(&root, Some(eco));
+    let go_module = (target.ecosystem == Ecosystem::Go)
+        .then(|| crate::disclose::github_slug(&crate::disclose::go_module_url(&target.name)))
+        .flatten()
+        .map(|slug| {
+            (
+                slug,
+                crate::disclose::UpstreamOrigin::PackageMetadata {
+                    file: "go.mod".into(),
+                    field: "module path".into(),
+                },
+            )
+        });
+    let (github, github_source) = match go_module {
+        Some((g, src)) => (Some(g), Some(src)),
+        None => (meta.github, meta.github_source),
+    };
     UpstreamInfo {
         github,
         security_emails: meta.security_emails,
         policy_requirements: meta.policy_requirements,
-    }
-}
-
-/// Best-effort upstream repository URL from a package manifest.
-fn manifest_repository(root: &Path, target: &DependencyTarget) -> Option<String> {
-    match target.ecosystem {
-        Ecosystem::Go => Some(format!("https://{}", target.name)), // module path is the repo
-        Ecosystem::Cargo => {
-            let t = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
-            let m: toml::Value = toml::from_str(&t).ok()?;
-            m.get("package")?
-                .get("repository")?
-                .as_str()
-                .map(str::to_string)
-        }
-        Ecosystem::Npm => {
-            let t = std::fs::read_to_string(root.join("package.json")).ok()?;
-            let v: serde_json::Value = serde_json::from_str(&t).ok()?;
-            match v.get("repository") {
-                Some(serde_json::Value::String(s)) => Some(s.clone()),
-                Some(obj) => obj.get("url").and_then(|u| u.as_str()).map(str::to_string),
-                None => None,
-            }
-        }
-        Ecosystem::PyPi => {
-            let t = std::fs::read_to_string(root.join("pyproject.toml")).ok()?;
-            let m: toml::Value = toml::from_str(&t).ok()?;
-            let urls = m.get("project")?.get("urls")?;
-            ["Repository", "Source", "Homepage"]
-                .iter()
-                .find_map(|k| urls.get(k).and_then(|u| u.as_str()).map(str::to_string))
-        }
+        github_source,
     }
 }
 
@@ -1523,6 +1516,52 @@ mod tests {
     use crate::audit::schema::{FindingKind, Severity};
     use crate::hunt::Ecosystem;
     use std::collections::HashMap;
+
+    /// A dependency's stored `error` is report data: a zh-TW terminal must
+    /// not write Chinese into it (the report renders later in any language).
+    #[test]
+    fn engine_auditor_error_is_english_under_a_zh_terminal() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("no-such-source");
+        let auditor = EngineAuditor {
+            home: home.path().to_path_buf(),
+            finders: Vec::new(),
+            verifiers: Vec::new(),
+            poc_models: Vec::new(),
+            roster: Vec::new(),
+            max_modules: 1,
+            poc: false,
+        };
+        let err = crate::lang::with(crate::lang::Lang::ZhTw, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(auditor.audit_with_evidence(&missing))
+                .err()
+                .expect("a missing source directory fails before any model call")
+        });
+        assert!(err.starts_with("cannot resolve the target path"), "{err}");
+        assert!(
+            !err.chars()
+                .any(|c| matches!(c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF)),
+            "{err}"
+        );
+        // The terminal still gets its own language.
+        let zh = crate::lang::with(crate::lang::Lang::ZhTw, || {
+            crate::audit::ScanError::NotADirectory("x".into()).to_string()
+        });
+        assert!(zh.contains("資料夾"), "{zh}");
+    }
+
+    /// Reports written by older versions may carry a zh-TW `error`; they
+    /// still parse and render as-is.
+    #[test]
+    fn legacy_zh_dependency_error_still_parses() {
+        let raw = r#"{"target":{"ecosystem":"cargo","name":"legacy","version":"1.0.0","direct":true},"known":[],"audited":false,"error":"audit failed: 掃描目標不是資料夾：/x","upstream":{"github":null,"security_emails":[]},"findings":[]}"#;
+        let d: DependencyHunt = serde_json::from_str(raw).unwrap();
+        assert!(d.error.unwrap().contains("資料夾"));
+    }
 
     fn target(name: &str, direct: bool) -> DependencyTarget {
         DependencyTarget {
@@ -1960,6 +1999,7 @@ mod tests {
                 github: Some("acme/vuln-lib".into()),
                 security_emails: vec![],
                 policy_requirements: vec![],
+                github_source: None,
             },
             findings: vec![nh, nh2],
             seeds: None,
@@ -2505,6 +2545,7 @@ mod tests {
                 github: Some("evil/evil-pkg".into()),
                 security_emails: vec![],
                 policy_requirements: vec![],
+                github_source: None,
             },
             findings: vec![smuggled],
             seeds: None,
@@ -2578,6 +2619,70 @@ mod tests {
                 .join(crate::disclose::ledger::LEDGER_FILE)
                 .exists(),
             "nothing recorded"
+        );
+    }
+
+    #[test]
+    fn upstream_prefers_the_package_own_manifest_and_go_module_path() {
+        use crate::disclose::UpstreamOrigin;
+        let write = |dir: &Path, files: &[(&str, &str)]| {
+            for (name, body) in files {
+                std::fs::write(dir.join(name), body).unwrap();
+            }
+        };
+        // npm package that also ships a Cargo.toml (e.g. a native addon).
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("package");
+        std::fs::create_dir(&pkg).unwrap();
+        write(
+            &pkg,
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"a","version":"1.0.0","repository":"github:npm-owner/a"}"#,
+                ),
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"a\"\nrepository = \"https://github.com/other/a\"\n",
+                ),
+            ],
+        );
+        let mut t = target("a", true);
+        t.ecosystem = Ecosystem::Npm;
+        let up = detect_upstream(tmp.path(), &t);
+        assert_eq!(up.github.as_deref(), Some("npm-owner/a"));
+        assert_eq!(
+            up.github_source,
+            Some(UpstreamOrigin::PackageMetadata {
+                file: "package.json".into(),
+                field: "repository".into(),
+            })
+        );
+
+        // Go module zip with a stray package.json: the module path wins, and a
+        // major-version suffix still names the repository.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &[
+                ("go.mod", "module github.com/go-owner/mod/v2\n"),
+                (
+                    "package.json",
+                    r#"{"name":"x","repository":"github:other/x"}"#,
+                ),
+                ("setup.cfg", "[flake8]\nmax-line-length = 100\n"),
+            ],
+        );
+        let mut t = target("github.com/go-owner/mod/v2", true);
+        t.ecosystem = Ecosystem::Go;
+        let up = detect_upstream(tmp.path(), &t);
+        assert_eq!(up.github.as_deref(), Some("go-owner/mod"));
+        assert_eq!(
+            up.github_source,
+            Some(UpstreamOrigin::PackageMetadata {
+                file: "go.mod".into(),
+                field: "module path".into(),
+            })
         );
     }
 }
