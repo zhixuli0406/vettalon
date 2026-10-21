@@ -236,8 +236,10 @@ docker buildx imagetools inspect "$IMAGE" --format '{{ json .Provenance }}'
 docker buildx imagetools inspect "$IMAGE" --format '{{ json .SBOM }}'
 ```
 
-`vettalon agents pull` runs the same `cosign verify` (identity, issuer and
-repository), checks that every signature names this repository and a single
+cosign v2 checks the image signature; cosign v3 may report the provenance
+attestation bundle instead (same workflow identity, same digest), and either
+passes the identity check. `vettalon agents pull` runs the same `cosign verify`
+(identity, issuer and repository), checks that every signature names this repository and a single
 digest, then pulls that digest and tags it locally. Without `cosign` on `PATH`
 it refuses (cosign is taken from `PATH`, so whoever controls `PATH` controls
 the check). `--no-verify` pulls the tag unchecked and is insecure. Scans never

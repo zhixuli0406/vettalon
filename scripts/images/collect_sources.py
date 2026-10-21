@@ -30,7 +30,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import urllib.error
@@ -46,7 +45,12 @@ CODEX_PLATFORM = {
     "linux/arm64": ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
 }
 CODEX_NODE_MODULES = "/usr/local/lib/node_modules/@openai/codex"
-APORTS = "https://gitlab.alpinelinux.org/alpine/aports/-/archive/{c}/aports-{c}.tar.gz?path={repo}/{origin}"
+# aports by commit: Alpine's own git first, then its GitHub mirror. Git checks
+# every object against the commit id, so either gives the same bytes.
+# (gitlab.alpinelinux.org's web archive endpoint answers GitHub runners with
+# HTTP 418, so archives are not used.)
+APORTS_GIT = ("https://gitlab.alpinelinux.org/alpine/aports.git",
+              "https://github.com/alpinelinux/aports.git")
 DISTFILES = "https://distfiles.alpinelinux.org/distfiles/v{branch}/{name}"
 SNAPSHOT_MR = "https://snapshot.debian.org/mr/package/{src}/{ver}/srcfiles?fileinfo=1"
 SNAPSHOT_FILE = "https://snapshot.debian.org/file/{sha1}"
@@ -177,7 +181,7 @@ def download(url: str, dest: Path, tries: int = 5) -> None:
             return
         except urllib.error.HTTPError as e:
             last = e
-            if e.code in (404, 410):
+            if e.code in (403, 404, 410, 418):
                 break
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             last = e
@@ -274,6 +278,38 @@ def check_apkbuild(sources: dict, sums: dict, origin: str) -> tuple[dict, dict]:
     return sources, sums
 
 
+def git(*args: str, cwd: Path) -> None:
+    subprocess.run(["git", "-c", "advice.detachedHead=false", *args], cwd=cwd, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
+
+
+def fetch_aport(commit: str, origin: str, work: Path) -> tuple[Path, str]:
+    """The aports directory of `origin` at `commit` (main, else community)."""
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise SourceError(f"bad aports commit {commit!r}")
+    safe_name(origin)
+    errors = []
+    for remote in APORTS_GIT:
+        repo = work / f"aports-{commit}-{len(errors)}"
+        try:
+            if not (repo / ".git").exists():
+                repo.mkdir(parents=True)
+                git("init", "-q", cwd=repo)
+                git("fetch", "-q", "--depth", "1", "--filter=blob:none", remote, commit, cwd=repo)
+            for section in ("main", "community"):
+                try:
+                    git("checkout", "-q", "FETCH_HEAD", "--", f"{section}/{origin}", cwd=repo)
+                except subprocess.CalledProcessError:
+                    continue
+                if (repo / section / origin / "APKBUILD").is_file():
+                    return repo / section / origin, remote
+            raise SourceError(f"{origin} is in neither main nor community at {commit}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            err = getattr(e, "stderr", b"") or b""
+            errors.append(f"{remote}: {err.decode(errors='replace').strip()[:200] or e}")
+    raise SourceError(f"aport {origin} at {commit}: {'; '.join(errors)}")
+
+
 def collect_alpine(image: str, work: Path, out: Path) -> list[dict]:
     pkgs, branch = {}, None
     for platform in PLATFORMS:
@@ -288,23 +324,7 @@ def collect_alpine(image: str, work: Path, out: Path) -> list[dict]:
         branch = b
     components = []
     for (origin, commit), binaries in sorted(pkgs.items()):
-        aport, misses = None, []
-        for repo in ("main", "community"):
-            tgz = work / f"{origin}-{commit}-{repo}.tar.gz"
-            try:
-                download(APORTS.format(c=commit, repo=repo, origin=origin), tgz)
-            except SourceError as e:
-                misses.append(str(e))
-                continue
-            unpack = work / f"aport-{origin}-{commit}-{repo}"
-            with tarfile.open(tgz) as t:
-                t.extractall(unpack, filter="data")
-            found = list(unpack.glob(f"*/{repo}/{origin}/APKBUILD"))
-            if found:
-                aport = found[0].parent
-                break
-        if aport is None:
-            raise SourceError(f"aport {origin} not found at {commit}: {'; '.join(misses)}")
+        aport, aports_remote = fetch_aport(commit, origin, work)
         version = sorted({b["version"] for b in binaries})
         target = out / "alpine" / f"{origin}-{version[0]}-{commit[:12]}"
         shutil.copytree(aport, target)
@@ -323,7 +343,8 @@ def collect_alpine(image: str, work: Path, out: Path) -> list[dict]:
                 used = fetch_checked([url, DISTFILES.format(branch=branch, name=name)], path, "sha512", want)
             files.append({"name": name, "sha512": want, "from": used})
         components.append({
-            "kind": "alpine", "origin": origin, "aports_commit": commit, "versions": version,
+            "kind": "alpine", "origin": origin, "aports_commit": commit,
+            "aports_remote": aports_remote, "versions": version,
             "binary_packages": sorted({b["name"] for b in binaries}),
             "licenses": sorted({b["license"] for b in binaries}),
             "dir": str(target.relative_to(out)), "files": files,

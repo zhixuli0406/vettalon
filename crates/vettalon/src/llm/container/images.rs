@@ -270,7 +270,7 @@ fn verified_digest(cosign_stdout: &str, repo: &str) -> Result<String, String> {
         let reference = c["identity"]["docker-reference"]
             .as_str()
             .unwrap_or_default();
-        if reference != repo {
+        if reference_repo(reference) != repo {
             return Err(format!("signature is for {reference:?}, not {repo}"));
         }
         let d = c["image"]["docker-manifest-digest"]
@@ -285,6 +285,17 @@ fn verified_digest(cosign_stdout: &str, repo: &str) -> Result<String, String> {
         }
     }
     digest.ok_or_else(|| "cosign verified no signature".into())
+}
+
+/// The repository of a reference: cosign v2 records the bare repository,
+/// cosign v3 echoes the reference it was given (`repo:tag`).
+fn reference_repo(r: &str) -> &str {
+    let r = r.split_once('@').map_or(r, |(repo, _)| repo);
+    match (r.rfind(':'), r.rfind('/')) {
+        (Some(colon), Some(slash)) if colon > slash => &r[..colon],
+        (Some(colon), None) => &r[..colon],
+        _ => r,
+    }
 }
 
 fn is_sha256_digest(d: &str) -> bool {
@@ -710,14 +721,28 @@ exit 0"#
         };
         let repo = "ghcr.io/zhixuli0406/vettalon-egress";
         let other = format!("sha256:{}", "b".repeat(64));
-        assert_eq!(
-            verified_digest(&format!("[{}]", sig(repo, FAKE_DIGEST)), repo).unwrap(),
-            FAKE_DIGEST
-        );
+        // cosign v2 records the repository, cosign v3 echoes `repo:tag`.
+        for reference in [
+            repo.to_string(),
+            format!("{repo}:708d7566775b"),
+            format!("{repo}@{FAKE_DIGEST}"),
+        ] {
+            assert_eq!(
+                verified_digest(&format!("[{}]", sig(&reference, FAKE_DIGEST)), repo).unwrap(),
+                FAKE_DIGEST
+            );
+        }
+        assert_eq!(reference_repo("localhost:5000/r"), "localhost:5000/r");
+        assert_eq!(reference_repo("localhost:5000/r:t"), "localhost:5000/r");
         for bad in [
             "[]".to_string(),
             "not json".to_string(),
             format!("[{}]", sig("ghcr.io/evil/vettalon-egress", FAKE_DIGEST)),
+            format!(
+                "[{}]",
+                sig("ghcr.io/evil/vettalon-egress:708d7566775b", FAKE_DIGEST)
+            ),
+            format!("[{}]", sig(&format!("{repo}-x:t"), FAKE_DIGEST)),
             format!("[{},{}]", sig(repo, FAKE_DIGEST), sig(repo, &other)),
             format!("[{}]", sig(repo, "sha256:XYZ")),
         ] {
