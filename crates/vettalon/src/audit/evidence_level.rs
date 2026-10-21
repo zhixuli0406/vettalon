@@ -456,7 +456,9 @@ impl Finding {
         (!bounded.is_empty()).then(|| bounded.to_string())
     }
 
-    /// One line for the CLI: level and gaps by key.
+    /// One line of keys: level, gaps, counter-evidence and fix check. The
+    /// terminal summary renders the same facts in plain words
+    /// (`report_evidence`).
     pub fn evidence_summary(&self) -> String {
         let gaps: Vec<&str> = self.proof_gaps().iter().map(|g| g.key()).collect();
         let mut line = format!(

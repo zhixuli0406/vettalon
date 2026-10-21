@@ -1,0 +1,212 @@
+{
+ "https://api.github.com/repos/zhixuli0406/vettalon/actions/runs/39410338641/attempts/1": {
+  "conclusion": "failure",
+  "run_attempt": 1
+ },
+ "https://api.github.com/repos/zhixuli0406/vettalon/actions/runs/39410338641/attempts/2": {
+  "conclusion": "failure",
+  "run_attempt": 2
+ },
+ "https://api.github.com/repos/zhixuli0406/vettalon/actions/runs/39410338641/attempts/3": {
+  "conclusion": "success",
+  "run_attempt": 3
+ },
+ "https://api.github.com/repos/zhixuli0406/vettalon/actions/workflows/release.yml/runs?branch=v0.3.0&per_page=100": {
+  "total_count": 1,
+  "workflow_runs": [
+   {
+    "conclusion": "failure",
+    "head_branch": "v0.3.0",
+    "head_sha": "25dc109667b914353673ebdd7bc5ee50b324718b",
+    "id": 39410338641,
+    "path": ".github/workflows/release.yml",
+    "repository": {
+     "full_name": "zhixuli0406/vettalon"
+    },
+    "run_attempt": 4
+   }
+  ]
+ },
+ "https://api.github.com/repos/zhixuli0406/vettalon/actions/workflows/release.yml/runs?branch=v0.3.1&per_page=100": {
+  "total_count": 1,
+  "workflow_runs": [
+   {
+    "conclusion": "success",
+    "head_branch": "v0.3.1",
+    "head_sha": "3c5a459f9338acab92e91e824d26343fd3a129cc",
+    "id": 39545317385,
+    "path": ".github/workflows/release.yml",
+    "repository": {
+     "full_name": "zhixuli0406/vettalon"
+    },
+    "run_attempt": 1
+   }
+  ]
+ },
+ "https://api.github.com/repos/zhixuli0406/vettalon/commits/refs/tags/v0.3.0": {
+  "sha": "25dc109667b914353673ebdd7bc5ee50b324718b"
+ },
+ "https://api.github.com/repos/zhixuli0406/vettalon/commits/refs/tags/v0.3.1": {
+  "sha": "3c5a459f9338acab92e91e824d26343fd3a129cc"
+ },
+ "https://api.github.com/repos/zhixuli0406/vettalon/releases/tags/v0.3.0": {
+  "draft": false,
+  "tag_name": "v0.3.0"
+ },
+ "https://api.github.com/repos/zhixuli0406/vettalon/releases/tags/v0.3.1": {
+  "draft": false,
+  "tag_name": "v0.3.1"
+ },
+ "https://registry.npmjs.org/-/npm/v1/attestations/@vettalon%2Fdarwin-arm64@0.3.0": {
+  "attestations": [
+   {
+    "bundle": {
+     "dsseEnvelope": {
+      "payload": "eyJfdHlwZSI6ICJodHRwczovL2luLXRvdG8uaW8vU3RhdGVtZW50L3YxIiwgInByZWRpY2F0ZSI6IHsiYnVpbGREZWZpbml0aW9uIjogeyJidWlsZFR5cGUiOiAiaHR0cHM6Ly9zbHNhLWZyYW1ld29yay5naXRodWIuaW8vZ2l0aHViLWFjdGlvbnMtYnVpbGR0eXBlcy93b3JrZmxvdy92MSIsICJleHRlcm5hbFBhcmFtZXRlcnMiOiB7IndvcmtmbG93IjogeyJwYXRoIjogIi5naXRodWIvd29ya2Zsb3dzL3JlbGVhc2UueW1sIiwgInJlZiI6ICJyZWZzL3RhZ3MvdjAuMy4wIiwgInJlcG9zaXRvcnkiOiAiaHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uIn19LCAiaW50ZXJuYWxQYXJhbWV0ZXJzIjogeyJnaXRodWIiOiB7ImV2ZW50X25hbWUiOiAicHVzaCIsICJyZXBvc2l0b3J5X2lkIjogIjE0MTY4NzYxOTUiLCAicmVwb3NpdG9yeV9vd25lcl9pZCI6ICIxMDk2NTk0ODMifX0sICJyZXNvbHZlZERlcGVuZGVuY2llcyI6IFt7ImRpZ2VzdCI6IHsiZ2l0Q29tbWl0IjogIjI1ZGMxMDk2NjdiOTE0MzUzNjczZWJkZDdiYzVlZTUwYjMyNDcxOGIifSwgInVyaSI6ICJnaXQraHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uQHJlZnMvdGFncy92MC4zLjAifV19LCAicnVuRGV0YWlscyI6IHsiYnVpbGRlciI6IHsiaWQiOiAiaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvcnVubmVyL2dpdGh1Yi1ob3N0ZWQifSwgIm1ldGFkYXRhIjogeyJpbnZvY2F0aW9uSWQiOiAiaHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uL2FjdGlvbnMvcnVucy8zOTQxMDMzODY0MS9hdHRlbXB0cy80In19fSwgInByZWRpY2F0ZVR5cGUiOiAiaHR0cHM6Ly9zbHNhLmRldi9wcm92ZW5hbmNlL3YxIiwgInN1YmplY3QiOiBbeyJkaWdlc3QiOiB7InNoYTUxMiI6ICJiNTMwZmEzNmMxMTk3ODYxMGIzNzk3OGEwZjEzZjY2OWE0MDIwODk4OGUxYjNiY2E1NzZhN2M3YTkwMjNkNDJiYWE4NjE4OWRkNWFmMjgwYmJhNWVjMjkwN2FmNjYyODA3YzIxMzNjOGY3YjIxMTIxYzQwOTMxMTVhODRjMWZhNCJ9LCAibmFtZSI6ICJwa2c6bnBtLyU0MHZldHRhbG9uL2Rhcndpbi1hcm02NEAwLjMuMCJ9XX0="
+     }
+    },
+    "predicateType": "https://slsa.dev/provenance/v1"
+   }
+  ]
+ },
+ "https://registry.npmjs.org/-/npm/v1/attestations/@vettalon%2Fdarwin-arm64@0.3.1": {
+  "attestations": [
+   {
+    "bundle": {
+     "dsseEnvelope": {
+      "payload": "eyJfdHlwZSI6ICJodHRwczovL2luLXRvdG8uaW8vU3RhdGVtZW50L3YxIiwgInByZWRpY2F0ZSI6IHsiYnVpbGREZWZpbml0aW9uIjogeyJidWlsZFR5cGUiOiAiaHR0cHM6Ly9zbHNhLWZyYW1ld29yay5naXRodWIuaW8vZ2l0aHViLWFjdGlvbnMtYnVpbGR0eXBlcy93b3JrZmxvdy92MSIsICJleHRlcm5hbFBhcmFtZXRlcnMiOiB7IndvcmtmbG93IjogeyJwYXRoIjogIi5naXRodWIvd29ya2Zsb3dzL3JlbGVhc2UueW1sIiwgInJlZiI6ICJyZWZzL3RhZ3MvdjAuMy4xIiwgInJlcG9zaXRvcnkiOiAiaHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uIn19LCAiaW50ZXJuYWxQYXJhbWV0ZXJzIjogeyJnaXRodWIiOiB7ImV2ZW50X25hbWUiOiAicHVzaCIsICJyZXBvc2l0b3J5X2lkIjogIjE0MTY4NzYxOTUiLCAicmVwb3NpdG9yeV9vd25lcl9pZCI6ICIxMDk2NTk0ODMifX0sICJyZXNvbHZlZERlcGVuZGVuY2llcyI6IFt7ImRpZ2VzdCI6IHsiZ2l0Q29tbWl0IjogIjNjNWE0NTlmOTMzOGFjYWI5MmU5MWU4MjRkMjYzNDNmZDNhMTI5Y2MifSwgInVyaSI6ICJnaXQraHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uQHJlZnMvdGFncy92MC4zLjEifV19LCAicnVuRGV0YWlscyI6IHsiYnVpbGRlciI6IHsiaWQiOiAiaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvcnVubmVyL2dpdGh1Yi1ob3N0ZWQifSwgIm1ldGFkYXRhIjogeyJpbnZvY2F0aW9uSWQiOiAiaHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uL2FjdGlvbnMvcnVucy8zOTU0NTMxNzM4NS9hdHRlbXB0cy8xIn19fSwgInByZWRpY2F0ZVR5cGUiOiAiaHR0cHM6Ly9zbHNhLmRldi9wcm92ZW5hbmNlL3YxIiwgInN1YmplY3QiOiBbeyJkaWdlc3QiOiB7InNoYTUxMiI6ICJjOTM0NGRkMWUzMTY3ZDBhNzc2ZWI0ZWI2MWQxMTc3ODUxYjEzYjZiMDU0NGNiYWJhZTkxZDJlZDNhODBjNWIzNGMyZDBjNDBiYjQzZTU2YWM4Mzc2MDBmZDAxZTNkM2UwYjA0YWMxZjA0YTMyNDZmZWQyZTJiOTcwMzY5ZTc3OCJ9LCAibmFtZSI6ICJwa2c6bnBtLyU0MHZldHRhbG9uL2Rhcndpbi1hcm02NEAwLjMuMSJ9XX0="
+     }
+    },
+    "predicateType": "https://slsa.dev/provenance/v1"
+   }
+  ]
+ },
+ "https://registry.npmjs.org/-/npm/v1/attestations/vettalon@0.3.0": {
+  "attestations": [
+   {
+    "bundle": {
+     "dsseEnvelope": {
+      "payload": "eyJfdHlwZSI6ICJodHRwczovL2luLXRvdG8uaW8vU3RhdGVtZW50L3YxIiwgInByZWRpY2F0ZSI6IHsiYnVpbGREZWZpbml0aW9uIjogeyJidWlsZFR5cGUiOiAiaHR0cHM6Ly9zbHNhLWZyYW1ld29yay5naXRodWIuaW8vZ2l0aHViLWFjdGlvbnMtYnVpbGR0eXBlcy93b3JrZmxvdy92MSIsICJleHRlcm5hbFBhcmFtZXRlcnMiOiB7IndvcmtmbG93IjogeyJwYXRoIjogIi5naXRodWIvd29ya2Zsb3dzL3JlbGVhc2UueW1sIiwgInJlZiI6ICJyZWZzL3RhZ3MvdjAuMy4wIiwgInJlcG9zaXRvcnkiOiAiaHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uIn19LCAiaW50ZXJuYWxQYXJhbWV0ZXJzIjogeyJnaXRodWIiOiB7ImV2ZW50X25hbWUiOiAicHVzaCIsICJyZXBvc2l0b3J5X2lkIjogIjE0MTY4NzYxOTUiLCAicmVwb3NpdG9yeV9vd25lcl9pZCI6ICIxMDk2NTk0ODMifX0sICJyZXNvbHZlZERlcGVuZGVuY2llcyI6IFt7ImRpZ2VzdCI6IHsiZ2l0Q29tbWl0IjogIjI1ZGMxMDk2NjdiOTE0MzUzNjczZWJkZDdiYzVlZTUwYjMyNDcxOGIifSwgInVyaSI6ICJnaXQraHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uQHJlZnMvdGFncy92MC4zLjAifV19LCAicnVuRGV0YWlscyI6IHsiYnVpbGRlciI6IHsiaWQiOiAiaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvcnVubmVyL2dpdGh1Yi1ob3N0ZWQifSwgIm1ldGFkYXRhIjogeyJpbnZvY2F0aW9uSWQiOiAiaHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uL2FjdGlvbnMvcnVucy8zOTQxMDMzODY0MS9hdHRlbXB0cy8zIn19fSwgInByZWRpY2F0ZVR5cGUiOiAiaHR0cHM6Ly9zbHNhLmRldi9wcm92ZW5hbmNlL3YxIiwgInN1YmplY3QiOiBbeyJkaWdlc3QiOiB7InNoYTUxMiI6ICJjYTFkOGE1ZDllNTUxNGI5ZTRhNmM5YjBkNDJmN2U2YTNhMmM5YWU5ZjQzZjViYjVmMzgzNzhkMTlkZmNkZGU4OWUzYzg4MzVlZWQ5ZDNmMDUxOTdiOWE5ODcwNDM3NTU1NjFhMTdlNmRjMzI0ZjQ5ZTZhMWNlNWQyY2IzMmQ3YyJ9LCAibmFtZSI6ICJwa2c6bnBtL3ZldHRhbG9uQDAuMy4wIn1dfQ=="
+     }
+    },
+    "predicateType": "https://slsa.dev/provenance/v1"
+   }
+  ]
+ },
+ "https://registry.npmjs.org/-/npm/v1/attestations/vettalon@0.3.1": {
+  "attestations": [
+   {
+    "bundle": {
+     "dsseEnvelope": {
+      "payload": "eyJfdHlwZSI6ICJodHRwczovL2luLXRvdG8uaW8vU3RhdGVtZW50L3YxIiwgInByZWRpY2F0ZSI6IHsiYnVpbGREZWZpbml0aW9uIjogeyJidWlsZFR5cGUiOiAiaHR0cHM6Ly9zbHNhLWZyYW1ld29yay5naXRodWIuaW8vZ2l0aHViLWFjdGlvbnMtYnVpbGR0eXBlcy93b3JrZmxvdy92MSIsICJleHRlcm5hbFBhcmFtZXRlcnMiOiB7IndvcmtmbG93IjogeyJwYXRoIjogIi5naXRodWIvd29ya2Zsb3dzL3JlbGVhc2UueW1sIiwgInJlZiI6ICJyZWZzL3RhZ3MvdjAuMy4xIiwgInJlcG9zaXRvcnkiOiAiaHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uIn19LCAiaW50ZXJuYWxQYXJhbWV0ZXJzIjogeyJnaXRodWIiOiB7ImV2ZW50X25hbWUiOiAicHVzaCIsICJyZXBvc2l0b3J5X2lkIjogIjE0MTY4NzYxOTUiLCAicmVwb3NpdG9yeV9vd25lcl9pZCI6ICIxMDk2NTk0ODMifX0sICJyZXNvbHZlZERlcGVuZGVuY2llcyI6IFt7ImRpZ2VzdCI6IHsiZ2l0Q29tbWl0IjogIjNjNWE0NTlmOTMzOGFjYWI5MmU5MWU4MjRkMjYzNDNmZDNhMTI5Y2MifSwgInVyaSI6ICJnaXQraHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uQHJlZnMvdGFncy92MC4zLjEifV19LCAicnVuRGV0YWlscyI6IHsiYnVpbGRlciI6IHsiaWQiOiAiaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvcnVubmVyL2dpdGh1Yi1ob3N0ZWQifSwgIm1ldGFkYXRhIjogeyJpbnZvY2F0aW9uSWQiOiAiaHR0cHM6Ly9naXRodWIuY29tL3poaXh1bGkwNDA2L3ZldHRhbG9uL2FjdGlvbnMvcnVucy8zOTU0NTMxNzM4NS9hdHRlbXB0cy8xIn19fSwgInByZWRpY2F0ZVR5cGUiOiAiaHR0cHM6Ly9zbHNhLmRldi9wcm92ZW5hbmNlL3YxIiwgInN1YmplY3QiOiBbeyJkaWdlc3QiOiB7InNoYTUxMiI6ICIwMTUyZjFkNjg4YWY1ZTE5Zjc1NTI4NWNhODYxMjNlZTFjNzQ4YTAwYzMyYzE1YmNjZTMyNTNjZjVjNjllYTYzMmU0ZmQzYTQ3NDFjMTljODg3ZGYzNjA5YmQzYTY2NzYzNmNjNjRjYjg2ODhmZjM4MjBkYzg5NDFmNWFkNTUwOSJ9LCAibmFtZSI6ICJwa2c6bnBtL3ZldHRhbG9uQDAuMy4xIn1dfQ=="
+     }
+    },
+    "predicateType": "https://slsa.dev/provenance/v1"
+   }
+  ]
+ },
+ "https://registry.npmjs.org/@vettalon%2Fdarwin-arm64": {
+  "name": "@vettalon/darwin-arm64",
+  "versions": {
+   "0.0.0-stage": {
+    "dist": {
+     "integrity": "sha512-L4LnfjziONWcPjQVaWMjm/2hPs3B0C7+5uLTyxpKkE+SziXH1dBOmUpe/SpXK1PewCvJzNAlHuvL3w8nL4HfPg=="
+    }
+   },
+   "0.1.0": {
+    "dist": {
+     "integrity": "sha512-JNhCRdeZneGnWRR0RXdRXR8+tAtvjldttPXLwQxkOSMj8yn/ovpdnMA29DPxZo82L1L25nCzojqL5pFpvU8Ogg=="
+    }
+   },
+   "0.1.1": {
+    "dist": {
+     "integrity": "sha512-GbAkQb0QzAU4Wg03G7E9RzFTlWT7MScOykV8uaWmwysM13//m1jWyWjXrkjHHQe0/DwGS9NT3JskxKnIcSnx5w=="
+    }
+   },
+   "0.2.0": {
+    "dist": {
+     "integrity": "sha512-yT8AmFWG3td2wWyDq1229dcKc7GqxFaho030nkhYiaiTOT/tRh1Gb3o7O6maawOi3nSKJ6F+vsTTV99QbF/pqQ=="
+    }
+   },
+   "0.2.1": {
+    "dist": {
+     "integrity": "sha512-EkJ12/awcqooptW8YG+UAEnC0+/ENbuhybiZwmjJWplXsgjMTObqg+n+58v12RS1BBMmVWBhaFR99CdbYhCwfg=="
+    }
+   },
+   "0.3.0": {
+    "dist": {
+     "attestations": {
+      "provenance": {
+       "predicateType": "https://slsa.dev/provenance/v1"
+      },
+      "url": "https://registry.npmjs.org/-/npm/v1/attestations/@vettalon%2fdarwin-arm64@0.3.0"
+     },
+     "integrity": "sha512-tTD6NsEZeGELN5eKDxP2aaQCCJiOGzvKV2p8epAj1Cuqhhid1a8oC7pewpB69mKAfCEzyPeyESHECTEVqEwfpA=="
+    }
+   },
+   "0.3.1": {
+    "dist": {
+     "attestations": {
+      "provenance": {
+       "predicateType": "https://slsa.dev/provenance/v1"
+      },
+      "url": "https://registry.npmjs.org/-/npm/v1/attestations/@vettalon%2fdarwin-arm64@0.3.1"
+     },
+     "integrity": "sha512-yTRN0eMWfQp3brTrYdEXeFGxO2sFRMurrpHS7TqAxbNMLQxAu0Plasg3YA/QHj0+CwSsHwSjJG/tLiuXA2nneA=="
+    }
+   }
+  }
+ },
+ "https://registry.npmjs.org/vettalon": {
+  "name": "vettalon",
+  "versions": {
+   "0.0.0-stage": {
+    "dist": {
+     "integrity": "sha512-/J57+toeMUdcgtpXiEQtCXmNu6TtLiHhaT0FQAIoEJwMkyOMxjz4FwC/se+zG1tEzBoZkNQsdIUqp9PTj0Afhg=="
+    }
+   },
+   "0.1.0": {
+    "dist": {
+     "integrity": "sha512-i0xMGf8ld9PjVITLziewnO4TdP8LB2o/FsD/39rU5zI//zilWYyPwEwUi+54fjTHZZPrxGIpzBR2cSdVEyVcMA=="
+    }
+   },
+   "0.1.1": {
+    "dist": {
+     "integrity": "sha512-d5l5z0f+ygacemViBqLwsPVus/TB4hXzhy0Ex1DYII7YYzx+Gfq/67lEcIe+8TWTqvUhaGnMGo4soDySkRae5A=="
+    }
+   },
+   "0.2.0": {
+    "dist": {
+     "integrity": "sha512-Zmo7zsVvJuGoywc0Lp14TSMX996K04SIllltyX9Tkp9qer5FpAWuN/9b8hHaqUBNhDWlz0MPXHmlJIkPNEpM1g=="
+    }
+   },
+   "0.2.1": {
+    "dist": {
+     "integrity": "sha512-wye1+v5eg36EbZudquELofAV+lIO86rMFqYK8SU84ANSbM/SOzTyOdzYJ6nzyKYMSfT5m0bCR0PVv4iYhiHM4Q=="
+    }
+   },
+   "0.3.0": {
+    "dist": {
+     "attestations": {
+      "provenance": {
+       "predicateType": "https://slsa.dev/provenance/v1"
+      },
+      "url": "https://registry.npmjs.org/-/npm/v1/attestations/vettalon@0.3.0"
+     },
+     "integrity": "sha512-yh2KXZ5VFLnkpsmw1C9+ajosmun0P1u184N40Z383eiePIg17tnT8FGXuamHBDdVVhoX5twyT0nmoc5dLLMtfA=="
+    }
+   },
+   "0.3.1": {
+    "dist": {
+     "attestations": {
+      "provenance": {
+       "predicateType": "https://slsa.dev/provenance/v1"
+      },
+      "url": "https://registry.npmjs.org/-/npm/v1/attestations/vettalon@0.3.1"
+     },
+     "integrity": "sha512-AVLx1oivXhn3VShcqGEj7hx0igDDLBW8zjJTz1xp6mMuT9OkdBwZyIffNgm9OmZ2Nsxky4aI/zgg3IlB9a1VCQ=="
+    }
+   }
+  }
+ }
+}

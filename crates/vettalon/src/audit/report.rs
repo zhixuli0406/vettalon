@@ -273,15 +273,7 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
         }
         out.push('\n');
     }
-    for finding in &report.findings {
-        out.push_str(&format!(
-            "  Proof {}:\n{}\n  Evidence {}: {}\n",
-            finding.id,
-            finding.proof_summary(),
-            finding.id,
-            finding.evidence_summary()
-        ));
-    }
+    crate::audit::report_evidence::render_finding_evidence(report, &mut out);
     let policy_failed = crate::audit::gate::any_failed(&report.summary.policy);
     let severity_hits = fail_on.map(|s| (s, report.summary.gate_counts().count_at_or_above(s)));
     match severity_hits {
@@ -987,6 +979,45 @@ mod tests {
         let text = with(Lang::En, || render_summary(&clean, Severity::High));
         assert!(text.contains("Result: PASS"));
         assert!(!has_cjk(&text), "Chinese text in English summary:\n{text}");
+    }
+
+    #[test]
+    fn render_summary_groups_finding_evidence_before_a_blank_line_and_result() {
+        use crate::lang::{Lang, with};
+        let finding = Finding::candidate(
+            "cargo-audit",
+            FindingKind::DependencyVulnerability,
+            Severity::High,
+            "t",
+            "Cargo.lock",
+            None,
+            "s",
+            "RUSTSEC-2021-0003",
+            vec![],
+        );
+        let id = finding.id.clone();
+        let report = base_report(vec![finding]);
+        for (lang, header, result) in [
+            (Lang::En, "Evidence per finding:", "Result: FAIL"),
+            (Lang::ZhTw, "各項發現的證據：", "結論："),
+        ] {
+            let text = with(lang, || render_summary(&report, Severity::High));
+            let block = &text[text.find(header).expect(header)..];
+            assert!(
+                block.starts_with(&format!("{header}\n  {id}\n    ")),
+                "{text}"
+            );
+            assert!(block.contains(&format!("\n\n{result}")), "{text}");
+            assert_eq!(text.matches(&id).count(), 1, "{text}");
+            for jargon in [
+                "Proof limits",
+                "proof_level=",
+                "proof_gaps=",
+                "legacy transcripts",
+            ] {
+                assert!(!text.contains(jargon), "{jargon} in:\n{text}");
+            }
+        }
     }
 
     // ── save_timestamp_basic / save_report ───────────────────────────

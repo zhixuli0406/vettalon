@@ -1,0 +1,80 @@
+# Daily check that every npm version from 0.3.0 on has a matching GitHub
+# release, a successful release.yml run for its tag and npm provenance naming
+# that run (scripts/trust/registry_alert.py). On a mismatch the check fails and
+# a separate job opens or comments on one alert issue. Runs only on the public
+# repo; read-only apart from that issue. Uses GITHUB_TOKEN only.
+name: Registry alert
+
+on:
+  schedule:
+    - cron: '41 5 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    name: npm versions match release runs
+    if: github.repository == 'zhixuli0406/vettalon'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      status: ${{ steps.scan.outputs.status }}
+      report: ${{ steps.scan.outputs.report }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare registry versions with release runs
+        id: scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python3 -I scripts/trust/registry_alert.py --repo "$GITHUB_REPOSITORY" --report "$RUNNER_TEMP/report.md"
+          rc=$?
+          set -e
+          case "$rc" in 0) status=ok ;; 1) status=mismatch ;; *) status=error ;; esac
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ -f "$RUNNER_TEMP/report.md" ]; then
+            cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+            delimiter="REPORT_$(openssl rand -hex 16)"
+            { echo "report<<$delimiter"; cat "$RUNNER_TEMP/report.md"; echo "$delimiter"; } >> "$GITHUB_OUTPUT"
+          fi
+      # A separate step fails the job, so the scan step's outputs are always set.
+      - name: Fail unless every version matched
+        env:
+          STATUS: ${{ steps.scan.outputs.status }}
+        run: |
+          echo "registry alert status: $STATUS"
+          [ "$STATUS" = ok ]
+
+  issue:
+    name: Open or update the alert issue
+    needs: check
+    if: always() && needs.check.outputs.status == 'mismatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REPORT: ${{ needs.check.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: Registry version without a matching release run
+        run: |
+          body="$RUNNER_TEMP/body.md"
+          { printf 'Failed check: %s\n\n' "$RUN_URL"; printf '%s\n' "$REPORT"; } > "$body"
+          number=$(gh issue list --state open --limit 500 --json number,title \
+            --jq 'map(select(.title == env.TITLE)) | .[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file "$body"
+          else
+            gh issue create --title "$TITLE" --body-file "$body"
+          fi
