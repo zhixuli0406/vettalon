@@ -3,9 +3,10 @@
 //! No model is hardcoded anywhere else. Without a config file the roster is
 //! auto-detected from the CLIs on `PATH` whose tools can be fully disabled
 //! (today: claude). CLIs that keep host access (codex, grok; see
-//! `llm::cli`) are added through a config file; they run in the agents
-//! container by default (`vettalon agents pull` or `build`), or on the host with
-//! `allow_agent_tools = true`. API keys are never stored in the file: a
+//! `llm::cli`) cannot safely combine untrusted source prompts with reusable
+//! CLI credentials. They require the explicit high-risk host opt-in
+//! `allow_agent_tools = true`; otherwise validation fails closed. API keys
+//! are never stored in the file: a
 //! model names the environment variable that holds its key (`api_key_env`).
 //!
 //! The config file is trusted code (it chooses programs to run and where
@@ -63,8 +64,8 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Required for CLIs whose model keeps tools that can read the host
-    /// (codex, grok, any custom `program`): the operator accepts that a
-    /// prompt injection in audited code could make it read local files.
+    /// (codex, grok, any custom `program`): the operator explicitly accepts
+    /// that prompt injection in audited code can read local files and auth.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_agent_tools: bool,
     /// Extra environment variable names passed to a CLI.
@@ -313,8 +314,18 @@ impl Config {
                             m.id
                         ));
                     }
-                    // A tool-capable preset (codex, grok) runs in the container
-                    // by default; `allow_agent_tools = true` opts into host.
+                    if let Some(preset) = m.preset.as_deref()
+                        && crate::llm::cli::TOOL_CAPABLE_PRESETS.contains(&preset)
+                        && !m.allow_agent_tools
+                    {
+                        return Err(format!(
+                            "model {:?}: preset {preset:?} keeps local tools and cannot securely share reusable CLI credentials with untrusted source; use a tool-disabled or HTTP/Ollama backend, or set `allow_agent_tools = true` only to explicitly accept host access risk",
+                            m.id
+                        ));
+                    }
+                    // Tool-capable presets cannot receive reusable credentials
+                    // in the container. Only an explicit unsafe host opt-in is
+                    // accepted until a non-exportable credential broker exists.
                     if let Some(prog) = &m.program
                         && !Path::new(prog).is_absolute()
                     {
@@ -678,10 +689,9 @@ impl ModelConfig {
         Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))
     }
 
-    /// How a CLI model runs. A tool-capable preset (codex, grok) runs in the
-    /// agents container unless `allow_agent_tools` opts into the host; every
-    /// other CLI runs on the host (claude's tools are off; a custom program
-    /// required the opt-in at validation time).
+    /// How a CLI model would run after validation. Tool-capable presets without
+    /// the host opt-in are rejected by `validate`; the container branch remains
+    /// fail-closed for direct library construction and future credential brokers.
     fn isolation(&self) -> crate::llm::container::Isolation {
         use crate::llm::container::{self, ContainerSpec, Isolation};
         if self.backend != Backend::Cli || self.allow_agent_tools {
@@ -879,7 +889,8 @@ roles = ["finder", "verifier"]
             matches!(claude.isolation(), Isolation::Host),
             "claude tools are off"
         );
-        // The container spec carries the preset's auth file.
+        // Tool-capable presets are not valid without an explicit unsafe host
+        // opt-in because a model with tools must never share a credential.
         if let Isolation::Container(c) = grok.isolation() {
             assert_eq!(c.auth_files.len(), 1);
             assert!(c.auth_files[0].1.ends_with("auth.json"));
@@ -970,10 +981,10 @@ api_key = "sk-123"
         assert!(Config::parse(dup).unwrap_err().contains("duplicate"));
         let nofam = "[[model]]\nid='a'\nbackend='ollama'\nmodel='m'\n";
         assert!(Config::parse(nofam).unwrap_err().contains("family"));
-        // A tool-capable preset runs in the container by default (valid);
-        // allow_agent_tools opts into host (also valid).
+        // A tool-capable preset cannot safely share CLI credentials with an
+        // untrusted source prompt. Only the explicit unsafe host opt-in stays.
         let tools = "[[model]]\nid='g'\nbackend='cli'\npreset='grok'\n";
-        assert!(Config::parse(tools).is_ok());
+        assert!(Config::parse(tools).is_err());
         assert!(Config::parse(&format!("{tools}allow_agent_tools = true\n")).is_ok());
         // agy has no container image: host only, and only with the opt-in.
         let agy = "[[model]]\nid='g'\nbackend='cli'\npreset='agy'\n";

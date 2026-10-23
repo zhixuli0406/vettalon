@@ -83,13 +83,14 @@ fn missing_ai_engines(report: &AuditReport) -> usize {
         .count()
 }
 
-const AI_AUDIT_ENGINE: &str = "ai_audit";
+pub(super) const AI_AUDIT_ENGINE: &str = "ai_audit";
 
 /// `vettalon scan`'s exit code: [`AI_UNAVAILABLE_EXIT`] when the deep AI
 /// audit could not run at all (unless `allow_incomplete`), else
 /// [`exit_code_with`]. It takes precedence over `1`: a gate verdict over a
 /// deep scan that reviewed nothing with AI is not the result that was asked
-/// for, and the summary still prints the gate result.
+/// for. The summary's verdict then says "incomplete" and prints a failed
+/// gate on its own line (`report_verdict`).
 pub fn scan_exit_code(
     report: &AuditReport,
     fail_on: Option<Severity>,
@@ -110,7 +111,20 @@ pub fn render_summary(report: &AuditReport, fail_on: Severity) -> String {
 }
 
 /// [`render_summary`] with `--fail-on` optional and the policy gate shown.
+/// The verdict matches `vettalon scan` without `--allow-incomplete`.
+#[cfg(test)]
 pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> String {
+    render_scan_summary(report, fail_on, false)
+}
+
+/// The summary `vettalon scan` prints. `allow_incomplete` only changes the
+/// verdict lines of a deep scan whose AI audit could not run at all (see
+/// `report_verdict`), matching [`scan_exit_code`].
+pub fn render_scan_summary(
+    report: &AuditReport,
+    fail_on: Option<Severity>,
+    allow_incomplete: bool,
+) -> String {
     let mut out = String::new();
     out.push_str(pick(
         "程式碼安全審計（vettalon）\n",
@@ -327,44 +341,7 @@ pub fn render_summary_with(report: &AuditReport, fail_on: Option<Severity>) -> S
         out.push('\n');
     }
     crate::audit::report_evidence::render_finding_evidence(report, &mut out);
-    let policy_failed = crate::audit::gate::any_failed(&report.summary.policy);
-    let severity_hits = fail_on.map(|s| (s, report.summary.gate_counts().count_at_or_above(s)));
-    match severity_hits {
-        Some((s, n)) if n > 0 => out.push_str(&tr!(
-            "結論：發現 {n} 項 {} 以上等級的問題，未通過。\n",
-            "Result: FAIL, {n} finding(s) at {} or above.\n",
-            s.as_str()
-        )),
-        _ if policy_failed => out.push_str(pick(
-            "結論：政策門檻有條件未通過，未通過。\n",
-            "Result: FAIL, a policy gate condition failed.\n",
-        )),
-        Some((s, _)) => out.push_str(&tr!(
-            "結論：未達 --fail-on 門檻（{}），視為通過。\n",
-            "Result: PASS, nothing reached the --fail-on threshold ({}).\n",
-            s.as_str()
-        )),
-        None if report.summary.policy.is_empty() => out.push_str(pick(
-            "結論：未設定 --fail-on 或 --gate 門檻，僅供參考。\n",
-            "Result: no --fail-on or --gate threshold set; for information only.\n",
-        )),
-        None => out.push_str(pick(
-            "結論：政策門檻全部通過。\n",
-            "Result: PASS, every policy gate condition passed.\n",
-        )),
-    }
-    let failed = policy_failed || severity_hits.is_some_and(|(_, n)| n > 0);
-    if ai_audit_unavailable(report) {
-        out.push_str(pick(
-            "注意：沒有任何 AI 引擎能執行，深度審查沒有做；這次結果只涵蓋 OSS 掃描器（上方 [略過] ai_audit 列有原因）。\n",
-            "Note: no AI engine could run, so the deep audit did not happen; this result covers the OSS scanners only (the [skipped] ai_audit lines above say why).\n",
-        ));
-    } else if !failed && report.run_status == RunStatus::Incomplete {
-        out.push_str(pick(
-            "注意：本次掃描不完整，通過只代表「已審查的部分」沒有達到門檻，不代表沒有問題。\n",
-            "Note: this scan is incomplete. A pass only means the reviewed part stayed under the threshold, not that there are no problems.\n",
-        ));
-    }
+    crate::audit::report_verdict::render_verdict(report, fail_on, allow_incomplete, &mut out);
     out
 }
 
@@ -1519,8 +1496,94 @@ mod tests {
         assert_eq!(scan_exit_code(&report, Some(Severity::High), true), 0);
         let text = render_summary(&report, Severity::High);
         assert!(text.contains("執行狀態：未完成（沒有任何 AI 引擎能執行"));
-        assert!(text.contains("深度審查沒有做"));
+        assert!(text.contains(
+            "結論：未完成。所有 AI 引擎都無法使用（codex、grok：容器映像檔不存在），AI 審查沒有執行；結果只含已執行的掃描器。結束碼 4。\n"
+        ), "{text}");
+        assert!(text.contains("`vettalon agents pull`"), "{text}");
+        assert!(
+            !text.contains("視為通過"),
+            "no PASS verdict on exit 4:\n{text}"
+        );
+        assert!(
+            !text.contains("門檻："),
+            "the gate passed, so no gate line:\n{text}"
+        );
         assert!(!text.contains("本次掃描不完整"), "one note, not two");
+    }
+
+    #[test]
+    fn exit_4_verdict_names_each_cause_in_both_languages() {
+        use crate::lang::{Lang, with};
+        let mut report = deep_report(&[], &["codex"], vec![high_candidate()]);
+        report.engines_missing.push(EngineMissing {
+            engine: "ai_audit[ghost]".into(),
+            reason: "LLM call failed: /x/ghost-cli CLI not found on PATH".into(),
+        });
+        report.summary = Summary::from_findings(&report.findings, 1, 2, GatePolicy::default(), &[]);
+        let en = with(Lang::En, || {
+            render_scan_summary(&report, Some(Severity::High), false)
+        });
+        let tail = &en[en.find("Result:").expect("verdict")..];
+        assert!(tail.starts_with(
+            "Result: INCOMPLETE. No AI engine could run (codex: container image missing; ghost: CLI not found), so the AI audit did not run; the result covers only the scanners that ran. Exit code 4.\n\
+             Gate: FAIL, 1 finding(s) at high or above.\n\
+             \x20 To fix: make sure Docker is running, then run `vettalon agents pull` or `vettalon agents build` to get the image; install the CLI or fix its `program` path in the config. To exit on the gate result instead, pass --allow-incomplete.\n"
+        ), "{tail}");
+        assert!(!has_cjk(&en), "Chinese text in English summary:\n{en}");
+
+        let zh = with(Lang::ZhTw, || {
+            render_scan_summary(&report, Some(Severity::High), false)
+        });
+        assert!(
+            zh.contains(
+                "結論：未完成。所有 AI 引擎都無法使用（codex：容器映像檔不存在；ghost：找不到 CLI）"
+            ),
+            "{zh}"
+        );
+        assert!(
+            zh.contains("\n門檻：發現 1 項 high 以上等級的問題，未通過。\n"),
+            "{zh}"
+        );
+        assert!(
+            zh.contains("要改以門檻結果結束，加 --allow-incomplete。"),
+            "{zh}"
+        );
+    }
+
+    #[test]
+    fn allow_incomplete_prints_the_gate_verdict_and_still_says_incomplete() {
+        use crate::lang::{Lang, with};
+        let clean = deep_report(&[], &["codex"], vec![]);
+        let en = with(Lang::En, || {
+            render_scan_summary(&clean, Some(Severity::High), true)
+        });
+        assert!(
+            en.contains(
+                "Result: PASS, nothing reached the --fail-on threshold (high).\n\
+             Note: this scan is INCOMPLETE. No AI engine could run (codex: container image missing)"
+            ),
+            "{en}"
+        );
+        assert!(en.contains("the exit code follows the gate"), "{en}");
+        assert!(!en.contains("Exit code 4"), "{en}");
+        assert!(!has_cjk(&en), "{en}");
+
+        let mut failed = deep_report(&[], &["codex"], vec![high_candidate()]);
+        failed.summary = Summary::from_findings(&failed.findings, 1, 2, GatePolicy::default(), &[]);
+        let zh = with(Lang::ZhTw, || {
+            render_scan_summary(&failed, Some(Severity::High), true)
+        });
+        assert!(zh.contains(
+            "結論：發現 1 項 high 以上等級的問題，未通過。\n注意：本次掃描未完成。所有 AI 引擎都無法使用（codex：容器映像檔不存在）"
+        ), "{zh}");
+        assert!(
+            zh.contains("因為有 --allow-incomplete，結束碼照門檻結果。"),
+            "{zh}"
+        );
+        assert!(
+            !zh.contains("門檻："),
+            "the gate is the verdict here:\n{zh}"
+        );
     }
 
     #[test]
@@ -1544,8 +1607,11 @@ mod tests {
         assert_eq!(scan_exit_code(&report, Some(Severity::High), false), 4);
         assert_eq!(scan_exit_code(&report, Some(Severity::High), true), 1);
         let text = render_summary(&report, Severity::High);
-        assert!(text.contains("未通過"), "the gate result is still shown");
-        assert!(text.contains("深度審查沒有做"));
+        assert!(
+            text.contains("門檻：發現 1 項 high 以上等級的問題，未通過。"),
+            "the gate result is still shown"
+        );
+        assert!(text.contains("結論：未完成。"));
     }
 
     #[test]
@@ -1555,7 +1621,10 @@ mod tests {
         assert_eq!(scan_exit_code(&report, Some(Severity::High), false), 0);
         let text = render_summary(&report, Severity::High);
         assert!(text.contains("1 個 AI 引擎無法使用，分給它的模組沒有審查"));
-        assert!(text.contains("本次掃描不完整"));
+        assert!(
+            text.contains("結論：未達 --fail-on 門檻（high），視為通過。\n注意：本次掃描不完整")
+        );
+        assert!(!text.contains("未完成。所有 AI 引擎"), "{text}");
     }
 
     #[test]

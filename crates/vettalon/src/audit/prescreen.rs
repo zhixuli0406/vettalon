@@ -507,8 +507,9 @@ pub struct PromptDumpUnit {
 
 /// What a deep scan's prescreen would send for `repo_root`, without calling
 /// any model: the same intake, ranking, paging and prompt builder as the
-/// scan. Used by `benchmarks/ranking` (`examples/prescreen_prompts.rs`) so
-/// the benchmark scores exactly the scan's prompts.
+/// scan. Used by the module-ranking benchmark (not in the public repo) via
+/// `examples/prescreen_prompts.rs`, so the benchmark scores exactly the
+/// scan's prompts.
 pub async fn dump_prompts(repo_root: &Path, pool: usize) -> PromptDump {
     let profile = super::intake::build_profile(repo_root).await;
     let ranked = super::ai_audit::paginate_modules(

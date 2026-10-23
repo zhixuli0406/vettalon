@@ -4,12 +4,16 @@
 //! real, isolated container returns `Err`, and the caller records the PoC as
 //! skipped. The container gets no network, a read-only root filesystem, no
 //! Linux capabilities, `no-new-privileges`, a non-root uid, memory/pid/CPU
-//! caps, and only the script directory mounted read-only.
+//! caps. Direct model-generated scripts are streamed over stdin and never
+//! written to a host scratch directory or bind-mounted into the container.
+//! Harness-authored multi-file checks use fresh temporary copies mounted
+//! read-only; the user's original tree is never mounted directly.
 
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 /// Default image: small, has `python3` and `bash`. Never pulled
@@ -121,21 +125,31 @@ impl DockerSandbox {
         .await;
     }
 
-    /// The `docker run` argument vector for one PoC. Pure, so the isolation
-    /// flags are unit-tested.
-    pub fn run_args(&self, name: &str, workspace: &Path, cmd: &[String]) -> Vec<String> {
-        self.run_args_mounted(name, &[(workspace, "/workspace")], "/tmp", cmd)
+    /// The unmounted `docker run` argument vector for a direct PoC. Pure, so
+    /// the isolation flags and absence of host mounts are unit-tested.
+    pub fn run_args(&self, name: &str, cmd: &[String]) -> Vec<String> {
+        self.build_run_args(name, &[], "/tmp", true, cmd)
     }
 
-    /// [`run_args`](Self::run_args) with several read-only bind mounts and a
-    /// chosen working directory. Every isolation flag is identical; only the
-    /// mounts (all `readonly`) and `--workdir` differ. The suggested-fix check
-    /// uses it to mount a temporary copy of the scanned tree.
+    /// Build an invocation with explicit read-only mounts. Only harness-owned
+    /// scratch data or a prepared temporary copy of the scanned tree may be
+    /// passed here.
     pub fn run_args_mounted(
         &self,
         name: &str,
         mounts: &[(&Path, &str)],
         workdir: &str,
+        cmd: &[String],
+    ) -> Vec<String> {
+        self.build_run_args(name, mounts, workdir, false, cmd)
+    }
+
+    fn build_run_args(
+        &self,
+        name: &str,
+        mounts: &[(&Path, &str)],
+        workdir: &str,
+        interactive: bool,
         cmd: &[String],
     ) -> Vec<String> {
         let owner_label = format!("{POC_OWNER_KEY}={}", std::process::id());
@@ -173,6 +187,9 @@ impl DockerSandbox {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        if interactive {
+            args.insert(2, "-i".to_string());
+        }
         for (source, target) in mounts {
             args.push("--mount".to_string());
             args.push(format!(
@@ -200,18 +217,11 @@ impl DockerSandbox {
         language: &str,
         timeout: Duration,
     ) -> Result<(i64, String), String> {
-        let (file, cmd) = match language {
-            "python" => (
-                "poc.py",
-                vec!["python3".to_string(), "/workspace/poc.py".to_string()],
-            ),
-            "bash" => (
-                "poc.sh",
-                vec!["bash".to_string(), "/workspace/poc.sh".to_string()],
-            ),
-            other => return Err(format!("unsupported PoC language {other:?}")),
-        };
-        self.run_workspace(&[(file, script)], &cmd, timeout).await
+        let cmd = script_command(language)?;
+        let name = format!("vettalon-poc-{}", uuid::Uuid::new_v4().simple());
+        let args = self.run_args(&name, &cmd);
+        self.run_container(&name, &args, Some(script), timeout)
+            .await
     }
 
     /// Run a multi-file workspace: each `(name, contents)` pair is written into
@@ -281,9 +291,23 @@ impl DockerSandbox {
         }
         let name = format!("vettalon-poc-{}", uuid::Uuid::new_v4().simple());
         let args = self.run_args_mounted(&name, mounts, workdir, cmd);
+        self.run_container(&name, &args, None, timeout).await
+    }
+
+    async fn run_container(
+        &self,
+        name: &str,
+        args: &[String],
+        input: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(i64, String), String> {
         let mut child = Command::new(&self.docker_bin)
-            .args(&args)
-            .stdin(Stdio::null())
+            .args(args)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -293,26 +317,39 @@ impl DockerSandbox {
         // If this future is dropped mid-run (the scan was cancelled), killing
         // the `docker run` client does not stop the container; the guard
         // removes it. Disarmed once the run has finished on its own.
-        let mut guard = ContainerGuard::new(&self.docker_bin, &name);
+        let mut guard = ContainerGuard::new(&self.docker_bin, name);
 
+        let mut stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let collect = async {
-            let (out, err) = tokio::join!(
+            let write = async {
+                if let Some(data) = input {
+                    let mut pipe = stdin
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("missing container stdin"))?;
+                    pipe.write_all(data.as_bytes()).await?;
+                    drop(pipe);
+                }
+                Ok::<(), std::io::Error>(())
+            };
+            let (write, out, err) = tokio::join!(
+                write,
                 crate::util::read_capped(stdout, OUTPUT_CAP_BYTES),
                 crate::util::read_capped(stderr, OUTPUT_CAP_BYTES)
             );
             let status = child.wait().await;
             (
+                write,
                 status,
                 out.map(|(b, _)| b).unwrap_or_default(),
                 err.map(|(b, _)| b).unwrap_or_default(),
             )
         };
         let collected = tokio::time::timeout(timeout, collect).await;
-        guard.disarm();
         match collected {
-            Ok((Ok(status), out, err)) => {
+            Ok((Ok(()), Ok(status), out, err)) => {
+                guard.disarm();
                 let mut combined = String::from_utf8_lossy(&out).to_string();
                 combined.push_str(&String::from_utf8_lossy(&err));
                 let combined = crate::util::truncate_bytes(&combined, OUTPUT_CAP_BYTES).to_string();
@@ -325,9 +362,11 @@ impl DockerSandbox {
                     None => Err("container terminated by a signal".to_string()),
                 }
             }
-            Ok((Err(e), _, _)) => Err(format!("container wait failed: {e}")),
+            Ok((Err(error), _, _, _)) => Err(format!("cannot stream PoC script: {error}")),
+            Ok((_, Err(error), _, _)) => Err(format!("container wait failed: {error}")),
             Err(_) => {
-                self.force_remove(&name).await;
+                self.force_remove(name).await;
+                guard.disarm();
                 Err(format!(
                     "container execution exceeded the {}s hard timeout",
                     timeout.as_secs()
@@ -380,6 +419,14 @@ fn write_scratch(
         }
     }
     Ok(scratch)
+}
+
+fn script_command(language: &str) -> Result<Vec<String>, String> {
+    match language {
+        "python" => Ok(vec!["python3".into(), "-".into()]),
+        "bash" => Ok(vec!["bash".into(), "-s".into()]),
+        other => Err(format!("unsupported PoC language {other:?}")),
+    }
 }
 
 /// Removes a PoC container when dropped while still armed, i.e. when the run
@@ -491,7 +538,7 @@ mod tests {
             docker_bin: "docker".into(),
             image: "img".into(),
         };
-        let a = sb.run_args("n", Path::new("/tmp/x"), &["true".into()]);
+        let a = sb.run_args("n", &["true".into()]);
         let owner = format!("{POC_OWNER_KEY}={}", std::process::id());
         assert!(a.contains(&owner), "missing {owner}: {a:?}");
     }
@@ -532,12 +579,9 @@ ghi789 notapid
             docker_bin: "docker".into(),
             image: "img".into(),
         };
-        let a = sb.run_args(
-            "n",
-            Path::new("/tmp/x"),
-            &["python3".into(), "/workspace/poc.py".into()],
-        );
+        let a = sb.run_args("n", &["python3".into(), "-".into()]);
         for flag in [
+            "-i",
             "--network=none",
             "--read-only",
             "--cap-drop=ALL",
@@ -547,26 +591,19 @@ ghi789 notapid
             assert!(a.iter().any(|x| x == flag), "missing {flag}: {a:?}");
         }
         assert!(
-            a.iter()
-                .any(|x| x == "type=bind,source=/tmp/x,target=/workspace,readonly")
+            !a.iter().any(|x| x == "--mount"),
+            "host mounts are forbidden: {a:?}"
         );
         for flag in ["--pull=never", "--memory-swap=512m", "vettalon.poc=1"] {
             assert!(a.iter().any(|x| x == flag), "missing {flag}");
         }
         let user = a.iter().position(|x| x == "--user").unwrap();
-        assert_ne!(a[user + 1], "0");
+        assert_eq!(a[user + 1], "65534:65534");
         // The image comes right before the command.
         let img = a.iter().position(|x| x == "img").unwrap();
         assert_eq!(
             &a[img + 1..],
-            &[
-                "timeout",
-                "-s",
-                "KILL",
-                "125",
-                "python3",
-                "/workspace/poc.py"
-            ]
+            &["timeout", "-s", "KILL", "125", "python3", "-"]
         );
     }
 
@@ -585,9 +622,15 @@ ghi789 notapid
             "/workspace",
             &["sh".into(), "-c".into(), "pytest".into()],
         );
-        let base = sb.run_args("n", Path::new("/tmp/h"), &["sh".into()]);
-        for flag in base.iter().take_while(|f| *f != "--workdir") {
-            assert!(a.contains(flag), "missing {flag}");
+        for flag in [
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--rm",
+            "--pull=never",
+        ] {
+            assert!(a.iter().any(|value| value == flag), "missing {flag}");
         }
         assert!(
             a.iter()
@@ -600,6 +643,7 @@ ghi789 notapid
         );
         let wd = a.iter().position(|x| x == "--workdir").unwrap();
         assert_eq!(a[wd + 1], "/workspace");
+        assert!(!a.iter().any(|x| x == "-i"));
     }
 
     #[tokio::test]
@@ -622,6 +666,15 @@ ghi789 notapid
             .await
             .unwrap_err();
         assert!(e.contains("invalid workspace file name"), "{e}");
+    }
+
+    #[test]
+    fn poc_commands_read_scripts_from_stdin_without_host_files() {
+        let python = script_command("python").unwrap();
+        let bash = script_command("bash").unwrap();
+        assert_eq!(python, ["python3", "-"]);
+        assert_eq!(bash, ["bash", "-s"]);
+        assert!(script_command("ruby").is_err());
     }
 
     #[test]

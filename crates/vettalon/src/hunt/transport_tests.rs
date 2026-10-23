@@ -224,7 +224,9 @@ async fn local_tls_hunt_transport_policies_and_osv_states() {
     assert!(
         server
             .client(fetch::fetch_client_builder())
-            .get("http://crates.io/initial")
+            // Deliberate cleartext downgrade input: the client must reject it
+            // before any request reaches the local TLS fixture.
+            .get("http://crates.io/initial") // lgtm[rust/non-https-url]
             .send()
             .await
             .is_err()

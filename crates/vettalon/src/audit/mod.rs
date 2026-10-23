@@ -34,6 +34,9 @@
 
 mod adversarial;
 pub use adversarial::{DEFAULT_REFUTER_RUNS, DEFAULT_VERIFIER_PARSE_RETRIES, MAX_REFUTER_RUNS};
+mod refuter_policy;
+pub use refuter_policy::{EvidenceScope, RefuterPolicy};
+mod refuter_score;
 /// Default and maximum for `--finder-parse-retries`.
 pub const DEFAULT_FINDER_PARSE_RETRIES: usize = ai_audit::AI_AUDIT_PARSE_RETRIES;
 mod ai_audit;
@@ -68,6 +71,7 @@ mod prompts;
 pub mod rank_snapshot;
 mod report;
 mod report_evidence;
+mod report_verdict;
 pub mod sarif;
 mod scanners;
 /// Bounded subprocess capture and owned-process cleanup, shared with local renderers.
@@ -178,6 +182,14 @@ pub struct ScanOptions {
     /// breaks the reply contract (0 or 1; default
     /// [`DEFAULT_VERIFIER_PARSE_RETRIES`]).
     pub verifier_parse_retries: usize,
+    /// `--refuter-policy` (default [`RefuterPolicy::CURRENT`], the
+    /// refute-by-default refuter); see `refuter_policy`.
+    pub refuter_policy: RefuterPolicy,
+    /// Record an opt-in verbalized probability and evidence level per refuter run.
+    pub refuter_score: bool,
+    /// `--refuter-score-threshold`: a refutation closes only when its
+    /// `p_real` is below this; `None` = off (the default).
+    pub refuter_score_threshold: Option<u8>,
     /// `--prescreen cheap-model`: score the top of the ranked pool with a
     /// cheap model and give the deep audit only the top fraction. `None` =
     /// off (the default; no prescreen call is made).
@@ -740,10 +752,11 @@ pub async fn cmd_scan_with(home_dir: &Path, opts: ScanOptions, allow_incomplete:
 
     // Repo-derived strings (paths, extensions, errors) reach the terminal:
     // drop control characters so they cannot inject escape sequences.
-    let summary_text: String = report::render_summary_with(&audit_report, fail_on)
-        .chars()
-        .map(|c| if c.is_control() && c != '\n' { '?' } else { c })
-        .collect();
+    let summary_text: String =
+        report::render_scan_summary(&audit_report, fail_on, allow_incomplete)
+            .chars()
+            .map(|c| if c.is_control() && c != '\n' { '?' } else { c })
+            .collect();
     println!("{summary_text}");
 
     if let Some(path) = &opts.report {
@@ -1561,6 +1574,9 @@ async fn review_step(
                     runs: adversarial::runs_for(&f, opts.refuter_runs),
                     deadline: limits.extra_runs_deadline,
                     parse_retries: opts.verifier_parse_retries,
+                    policy: opts.refuter_policy,
+                    score: opts.refuter_score,
+                    score_threshold: opts.refuter_score_threshold,
                 };
                 let votes = match adversarial::review_with(repo_root, &mut f, &caller, plan).await {
                     adversarial::ReviewOutcome::ZeroLlm => Vec::new(),
@@ -1879,6 +1895,9 @@ mod tests {
             refuter_runs: 1,
             finder_parse_retries: DEFAULT_FINDER_PARSE_RETRIES,
             verifier_parse_retries: DEFAULT_VERIFIER_PARSE_RETRIES,
+            refuter_policy: RefuterPolicy::CURRENT,
+            refuter_score: false,
+            refuter_score_threshold: None,
             prescreen: None,
             role_caps: Default::default(),
             fix_test_command: None,

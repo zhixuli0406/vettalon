@@ -9,7 +9,7 @@ use std::time::Instant;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, JobObject, KillOnDrop};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{RunLimits, RunOutcome};
+use super::{GIT_ENV_REMOVE, RunLimits, RunOutcome};
 
 const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -52,7 +52,20 @@ fn spawn_job(program: &str, args: &[&str], cwd: &Path) -> io::Result<OwnedJob> {
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .env("PATH", crate::util::trusted_path_for_scan(cwd))
+            .env("NoDefaultCurrentDirectoryInExePath", "1");
+        for name in GIT_ENV_REMOVE {
+            command.env_remove(name);
+        }
+        for index in 0..64 {
+            command.env_remove(format!("GIT_CONFIG_KEY_{index}"));
+            command.env_remove(format!("GIT_CONFIG_VALUE_{index}"));
+        }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .env("GIT_OPTIONAL_LOCKS", "0");
     });
     // KillOnDrop must be registered as a wrapper: JobObject queries it before
     // enabling JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. A raw Command flag is not enough.

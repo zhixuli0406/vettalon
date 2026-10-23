@@ -20,9 +20,10 @@ formal E1 denominator remains 0/45 executed pairs.
 
 The scan-report `coverage[]` below describes which customer source ranges entered
 review. It is not the test suite's line or branch coverage. A bounded test
-coverage receipt for the **public CLI v0.2.0 source tag** is in the local
-acceptance directory at
-`reports/evidence-acceptance/trust-coverage-next-20261018/contract-v020-nightly/receipt.json`.
+coverage receipt for the **public CLI v0.2.0 source tag** is kept in the
+maintainer's local acceptance records. The receipt, its readbacks and the
+receipt wrapper are not part of this repository; this section records what
+they contain and how they were produced.
 It records commit `e3493f620487d23dbbd6a13021c216f415974585`, a clean tracked-file
 content manifest, Rust nightly `2026-10-17`, and `cargo-llvm-cov 0.9.1`. The
 `vettalon-contract` package's 45 unit tests measured 1,246/1,274 source lines
@@ -31,8 +32,8 @@ content manifest, Rust nightly `2026-10-17`, and `cargo-llvm-cov 0.9.1`. The
 Desktop/Pro, nor published-binary coverage. The published binary's test coverage
 is **unknown**; the source tag match alone does not instrument that binary.
 
-To reproduce in a fresh checkout, install the reviewed, pinned Rust toolchain
-and coverage helper, then give the runner new output and target paths outside
+The wrapper runs against a fresh checkout with the reviewed, pinned Rust
+toolchain and coverage helper, and takes new output and target paths outside
 the checkout. The wrapper refuses a dirty tree, tracked bytes differing from
 the tag's HEAD blobs (including `assume-unchanged` files), wrong full source commit/tag,
 missing or zero line/branch denominator, failed tests, extra/untracked LLVM
@@ -50,18 +51,15 @@ It does not independently derive hits from detailed execution counters.
 The receipt records the original checkout root; verification maps LLVM's
 absolute raw filenames into a different clean checkout only when the path is
 canonical, inside the recorded package source directory, and tracked at the
-same tag. The pre-amendment receipt was copied as
-[`receipt-original-v1.json`](../reports/evidence-acceptance/trust-coverage-next-20261018/contract-v020-nightly/receipt-original-v1.json)
-with SHA-256 `dab756aa0c182789514f555392f185bbb25611b587b5e49629bd6c9c14505331`;
-the amended `receipt.json` has SHA-256 `8efe858bd230a14e2c423a88ca597b42e65e624c74e4de9ce7657f2c080fc4b7`.
+same tag. The pre-amendment receipt was kept as a
+separate copy with SHA-256 `dab756aa0c182789514f555392f185bbb25611b587b5e49629bd6c9c14505331`;
+the amended receipt has SHA-256 `8efe858bd230a14e2c423a88ca597b42e65e624c74e4de9ce7657f2c080fc4b7`.
 Only the recorded source-root and test-scope wording changed. The receipt's
 `runner_sha256` describes the historical execution code, whose original bytes
 are unavailable here; subsequent verifier versions have different SHA-256
 values and only revalidate the unchanged raw artifacts. The original
-[`verification-readback.json`](../reports/evidence-acceptance/trust-coverage-next-20261018/verification-readback.json)
-is retained with its original verifier hash. The historical
-[`schema-v2 readback`](../reports/evidence-acceptance/trust-coverage-next-20261018/verification-readback-schema-v2-20261018.json)
-records that verifier version's hash, matching results after copying the
+verification readback is retained with its original verifier hash. The
+historical schema-v2 readback records that verifier version's hash, matching results after copying the
 byte-identical receipt directory to a new location, and rejection of a
 modified legacy receipt.
 
@@ -87,7 +85,7 @@ percentages. These values can be forged together with an unsigned local
 receipt, so a match alone is **not provenance verification**. Substitution
 detection requires expected values from an independently trusted channel,
 not from the receipt or readback being checked.
-The [anchored readback](../reports/evidence-acceptance/trust-coverage-next-20261018/ANCHORED-VERIFIER.json)
+The anchored readback
 records a successful original and relocated verification plus five failing
 negative cases. It checks the historical package-scoped result only; it does
 not authenticate a new v2 receipt without an independently retained digest.
@@ -100,12 +98,15 @@ source commit and a published GitHub release at that time. That observation
 does not establish that a shipped executable was built from or instrumented at
 that commit.
 
+The commands below record the maintainer's run. `COVERAGE_RECEIPT` stands
+for the receipt wrapper, which is not published in this repository.
+
 ```bash
 git clone --depth 1 --branch v0.2.0 --single-branch \
   https://github.com/zhixuli0406/vettalon.git /tmp/vettalon-v020-source
 rustup toolchain install nightly-2026-10-17 --profile minimal --component llvm-tools-preview
 cargo install --root /tmp/vettalon-cov-tools --version 0.9.1 --locked cargo-llvm-cov
-python3 scripts/trust/coverage_receipt.py \
+python3 "$COVERAGE_RECEIPT" \
   --source-root /tmp/vettalon-v020-source \
   --expected-source-sha e3493f620487d23dbbd6a13021c216f415974585 \
   --expected-tag v0.2.0 --package vettalon-contract \
@@ -114,7 +115,7 @@ python3 scripts/trust/coverage_receipt.py \
   --toolchain nightly-2026-10-17 \
   --output-dir /tmp/NEW-vettalon-cov-receipt \
   --target-dir /tmp/NEW-vettalon-cov-target
-python3 scripts/trust/coverage_receipt.py verify \
+python3 "$COVERAGE_RECEIPT" verify \
   --receipt-dir /tmp/NEW-vettalon-cov-receipt \
   --source-root /tmp/vettalon-v020-source \
   --expected-receipt-sha256 EXPECTED_NEW_RECEIPT_SHA256 \
@@ -173,9 +174,10 @@ Findings optionally carry `proof_evidence[]`. An absent historical field means `
 
 A record includes origin, run id, manifest SHA-256, artifact roles/relative paths/SHA-256/bytes, optional differential pair id, and optional operator-supplied human-decision data. None of these fields changes a finding's status, authorizes disclosure, or constitutes trusted build provenance. Links, hashes and exit 0 do not automatically confirm a vulnerability. Existing generated PoCs remain pattern demonstrations.
 
-The [Ammonia 4.2.3/4.2.4 standalone paired run](../reports/evidence-acceptance/ammonia-paired-20261019/README.md) is an external library-policy regression with raw outputs and an offline readback verifier. It is not a Vettalon finding attachment or a product detection score. Its verifier checks the archived bytes and declared container policy for internal consistency; it cannot independently attest the Docker daemon, crates.io response, or unpublished pinned dependency payload.
+The Ammonia 4.2.3/4.2.4 standalone paired run is an external library-policy regression with raw outputs and an offline readback verifier, both kept in private acceptance records. It is not a Vettalon finding attachment or a product detection score. Its verifier checks the archived bytes and declared container policy for internal consistency; it cannot independently attest the Docker daemon, crates.io response, or unpublished pinned dependency payload.
 
-The [aiohttp 3.9.1/3.9.2 local paired case](../benchmarks/real-oss-pairs/aiohttp/README.md) has a [bounded run-08 four-cell receipt](../reports/evidence-acceptance/aiohttp-paired-20261019/README.md) bound to the current runner and checked by offline raw HTTP readback. Run-06 and run-07 remain incomplete historical attempts. This case has not been attached to a Vettalon finding or used to calculate product detection performance. Its no-symlink fixture cannot establish a general containment guarantee for `follow_symlinks=True`.
+The aiohttp 3.9.1/3.9.2 local paired case (case files and receipts kept in
+private acceptance records) has a bounded run-08 four-cell receipt bound to the current runner and checked by offline raw HTTP readback. Run-06 and run-07 remain incomplete historical attempts. This case has not been attached to a Vettalon finding or used to calculate product detection performance. Its no-symlink fixture cannot establish a general containment guarantee for `follow_symlinks=True`.
 
 ## Attach local evidence without executing it
 

@@ -23,6 +23,7 @@ local. Choose providers and review their retention terms before scanning sensiti
 | `disclose` | Draft files and local repository metadata | Does not submit or send messages. Human review, channel and disclosure authorization remain required. Writes the local throttle ledger `~/.vettalon/disclosure-ledger.json` (project key, finding id, dates, override reason). Without `--check-duplicates` it makes no network request. |
 | `disclose` / `hunt --disclose-dir` / Pro disclosure panel with `--check-duplicates` (explicit opt-in) | (1) Package `name@version` and ecosystem to `api.osv.dev` (`POST /v1/query`). (2) GitHub `owner/repo`, the finding's file path and a 90-day `since` date to `api.github.com` (`GET /repos/{owner}/{repo}/commits?path=…&since=…&per_page=10`). (3) `repo:{owner}/{repo} is:open <file base name>` to `api.github.com` (`GET /search/issues`) | Finding text, code, severity and the host project's identity are not sent. OSV keeps its own client (HTTPS `api.osv.dev:443` only). GitHub requests go through the hunt egress allowlist `UPSTREAM_CHECK_HOSTS = ["api.github.com"]` (HTTPS, port 443, no userinfo, at most three redirects on the same allowlist, 20-second timeout, no retries, 1 MiB response cap), kept separate from the registry allowlist so archive downloads cannot be redirected there. Unauthenticated: no token leaves the machine, and GitHub's rate limit turns a check into "query failed". Offline or failed checks are written as "not checked"; an empty result never reads as "no duplicates" (private reports are invisible). Returned commit messages and issue titles are external text: shown as one bounded line with invisible characters made visible. |
 | `--poc` | Model receives selected source/context to generate a script; script runs in network-disabled Docker | Preload image. The sandbox reproduces a **pattern**, not the complete target application. For command injection, path traversal and SQL injection the harness judges a real effect via a one-time nonce (no new network: SSRF stays unsupported precisely because the sandbox has no network); the same `--network=none` isolation is unchanged. Success never sets `confirmed`. |
+| `verify --joern-keep`, `joern check` (experimental, explicit opt-in) | None. Joern runs in the local `vettalon-joern:<definition hash>` container with `--network=none`, the source tree mounted read-only | `vettalon joern build` must run first; it downloads the pinned Joern release (about 1.8 GB, `github.com` release assets, SHA-256 and SHA-512 checked), the digest-pinned JDK base image and php-cli from the Ubuntu archive. The image is never pulled from or pushed to a registry. |
 | Report / SARIF | Local output files; integrations upload only if the operator does so | Source excerpts and findings can be sensitive despite secret masking. Reports are not proof that no source was sent during review. |
 | Install / doctor / agent image build / trust tools | Package registries, model/image downloads, version probes, GitHub verification or explicitly requested inventory tools | Prepare separately. Their traffic must not be confused with a scan's observed traffic. |
 
@@ -78,8 +79,8 @@ Python/JavaScript/TypeScript fixtures: the positive case covered all six bundled
 rule IDs (eight findings), and the selected safe case returned zero findings;
 Semgrep `errors` was empty in both. The two Vettalon reports were complete for
 that selected engine/scope and passed validation, with source hashes unchanged.
-Raw version/argv/policy/results are in
-`reports/evidence-acceptance/root/semgrep-live-20261016/{commands,result}.json`.
+Raw version/argv/policy/results are kept in private acceptance records, not
+in this repository.
 This establishes only that version, bundled rules, fixtures and OS configuration;
 it does not establish all-scanner offline behavior, general detection quality or
 arbitrary source safety. The isolated installation is acceptance setup, not an
@@ -103,8 +104,8 @@ runtime and Windows native execution require their own acceptance; these Mac
 results do not prove either platform. Process groups are
 ownership cleanup, not a sandbox against `setsid`, group escapes, external
 SIGCHLD reapers or a replacement for OS network/memory isolation. Private raw
-records and exact test scope are in
-`reports/evidence-acceptance/scanner-process-limits-20261016/`.
+records and exact test scope are kept in acceptance records outside this
+repository.
 
 Windows has a separate runner using Windows-only pinned `process-wrap =10.0.1`:
 suspended spawn, Job Object assignment, then resume; the outer kill-on-close

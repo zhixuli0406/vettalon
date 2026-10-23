@@ -4,7 +4,8 @@
 //! (paths, byte sizes, entry-point flag, git touch counts) — never file
 //! contents. It never replaces the finder/verifier models; it only changes
 //! dispatch order so a high-value file lands inside the `--max-modules`
-//! budget. The benchmark that justified this lives in `benchmarks/ranking/`.
+//! budget. The benchmark that justified this is summarized at
+//! <https://vettalon.dudustudio.monster/#benchmarks>.
 //!
 //! Safety: this ranker sends metadata only when the operator passes `--rank jev`.
 //! Before every ranking request, [`assert_metadata_only`] fails closed on

@@ -2,15 +2,16 @@
 //! (codex, grok).
 //!
 //! Each call runs in a fresh `vettalon-agents` container that sees only a
-//! per-call temp HOME holding a copy of the CLI's auth file and an empty
-//! work dir; nothing from the host filesystem or environment. The container
+//! credential-free, owner-only per-call HOME and an empty work dir; nothing
+//! from the host filesystem or ambient environment. The container
 //! sits on an `--internal` Docker network with no route out; the only way
 //! out is the `vettalon-egress` proxy, which forwards CONNECT tunnels to
 //! the model vendors' domains and refuses everything else. A CLI that
 //! ignores the proxy simply cannot connect (fails closed).
 //!
-//! Residual risk: the model's tools can read the copied auth file and could
-//! send it to an allowlisted vendor domain.
+//! Reusable auth files and environment passthrough are rejected before Docker
+//! starts. A future credential-brokered backend may provide non-exportable,
+//! short-lived access without weakening this boundary.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -27,7 +28,7 @@ mod images;
 use images::missing_image_error;
 pub use images::{
     REGISTRY_PREFIX, SIGNER_IDENTITY_REGEXP, SIGNER_ISSUER, agents_base_image, agents_image,
-    build_images, egress_image, pull_images,
+    build_images, build_joern_image, egress_image, joern_image, pull_images,
 };
 
 /// The prompt file and final-message file, as seen inside the container.
@@ -42,6 +43,8 @@ const OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 pub const NETWORK: &str = "vettalon-int";
 pub const EGRESS_CONTAINER: &str = "vettalon-egress";
 pub const PROXY_URL: &str = "http://vettalon-egress:8888";
+const AGENT_OWNER_KEY: &str = "vettalon.agent.owner";
+const MAX_AGENT_TIMEOUT_SECS: u64 = 30 * 60;
 /// HOME inside the agent container.
 pub const CONTAINER_HOME: &str = "/home/agent";
 pub const CONTAINER_WORK: &str = "/home/agent/work";
@@ -81,12 +84,17 @@ pub fn host_home() -> PathBuf {
 
 /// The `docker run` prefix for one agent call (everything before the CLI's
 /// own argv). Pure, so the isolation flags are unit-tested.
-pub fn run_args(
-    name: &str,
-    image: &str,
-    home_mount: &Path,
-    env: &[(String, String)],
-) -> Vec<String> {
+pub fn run_args(name: &str, image: &str, home_mount: &Path) -> Vec<String> {
+    let owner_label = format!("{AGENT_OWNER_KEY}={}", std::process::id());
+    #[cfg(unix)]
+    let container_user = {
+        // SAFETY: geteuid/getegid have no arguments and only read process identity.
+        format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+            libc::getegid()
+        })
+    };
+    #[cfg(not(unix))]
+    let container_user = "10001:10001".to_string();
     let mut a: Vec<String> = [
         "run",
         "--rm",
@@ -95,6 +103,8 @@ pub fn run_args(
         name,
         "--label",
         AGENT_LABEL,
+        "--label",
+        owner_label.as_str(),
         "--pull=never",
         "--network",
         NETWORK,
@@ -103,6 +113,8 @@ pub fn run_args(
         "/tmp:rw,nosuid,size=256m",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
+        "--user",
+        container_user.as_str(),
         "--pids-limit=512",
         "--memory=2g",
         "--memory-swap=2g",
@@ -124,10 +136,6 @@ pub fn run_args(
     .iter()
     .map(|s| s.to_string())
     .collect();
-    for (k, v) in env {
-        a.push("--env".into());
-        a.push(format!("{k}={v}"));
-    }
     a.push("--mount".into());
     a.push(format!(
         "type=bind,source={},target={CONTAINER_HOME}",
@@ -137,49 +145,25 @@ pub fn run_args(
     a
 }
 
-/// Lay out a per-call HOME under `root`: `home/<auth files>` and
-/// `home/work/`. Returns the host path to mount as the container HOME.
+/// Lay out a credential-free per-call HOME under `root`.
 pub fn prepare_home(root: &Path, auth_files: &[(PathBuf, String)]) -> Result<PathBuf, String> {
+    if !auth_files.is_empty() {
+        return Err(
+            "reusable CLI credentials are forbidden in tool-capable model containers".into(),
+        );
+    }
     let home = root.join("home");
     let work = home.join("work");
     std::fs::create_dir_all(&work).map_err(|e| format!("cannot create container home: {e}"))?;
-    for (src, rel) in auth_files {
-        if rel.contains("..") || rel.starts_with('/') {
-            return Err(format!("invalid auth file target {rel:?}"));
-        }
-        let dst = home.join(rel);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-        }
-        std::fs::copy(src, &dst).map_err(|e| {
-            format!(
-                "cannot copy auth file {} (log in to the CLI on this machine first): {e}",
-                src.display()
-            )
-        })?;
-    }
-    // The container user (uid 10001) must be able to write its HOME (token
-    // refresh, session files). The enclosing temp dir stays 0700 on the host.
     #[cfg(unix)]
-    chmod_tree_open(&home);
-    Ok(home)
-}
-
-#[cfg(unix)]
-fn chmod_tree_open(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777));
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                chmod_tree_open(&p);
-            } else {
-                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666));
-            }
-        }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot protect container home: {e}"))?;
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot protect container work dir: {e}"))?;
     }
+    Ok(home)
 }
 
 async fn docker(docker_bin: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -232,6 +216,7 @@ async fn check_images(docker_bin: &str) -> Result<(), String> {
 pub async fn ensure_infra() -> Result<(), String> {
     let bin = docker_bin()?;
     check_images(&bin).await?;
+    remove_agent_leftovers(&bin).await;
     let net = docker(
         &bin,
         &["network", "inspect", "--format", "{{.Internal}}", NETWORK],
@@ -311,6 +296,107 @@ pub async fn ensure_infra() -> Result<(), String> {
     Ok(())
 }
 
+async fn remove_agent_leftovers(docker_bin: &str) {
+    let format = format!("{{{{.ID}}}} {{{{.Label \"{AGENT_OWNER_KEY}\"}}}}");
+    let Ok(output) = docker(
+        docker_bin,
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={AGENT_LABEL}"),
+            "--format",
+            &format,
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let me = std::process::id();
+    for (id, owner) in parse_agent_listing(&String::from_utf8_lossy(&output.stdout)) {
+        if agent_is_leftover(owner, me) {
+            let _ = docker(docker_bin, &["rm", "-f", &id]).await;
+        }
+    }
+}
+
+fn parse_agent_listing(listing: &str) -> Vec<(String, Option<u32>)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let id = parts.next()?.to_string();
+            let owner = parts.next().and_then(|part| part.parse().ok());
+            Some((id, owner))
+        })
+        .collect()
+}
+
+fn agent_is_leftover(owner: Option<u32>, current: u32) -> bool {
+    match owner {
+        None => true,
+        Some(owner) if owner == current => false,
+        Some(owner) => !process_is_alive(owner),
+    }
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 performs an existence/permission check only.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+
+        type Handle = *mut c_void;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
+            fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+            fn CloseHandle(object: Handle) -> i32;
+            fn GetLastError() -> u32;
+        }
+
+        // SAFETY: the handle is queried read-only and closed on every success
+        // path. Access-denied means the process exists but is protected.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return match GetLastError() {
+                    ERROR_INVALID_PARAMETER => false,
+                    ERROR_ACCESS_DENIED => true,
+                    _ => true,
+                };
+            }
+            let mut exit_code = 0u32;
+            let queried = GetExitCodeProcess(process, &mut exit_code);
+            let _ = CloseHandle(process);
+            queried != 0 && exit_code == STILL_ACTIVE
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Force-remove a (possibly still running) agent container.
 pub async fn force_remove(name: &str) {
     if let Ok(bin) = docker_bin() {
@@ -329,19 +415,61 @@ pub async fn teardown() -> Result<(), String> {
 /// Full `docker` argv for one call: the isolation flags, then the CLI's
 /// program and its arguments rendered with the in-container prompt/output
 /// paths. Pure, so the whole command line is unit-testable without docker.
-pub fn docker_argv(
-    name: &str,
-    image: &str,
-    home_mount: &Path,
-    env: &[(String, String)],
-    spec: &CliSpec,
-) -> Vec<String> {
-    let mut argv = run_args(name, image, home_mount, env);
+pub fn docker_argv(name: &str, image: &str, home_mount: &Path, spec: &CliSpec) -> Vec<String> {
+    let mut argv = run_args(name, image, home_mount);
+    argv.extend([
+        "timeout".to_string(),
+        "-s".to_string(),
+        "KILL".to_string(),
+        spec.timeout
+            .as_secs()
+            .clamp(1, MAX_AGENT_TIMEOUT_SECS)
+            .to_string(),
+    ]);
     argv.push(spec.program.clone());
     // Inside the container the prompt file and output file are at fixed
     // paths under the mounted work dir; an `arg` prompt is passed inline.
     argv.extend(spec.render_args_with("", CONTAINER_OUT_FILE, CONTAINER_PROMPT_FILE));
     argv
+}
+
+/// Cancellation-safe ownership of a named agent container. Killing the
+/// `docker run` client does not guarantee daemon-side container removal.
+struct AgentContainerGuard {
+    docker_bin: String,
+    name: String,
+    armed: bool,
+}
+
+impl AgentContainerGuard {
+    fn new(docker_bin: &str, name: &str) -> Self {
+        Self {
+            docker_bin: docker_bin.to_string(),
+            name: name.to_string(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AgentContainerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut command = std::process::Command::new(&self.docker_bin);
+        command
+            .args(["rm", "-f", &self.name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        std::thread::spawn(move || {
+            let _ = command.status();
+        });
+    }
 }
 
 /// A [`CliSpec`] whose tools stay on, run inside the agents container.
@@ -354,6 +482,12 @@ pub struct ContainerCliCaller {
 #[async_trait]
 impl LlmCaller for ContainerCliCaller {
     async fn complete(&self, prompt: &str) -> super::Result<String> {
+        if !self.container.auth_files.is_empty() || !self.spec.env_passthrough.is_empty() {
+            return Err(LlmError::Executor(
+                "tool-capable model containers refuse reusable credentials and environment passthrough; use a tool-disabled or credential-brokered backend"
+                    .into(),
+            ));
+        }
         if self.spec.prompt_via == PromptVia::Arg {
             // The container passes the prompt by file or stdin, never argv
             // (argv would appear in `docker inspect`); presets never use Arg
@@ -372,27 +506,10 @@ impl LlmCaller for ContainerCliCaller {
         let home =
             prepare_home(root.path(), &self.container.auth_files).map_err(LlmError::Executor)?;
         let work = home.join("work");
-        std::fs::write(work.join(WORK_PROMPT_FILE), prompt)
+        crate::util::write_private(&work.join(WORK_PROMPT_FILE), prompt.as_bytes())
             .map_err(|e| LlmError::Executor(format!("cannot write prompt: {e}")))?;
-        // The container user (uid 10001) must read the prompt and write the
-        // output; prepare_home already opened the tree, re-apply to the new file.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                work.join(WORK_PROMPT_FILE),
-                std::fs::Permissions::from_mode(0o666),
-            );
-        }
-
-        let env: Vec<(String, String)> = self
-            .spec
-            .env_passthrough
-            .iter()
-            .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
-            .collect();
         let name = format!("vettalon-agent-{}", uuid::Uuid::new_v4().simple());
-        let argv = docker_argv(&name, &self.container.image, &home, &env, &self.spec);
+        let argv = docker_argv(&name, &self.container.image, &home, &self.spec);
 
         let mut child = Command::new(&docker_bin)
             .args(&argv)
@@ -402,6 +519,7 @@ impl LlmCaller for ContainerCliCaller {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| LlmError::Executor(format!("cannot start docker: {e}")))?;
+        let mut guard = AgentContainerGuard::new(&docker_bin, &name);
 
         let feed: Vec<u8> = self.spec.stdin_payload(prompt);
         let mut stdin = child.stdin.take().expect("piped stdin");
@@ -430,6 +548,7 @@ impl LlmCaller for ContainerCliCaller {
             Ok(r) => r,
             Err(_) => {
                 force_remove(&name).await;
+                guard.disarm();
                 return Err(LlmError::Executor(format!(
                     "{} in container timed out after {}s",
                     self.spec.program,
@@ -437,7 +556,13 @@ impl LlmCaller for ContainerCliCaller {
                 )));
             }
         };
-        let status = status.map_err(|e| LlmError::Executor(format!("wait failed: {e}")))?;
+        let status = match status {
+            Ok(status) => {
+                guard.disarm();
+                status
+            }
+            Err(error) => return Err(LlmError::Executor(format!("wait failed: {error}"))),
+        };
         if !status.success() {
             let tail = crate::util::mask_sensitive_text(String::from_utf8_lossy(&err).trim());
             return Err(LlmError::Executor(format!(
@@ -490,12 +615,7 @@ mod tests {
 
     #[test]
     fn run_args_isolate_network_fs_and_privileges() {
-        let a = run_args(
-            "n",
-            "img",
-            Path::new("/tmp/h"),
-            &[("OPENAI_API_KEY".into(), "k".into())],
-        );
+        let a = run_args("n", "img", Path::new("/tmp/h"));
         for flag in [
             "--rm",
             "--read-only",
@@ -506,6 +626,10 @@ mod tests {
         ] {
             assert!(a.iter().any(|x| x == flag), "missing {flag}");
         }
+        assert!(
+            a.iter()
+                .any(|value| value == &format!("{AGENT_OWNER_KEY}={}", std::process::id()))
+        );
         let n = a.iter().position(|x| x == "--network").unwrap();
         assert_eq!(a[n + 1], NETWORK);
         assert!(
@@ -513,7 +637,7 @@ mod tests {
                 .any(|x| x == &format!("type=bind,source=/tmp/h,target={CONTAINER_HOME}"))
         );
         assert!(a.iter().any(|x| x == &format!("HTTPS_PROXY={PROXY_URL}")));
-        assert!(a.iter().any(|x| x == "OPENAI_API_KEY=k"));
+        assert!(!a.iter().any(|x| x.starts_with("OPENAI_API_KEY=")));
         assert_eq!(a.last().unwrap(), "img");
         // The host HOME is never mounted.
         assert!(
@@ -523,27 +647,48 @@ mod tests {
     }
 
     #[test]
-    fn prepare_home_copies_only_the_auth_files() {
+    fn agent_listing_and_owner_policy_preserve_live_current_containers() {
+        assert_eq!(
+            parse_agent_listing("abc 42\ndef\nghi nope\n"),
+            vec![
+                ("abc".to_string(), Some(42)),
+                ("def".to_string(), None),
+                ("ghi".to_string(), None),
+            ]
+        );
+        let me = std::process::id();
+        assert!(!agent_is_leftover(Some(me), me));
+        assert!(agent_is_leftover(None, me));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_agent_owner_probe_distinguishes_live_and_absent_processes() {
+        let me = std::process::id();
+        assert!(process_is_alive(me));
+        assert!(!process_is_alive(u32::MAX));
+        assert!(!agent_is_leftover(Some(me), me));
+        assert!(agent_is_leftover(Some(u32::MAX), me));
+    }
+
+    #[test]
+    fn prepare_home_refuses_auth_files_and_keeps_the_mount_private() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
         let src = tempfile::tempdir().unwrap();
         let auth = src.path().join("auth.json");
         std::fs::write(&auth, "{}").unwrap();
-        std::fs::write(src.path().join("other-secret"), "x").unwrap();
         let root = tempfile::tempdir().unwrap();
-        let home = prepare_home(root.path(), &[(auth, ".codex/auth.json".into())]).unwrap();
-        assert!(home.join(".codex/auth.json").is_file());
+        let error = prepare_home(root.path(), &[(auth, ".codex/auth.json".into())]).unwrap_err();
+        assert!(error.contains("credentials"), "{error}");
+
+        let home = prepare_home(root.path(), &[]).unwrap();
         assert!(home.join("work").is_dir());
-        let names: Vec<_> = std::fs::read_dir(&home)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name())
-            .collect();
-        assert_eq!(names.len(), 2, "{names:?}");
-        assert!(
-            prepare_home(
-                root.path(),
-                &[(src.path().join("auth.json"), "../x".into())]
-            )
-            .is_err()
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 
@@ -558,7 +703,7 @@ mod tests {
             )],
         )
         .unwrap_err();
-        assert!(e.contains("log in"));
+        assert!(e.contains("credentials"));
     }
 
     fn codex_container_spec() -> (CliSpec, ContainerSpec) {
@@ -576,13 +721,13 @@ mod tests {
     #[test]
     fn docker_argv_appends_program_and_container_paths() {
         let (spec, cspec) = codex_container_spec();
-        let a = docker_argv("n", &cspec.image, Path::new("/tmp/home"), &[], &spec);
+        let a = docker_argv("n", &cspec.image, Path::new("/tmp/home"), &spec);
         let prog = a
             .iter()
             .position(|x| x == "codex")
             .expect("program present");
-        // Everything before the program is docker isolation; the image is last.
-        assert_eq!(a[prog - 1], cspec.image);
+        assert!(a[..prog].iter().any(|x| x == &cspec.image));
+        assert_eq!(&a[prog - 4..prog], ["timeout", "-s", "KILL", "60"]);
         let rest = &a[prog + 1..];
         assert!(rest.iter().any(|x| x == CONTAINER_OUT_FILE), "{rest:?}");
         assert!(rest.iter().any(|x| x == "--sandbox"));
@@ -590,18 +735,70 @@ mod tests {
         assert!(!a.iter().any(|x| x.contains("/host/.codex")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn run_args_uses_the_private_home_owner_instead_of_a_shared_uid() {
+        use std::os::unix::fs::MetadataExt;
+        let home = tempfile::tempdir().unwrap();
+        let a = run_args("n", "img", home.path());
+        let user = a.iter().position(|x| x == "--user").unwrap();
+        let meta = std::fs::metadata(home.path()).unwrap();
+        assert_eq!(a[user + 1], format!("{}:{}", meta.uid(), meta.gid()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_container_guard_removes_only_while_armed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let fake = dir.path().join("docker");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = fake.display().to_string();
+
+        let mut done = AgentContainerGuard::new(&bin, "finished");
+        done.disarm();
+        drop(done);
+        drop(AgentContainerGuard::new(&bin, "cancelled"));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let calls = loop {
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            if !calls.is_empty() || std::time::Instant::now() > deadline {
+                break calls;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(calls.trim(), "rm -f cancelled");
+    }
+
     #[test]
     fn grok_container_argv_uses_the_prompt_file() {
         let spec = CliSpec::preset("grok", None, Duration::from_secs(60)).unwrap();
-        let a = docker_argv("n", "img", Path::new("/tmp/home"), &[], &spec);
+        let a = docker_argv("n", "img", Path::new("/tmp/home"), &spec);
         let prog = a.iter().position(|x| x == "grok").unwrap();
         assert!(a[prog + 1..].iter().any(|x| x == CONTAINER_PROMPT_FILE));
+    }
+
+    #[test]
+    fn in_container_timeout_has_a_hard_upper_bound() {
+        let mut spec = CliSpec::preset("grok", None, Duration::from_secs(60)).unwrap();
+        spec.timeout = Duration::from_secs(999_999);
+        let a = docker_argv("n", "img", Path::new("/tmp/home"), &spec);
+        let prog = a.iter().position(|x| x == "grok").unwrap();
+        assert_eq!(&a[prog - 4..prog], ["timeout", "-s", "KILL", "1800"]);
     }
 
     #[tokio::test]
     async fn arg_prompt_is_refused_by_the_container_backend() {
         let mut spec = CliSpec::preset("grok", None, Duration::from_secs(1)).unwrap();
         spec.prompt_via = PromptVia::Arg;
+        spec.env_passthrough.clear();
         let caller = ContainerCliCaller {
             spec,
             container: ContainerSpec {
@@ -635,5 +832,19 @@ mod tests {
             calls.lines().all(|l| l.starts_with("image inspect")),
             "{calls}"
         );
+    }
+
+    #[tokio::test]
+    async fn credential_environment_is_refused_before_docker_startup() {
+        let spec = CliSpec::preset("codex", None, Duration::from_secs(1)).unwrap();
+        let caller = ContainerCliCaller {
+            spec,
+            container: ContainerSpec {
+                image: "img".into(),
+                auth_files: vec![],
+            },
+        };
+        let error = caller.complete("untrusted source").await.unwrap_err();
+        assert!(error.to_string().contains("credentials"), "{error}");
     }
 }

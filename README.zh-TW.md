@@ -42,7 +42,7 @@ AI 深度審計／對抗式覆核／PoC（deep profile）：
 - macOS 或 Linux（容器隔離、PoC 沙箱與 0600 權限用的是 Unix 專屬機制；暫不支援 Windows）
 - Rust 1.88 以上（`cargo`）
 - deep 模式至少要有一個模型，下列擇一：
-  - 已登入的 `claude`（Claude Code）；`codex`、`grok` 也能用，預設會在容器沙箱裡跑（需要 Docker，先跑一次 `vettalon agents pull` 或 `vettalon agents build`）；`agy`（Google Antigravity CLI）只能在 host 上跑，要設 `allow_agent_tools = true`。細節見下面的「安全邊界」
+  - 已登入、且能完全關閉工具的 `claude`（Claude Code）。已認證的 `codex`、`grok` 與 `agy` CLI 需明確設定高風險的 `allow_agent_tools = true` 才會在 host 上執行；建議改用 HTTP/OpenAI-compatible API 或 Ollama。細節見下面的「安全邊界」
   - OpenAI 相容 API 的金鑰（放在環境變數裡）
   - 本機 Ollama
 - 選用：`semgrep`、`gitleaks`、`cargo-audit`（有裝才會跑）
@@ -220,11 +220,37 @@ vettalon rule-draft hunt.json --finding <id>  # 從人工確認的 finding 產 S
 | `0` | 沒有達到 `--fail-on` 門檻，`--gate` 條件全部通過。未完成的掃描也可能是 0（時間預算用完、模型拒答、幾個 AI 引擎中有一個掛掉），要看報告的 `run_status` 與 `incomplete_reason`。 |
 | `1` | 有發現達到 `--fail-on`，或 `--gate` 條件不通過。 |
 | `2` | 掃描本身沒能完成：路徑錯誤、旗標或預算值不合理、門檻條件寫錯、報告寫不出來等等。 |
-| `4` | 只在 `--profile deep`：沒有任何 AI 引擎能執行（容器映像檔不存在、找不到 CLI、連不上供應商），沒有模組經過 AI 審查。報告照樣寫出（`run_status: incomplete`、`incomplete_reason: engine_unavailable`，原因在 `engines_missing`）。優先於 `1`，終端摘要仍會顯示門檻結果。加 `--allow-incomplete` 就照舊以 `0`／`1` 結束。0.3.1 以前這種情況是 0。 |
+| `4` | 只在 `--profile deep`：沒有任何 AI 引擎能執行（容器映像檔不存在、找不到 CLI、連不上供應商），沒有模組經過 AI 審查。報告照樣寫出（`run_status: incomplete`、`incomplete_reason: engine_unavailable`，原因在 `engines_missing`）。優先於 `1`：終端摘要的 `結論：` 寫「未完成」，附上每個引擎的原因與處理方式，門檻沒過時另起一行 `門檻：`。加 `--allow-incomplete` 就照舊以 `0`／`1` 結束，摘要改印門檻結論，後面仍註明這次掃描未完成。0.3.1 以前這種情況是 0。 |
 
 `vettalon` 不用 `3`，Vettalon Pro 的 CLI 用它表示「需要授權」。只有部分 AI 引擎無法使用時，整次標為未完成（`engine_unavailable`），終端會寫出幾個引擎沒跑，結束碼照門檻結果。quick 掃描不會出現 4。
 
 `vettalon verify` 只要輸出檔寫出就是 `0`，覆核模型連不上也一樣（看輸出的 `incomplete` 與 `unverified`）；沒辦法執行（輸入檔有誤、模型清單沒有這個 verifier、輸出檔寫不出來）時是 `2`。
+
+### 保守模式
+
+`--refuter-policy evidence+retrieval` 讓 refuter 比較不容易關掉發現。推翻要引用 vettalon 會檢查的程式碼行，refuter 判斷不了的主張維持 `candidate`；refuter 說看不到某個識別字時，vettalon 用確定性的定義搜尋找出定義，再請它判一次。適合漏掉一個真漏洞的代價比多看一些告警高的稽核。這個模式要自己選用，預設仍是 `current`。
+
+```bash
+vettalon scan . --profile deep --refuter-policy evidence+retrieval
+vettalon verify . --input report.json --verifier claude --refuter-policy evidence+retrieval --out verified.json
+```
+
+目前只量過一次（2026-10-22）：用 `vettalon verify` 跑 SastBench 確認集，只算真告警標籤經過人工核對的子集（144 個真告警、196 個假告警）。兩種政策用同一個執行檔、同一天並行，verifier 是透過 `claude` CLI 的 Sonnet，`--refuter-runs 1`。
+
+| 被 refuter 關掉的比例 | `current` | `evidence+retrieval` | 差 [95% 區間] |
+|---|---|---|---|
+| 真告警（真的漏洞） | 52.1% | 32.6% | −19.4 pp [−26.4, −12.5]，Holm p = 4.9 × 10⁻⁷ |
+| 假告警 | 83.7% | 62.8% | −20.9 pp [−27.0, −14.8] |
+| 鑑別力（ΔJ） | | | −1.5 pp [−11.9, +7.3] |
+
+代價：真漏洞被關掉的比例少了 19.4 pp，假告警被關掉的比例也少了 20.9 pp，誤關的真漏洞變少，留給你看的告警變多。鑑別力未觀察到差異（檢定力不足，不能當成沒有差異）。340 個告警裡有 42 個回 `unresolved`，這些發現維持 `candidate`。呼叫也比較多：同樣 368 個告警，它用了 476 次模型呼叫，`current` 是 375 次。
+
+這次量測的限制：
+
+- 只有一個基準、一個 verifier 模型。SastBench 的告警來自 SAST 工具；vettalon 自己 AI finder 的候選沒有量，原本為它們準備的護欄跑分（含 holdout 檢查）這個政策沒有跑。
+- 每個發現只覆核一次。High 以上預設跑 3 次，這個設定沒有量過。
+- 沒有顯示鑑別力比較好，事先登錄的主要檢定也沒有通過，所以沒有改成預設。
+- `evidence`、`evidence+prosecutor` 在同一個研究裡篩選過，沒有確認；`evidence-ext` 沒有量過。這些請當成實驗性功能。
 
 ### 模組排序（`--rank`）
 
@@ -318,21 +344,13 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 | grok | `--tools ""` | **無效**，仍能讀檔，也能執行指令 |
 | agy | 沒有這種旗標 | headless 模式會自動拒絕需要授權的工具（執行指令、讀空工作目錄以外的檔案、寫檔；2026-10-20 實測沒有建立或讀到任何檔案），但 `search_web` 不需授權就執行了 |
 
-所以 codex、grok **預設在容器沙箱裡跑**：
+已認證的 codex 與 grok 設定現在**預設 fail-closed**。它們的工具控制無法阻止讀檔；若把可重用的 CLI 認證放進沙箱，模型就能讀取，並可能經允許的廠商網域將它送出，所以只有網路隔離不是充分的憑證邊界。除非明確設定 `allow_agent_tools = true`，接受在 host 上直接讀取本機檔案與憑證的風險，Vettalon 會拒絕這類設定；自訂 `program` 也一樣。建議改用能完全關閉工具的 CLI、用環境變數傳入限縮金鑰的 HTTP/OpenAI-compatible API，或本機 Ollama。
 
-- 先跑一次 `vettalon agents pull`。它從 GHCR 下載兩個映像檔：egress proxy，以及裝好 codex、沒有 grok 的基底映像檔。下載前先用 cosign 驗證簽章（必須是這個 repo 的 `images.yml` workflow 在 `main` 或發版 tag 上簽的），驗過才用 digest 釘住，最後在你的機器上從 x.ai 下載 grok，疊在基底上面。grok 的授權不允許轉散布，所以公開的映像檔裡都沒有它。沒裝 `cosign` 時 `pull` 會停下來，請你安裝 cosign，或改用 `vettalon agents build`：它用執行檔內建的定義在本機建出全部三個映像檔，完全不從 GHCR 拉。`--no-verify` 會略過簽章檢查，不安全。掃描本身從不拉映像檔（`docker run --pull=never`）。
-- 標籤取自映像檔定義，跟 vettalon 版本號無關，所以升級 vettalon 後，只有新版改了這些定義才要重新 pull 或重建。**從 0.3.1 以前升級時要再跑一次 `vettalon agents pull`（或 `vettalon agents build`）**：舊映像檔的標籤是版本號，新標籤（`<repo>:<定義內容 SHA-256 的前 12 個十六進位字元>`）的映像檔還不存在。需要時，掃描會回報 `container image vettalon-agents:<tag> is missing`，並附上要跑的指令。`vettalon agents images` 依序印出 agents 映像檔、egress proxy、公開基底的標籤。想自己動手驗證映像檔或下載它們的原始碼，見[容器映像檔驗證](docs/TRUST.md#container-images)。
-- 每次呼叫都開一個全新容器，裡面只有一份複製進去的 auth 檔和一個空的工作目錄，看不到 host 的檔案系統和環境變數。
-- 容器接在 `--internal` 的 Docker 網路上，沒有對外路由；唯一的出口是 proxy，只放行模型廠商的網域，其他一律拒絕。
-- 實測：容器裡的 grok 被要求讀 host 檔案時回「不存在」。
-
-殘留風險：容器裡的模型仍讀得到那份複製進去的 auth 檔，理論上能把它送到白名單內的廠商網域。
-
-如果你確定只審自己信任的程式碼，想省掉容器的額外時間，可以在設定檔對該模型設 `allow_agent_tools = true`，改成直接在 host 上跑（接受上面的讀檔風險）。自訂 `program` 無法自動容器化，只能走這條路。
+`vettalon agents pull`、`build`、`images` 與 `stop` 仍可用於準備不含憑證的映像檔，以及未來有憑證 broker 的流程；這些指令不會授權已認證的 codex 或 grok 模型呼叫，也不會繞過 fail-closed 設定檢查。`pull` 預設驗證公開映像檔的簽章；`--no-verify` 不安全。映像檔標籤取自定義內容，不是 Vettalon 版本號。手動驗證方法見[容器映像檔驗證](docs/TRUST.md#container-images)。
 
 `agy` 沒有容器映像檔（登入資訊沒辦法複製進容器），所以一定要設 `allow_agent_tools = true`，在 host 上跑。vettalon 從 stdin 送 prompt（不放在 argv），在前面加一行「不要用工具，只依這則訊息回答」，CLI 的串流裡只要出現任何工具步驟、被拒的動作或空回覆，就把整個回覆丟掉。關不掉的部分：agy 會讀你自己的 `~/.gemini/GEMINI.md`（可能改變回覆語言），也會保留自己的對話紀錄，裡面有被審的程式碼。2026-10-20 實測時，Gemini 的供應商過濾器把 vettalon 每一個覆核 prompt 都回成「This request was blocked by Gemini's filters」（三個 Flash 等級共 5 次、5 次都被擋），vettalon 會記成拒答；同一個 CLI 換用 GPT-OSS 120B 則正常回答。
 
-管理容器：`vettalon agents pull` 下載並驗證公開映像檔、`vettalon agents build` 在本機建出全部映像檔、`vettalon agents images` 印出應有的映像檔標籤、`vettalon agents stop` 收掉 proxy 和內網。
+管理不含憑證的容器基礎設施：`vettalon agents pull` 下載並驗證公開映像檔、`vettalon agents build` 在本機建出全部映像檔、`vettalon agents images` 印出應有的映像檔標籤、`vettalon agents stop` 收掉 proxy 和內網。
 
 ## 怎麼運作
 
@@ -342,7 +360,7 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 4. **高風險模組雙審**：git 安全熱點或進入點的模組（天然少數）會自動再交給一家不同家族的 finder 審一次，兩家各讀一遍；加 `--cross-check-top N` 可把前 N 個高分模組也納入。一家漏看、另一家補上。
    `--dual-finder-top N`（預設關閉）在前 N 個模組上再多做一步：兩家 finder 都被要求替每筆候選附一個選填的修補建議（單一檔案、最多 10 行），覆核前先依根因合併兩邊的清單。兩家回報同一個 id 的主張會最先配對（`identical_claim`）。其餘的，把某個修補套到檔案的記憶體副本上，若兩筆候選的 sink 行都被改掉，就合併成一筆（`dedupe_basis=same_patch`）；修補沒動到另一筆的 sink 行，或兩筆的 CWE 不同，就保留兩筆。兩邊都沒有可用修補時，退回看同一個 sink 檔案、sink 行相距 3 行內且 CWE 相同（`location_cwe`），缺 CWE 一律不合併。在 sink 行上方加防禦、sink 行本身沒變的修補不算數，所以會留下一些重複，這是比較安全的方向。合併後的那筆在 `found_by` 列出兩家 finder，並帶一筆 `dual_finder_merge` 證據。之後每筆候選盡量交給第三個家族的模型反駁。報告的 `ensemble.dual_finder` 逐家族記錄候選數、只有該家族找到的根因數（以及其中幾筆最後是 `needs_human`），也記錄加開那一家的呼叫次數、送出的原始碼量，和每多一筆 `needs_human` 花了幾次呼叫。Vettalon 看不到每次呼叫的價格，金額請用你自己的費率換算。finder 只有一個家族時，這個旗標會記為 skipped。這 N 個模組指的是實際送審模組的前 N 個（有開 `--prescreen` 時是篩選後的順序）。第二家族的模組審查和其他 finder 共用同一個期限（`--finder-budget` 或 `--time-budget`），用完後剩下的模組照常列為 deferred，邊際產出只計實際跑完的呼叫。
 5. **跨家族覆核**：每個候選交給一個與 finder 不同家族的 verifier，要它從零開始試著推翻。推翻不了的標成 `needs_human`，附上「還需要確認什麼」的清單。模型清單裡沒有其他家族時，會退回同家族的其他模型，再不行就由 finder 自己覆核，投票紀錄裡會寫明（`same_model`）。
-   verifier 只拿到主張（位置、威脅模型、trace 位置、前置條件）和重新讀取的程式碼，看不到 finder 的推理，prompt 預設「程式碼證明不了就推翻」。High 以上的發現跑 3 次獨立覆核（`--refuter-runs`，1 到 5）：3 次都判可能成立才標 `needs_human` 並記 `refuter_consistent: 3/3`，3 次都推翻才算證偽，結論不一致就維持 `candidate` 並記 `verify_uncertain: k/n plausible`。每一次都各記一票。推翻理由若依賴某個防禦檢查，必須附上該檢查的檔案與行號；行號不存在或不在主張的 trace 上，這次推翻不採用（`verify_error: refutation cites missing guard`），發現維持 `candidate`。覆核沒跑完（呼叫失敗、拒答，或 `--time-budget` 用完而不再開始額外的覆核）時，發現維持 `candidate` 並記 `verify_error: incomplete refuter runs`，整次執行標成 incomplete。防護或消毒只有在擋下所有流到 sink 的輸入形式時才算安全；看得出只擋住部分形式，或流向看得到、但決定是否安全的那段程式碼（定義、被呼叫的函式、值的來源）不在摘錄裡時，verifier 會被要求回 `plausible` 並把缺口寫進 blockers，不要推翻。完全看不到流向的主張仍然推翻。回覆違反回覆合約（不是 JSON、`plausible` 沒有 blockers 或驗證計畫、`refuted` 沒有理由類別）不算結論：vettalon 會把問題寫明，請同一次覆核再答一次（`--verifier-parse-retries`，預設 1，設 0 關閉；修正算一次額外呼叫）。第二次仍違約，那次覆核記為 `verify_error`、視為缺席，不會算成推翻也不算意見分歧，發現維持 `candidate`。報告會記 `verifier_reflector: N reply(ies) ... re-asked, M recovered`，另外每次重問各記一行原因與第二次回覆的結果。
+   verifier 只拿到主張（位置、威脅模型、trace 位置、前置條件）和重新讀取的程式碼，看不到 finder 的推理，prompt 預設「程式碼證明不了就推翻」。High 以上的發現跑 3 次獨立覆核（`--refuter-runs`，1 到 5）：3 次都判可能成立才標 `needs_human` 並記 `refuter_consistent: 3/3`，3 次都推翻才算證偽，結論不一致就維持 `candidate` 並記 `verify_uncertain: k/n plausible`。每一次都各記一票。推翻理由若依賴某個防禦檢查，必須附上該檢查的檔案與行號；行號不存在或不在主張的 trace 上，這次推翻不採用（`verify_error: refutation cites missing guard`），發現維持 `candidate`。覆核沒跑完（呼叫失敗、拒答，或 `--time-budget` 用完而不再開始額外的覆核）時，發現維持 `candidate` 並記 `verify_error: incomplete refuter runs`，整次執行標成 incomplete。防護或消毒只有在擋下所有流到 sink 的輸入形式時才算安全；看得出只擋住部分形式，或流向看得到、但決定是否安全的那段程式碼（定義、被呼叫的函式、值的來源）不在摘錄裡時，verifier 會被要求回 `plausible` 並把缺口寫進 blockers，不要推翻。完全看不到流向的主張仍然推翻。回覆違反回覆合約（不是 JSON、`plausible` 沒有 blockers 或驗證計畫、`refuted` 沒有理由類別）不算結論：vettalon 會把問題寫明，請同一次覆核再答一次（`--verifier-parse-retries`，預設 1，設 0 關閉；修正算一次額外呼叫）。第二次仍違約，那次覆核記為 `verify_error`、視為缺席，不會算成推翻也不算意見分歧，發現維持 `candidate`。報告會記 `verifier_reflector: N reply(ies) ... re-asked, M recovered`，另外每次重問各記一行原因與第二次回覆的結果。每個推翻也會記 `refute_basis: run i/n <依據>; guard=…; cited=…; outcome=…`。`--refuter-policy`（預設 `current`，即上述行為）可以選用其他政策。`evidence+retrieval` 是量測過的選用保守模式：關閉要引用 vettalon 會檢查的程式碼行（檢查不過或回 `unresolved` 時，發現維持 `candidate` 並記 `verify_uncertain: unresolved`），refuter 看不到的定義會用確定性搜尋取回，再判一次；代價見[保守模式](#保守模式)。其他政策是實驗性的，不建議使用：`evidence` 與 `evidence+prosecutor`（以防護或信任理由關閉時多一次盲測繞過）篩選過但沒有確認，`evidence-ext`（只對外部掃描器的主張套用）沒有量過。`--refuter-score`（預設關閉，實驗性）會請每次覆核另外給 `p_real`（0 到 100，主張為真的機率）與 `evidence_level`（`safe_shown`、`safe_likely`、`undetermined`、`flow_likely`、`flow_shown`），記成 `refuter_score: run i/n p_real=… evidence=…; verdict=…`。這兩個值在一般解析之前就被取出，解析看到的是同一份 JSON；但 prompt 多了一段，模型的回答會不會因此不同要靠量測，不是保證；缺值或格式錯誤會照實記下。這裡的 `evidence_level` 是 refuter 對摘錄的判讀，不是報告裡由證據鏈算出的 `evidence_level`。分數還在量測。唯一會讀它的是 `--refuter-score-threshold P`（0 到 100，預設關閉，實驗性，會一併打開分數）：推翻只有在該次 `p_real` 低於 P 時才關閉發現；分數較高、缺值或格式錯誤時，發現維持 `candidate`，那次覆核記為被降級的 `unresolved`。它從不關掉 refuter 沒有推翻的發現。`verify --joern-keep`（預設關閉，實驗性）在覆核之後，對 refuter 用模型回覆關掉的每個發現問 [Joern](https://github.com/joernio/joern)：從固定的輸入來源（請求參數、`argv` 這類）到主張那一行的呼叫，有沒有資料流路徑。有被規則接受的路徑，發現就維持 `candidate`，記一行 `joern_path:`（路徑上的檔案、行號與程式碼）和 `verify_uncertain: joern path`；沒有路徑、那行沒有呼叫、語言不支援、逾時或任何錯誤，判決都不變，只記一行 `joern:`。找不到路徑不代表告警是假的，所以它只會讓發現保留，不會關掉任何發現。先跑一次 `vettalon joern build`（下載固定版本的 Joern，約 1.8 GB，核對 SHA-256 與 SHA-512）；分析在沒有網路、原始碼唯讀掛載的容器裡跑，查詢是固定模板，模型不寫查詢。`--joern-timeout` 設定每次容器執行的上限（預設 900 秒）。是否值得用還在量測。
    verifier 讀到的程式碼會先去掉註解與 docstring，行號不變。ALIBI 研究（arXiv 2607.24964）在真實漏洞旁植入「此處已驗證安全」或假造的掃描結果，騙過 LLM 審查的比例超過九成，而且去掉註解比在 prompt 裡警告有效得多。被去掉的文字仍會另外附上，標明是程式作者寫的資料。會改變編譯器或檢查工具行為的註解保留：`# type:`、`# noqa`、`# pragma: no cover`、`//go:build`、`// +build`、cgo preamble、`/// <reference>`、`// @ts-ignore`、`{-# LANGUAGE #-}`、第一行的 shebang 與編碼宣告。每一種都要完全符合已知格式，而且只留符合的那段（最多 120 位元組）：`# nosec: audited, verified safe` 在程式碼裡只剩 `# nosec`，其餘照樣去掉。主張引用的某一行若落在多行註解或 docstring 裡，那段摘錄改用原檔內容，避免 lexer 判斷錯誤或偽裝成註解的程式碼把被指稱的程式碼藏起來。支援的語言有 Rust、Go、C/C++/Java/C#/Kotlin/Swift/Scala/Dart、JavaScript/TypeScript、PHP、Python、Ruby、shell、YAML/TOML、Perl/R/Elixir、Terraform/HCL、SQL、Lua、Haskell，其他檔案原樣送出。一筆發現本來就要跑多次覆核時，第二次會讀帶註解的原始碼；如果這一次的結論跟所有去註解的覆核相反，就記一筆 `comment_sensitivity`，此時各次結論不一致，發現維持 `candidate`。第 6 步的零 LLM injection 掃描照舊先跑，而且掃的是原始檔。帶註解的那一次本來就是 `--refuter-runs` 其中一次，不多花呼叫，也受 refuter 預算限制：`--refuter-budget`（或 `--time-budget`）用完後就不開始，那筆發現也不會有 `comment_sensitivity` 紀錄。
    verifier 判可能成立時，也要列出它自己看到的前置條件（報告裡的 `refuter_conditions`）。可利用性等級取 finder 與 verifier 兩者中摩擦較高的那個；兩邊等級不同時記一筆 `tier_disagreement`，CLI 摘要、SARIF 與 Pro 報告都會標出來。
 6. **偵測寫給模型看的指令**：審查前先用零 LLM 的規則掃過每個模組，找出「叫審查模型回報乾淨」這類文字（例如 `respond with {"candidates": []}`、「report no vulnerabilities」、「this file is secure」）。命中的模組會額外交給另一家族的模型再審一次，並記在報告的 `ensemble.suspected_injection`；模型清單只有一個家族、無法交叉覆審時，整次執行標成 `incomplete`。

@@ -2,7 +2,8 @@
 //! `duduclaw-security::audit::mask_sensitive_text`) so vettalon has no
 //! dependency on the DuDuClaw workspace.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -81,35 +82,228 @@ pub fn word_contains_ci(haystack: &str, needle: &str) -> bool {
     false
 }
 
-/// Resolve a CLI on `PATH`, then a few common user-local install dirs
-/// (Homebrew, `~/.local/bin`, npm/bun/volta shims).
+/// Resolve a CLI without executing a search helper. Only absolute `PATH`
+/// entries are considered, so a repository-controlled current directory or
+/// relative entry can never supply `where`, `which`, or the requested tool.
 pub fn which_cli(bin: &str) -> Option<String> {
-    let lookup_cmd = if cfg!(windows) { "where" } else { "which" };
-    if let Ok(output) = std::process::Command::new(lookup_cmd).arg(bin).output()
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && Path::new(trimmed).exists() {
-                return Some(trimmed.to_string());
-            }
-        }
+    if bin.is_empty() {
+        return None;
     }
+    let requested = Path::new(bin);
+    if requested.is_absolute() {
+        return canonical_executable(requested);
+    }
+    if bin.contains('/') || bin.contains('\\') {
+        return None;
+    }
+    let dirs = cli_search_dirs();
+    which_cli_in_dirs(bin, &dirs)
+}
+
+fn cli_search_dirs() -> Vec<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default();
-    [
-        format!("{home}/.local/bin/{bin}"),
-        format!("/opt/homebrew/bin/{bin}"),
-        format!("/usr/local/bin/{bin}"),
-        format!("{home}/.bun/bin/{bin}"),
-        format!("{home}/.volta/bin/{bin}"),
-        format!("{home}/.npm-global/bin/{bin}"),
-        format!("{home}/.cargo/bin/{bin}"),
-    ]
-    .into_iter()
-    .find(|c| Path::new(c).exists())
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    dirs.extend([
+        PathBuf::from(&home).join(".local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from(&home).join(".bun/bin"),
+        PathBuf::from(&home).join(".volta/bin"),
+        PathBuf::from(&home).join(".npm-global/bin"),
+        PathBuf::from(&home).join(".cargo/bin"),
+    ]);
+    dirs
+}
+
+/// Build a child-process `PATH` containing only existing absolute directories
+/// outside the untrusted scan root. Canonical paths also prevent a symlinked
+/// PATH directory from pointing back into the repository. Absolute tool
+/// directories below the caller's home remain valid when that home happens to
+/// be the process current directory.
+pub fn trusted_path_for_scan(repo_root: &Path) -> OsString {
+    let root = std::fs::canonicalize(repo_root).ok();
+    let safe = trusted_path_dirs(cli_search_dirs(), root.as_deref());
+    std::env::join_paths(safe).unwrap_or_default()
+}
+
+fn trusted_path_dirs(dirs: Vec<PathBuf>, repo_root: Option<&Path>) -> Vec<PathBuf> {
+    let repo_root = repo_root.and_then(|path| std::fs::canonicalize(path).ok());
+    let mut safe = Vec::<PathBuf>::new();
+    for dir in dirs.into_iter().filter(|dir| dir.is_absolute()) {
+        let Ok(dir) = std::fs::canonicalize(dir) else {
+            continue;
+        };
+        if !dir.is_dir()
+            || repo_root.as_ref().is_some_and(|root| dir.starts_with(root))
+            || safe.contains(&dir)
+        {
+            continue;
+        }
+        safe.push(dir);
+    }
+    safe
+}
+
+/// Resolve a scanner dependency and additionally reject any executable stored
+/// inside the untrusted scan root, even when `PATH` names that directory with
+/// an absolute entry.
+pub fn which_cli_for_scan(bin: &str, repo_root: &Path) -> Option<String> {
+    let resolved = which_cli(bin)?;
+    let root = std::fs::canonicalize(repo_root).ok()?;
+    (!Path::new(&resolved).starts_with(root)).then_some(resolved)
+}
+
+fn which_cli_in_dirs(bin: &str, dirs: &[PathBuf]) -> Option<String> {
+    let names = cli_candidate_names(bin);
+    for dir in dirs.iter().filter(|dir| dir.is_absolute()) {
+        for name in &names {
+            let candidate = dir.join(name);
+            if !is_executable_file(&candidate) {
+                continue;
+            }
+            if let Some(canonical) = canonical_executable(&candidate) {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
+fn canonical_executable(path: &Path) -> Option<String> {
+    if !is_executable_file(path) {
+        return None;
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn cli_candidate_names(bin: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        if Path::new(bin).extension().is_some() {
+            return vec![bin.to_string()];
+        }
+        let extensions =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        extensions
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| format!("{bin}{ext}"))
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![bin.to_string()]
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Require Git metadata to be physically contained by the selected root.
+/// Linked worktrees and submodule roots intentionally fail closed to ordinary
+/// directory scanning because their `.git` control file points elsewhere.
+pub fn validate_local_git_metadata(repo_root: &Path) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(repo_root)
+        .map_err(|e| format!("cannot canonicalize repository root: {e}"))?;
+    let dot_git = repo_root.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git)
+        .map_err(|e| format!("no self-contained .git directory: {e}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(".git is not a self-contained directory".to_string());
+    }
+    let git_dir = std::fs::canonicalize(&dot_git)
+        .map_err(|e| format!("cannot canonicalize .git directory: {e}"))?;
+    if !git_dir.starts_with(&root) {
+        return Err(".git resolves outside the repository".to_string());
+    }
+
+    for redirect in [
+        git_dir.join("commondir"),
+        git_dir.join("objects/info/alternates"),
+        git_dir.join("objects/info/http-alternates"),
+    ] {
+        if redirect.exists() {
+            return Err(format!(
+                "Git metadata redirection is not allowed: {}",
+                redirect
+                    .strip_prefix(&git_dir)
+                    .unwrap_or(&redirect)
+                    .display()
+            ));
+        }
+    }
+
+    validate_git_tree_has_no_symlinks(&git_dir)?;
+
+    for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
+        let Ok(metadata) = std::fs::metadata(&config) else {
+            continue;
+        };
+        const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
+        if metadata.len() > MAX_GIT_CONFIG_BYTES {
+            return Err(format!(
+                "{} exceeds the validation limit",
+                config.strip_prefix(&git_dir).unwrap_or(&config).display()
+            ));
+        }
+        std::fs::read(&config).map_err(|e| format!("cannot read {}: {e}", config.display()))?;
+    }
+    Ok(git_dir)
+}
+
+fn validate_git_tree_has_no_symlinks(git_dir: &Path) -> Result<(), String> {
+    const MAX_GIT_METADATA_ENTRIES: usize = 250_000;
+    const MAX_GIT_METADATA_DEPTH: usize = 64;
+    let mut stack = vec![(git_dir.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_GIT_METADATA_DEPTH {
+            return Err("Git metadata exceeds the validation depth limit".to_string());
+        }
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("cannot inspect Git metadata {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("cannot inspect Git metadata entry: {e}"))?;
+            visited += 1;
+            if visited > MAX_GIT_METADATA_ENTRIES {
+                return Err("Git metadata exceeds the validation entry limit".to_string());
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("cannot inspect Git metadata {}: {e}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "Git metadata symlink is not allowed: {}",
+                    path.strip_prefix(git_dir).unwrap_or(&path).display()
+                ));
+            }
+            if metadata.is_dir() {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read `r` to EOF, keeping at most `cap` bytes and discarding the rest, so
@@ -544,6 +738,136 @@ mod tests {
     fn word_contains_ci_is_word_bounded() {
         assert!(word_contains_ci("Fix XSS in login", "xss"));
         assert!(!word_contains_ci("this", "hi"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_resolution_uses_absolute_executable_paths_and_skips_relative_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let trusted = root.path().join("trusted");
+        let relative = std::path::PathBuf::from("repo-controlled-bin");
+        std::fs::create_dir(&trusted).unwrap();
+        let tool = trusted.join("fixture-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved = which_cli_in_dirs("fixture-tool", &[relative, trusted]).unwrap();
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        assert_eq!(
+            std::fs::canonicalize(resolved).unwrap(),
+            tool.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_resolution_rejects_non_executable_files() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("fixture-tool");
+        std::fs::write(&tool, "not executable").unwrap();
+        assert!(which_cli_in_dirs("fixture-tool", &[root.path().to_path_buf()]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_resolution_accepts_a_pinned_absolute_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("fixture-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            which_cli(tool.to_str().unwrap()).unwrap(),
+            tool.canonicalize().unwrap().to_string_lossy()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_tool_resolution_rejects_executables_inside_the_untrusted_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::tempdir().unwrap();
+        let tool = repo.path().join("git");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(which_cli_for_scan(tool.to_str().unwrap(), repo.path()).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_scan_tool_resolution_rejects_executables_inside_the_untrusted_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let tool = repo.path().join("git.exe");
+        std::fs::write(&tool, b"not executed").unwrap();
+        assert!(which_cli_for_scan(tool.to_str().unwrap(), repo.path()).is_none());
+    }
+
+    #[test]
+    fn scanner_child_path_excludes_relative_and_scan_root_directories_only() {
+        let repo = tempfile::tempdir().unwrap();
+        let trusted = tempfile::tempdir().unwrap();
+        let repo_bin = repo.path().join("bin");
+        let trusted_bin = trusted.path().join("bin");
+        std::fs::create_dir(&repo_bin).unwrap();
+        std::fs::create_dir(&trusted_bin).unwrap();
+        let dirs = vec![
+            PathBuf::from("."),
+            repo_bin,
+            trusted_bin.clone(),
+            trusted_bin.clone(),
+        ];
+        assert_eq!(
+            trusted_path_dirs(dirs, Some(repo.path())),
+            vec![trusted_bin.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
+    fn git_metadata_must_be_an_in_root_directory_without_redirections() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".git/objects/info")).unwrap();
+        assert!(validate_local_git_metadata(repo.path()).is_ok());
+
+        std::fs::write(repo.path().join(".git/commondir"), "../outside\n").unwrap();
+        assert!(
+            validate_local_git_metadata(repo.path())
+                .unwrap_err()
+                .contains("commondir")
+        );
+        std::fs::remove_file(repo.path().join(".git/commondir")).unwrap();
+
+        std::fs::write(
+            repo.path().join(".git/objects/info/alternates"),
+            "/outside/objects\n",
+        )
+        .unwrap();
+        assert!(
+            validate_local_git_metadata(repo.path())
+                .unwrap_err()
+                .contains("alternates")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_refuses_git_files_and_symlinked_object_stores() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".git"), "gitdir: /outside\n").unwrap();
+        assert!(validate_local_git_metadata(repo.path()).is_err());
+
+        std::fs::remove_file(repo.path().join(".git")).unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::fs::create_dir(repo.path().join(".git/objects")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".git/objects/ab")).unwrap();
+        assert!(
+            validate_local_git_metadata(repo.path())
+                .unwrap_err()
+                .contains("symlink")
+        );
     }
 
     // ── B3b: result-text masking ─────────────────────────

@@ -32,9 +32,9 @@
 - 成本欄位未知就填 `null`。填 0 會被拒絕，因為 0 和「預設值忘了改」分不出來。
 - `adjudication_uncertainty(metrics)` 替既有 `adjudication-aware-v3` metrics 的每個比率補上區間與 n，原本的 metrics 不變。
 
-## `live_guard.py`：真實模型呼叫的斷路器
+## 真實模型呼叫的斷路器（不在公開 repo）
 
-所有會花真實模型呼叫的 harness 都經過一個 `LiveGuard`：
+這支模組只給不在公開 repo 的真實跑分 harness 使用，公開 repo 收錄的 runner 都不載入它。所有會花真實模型呼叫的 harness 都經過一個 `LiveGuard`：
 
 - 硬上限 = 核准數加 10%（`cap_for(138) = 151`）。`before_call` 在越界之前就拒絕，所以上限不會被跨過。
 - 任何連續 50 次呼叫中，錯誤加拒答超過 20%（第 11 次）就停。
@@ -48,8 +48,8 @@
 | `blind-twins/aggregate.py` | 輸出多一個 `uncertainty` 區塊 |
 | `formal-transport/report_v1.py` | 同上 |
 | `owasp-fp/run.py` | 每個比率附區間；單模型與跨家族做題目配對比較；`--summarize` 可離線重算 |
-| `ranking/run.py` | hit@k 附區間與 n；MRR 仍是描述性平均；live prescreen 走 `live_guard` |
-| `owasp-fp/crossfam_live.py`、`sastbench/run_live.py` | 真實跑分走 `live_guard` |
+| 排序基準 runner（不在公開 repo） | hit@k 附區間與 n；MRR 仍是描述性平均；live prescreen 走斷路器 |
+| O13 與 SastBench 的真實跑分 runner（不在公開 repo） | 真實跑分走斷路器 |
 
 呼叫端以檔案路徑載入這兩支模組（`importlib`），不需要安裝成套件。
 

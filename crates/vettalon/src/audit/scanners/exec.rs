@@ -28,6 +28,26 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// stderr is only kept for diagnostics on failure — a small tail is plenty.
 const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
+/// Ambient Git variables must never redirect a scanner from its validated
+/// repository root. The local repository config is still available, but
+/// system/global configuration and caller-supplied path overrides are not.
+pub(super) const GIT_ENV_REMOVE: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_SHALLOW_FILE",
+];
+
 #[derive(Debug, Clone, Copy)]
 pub struct RunLimits {
     pub timeout: Duration,
@@ -349,6 +369,20 @@ async fn run_capped_direct(
         // Unix cleanup must verify ownership before signalling. In particular,
         // an external reap/ECHILD must not trigger Tokio's numeric-PID kill.
         .kill_on_drop(cfg!(not(unix)));
+    cmd.env("PATH", crate::util::trusted_path_for_scan(cwd));
+    for name in GIT_ENV_REMOVE {
+        cmd.env_remove(name);
+    }
+    for index in 0..64 {
+        cmd.env_remove(format!("GIT_CONFIG_KEY_{index}"));
+        cmd.env_remove(format!("GIT_CONFIG_VALUE_{index}"));
+    }
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_OPTIONAL_LOCKS", "0");
 
     #[cfg(unix)]
     cmd.process_group(0);
