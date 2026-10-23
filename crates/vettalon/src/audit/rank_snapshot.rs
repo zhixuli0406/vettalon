@@ -1,6 +1,6 @@
 //! Read-only, deterministic dump of how a deep scan would rank and page a
 //! repo's modules — with the metadata features behind that ranking — WITHOUT
-//! calling any model. Dev/benchmark hook (`benchmarks/ranking/`): it lets a
+//! calling any model. Dev/benchmark hook (module-ranking benchmark): it lets a
 //! ranking experiment measure where a known-vulnerable file lands in the audit
 //! order at zero audit cost.
 //!

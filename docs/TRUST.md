@@ -144,6 +144,28 @@ version rejected a wrong tag identity and a modified archive. Verify with cosign
 v2.6.5 or later, or v3.x: earlier versions are affected by verification
 advisories GHSA-whqx-f9j3-ch6m, GHSA-w6c6-c85g-mmv6 and GHSA-fx35-mq7g-6g98.
 
+### Who controls the signing identity
+
+A keyless signature only names a workflow and a ref: `release.yml` on
+`refs/tags/v*` for CLI archives, `images.yml` on `refs/heads/main` or
+`refs/tags/v*` for container images. It means something only because two
+repository rulesets on `zhixuli0406/vettalon` limit who can produce those refs:
+
+- `protect-release-tags` (active since 2026-10-21) restricts creating,
+  updating, deleting and force-pushing any `refs/tags/v*` tag. Only the
+  Repository admin role can bypass it, so only repository admins can create a
+  release tag. The repository has one admin, its owner (checked 2026-10-21).
+- `protect-main` covers the default branch with no bypass: changes land only
+  through a pull request whose required checks pass (`fmt`, `test` on
+  ubuntu-24.04 and macOS, `trust tools (no signing or publishing)`, `scanner
+  process limits (Windows native)`), and `main` cannot be deleted or
+  force-pushed. It requires zero approving reviews, because the project has a
+  single maintainer.
+
+Anyone who could get around either ruleset could make the workflows sign
+something else, so a valid signature is only as strong as these two rules and
+the admin account behind them.
+
 ## Immutable releases
 
 Immutable releases are enabled on `zhixuli0406/vettalon` (since 2026-10-21).
@@ -211,7 +233,8 @@ The tag names the definition, not exact bytes: the base installs codex from
 npm and packages from Debian at build time, so two builds of one definition
 differ. That is why a published tag is never rebuilt. The signature proves the
 image came from this workflow on `main` or a release tag, so it is only as
-strong as who can push to `main` and create `v*` tags in the public repo.
+strong as who can push to `main` and create `v*` tags in the public repo (see
+[Who controls the signing identity](#who-controls-the-signing-identity)).
 
 Each image is signed by digest with keyless cosign v2.6.5, has a GitHub build
 provenance attestation, and carries BuildKit SLSA provenance (`mode=max`) and

@@ -12,6 +12,7 @@ pub mod config;
 pub mod disclose;
 pub mod guard;
 pub mod hunt;
+pub mod joern;
 pub mod kb;
 pub mod lang;
 pub mod llm;

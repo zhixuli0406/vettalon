@@ -8,7 +8,8 @@
 //! their own network boundaries. Instead of registry shortcuts,
 //! this module writes a small **bundled, local** rule file
 //! ([`BUNDLED_RULES_YAML`]) to a temp path and invokes
-//! `semgrep scan --json --metrics=off --disable-version-check --config <local-path>`.
+//! `semgrep scan --json --metrics=off --disable-version-check --no-git-ignore
+//! --disable-nosem --x-ignore-semgrepignore-files --config <local-path>`.
 //! The local config avoids registry rule downloads. These flags are not an OS
 //! network firewall or live proof of all third-party network behavior. We omit
 //! `--error`, so every nonzero exit is a failed invocation even if candidates
@@ -19,7 +20,7 @@
 //! six rule IDs (eight results), while selected safe fixtures produced zero
 //! results; both had no Semgrep errors. This validates only those rules,
 //! fixtures, version and environment, not arbitrary source or all scanners.
-//! Private raw evidence: reports/evidence-acceptance/root/semgrep-live-20261016/.
+//! The raw evidence is kept in private acceptance records, not in this repo.
 //! Deeper coverage requires a separately selected and validated ruleset.
 
 use std::path::PathBuf;
@@ -37,6 +38,11 @@ pub fn args(rules_path: &str) -> Vec<String> {
         "--json",
         "--metrics=off",
         "--disable-version-check",
+        // A scanned repository is hostile input. It must not suppress its own
+        // targets or findings through VCS ignores, .semgrepignore, or nosem.
+        "--no-git-ignore",
+        "--disable-nosem",
+        "--x-ignore-semgrepignore-files",
         "--config",
         rules_path,
     ]
@@ -285,6 +291,9 @@ mod tests {
                 "--json",
                 "--metrics=off",
                 "--disable-version-check",
+                "--no-git-ignore",
+                "--disable-nosem",
+                "--x-ignore-semgrepignore-files",
                 "--config",
                 "/tmp/vettalon-local.yml"
             ]

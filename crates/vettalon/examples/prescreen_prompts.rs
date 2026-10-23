@@ -1,7 +1,8 @@
 //! Benchmark hook: print, as JSON, the exact prompts `scan --prescreen
 //! cheap-model` would send for a repo's top audit units. No model calls.
 //! The output CONTAINS SOURCE EXCERPTS (up to 60 lines per unit): keep it
-//! local. Used by `benchmarks/ranking/run.py` (prescreen arm).
+//! local. Used by the module-ranking benchmark's prescreen arm (not in the
+//! public repo).
 //!
 //! `cargo run -q -p vettalon --example prescreen_prompts -- <repo_dir> [pool]`
 use std::path::PathBuf;

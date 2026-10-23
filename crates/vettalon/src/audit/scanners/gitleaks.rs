@@ -1,9 +1,9 @@
 //! gitleaks JSON normalizer.
 //!
-//! Both scan modes (`gitleaks detect` for git history on repos, `gitleaks
-//! dir` for plain directories — mode picked in `scanners::mod::gitleaks_args`)
-//! emit the same top-level JSON array of leak objects via `--report-format
-//! json`. `gitleaks` has no severity concept of its own —
+//! Hostile repositories are scanned in `gitleaks dir` mode with a trusted
+//! explicit policy; history mode would delegate to Git and honor executable
+//! repository config such as `diff.*.textconv`. The JSON report is a top-level
+//! array of leak objects. `gitleaks` has no severity concept of its own —
 //! every hit is a plausible secret, mapped to `Severity::High` uniformly
 //! (a live/matched-pattern credential is always worth immediate attention;
 //! see known limitations in the module doc for why this isn't finer-grained).

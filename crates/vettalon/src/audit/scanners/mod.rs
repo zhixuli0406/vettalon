@@ -193,7 +193,7 @@ async fn run_semgrep(
     engines_missing: &mut Vec<EngineMissing>,
     findings: &mut Vec<Finding>,
 ) {
-    let bin = match crate::util::which_cli("semgrep") {
+    let bin = match crate::util::which_cli_for_scan("semgrep", repo_root) {
         Some(b) => b,
         None => {
             engines_missing.push(EngineMissing {
@@ -247,7 +247,7 @@ async fn run_gitleaks(
     engines_missing: &mut Vec<EngineMissing>,
     findings: &mut Vec<Finding>,
 ) {
-    let bin = match crate::util::which_cli("gitleaks") {
+    let bin = match crate::util::which_cli_for_scan("gitleaks", repo_root) {
         Some(b) => b,
         None => {
             engines_missing.push(EngineMissing {
@@ -266,24 +266,51 @@ async fn run_gitleaks_with_bin(
     engines_run: &mut Vec<EngineRun>,
     findings: &mut Vec<Finding>,
 ) {
-    // gitleaks' stdout-vs-report-file default behavior is not verified in
-    // this offline sandbox (no gitleaks binary / no network to check docs
-    // against) — using the well-documented, stable `--report-path` flag to
-    // a known temp location sidesteps the ambiguity entirely rather than
-    // guessing at stdout parsing.
-    let report_path =
-        std::env::temp_dir().join(format!("vettalon-gitleaks-{}.json", uuid::Uuid::new_v4()));
+    // A hostile repository must not choose Gitleaks policy or make Gitleaks
+    // invoke Git against repository-controlled config. Use current-tree `dir`
+    // mode plus an explicit private policy that extends the embedded defaults.
+    // The empty ignore file and `--ignore-gitleaks-allow` prevent repository
+    // suppressions from turning a scan into a false clean result.
+    let policy_dir = match tempfile::Builder::new()
+        .prefix("vettalon-gitleaks-")
+        .tempdir()
+    {
+        Ok(dir) => dir,
+        Err(error) => {
+            engines_run.push(EngineRun {
+                engine: gitleaks::ENGINE_NAME.to_string(),
+                findings_count: 0,
+                duration_ms: 0,
+                parse_error: Some(format!("cannot create trusted gitleaks policy: {error}")),
+                timed_out: false,
+            });
+            return;
+        }
+    };
+    let config_path = policy_dir.path().join("gitleaks.toml");
+    let ignore_path = policy_dir.path().join("gitleaksignore");
+    if let Err(error) = std::fs::write(&config_path, "[extend]\nuseDefault = true\n")
+        .and_then(|_| std::fs::write(&ignore_path, ""))
+    {
+        engines_run.push(EngineRun {
+            engine: gitleaks::ENGINE_NAME.to_string(),
+            findings_count: 0,
+            duration_ms: 0,
+            parse_error: Some(format!("cannot write trusted gitleaks policy: {error}")),
+            timed_out: false,
+        });
+        return;
+    }
+    let report_path = policy_dir.path().join("report.json");
     let report_path_str = report_path.to_string_lossy().to_string();
-    // Mode selection (live-fired against the real 8.30.1 binary, 2026-09-01):
-    // `detect` walks *git history* — on a plain directory it logs "0 commits
-    // scanned, ~0 bytes", writes an empty report, and exits 0, i.e. a
-    // permanent fake-clean that no exit-code check can catch. `dir` (v8.19+)
-    // walks the files actually on disk. The OS daily scan target
-    // (a deployed data dir) is exactly the non-git shape, so anything without a
-    // .git entry MUST take the `dir` path; git repos keep `detect` so
-    // existing history-scan behavior is unchanged.
-    let git_mode = repo_root.join(".git").exists();
-    let args = gitleaks_args(git_mode, report_path_str.as_str());
+    let config_path_str = config_path.to_string_lossy().to_string();
+    let ignore_path_str = ignore_path.to_string_lossy().to_string();
+    let args = gitleaks_args(
+        ".",
+        report_path_str.as_str(),
+        config_path_str.as_str(),
+        ignore_path_str.as_str(),
+    );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let outcome = run_capped(bin, &arg_refs, repo_root, &RunLimits::default()).await;
 
@@ -396,18 +423,23 @@ fn record_gitleaks_outcome(
     }
 }
 
-/// Pure arg builder for the gitleaks invocation so the git-vs-dir mode split
-/// is unit-testable without a gitleaks binary. `git_mode` ⇒ `detect` (git
-/// history, matches pre-2026-09 behavior on repos); otherwise `dir` (files on
-/// disk — the only mode that scans anything in a non-git directory).
-fn gitleaks_args(git_mode: bool, report_path: &str) -> Vec<String> {
-    let mut args: Vec<String> = if git_mode {
-        vec!["detect".into(), "--source".into(), ".".into()]
-    } else {
-        vec!["dir".into(), ".".into()]
-    };
+/// Pure arg builder for the hostile-repository Gitleaks boundary. History mode
+/// is intentionally unavailable because it delegates to Git and honors local
+/// config capable of executing textconv commands.
+fn gitleaks_args(
+    source: &str,
+    report_path: &str,
+    config_path: &str,
+    ignore_path: &str,
+) -> Vec<String> {
+    let mut args = vec!["dir".to_string(), source.to_string()];
     args.extend(
         [
+            "--config",
+            config_path,
+            "--gitleaks-ignore-path",
+            ignore_path,
+            "--ignore-gitleaks-allow",
             "--report-format",
             "json",
             "--report-path",
@@ -463,14 +495,18 @@ async fn run_cargo_audit(
         });
         return;
     }
-    if crate::util::which_cli("cargo-audit").is_none() {
+    let Some(bin) = crate::util::which_cli_for_scan("cargo-audit", repo_root) else {
         engines_missing.push(EngineMissing {
             engine: cargo_audit::ENGINE_NAME.to_string(),
             reason: "not installed (install via `cargo install cargo-audit`)".to_string(),
         });
         return;
-    }
-    run_cargo_audit_with_bin(repo_root, "cargo", engines_run, findings).await;
+    };
+    run_cargo_audit_with_bin(repo_root, &bin, engines_run, findings).await;
+}
+
+fn cargo_audit_args() -> [&'static str; 2] {
+    ["--json", "--no-fetch"]
 }
 
 async fn run_cargo_audit_with_bin(
@@ -479,19 +515,14 @@ async fn run_cargo_audit_with_bin(
     engines_run: &mut Vec<EngineRun>,
     findings: &mut Vec<Finding>,
 ) {
-    // Invoked via `cargo audit`, not the `cargo-audit` binary directly —
-    // lets cargo's own subcommand resolution handle argv shaping.
+    // Invoke the resolved cargo-audit binary directly. Going through
+    // `cargo audit` would load repository-local Cargo aliases/configuration
+    // before the scanner starts, turning an untrusted repository into code.
     // `--no-fetch` uses whatever advisory-db is already cached locally
     // instead of git-fetching an update (zero-network discipline; if no
     // cache exists at all the command fails, which surfaces below as a
     // normal parse_error, not a crash).
-    let outcome = run_capped(
-        bin,
-        &["audit", "--json", "--no-fetch"],
-        repo_root,
-        &RunLimits::default(),
-    )
-    .await;
+    let outcome = run_capped(bin, &cargo_audit_args(), repo_root, &RunLimits::default()).await;
     record_stdout_scanner(
         cargo_audit::ENGINE_NAME,
         outcome,
@@ -520,25 +551,46 @@ mod tests {
     }
 
     #[test]
-    fn gitleaks_args_git_mode_uses_detect_with_source() {
-        let args = gitleaks_args(true, "/tmp/r.json");
-        assert_eq!(args[0], "detect");
-        assert_eq!(&args[1..3], ["--source", "."]);
+    fn gitleaks_args_never_enters_untrusted_git_history() {
+        let args = gitleaks_args(
+            "/repo",
+            "/tmp/r.json",
+            "/tmp/trusted-gitleaks.toml",
+            "/tmp/trusted-gitleaksignore",
+        );
+        assert_eq!(&args[0..2], ["dir", "/repo"]);
+        assert!(!args.contains(&"detect".to_string()));
         assert!(args.contains(&"--report-path".to_string()));
         assert!(args.contains(&"/tmp/r.json".to_string()));
-        // `--exit-code 0` must survive both modes: findings never become a
-        // non-zero exit that the fail-closed guard would misread as failure.
+        assert!(args.contains(&"--config".to_string()));
+        assert!(args.contains(&"/tmp/trusted-gitleaks.toml".to_string()));
+        assert!(args.contains(&"--gitleaks-ignore-path".to_string()));
+        assert!(args.contains(&"/tmp/trusted-gitleaksignore".to_string()));
+        assert!(args.contains(&"--ignore-gitleaks-allow".to_string()));
         assert_eq!(&args[args.len() - 2..], ["--exit-code", "0"]);
     }
 
+    #[tokio::test]
+    #[ignore = "requires a locally installed gitleaks binary"]
+    async fn live_gitleaks_ignores_repository_policy() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("ordinary.txt"), "no secrets here\n").unwrap();
+        // If the target's policy is consulted, this deliberately malformed
+        // file makes Gitleaks fail before it can emit a valid report.
+        std::fs::write(repo.path().join(".gitleaks.toml"), "[malformed\n").unwrap();
+        let Some(bin) = crate::util::which_cli_for_scan("gitleaks", repo.path()) else {
+            return;
+        };
+        let mut engines = Vec::new();
+        let mut findings = Vec::new();
+        run_gitleaks_with_bin(repo.path(), &bin, &mut engines, &mut findings).await;
+        assert_eq!(engines.len(), 1);
+        assert!(engines[0].parse_error.is_none(), "{:?}", engines[0]);
+    }
+
     #[test]
-    fn gitleaks_args_non_git_uses_dir_subcommand() {
-        let args = gitleaks_args(false, "/tmp/r.json");
-        // `detect` on a non-git dir scans 0 bytes and exits 0 (live-fired
-        // fake-clean) — the dir subcommand is load-bearing, not stylistic.
-        assert_eq!(&args[0..2], ["dir", "."]);
-        assert!(!args.contains(&"--source".to_string()));
-        assert_eq!(&args[args.len() - 2..], ["--exit-code", "0"]);
+    fn cargo_audit_is_invoked_directly_without_cargo_alias_resolution() {
+        assert_eq!(cargo_audit_args(), ["--json", "--no-fetch"]);
     }
 
     #[test]

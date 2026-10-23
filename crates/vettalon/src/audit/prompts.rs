@@ -6,7 +6,7 @@
 //! the same definitions, and the known model tendencies are listed as a
 //! negative checklist in every prompt rather than left to "be careful".
 //! The anti-pattern list is adapted from Cloudflare's security-audit-skill
-//! `SKILL.md` (MIT), see `research/harness-2026-08/cloudflare-security-audit-skill-2026-10.md`.
+//! `SKILL.md` (MIT).
 
 pub use vettalon_contract::severity::ANCHORS_ZH_TW;
 

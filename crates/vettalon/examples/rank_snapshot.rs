@@ -1,6 +1,7 @@
 //! Dev/benchmark hook: print how a deep scan would rank and page a repo's
 //! modules, with the metadata features behind the ranking, as JSON. No model
-//! calls, no file contents. Used by `benchmarks/ranking/run.py`.
+//! calls, no file contents. Used by the module-ranking benchmark (not in the
+//! public repo).
 //!
 //! `cargo run -q -p vettalon --example rank_snapshot -- <repo_dir>`
 use std::path::PathBuf;

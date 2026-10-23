@@ -4,8 +4,8 @@ These helpers generate local evidence and verify downloaded CLI release assets.
 They never create a release, sign with an identity, send a disclosure, or claim a
 certification. Python 3.11+, `jsonschema`, and an official Syft binary are required.
 
-Source-code test coverage uses a separate standard-library wrapper,
-[`coverage_receipt.py`](coverage_receipt.py). See the pinned
+Source-code test coverage uses a separate standard-library receipt wrapper,
+which is not published in this repository. See the pinned
 [line/branch reproduction and scope](../../docs/COVERAGE.md#source-code-test-coverage-is-a-separate-denominator).
 Its source-tag receipt does not measure the published binary or customer-source
 review coverage. The verifier compares every tracked file's bytes with the tag's
@@ -36,8 +36,7 @@ For a release-specific readback, supply `verify` with
 together. These caller-supplied values can be forged along with an unsigned
 receipt; a match only checks equality. The verifier reports summary arithmetic
 consistency, caller-anchor match, and `provenance_verified: false`. The
-[anchored v0.2.0 readback](../../reports/evidence-acceptance/trust-coverage-next-20261018/ANCHORED-VERIFIER.json)
-includes relocated-receipt and negative checks. No whole-CLI or Desktop/Pro
+anchored v0.2.0 readback (kept in private acceptance records) includes relocated-receipt and negative checks. No whole-CLI or Desktop/Pro
 line/branch denominator has been measured by this receipt.
 This readback is local and unsigned. Substitution detection requires expected
 values retained through an independent trusted channel; a digest stored next
@@ -88,8 +87,9 @@ not a substitute for GitHub-issued provenance. A local test archive can contain 
 fixture; do not call it a tested production binary. Release workflow uses the
 actual packaged binary and attests the archive and BOM digests.
 
-In the private development checkout, `scripts/export-oss.sh --stage-working-tree
-/tmp/NEW_PUBLIC_STAGE --skip-build` creates an allowlisted dirty-tree staging copy
+In the private development checkout, the open-core export script's
+working-tree staging mode (`--stage-working-tree /tmp/NEW_PUBLIC_STAGE
+--skip-build`) creates an allowlisted dirty-tree staging copy
 without commit, push, destination overwrite or touching the public repository.
 It still runs lock pruning, private-marker and gitleaks checks. The explicit skip
 means build/test/clippy have **not** passed. Normal export continues to read only

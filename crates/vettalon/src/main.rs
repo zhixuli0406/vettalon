@@ -140,6 +140,28 @@ struct ScanArgs {
     #[arg(long, default_value_t = audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64,
           value_parser = clap::value_parser!(u64).range(0..=audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64))]
     verifier_parse_retries: u64,
+    /// Refuter policy: `current` (default: refute unless provable) or
+    /// `evidence+retrieval`, an opt-in conservative mode (closing needs
+    /// cited, checked evidence; undecided claims stay candidate as
+    /// unresolved; definitions the refuter could not see are grepped and it
+    /// judges once more). In one benchmark it closed fewer real
+    /// vulnerabilities and also fewer false alerts, so expect more alerts to
+    /// review. Experimental: `evidence`, `evidence-ext` (evidence only for
+    /// external scanner claims) and `+prosecutor` (a blind bypass attempt on
+    /// guard / trust closures).
+    #[arg(long, default_value = "current", value_parser = parse_refuter_policy)]
+    refuter_policy: audit::RefuterPolicy,
+    /// Experimental: ask every refuter run for a probability (0-100) that the
+    /// claim is real and an evidence level, and record them. No decision
+    /// reads the scores; the prompt gains a section, so replies may differ.
+    #[arg(long)]
+    refuter_score: bool,
+    /// Experimental, opt-in: a refutation closes a finding only when the
+    /// same reply's probability is below this value (0-100); a higher,
+    /// missing or invalid score keeps the finding open as `candidate`.
+    /// Turns on --refuter-score.
+    #[arg(long, value_name = "P", value_parser = clap::value_parser!(u8).range(0..=100))]
+    refuter_score_threshold: Option<u8>,
     /// Module ranker for the deep audit: `heuristic` (default, local ranking)
     /// or `jev` (TypeSafe Jev, metadata-only; requires a `[jev]` config
     /// block). Cloud models and scanner database updates may also use the network.
@@ -202,6 +224,30 @@ struct VerifyArgs {
     #[arg(long, default_value_t = audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64,
           value_parser = clap::value_parser!(u64).range(0..=audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64))]
     verifier_parse_retries: u64,
+    /// Refuter policy, as `scan --refuter-policy` (default `current`;
+    /// `evidence+retrieval` is the opt-in conservative mode).
+    #[arg(long, default_value = "current", value_parser = parse_refuter_policy)]
+    refuter_policy: audit::RefuterPolicy,
+    /// Experimental, as `scan --refuter-score`: record each refuter run's
+    /// probability (0-100) and evidence level. No decision reads them.
+    #[arg(long)]
+    refuter_score: bool,
+    /// Experimental, as `scan --refuter-score-threshold`: close only when
+    /// the reply's probability is below this value (0-100).
+    #[arg(long, value_name = "P", value_parser = clap::value_parser!(u8).range(0..=100))]
+    refuter_score_threshold: Option<u8>,
+    /// Experimental, opt-in: after review, a Joern source-to-sink data-flow
+    /// path to the claimed line keeps a finding the refuter closed open
+    /// (`candidate`). Never closes anything; no path, an unsupported language
+    /// or any Joern error leaves the verdict as it was. Runs only in the local
+    /// `vettalon joern build` image, without network.
+    #[arg(long)]
+    joern_keep: bool,
+    /// Timeout per Joern container run in seconds (30-7200).
+    #[arg(long, value_name = "SECS", requires = "joern_keep",
+          default_value_t = vettalon::joern::DEFAULT_TIMEOUT_SECS,
+          value_parser = clap::value_parser!(u64).range(vettalon::joern::MIN_TIMEOUT_SECS..=vettalon::joern::MAX_TIMEOUT_SECS))]
+    joern_timeout: u64,
     /// Write the result JSON (vettalon.verify/1) here.
     #[arg(long)]
     out: PathBuf,
@@ -320,6 +366,11 @@ enum Command {
         #[command(subcommand)]
         action: AgentsAction,
     },
+    /// Experimental: the local Joern image behind `verify --joern-keep`.
+    Joern {
+        #[command(subcommand)]
+        action: JoernAction,
+    },
     /// Draft a vulnerability report for a reviewed finding, in the format a
     /// destination expects (GitHub advisory, minimal, Linux kernel, project
     /// email, TWCERT/CC, HITCON ZeroDay). Drafts only — nothing is ever sent.
@@ -413,6 +464,32 @@ enum LedgerAction {
         outcome: String,
         #[arg(long)]
         note: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum JoernAction {
+    /// Build the Joern image from the definition in this binary (downloads
+    /// the pinned Joern release, about 1.8 GB, and checks its hashes).
+    Build,
+    /// Print the expected Joern image tag (no Docker call).
+    Image,
+    /// Ask the fixed source-to-sink template about each claim's file:line in
+    /// one source tree. No model call, no verdict; writes
+    /// vettalon.joern-check/1 JSON.
+    Check {
+        /// Source tree the claims point into.
+        path: PathBuf,
+        /// Claims file (vettalon.claims/1).
+        #[arg(long)]
+        claims: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Timeout per container run in seconds (30-7200).
+        #[arg(long, value_name = "SECS",
+              default_value_t = vettalon::joern::DEFAULT_TIMEOUT_SECS,
+              value_parser = clap::value_parser!(u64).range(vettalon::joern::MIN_TIMEOUT_SECS..=vettalon::joern::MAX_TIMEOUT_SECS))]
+        timeout: u64,
     },
 }
 
@@ -568,9 +645,9 @@ fn load_config(
             "[vettalon] {}",
             vettalon::tr!(
                 "提示：偵測到 {}，但這些 CLI 的工具無法完全關閉（可能讀取本機檔案），沒有設定檔時不會使用。\
-要使用請在 ~/.vettalon/config.toml 加入；預設會在容器沙箱執行（先跑 `vettalon agents pull` 或 `vettalon agents build`），或設 allow_agent_tools = true 直接在本機跑。",
+可改用工具能完全關閉的 CLI、HTTP/Ollama backend；若設 allow_agent_tools = true，代表明確接受它直接讀取本機檔案與認證的風險。",
                 "note: found {}, but their tools cannot be fully disabled (they may read local files), so they are not used without a config file. \
-Add them to ~/.vettalon/config.toml: by default they run in the container sandbox (run `vettalon agents pull` or `vettalon agents build` first), or set allow_agent_tools = true to run them directly.",
+Use a tool-disabled CLI or HTTP/Ollama backend instead; setting allow_agent_tools = true explicitly accepts direct access to local files and credentials.",
                 skipped.join(vettalon::lang::pick("、", ", "))
             )
         );
@@ -665,6 +742,12 @@ async fn cmd_models(config: Option<PathBuf>, probe: bool) -> i32 {
     0
 }
 
+/// `--refuter-policy`: `current` or `+`-joined evidence / evidence-ext /
+/// prosecutor / retrieval.
+fn parse_refuter_policy(s: &str) -> Result<audit::RefuterPolicy, String> {
+    audit::RefuterPolicy::parse(s)
+}
+
 /// `--refuter-runs`: 1..=MAX_REFUTER_RUNS (each run is one more model call).
 fn parse_refuter_runs(s: &str) -> Result<usize, String> {
     let n: usize = s
@@ -674,6 +757,66 @@ fn parse_refuter_runs(s: &str) -> Result<usize, String> {
         Ok(n)
     } else {
         Err(format!("must be 1-{}", audit::MAX_REFUTER_RUNS))
+    }
+}
+
+async fn cmd_joern(action: JoernAction) -> i32 {
+    let fail = |msg: String| {
+        eprintln!("[vettalon] {msg}");
+        2
+    };
+    match action {
+        JoernAction::Image => {
+            println!("{}", vettalon::llm::container::joern_image());
+            0
+        }
+        JoernAction::Build => match vettalon::llm::container::build_joern_image().await {
+            Ok(()) => {
+                println!("{}", vettalon::lang::pick("完成", "Done"));
+                0
+            }
+            Err(e) => fail(e),
+        },
+        JoernAction::Check {
+            path,
+            claims,
+            out,
+            timeout,
+        } => {
+            use vettalon::audit::verify_only::VerifyInput;
+            let src = match path.canonicalize() {
+                Ok(p) if p.is_dir() => p,
+                _ => return fail(format!("{} is not a directory", path.display())),
+            };
+            let input = match std::fs::read_to_string(&claims)
+                .map_err(|e| format!("cannot read {}: {e}", claims.display()))
+                .and_then(|t| VerifyInput::parse(&t))
+            {
+                Ok(VerifyInput::Claims(c)) => c,
+                Ok(_) => {
+                    return fail("`joern check` takes a claims file (vettalon.claims/1)".into());
+                }
+                Err(e) => return fail(e),
+            };
+            let refs: Vec<vettalon::joern::ClaimRef> = input
+                .iter()
+                .map(|c| (c.id.clone(), c.file.clone(), c.line))
+                .collect();
+            let settings = vettalon::joern::JoernSettings::new(timeout);
+            let report = match vettalon::joern::check_claims(&src, &refs, &settings).await {
+                Ok(r) => r,
+                Err(e) => return fail(e),
+            };
+            let json = match serde_json::to_string_pretty(&report) {
+                Ok(j) => j,
+                Err(e) => return fail(format!("cannot serialize the result: {e}")),
+            };
+            if let Err(e) = vettalon::util::write_private(&out, json.as_bytes()) {
+                return fail(format!("cannot write {}: {e}", out.display()));
+            }
+            // Exit 0 even when runs failed: every failure is in the JSON.
+            0
+        }
     }
 }
 
@@ -736,6 +879,12 @@ async fn cmd_verify(a: VerifyArgs) -> i32 {
             refuter_runs: a.refuter_runs,
             deadline,
             parse_retries: a.verifier_parse_retries as usize,
+            policy: a.refuter_policy,
+            score: a.refuter_score,
+            score_threshold: a.refuter_score_threshold,
+            joern: a
+                .joern_keep
+                .then(|| vettalon::joern::JoernSettings::new(a.joern_timeout)),
             trace: trace.clone(),
         },
     )
@@ -800,6 +949,9 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         refuter_runs,
         finder_parse_retries,
         verifier_parse_retries,
+        refuter_policy,
+        refuter_score,
+        refuter_score_threshold,
         rank,
         prescreen,
         prescreen_model,
@@ -1076,6 +1228,9 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         refuter_runs,
         finder_parse_retries: finder_parse_retries as usize,
         verifier_parse_retries: verifier_parse_retries as usize,
+        refuter_policy,
+        refuter_score,
+        refuter_score_threshold,
         prescreen,
         role_caps: budget.caps,
         fix_test_command,
@@ -2121,6 +2276,7 @@ async fn main() -> ExitCode {
         } => cmd_rule_draft(&report, &finding, out),
         Command::MalIndex { action } => cmd_mal_index(action).await,
         Command::Models { config, probe } => cmd_models(config, probe).await,
+        Command::Joern { action } => cmd_joern(action).await,
         Command::Agents { action } => {
             let r = match action {
                 AgentsAction::Build => vettalon::llm::container::build_images().await,

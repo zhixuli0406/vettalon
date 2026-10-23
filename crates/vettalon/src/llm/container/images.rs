@@ -15,6 +15,8 @@ use super::{docker, docker_bin};
 const AGENTS_REPO: &str = "vettalon-agents";
 const AGENTS_BASE_REPO: &str = "vettalon-agents-base";
 const EGRESS_REPO: &str = "vettalon-egress";
+/// Experimental Joern image (`verify --joern-keep`). Built locally only.
+const JOERN_REPO: &str = "vettalon-joern";
 /// Hex digits of the build-context digest used as the image tag.
 const IMAGE_TAG_HEX_LEN: usize = 12;
 
@@ -33,6 +35,7 @@ const BASE_INVENTORY: &str = include_str!("../../../../../docker/agents-base/inv
 const EGRESS_DOCKERFILE: &str = include_str!("../../../../../docker/egress/Dockerfile");
 const EGRESS_CONF: &str = include_str!("../../../../../docker/egress/tinyproxy.conf");
 const EGRESS_ALLOWLIST: &str = include_str!("../../../../../docker/egress/allowlist");
+const JOERN_DOCKERFILE: &str = include_str!("../../../../../docker/joern/Dockerfile");
 
 macro_rules! base_license {
     ($rel:literal) => {
@@ -64,6 +67,9 @@ const EGRESS_CONTEXT: &[(&str, &str)] = &[
     ("tinyproxy.conf", EGRESS_CONF),
     ("allowlist", EGRESS_ALLOWLIST),
 ];
+/// Joern pinned by version and two hashes (docker/joern/Dockerfile). Never
+/// published or pulled; `vettalon joern build` builds it here.
+const JOERN_CONTEXT: &[(&str, &str)] = &[("Dockerfile", JOERN_DOCKERFILE)];
 
 /// First [`IMAGE_TAG_HEX_LEN`] hex digits of a SHA-256 over every
 /// `(name, body)` of a context.
@@ -104,6 +110,7 @@ static BASE_IMAGE: LazyLock<String> = LazyLock::new(|| image_ref(AGENTS_BASE_REP
 static AGENTS_IMAGE: LazyLock<String> =
     LazyLock::new(|| layered_image_ref(AGENTS_REPO, tag_of(&BASE_IMAGE), AGENTS_CONTEXT));
 static EGRESS_IMAGE: LazyLock<String> = LazyLock::new(|| image_ref(EGRESS_REPO, EGRESS_CONTEXT));
+static JOERN_IMAGE: LazyLock<String> = LazyLock::new(|| image_ref(JOERN_REPO, JOERN_CONTEXT));
 
 /// The agents image this binary runs (`vettalon-agents:<definition digest>`).
 pub fn agents_image() -> &'static str {
@@ -118,6 +125,11 @@ pub fn agents_base_image() -> &'static str {
 /// The egress-proxy image this binary runs.
 pub fn egress_image() -> &'static str {
     &EGRESS_IMAGE
+}
+
+/// The Joern image `--joern-keep` runs (`vettalon-joern:<definition digest>`).
+pub fn joern_image() -> &'static str {
+    &JOERN_IMAGE
 }
 
 /// What the user sees when an image this binary needs is not built yet.
@@ -211,6 +223,26 @@ pub async fn build_images() -> Result<(), String> {
         docker_visible(&bin, &build_args(tag, None, &ctx.path().join(dir))).await?;
     }
     build_local_layer(&bin, agents_base_image(), ctx.path()).await
+}
+
+/// `vettalon joern build`: build the Joern image from the definition embedded
+/// in this binary. Downloads the pinned Joern release (about 1.8 GB) and
+/// checks its hashes; analysis later runs without network.
+pub async fn build_joern_image() -> Result<(), String> {
+    let bin = docker_bin()?;
+    let ctx = tempfile::Builder::new()
+        .prefix("vettalon-build-joern-")
+        .tempdir()
+        .map_err(|e| format!("cannot create build dir: {e}"))?;
+    for (name, body) in JOERN_CONTEXT {
+        std::fs::write(ctx.path().join(name), body).map_err(|e| e.to_string())?;
+    }
+    let tag = joern_image();
+    eprintln!(
+        "[vettalon] {}",
+        crate::tr!("建置 {tag}…", "building {tag}…")
+    );
+    docker_visible(&bin, &build_args(tag, None, ctx.path())).await
 }
 
 /// `ghcr.io/zhixuli0406/<repo>:<tag>` for a local `<repo>:<tag>`.
@@ -515,6 +547,7 @@ mod tests {
             ("agents-base", BASE_CONTEXT),
             ("agents", AGENTS_CONTEXT),
             ("egress", EGRESS_CONTEXT),
+            ("joern", JOERN_CONTEXT),
         ] {
             for (name, body) in context {
                 let rel = format!("{dir}/{name}");

@@ -25,7 +25,11 @@ def module(path=CANONICAL):
 class CaptureV2Tests(unittest.TestCase):
     def test_frozen_source_and_only_reviewed_timeout_delta(self):
         old = LEGACY.read_text(); new = CANONICAL.read_text()
-        self.assertEqual(hashlib.sha256(old.encode()).hexdigest(), '5289db0ecfb5a9b51fb2b1ac7ed8dc2b64e774e01248ad89ce2e26621e849059')
+        # Pins the reviewed reference file. Re-pinned for 7dc3687a6 (adapter
+        # 0.3.0, O16): it changed only classify, scan, the new
+        # blind_spot_signals and their constants; the four functions compared
+        # below are byte-identical to the fdb772853 version this test froze.
+        self.assertEqual(hashlib.sha256(old.encode()).hexdigest(), '321f759a13bc8de1f40750baac451b9027ef4ef1a1dee9a1e6838375b5991b26')
         def functions(source):
             return {n.name: ast.get_source_segment(source, n) for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)}
         prior, current = functions(old), functions(new)

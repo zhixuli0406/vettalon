@@ -7,8 +7,8 @@
 //! it is only ever counted/matched by fixed keyword lists, never executed or
 //! fed to an LLM in this wave.
 //!
-//! No `walkdir` dependency — plain `std::fs` recursion (same convention as
-//! `expert/safe_zip.rs`), with a fixed skip-list for vendor/build
+//! No `walkdir` dependency — plain `std::fs` recursion, with a fixed
+//! skip-list for vendor/build
 //! directories and a symlink guard against cycles.
 
 use std::collections::HashMap;
@@ -382,6 +382,9 @@ pub enum GitHistoryStatus {
 /// so an old checkout (benchmark fixtures, vendored snapshots, a repo nobody
 /// has touched in a year) still yields its security-fix history.
 const HOTSPOT_WINDOW_SECS: i64 = 365 * 24 * 60 * 60;
+const GIT_HISTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const GIT_HISTORY_OUTPUT_CAP: usize = 4 * 1024 * 1024;
+const GIT_HISTORY_MAX_COMMITS: &str = "--max-count=10000";
 
 /// `--since` argument for the hotspot window ending at `head_epoch`. Falls
 /// back to the wall-clock window when the HEAD date is unknown or too small
@@ -394,16 +397,136 @@ fn hotspot_since_arg(head_epoch: Option<i64>) -> String {
 }
 
 /// Committer date of HEAD as a unix timestamp, or `None` on any failure.
-async fn head_commit_epoch(repo_root_str: &str) -> Option<i64> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", repo_root_str, "log", "-1", "--format=%ct", "HEAD"])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
+async fn head_commit_epoch(git_bin: &str, git_dir: &Path, repo_root: &Path) -> Option<i64> {
+    let git_dir_arg = format!("--git-dir={}", git_dir.display());
+    let out = crate::audit::scanners::run_bounded_subprocess(
+        git_bin,
+        &[
+            "--no-pager",
+            git_dir_arg.as_str(),
+            "log",
+            "--no-show-signature",
+            "-1",
+            "--format=%ct",
+            "HEAD",
+        ],
+        repo_root,
+        &crate::audit::scanners::SubprocessLimits {
+            timeout: std::time::Duration::from_secs(5),
+            max_output_bytes: 4096,
+        },
+    )
+    .await;
+    if out.exit_code != Some(0)
+        || out.timed_out
+        || out.stdout_truncated
+        || out.spawn_error.is_some()
+        || out.cleanup_error.is_some()
+    {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    out.stdout.trim().parse().ok()
+}
+
+fn forbidden_git_config_key(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    key == "include.path"
+        || (key.starts_with("includeif.") && key.ends_with(".path"))
+        || key == "core.worktree"
+        || key == "core.fsmonitor"
+        || key == "core.hookspath"
+        || key == "core.sshcommand"
+        || key == "log.showsignature"
+        || key == "gpg.program"
+        || key == "gpg.openpgp.program"
+        || key == "gpg.x509.program"
+        || key == "gpg.ssh.program"
+        || key == "diff.external"
+        || (key.starts_with("diff.") && (key.ends_with(".command") || key.ends_with(".textconv")))
+        || (key.starts_with("filter.")
+            && (key.ends_with(".clean") || key.ends_with(".smudge") || key.ends_with(".process")))
+}
+
+/// Parse repository config with Git itself, but explicitly disable includes
+/// while parsing. This catches BOM, quoting, whitespace, case and includeIf
+/// variants without first following attacker-selected external paths.
+async fn validate_git_configs(
+    git_bin: &str,
+    git_dir: &Path,
+    repo_root: &Path,
+) -> Result<(), String> {
+    for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
+        if !config.is_file() {
+            continue;
+        }
+        let config_arg = config.to_string_lossy().into_owned();
+        let out = crate::audit::scanners::run_bounded_subprocess(
+            git_bin,
+            &[
+                "config",
+                "--file",
+                config_arg.as_str(),
+                "--null",
+                "--name-only",
+                "--list",
+                "--no-includes",
+            ],
+            repo_root,
+            &crate::audit::scanners::SubprocessLimits {
+                timeout: std::time::Duration::from_secs(5),
+                max_output_bytes: 1024 * 1024,
+            },
+        )
+        .await;
+        if out.exit_code != Some(0)
+            || out.timed_out
+            || out.stdout_truncated
+            || out.spawn_error.is_some()
+            || out.cleanup_error.is_some()
+        {
+            return Err(format!(
+                "cannot safely parse {}",
+                config.strip_prefix(git_dir).unwrap_or(&config).display()
+            ));
+        }
+        if let Some(key) = out
+            .stdout
+            .split('\0')
+            .map(str::trim)
+            .find(|key| !key.is_empty() && forbidden_git_config_key(key))
+        {
+            return Err(format!("unsafe Git config key is not allowed: {key}"));
+        }
+    }
+    Ok(())
+}
+
+fn git_history_from_outcome(out: crate::audit::scanners::SubprocessOutcome) -> GitHistoryStatus {
+    let unavailable = |reason: String| GitHistoryStatus::Unavailable { reason };
+    if let Some(error) = out.spawn_error {
+        return unavailable(format!("failed to spawn git: {error}"));
+    }
+    if out.timed_out {
+        return unavailable(format!("git log timed out after {GIT_HISTORY_TIMEOUT:?}"));
+    }
+    if let Some(error) = out.cleanup_error {
+        return unavailable(format!("git log cleanup failed: {error}"));
+    }
+    if out.stdout_truncated {
+        return unavailable(format!(
+            "git log exceeded the {GIT_HISTORY_OUTPUT_CAP}-byte output cap"
+        ));
+    }
+    if out.exit_code != Some(0) {
+        return unavailable(format!(
+            "git log exited with {:?}: {}",
+            out.exit_code,
+            crate::util::truncate_bytes(out.stderr_tail.trim(), 300)
+        ));
+    }
+    GitHistoryStatus::Available {
+        hotspots: parse_git_log_hotspots(&out.stdout),
+    }
 }
 
 /// Run `git log --since=<HEAD - 1 year> --no-merges --name-only` against
@@ -411,14 +534,22 @@ async fn head_commit_epoch(repo_root_str: &str) -> Option<i64> {
 /// repo, empty history) degrades to `Unavailable { reason }` — never an
 /// `Err` that would abort the whole intake pass.
 pub async fn compute_git_history(repo_root: &Path) -> GitHistoryStatus {
-    if crate::util::which_cli("git").is_none() {
+    let Some(git_bin) = crate::util::which_cli_for_scan("git", repo_root) else {
         return GitHistoryStatus::Unavailable {
-            reason: "git not found on PATH or common install locations".to_string(),
+            reason: "git not found on absolute PATH or common install locations".to_string(),
         };
-    }
-    if !repo_root.join(".git").exists() {
+    };
+    let git_dir = match crate::util::validate_local_git_metadata(repo_root) {
+        Ok(git_dir) => git_dir,
+        Err(reason) => {
+            return GitHistoryStatus::Unavailable {
+                reason: format!("Git metadata is not self-contained: {reason}"),
+            };
+        }
+    };
+    if let Err(reason) = validate_git_configs(&git_bin, &git_dir, repo_root).await {
         return GitHistoryStatus::Unavailable {
-            reason: "not a git repository (no .git found at repo root)".to_string(),
+            reason: format!("Git metadata is not self-contained: {reason}"),
         };
     }
 
@@ -426,43 +557,33 @@ pub async fn compute_git_history(repo_root: &Path) -> GitHistoryStatus {
     // literal is a plain `&str` — mixing `&str` literals with a `&Cow<str>`
     // (from `to_string_lossy()`) or an inline `&format!(...)` temporary
     // directly in the array does not type-unify.
-    let repo_root_str = repo_root.to_string_lossy().into_owned();
     let pretty_arg = format!("--pretty=format:{GIT_LOG_COMMIT_MARKER}%s");
-    let since_arg = hotspot_since_arg(head_commit_epoch(&repo_root_str).await);
-    let output = tokio::process::Command::new("git")
-        .args([
-            "-C",
-            repo_root_str.as_str(),
-            "log",
-            since_arg.as_str(),
-            "--no-merges",
-            "--name-only",
-            pretty_arg.as_str(),
-        ])
-        .output()
-        .await;
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let raw = String::from_utf8_lossy(&out.stdout);
-            GitHistoryStatus::Available {
-                hotspots: parse_git_log_hotspots(&raw),
-            }
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            GitHistoryStatus::Unavailable {
-                reason: format!(
-                    "git log exited with {}: {}",
-                    out.status,
-                    crate::util::truncate_bytes(stderr.trim(), 300)
-                ),
-            }
-        }
-        Err(e) => GitHistoryStatus::Unavailable {
-            reason: format!("failed to spawn git: {e}"),
+    let since_arg = hotspot_since_arg(head_commit_epoch(&git_bin, &git_dir, repo_root).await);
+    let git_dir_arg = format!("--git-dir={}", git_dir.display());
+    let args = [
+        "--no-pager",
+        git_dir_arg.as_str(),
+        "log",
+        // Defense in depth: even if Git learns another signature-related
+        // config key, history inspection must never invoke a GPG helper.
+        "--no-show-signature",
+        since_arg.as_str(),
+        GIT_HISTORY_MAX_COMMITS,
+        "--no-merges",
+        "--name-only",
+        pretty_arg.as_str(),
+    ];
+    let output = crate::audit::scanners::run_bounded_subprocess(
+        &git_bin,
+        &args,
+        repo_root,
+        &crate::audit::scanners::SubprocessLimits {
+            timeout: GIT_HISTORY_TIMEOUT,
+            max_output_bytes: GIT_HISTORY_OUTPUT_CAP,
         },
-    }
+    )
+    .await;
+    git_history_from_outcome(output)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -721,12 +842,110 @@ mod tests {
         let status = compute_git_history(dir.path()).await;
         match status {
             GitHistoryStatus::Unavailable { reason } => {
-                assert!(
-                    reason.contains("not a git repository") || reason.contains("git not found")
-                );
+                assert!(reason.contains("self-contained") || reason.contains("git not found"));
             }
             GitHistoryStatus::Available { .. } => panic!("expected Unavailable for a non-git dir"),
         }
+    }
+
+    #[tokio::test]
+    async fn git_history_refuses_external_gitdir_files_before_invoking_git() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "gitdir: /outside/repository\n").unwrap();
+        let status = compute_git_history(dir.path()).await;
+        match status {
+            GitHistoryStatus::Unavailable { reason } => {
+                assert!(reason.contains("self-contained"), "{reason}");
+            }
+            GitHistoryStatus::Available { .. } => panic!("external gitdir must be refused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn git_history_refuses_bom_prefixed_include_config() {
+        let dir = tempfile::tempdir().unwrap();
+        if crate::util::which_cli_for_scan("git", dir.path()).is_none() {
+            return;
+        }
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".git/config"),
+            "\u{feff}[include]\n\tpath = /outside/attacker-config\n",
+        )
+        .unwrap();
+        let status = compute_git_history(dir.path()).await;
+        match status {
+            GitHistoryStatus::Unavailable { reason } => {
+                assert!(reason.contains("self-contained"), "{reason}");
+            }
+            GitHistoryStatus::Available { .. } => panic!("BOM include config must be refused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn git_history_refuses_signature_helper_config() {
+        let dir = tempfile::tempdir().unwrap();
+        if crate::util::which_cli_for_scan("git", dir.path()).is_none() {
+            return;
+        }
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".git/config"),
+            "[log]\n\tshowSignature = true\n[gpg]\n\tprogram = /tmp/attacker-gpg\n",
+        )
+        .unwrap();
+        let status = compute_git_history(dir.path()).await;
+        match status {
+            GitHistoryStatus::Unavailable { reason } => {
+                assert!(reason.contains("unsafe Git config key"), "{reason}");
+            }
+            GitHistoryStatus::Available { .. } => panic!("signature helper config must be refused"),
+        }
+    }
+
+    #[test]
+    fn executable_git_config_keys_are_rejected_structurally() {
+        for key in [
+            "include.path",
+            "includeIf.gitdir:/tmp.path",
+            "diff.owned.textconv",
+            "filter.owned.process",
+            "core.fsmonitor",
+            "log.showSignature",
+            "gpg.program",
+            "gpg.openpgp.program",
+            "gpg.x509.program",
+            "gpg.ssh.program",
+        ] {
+            assert!(forbidden_git_config_key(key), "missed {key}");
+        }
+        assert!(!forbidden_git_config_key("remote.origin.url"));
+        assert!(!forbidden_git_config_key("branch.main.merge"));
+    }
+
+    #[test]
+    fn truncated_or_timed_out_git_history_is_never_treated_as_complete() {
+        let base = crate::audit::scanners::SubprocessOutcome {
+            stdout: format!("{GIT_LOG_COMMIT_MARKER}fix: auth\nsrc/auth.rs\n"),
+            stdout_truncated: true,
+            stderr_tail: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            spawn_error: None,
+            cleanup_error: None,
+        };
+        assert!(matches!(
+            git_history_from_outcome(base.clone()),
+            GitHistoryStatus::Unavailable { .. }
+        ));
+        let mut timed_out = base;
+        timed_out.stdout_truncated = false;
+        timed_out.timed_out = true;
+        assert!(matches!(
+            git_history_from_outcome(timed_out),
+            GitHistoryStatus::Unavailable { .. }
+        ));
     }
 
     #[test]

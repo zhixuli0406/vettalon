@@ -177,7 +177,34 @@ pub struct VerifyOptions<'a> {
     pub deadline: Option<Instant>,
     /// Correction calls per run for a reply that breaks the contract.
     pub parse_retries: usize,
+    /// `--refuter-policy`.
+    pub policy: super::refuter_policy::RefuterPolicy,
+    /// Record scores without changing any verdict.
+    pub score: bool,
+    /// `--refuter-score-threshold`: close only on `p_real` below this.
+    pub score_threshold: Option<u8>,
+    /// `--joern-keep` (experimental): after review, a Joern source→sink path
+    /// to the claimed line reopens a finding the refuter closed. `None` =
+    /// off (the default). It never closes anything.
+    pub joern: Option<crate::joern::JoernSettings>,
     pub trace: TraceLog,
+}
+
+/// What `--joern-keep` did in one verify run (written only when set).
+#[derive(Debug, Serialize)]
+pub struct JoernKeepInfo {
+    pub image: String,
+    pub joern: &'static str,
+    pub template: &'static str,
+    pub sources: &'static str,
+    pub rule: &'static str,
+    pub timeout_secs: u64,
+    /// Findings the refuter closed with a model reply (asked about).
+    pub checked: usize,
+    /// Of those, reopened by a path.
+    pub kept: usize,
+    /// One entry per container run (frontend).
+    pub runs: Vec<crate::joern::LangRun>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +213,18 @@ pub struct VerifyOutput {
     pub input: &'static str,
     pub verifier: VerifierInfo,
     pub refuter_runs: usize,
+    /// `--refuter-policy` the run used (`current` by default).
+    pub refuter_policy: String,
+    /// `--refuter-score` was on (written only then, so default output is
+    /// unchanged); each reply's score is a `refuter_score:` evidence line.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refuter_score: bool,
+    /// `--refuter-score-threshold` (written only when set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refuter_score_threshold: Option<u8>,
+    /// `--joern-keep` (written only when set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joern_keep: Option<JoernKeepInfo>,
     /// Every input finding in input order; reviewed ones carry their votes.
     pub findings: Vec<Finding>,
     /// Claims mode: `claim_ids[i]` is the id of `findings[i]`.
@@ -240,7 +279,10 @@ pub async fn run_verify(
         .with_trace(o.trace.clone());
     let (mut reviewed, mut unverified, mut zero_llm, mut passed) = (0, 0, 0, 0);
     let (mut answered_once, mut dead) = (false, false);
-    for f in findings.iter_mut() {
+    // Findings closed after a model reply: the only ones `--joern-keep` asks
+    // about (a zero-call pre-check closure has no line Joern could reach).
+    let mut model_refuted: Vec<usize> = Vec::new();
+    for (idx, f) in findings.iter_mut().enumerate() {
         let eligible = match mode {
             "claims" => f.status == FindingStatus::Candidate,
             _ => adversarial::is_eligible(f) && f.verification.is_empty(),
@@ -264,6 +306,9 @@ pub async fn run_verify(
             runs: adversarial::runs_for(f, o.refuter_runs),
             deadline: o.deadline,
             parse_retries: o.parse_retries,
+            policy: o.policy,
+            score: o.score,
+            score_threshold: o.score_threshold,
         };
         let votes = match adversarial::review_with(repo_root, f, &caller, plan).await {
             adversarial::ReviewOutcome::ZeroLlm => {
@@ -281,6 +326,9 @@ pub async fn run_verify(
                     dead = !refused && !answered_once;
                 }
                 reviewed += 1;
+                if f.status == FindingStatus::Refuted {
+                    model_refuted.push(idx);
+                }
                 votes
             }
         };
@@ -302,6 +350,10 @@ pub async fn run_verify(
             });
         }
     }
+    let joern_keep = match &o.joern {
+        Some(s) => Some(joern_keep(repo_root, &mut findings, &model_refuted, s).await),
+        None => None,
+    };
     VerifyOutput {
         schema: VERIFY_SCHEMA,
         input: mode,
@@ -310,6 +362,10 @@ pub async fn run_verify(
             family: o.verifier.family.clone(),
         },
         refuter_runs: o.refuter_runs,
+        refuter_policy: o.policy.label(),
+        refuter_score: o.score || o.score_threshold.is_some(),
+        refuter_score_threshold: o.score_threshold,
+        joern_keep,
         findings,
         claim_ids,
         title_truncated,
@@ -319,6 +375,47 @@ pub async fn run_verify(
         passed_through: passed,
         calls: caller.call_count(),
         incomplete: unverified > 0,
+    }
+}
+
+/// `--joern-keep`: ask Joern about every finding in `refuted` (closed after
+/// a model reply) and reopen those with an accepted path. Only
+/// [`crate::joern::apply_keep`] touches a status, and it can only turn
+/// `Refuted` into `Candidate`.
+async fn joern_keep(
+    repo_root: &Path,
+    findings: &mut [Finding],
+    refuted: &[usize],
+    s: &crate::joern::JoernSettings,
+) -> JoernKeepInfo {
+    let items: Vec<crate::joern::ItemCheck> = refuted
+        .iter()
+        .map(|&i| crate::joern::ItemCheck {
+            file: findings[i].file.clone(),
+            line: findings[i].line,
+        })
+        .collect();
+    let (verdicts, runs) = if items.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        crate::joern::check_items(repo_root, &items, s).await
+    };
+    let mut kept = 0;
+    for (&i, v) in refuted.iter().zip(&verdicts) {
+        if crate::joern::apply_keep(&mut findings[i], v, s.rule) {
+            kept += 1;
+        }
+    }
+    JoernKeepInfo {
+        image: s.image.clone(),
+        joern: crate::joern::JOERN_VERSION,
+        template: crate::joern::TEMPLATE_ID,
+        sources: crate::joern::SOURCES_VERSION,
+        rule: s.rule.token(),
+        timeout_secs: s.timeout_secs,
+        checked: refuted.len(),
+        kept,
+        runs,
     }
 }
 
@@ -406,6 +503,10 @@ mod tests {
                 refuter_runs: 1,
                 deadline: None,
                 parse_retries: 1,
+                policy: Default::default(),
+                score: false,
+                score_threshold: None,
+                joern: None,
                 trace: TraceLog::recording(),
             },
         )
@@ -419,6 +520,61 @@ mod tests {
             "claims have no finder family"
         );
         assert_ne!(f.status, FindingStatus::Candidate);
+        assert!(out.joern_keep.is_none());
+    }
+
+    #[tokio::test]
+    async fn joern_keep_without_an_image_records_the_error_and_closes_nothing_new() {
+        let d = repo();
+        let VerifyInput::Claims(mut claims) = VerifyInput::parse(&claims_json(
+            r#",{"id":"c2","file":"src/app.py","line":3,"title":"CWE-78 again","cwe":"CWE-78","source":"sastbench"}"#,
+        ))
+        .unwrap() else {
+            panic!()
+        };
+        claims[1].line = Some(99); // out of range: zero-call pre-check closure
+        let fam = HashMap::new();
+        let out = run_verify(
+            d.path(),
+            VerifyInput::Claims(claims),
+            VerifyOptions {
+                verifier: handle("g", "google", vec![Ok(REFUTED.into())]),
+                families: &fam,
+                refuter_runs: 1,
+                deadline: None,
+                parse_retries: 1,
+                policy: Default::default(),
+                score: false,
+                score_threshold: None,
+                joern: Some(crate::joern::JoernSettings {
+                    image: "vettalon-joern:missing-in-tests".into(),
+                    timeout_secs: 30,
+                    rule: Default::default(),
+                }),
+                trace: TraceLog::default(),
+            },
+        )
+        .await;
+        let info = out.joern_keep.as_ref().unwrap();
+        // Only the model-refuted finding is asked about; the pre-check
+        // closure is not.
+        assert_eq!((info.checked, info.kept), (1, 0));
+        assert_eq!(out.findings[0].status, FindingStatus::Refuted);
+        assert_eq!(out.findings[1].status, FindingStatus::Refuted);
+        let joern_lines: Vec<&str> = out.findings[0]
+            .evidence
+            .iter()
+            .filter(|e| e.source == "joern")
+            .map(|e| e.detail.as_str())
+            .collect();
+        assert_eq!(joern_lines.len(), 1, "{joern_lines:?}");
+        assert!(
+            joern_lines[0].starts_with("joern: error"),
+            "{joern_lines:?}"
+        );
+        assert!(!out.findings[1].evidence.iter().any(|e| e.source == "joern"));
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["joern_keep"]["rule"], "strict");
     }
 
     #[tokio::test]
@@ -455,6 +611,10 @@ mod tests {
                 refuter_runs: 3,
                 deadline: None,
                 parse_retries: 1,
+                policy: Default::default(),
+                score: false,
+                score_threshold: None,
+                joern: None,
                 trace: TraceLog::default(),
             },
         )
@@ -479,6 +639,10 @@ mod tests {
                 refuter_runs: 1,
                 deadline: None,
                 parse_retries: 1,
+                policy: Default::default(),
+                score: false,
+                score_threshold: None,
+                joern: None,
                 trace: TraceLog::default(),
             },
         )
