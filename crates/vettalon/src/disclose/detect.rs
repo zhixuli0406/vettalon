@@ -2,7 +2,7 @@
 //! remote (or, without a GitHub one, the repository URL the package metadata
 //! declares), SECURITY.md and package manifest.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use super::upstream::{MetadataUpstream, UpstreamOrigin, pkg_info_field};
 use super::{Channel, ChannelOption, ProjectMeta};
@@ -10,13 +10,34 @@ use crate::lang::pick;
 
 const META_MAX_BYTES: u64 = 256 * 1024;
 
-/// Read a small regular file inside the repo (no symlinks, size-capped).
-fn read_small(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > META_MAX_BYTES {
+/// Read a small regular file that resolves inside `repo` (no leaf symlinks,
+/// size-capped). Parent symlinks may point elsewhere inside the same repo, but
+/// never outside it.
+fn read_small(repo: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(repo).ok()?;
+    let rel = rel
+        .components()
+        .map(|part| match part {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    let resolved = crate::util::resolve_in_repo(repo, &rel).ok()?;
+    // Preserve the existing fail-closed contract for a symlink at the leaf;
+    // resolve_in_repo deliberately permits one when its target stays in-repo.
+    if std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    let meta = std::fs::metadata(&resolved).ok()?;
+    if meta.len() > META_MAX_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(resolved).ok()
 }
 
 /// `owner/repo` from a GitHub repository URL (https, ssh, scp-style,
@@ -38,15 +59,15 @@ fn origin_url(git_config: &str) -> Option<String> {
     None
 }
 
-fn head_commit(git_dir: &Path) -> Option<String> {
-    let head = read_small(&git_dir.join("HEAD"))?;
+fn head_commit(repo: &Path, git_dir: &Path) -> Option<String> {
+    let head = read_small(repo, &git_dir.join("HEAD"))?;
     let head = head.trim();
     let sha = match head.strip_prefix("ref: ") {
-        Some(r) if !r.contains("..") => read_small(&git_dir.join(r))
+        Some(r) if !r.contains("..") => read_small(repo, &git_dir.join(r))
             .map(|s| s.trim().to_string())
             .or_else(|| {
                 // Packed refs: `<sha> <ref>` lines.
-                read_small(&git_dir.join("packed-refs"))?
+                read_small(repo, &git_dir.join("packed-refs"))?
                     .lines()
                     .find_map(|l| l.strip_suffix(r).map(|s| s.trim().to_string()))
             })?,
@@ -95,20 +116,20 @@ pub fn detect_project_as(repo: &Path, ecosystem: Option<&str>) -> ProjectMeta {
         return m;
     }
     let git = repo.join(".git");
-    if let Some(cfg) = read_small(&git.join("config")) {
+    if let Some(cfg) = read_small(repo, &git.join("config")) {
         m.github = origin_url(&cfg).as_deref().and_then(github_slug);
         if m.github.is_some() {
             m.github_source = Some(UpstreamOrigin::GitRemote);
         }
     }
-    m.commit = head_commit(&git);
+    m.commit = head_commit(repo, &git);
     for rel in [
         "SECURITY.md",
         ".github/SECURITY.md",
         "docs/SECURITY.md",
         "security.md",
     ] {
-        if let Some(t) = read_small(&repo.join(rel)) {
+        if let Some(t) = read_small(repo, &repo.join(rel)) {
             m.security_policy = Some(rel.to_string());
             m.security_emails = emails_in(&t);
             // DATA only: listed for the human, never acted on.
@@ -121,7 +142,7 @@ pub fn detect_project_as(repo: &Path, ecosystem: Option<&str>) -> ProjectMeta {
     // fall back to the repository URL the package metadata declares.
     if m.github.is_none() {
         let eco = ecosystem.or(m.ecosystem.as_deref());
-        match super::upstream::from_metadata(repo, eco, read_small) {
+        match super::upstream::from_metadata(repo, eco, |path| read_small(repo, path)) {
             MetadataUpstream::Github { slug, origin } => {
                 m.github = Some(slug);
                 m.github_source = Some(origin);
@@ -138,11 +159,11 @@ pub fn detect_project_as(repo: &Path, ecosystem: Option<&str>) -> ProjectMeta {
 
 /// Name, version and ecosystem from the package manifest.
 fn read_manifest(repo: &Path, m: &mut ProjectMeta) {
-    if let Some(t) = read_small(&repo.join("Cargo.toml")) {
+    if let Some(t) = read_small(repo, &repo.join("Cargo.toml")) {
         m.name = toml_field(&t, "package", "name");
         m.version = toml_field(&t, "package", "version");
         m.ecosystem = Some("Rust".into());
-    } else if let Some(t) = read_small(&repo.join("package.json")) {
+    } else if let Some(t) = read_small(repo, &repo.join("package.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
             m.name = v.get("name").and_then(|x| x.as_str()).map(str::to_string);
             m.version = v
@@ -151,19 +172,19 @@ fn read_manifest(repo: &Path, m: &mut ProjectMeta) {
                 .map(str::to_string);
         }
         m.ecosystem = Some("npm".into());
-    } else if let Some(t) = read_small(&repo.join("pyproject.toml")) {
+    } else if let Some(t) = read_small(repo, &repo.join("pyproject.toml")) {
         m.name =
             toml_field(&t, "project", "name").or_else(|| toml_field(&t, "tool.poetry", "name"));
         m.version = toml_field(&t, "project", "version")
             .or_else(|| toml_field(&t, "tool.poetry", "version"));
         m.ecosystem = Some("pip".into());
-    } else if let Some(t) = read_small(&repo.join("go.mod")) {
+    } else if let Some(t) = read_small(repo, &repo.join("go.mod")) {
         m.name = t
             .lines()
             .find_map(|l| l.trim().strip_prefix("module "))
             .map(|s| s.trim().to_string());
         m.ecosystem = Some("Go".into());
-    } else if read_small(&repo.join("PKG-INFO")).is_some() {
+    } else if read_small(repo, &repo.join("PKG-INFO")).is_some() {
         // A legacy sdist (setup.py, no pyproject). A bare setup.cfg is not
         // enough: many non-Python repos keep tool settings in one.
         m.ecosystem = Some("pip".into());
@@ -171,7 +192,7 @@ fn read_manifest(repo: &Path, m: &mut ProjectMeta) {
     // An sdist's PKG-INFO carries the resolved name and version (pyproject
     // often leaves the version dynamic).
     if m.ecosystem.as_deref() == Some("pip")
-        && let Some(t) = read_small(&repo.join("PKG-INFO"))
+        && let Some(t) = read_small(repo, &repo.join("PKG-INFO"))
     {
         m.name = m.name.take().or_else(|| pkg_info_field(&t, "Name"));
         m.version = m.version.take().or_else(|| pkg_info_field(&t, "Version"));

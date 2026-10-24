@@ -13,8 +13,8 @@
   CI: a deep scan in which no AI engine could run now exits 4 instead of 0 (the report is still written); `--allow-incomplete` keeps the old exit code.
 
 ### Security
-- 修復七個發版阻擋：Git metadata 外逸與無界歷史讀取、工具型 CLI 憑證暴露、agent 取消後的容器殘留、可執行檔 PATH 劫持、TLS/ZIP 依賴漏洞、PoC scratch 目錄暴露，並阻擋 gitleaks/semgrep 忽略參數繞過掃描。
-- Fixed seven release blockers: Git metadata escape and unbounded history reads, tool-capable CLI credential exposure, orphaned agent containers after cancellation, executable PATH hijacking, TLS/ZIP dependency vulnerabilities, PoC scratch-directory exposure, and gitleaks/semgrep ignore-flag bypasses.
+- 修復八個發版阻擋：Git metadata 外逸與無界歷史讀取、揭露中繼資料讀取的 symlink 父目錄越界、工具型 CLI 憑證暴露、agent 取消後的容器殘留、可執行檔 PATH 劫持、TLS/ZIP 依賴漏洞、PoC scratch 目錄暴露，並阻擋 gitleaks/semgrep 忽略參數繞過掃描。
+- Fixed eight release blockers: Git metadata escape and unbounded history reads, disclosure-metadata reads escaping through symlinked parent directories, tool-capable CLI credential exposure, orphaned agent containers after cancellation, executable PATH hijacking, TLS/ZIP dependency vulnerabilities, PoC scratch-directory exposure, and gitleaks/semgrep ignore-flag bypasses.
 
 ### Added
 - `verify --joern-keep`（預設關閉，實驗性）與 `vettalon joern build|image|check`：覆核之後，對 refuter 用模型回覆關掉的發現，在本機容器裡用 Joern（Apache-2.0，固定 v4.0.663）找「固定輸入來源 → 主張行上的呼叫」的資料流路徑。有被規則接受的路徑（預設 `strict`：路徑上沒有在同一個非運算子呼叫的兩個參數之間跳躍），發現改回 `candidate`，記 `joern_path: rule=… flows=… strict=…; path=…` 與 `verify_uncertain: joern path (refutation not applied)`；沒有路徑、那行沒有呼叫、語言不支援、沒有映像檔、逾時或任何錯誤都不改判決，只記一行 `joern: …`。它只會讓發現保留，從不關閉發現；零呼叫前置檢查的關閉不會被問到。verify 輸出在開啟時多一個 `joern_keep` 欄位（映像檔、模板、來源樣式版本、規則、每次容器執行的時間與記憶體）。`vettalon joern build` 從 binary 內的定義建 `vettalon-joern:<定義雜湊>` 映像檔：下載固定版本的 Joern（約 1.8 GB），核對寫死的 SHA-256 與 SHA-512，不用官方安裝腳本；這個映像檔不發布、不拉取。分析時容器 `--network=none`、唯讀根目錄、原始碼唯讀掛載、非 root、無 capabilities、記憶體 6 GB、2 CPU、容器內外各一道逾時（`--joern-timeout`，預設 900 秒）。查詢是編進 binary 的固定 Scala 模板，模型不寫查詢；主張的檔名與行號先過白名單，只當資料檔傳入。`vettalon joern check` 對一個 claims 檔回報每個位置的答案（`vettalon.joern-check/1`），不呼叫模型、不下判決，給離線評測用。是否值得用要看事先登錄的量測。

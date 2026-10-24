@@ -93,6 +93,89 @@ fn repo() -> tempfile::TempDir {
     d
 }
 
+#[test]
+fn project_detection_rejects_an_absolute_head_ref_outside_the_repo() {
+    let d = repo();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), "abcdef0123456789abcdef0123456789abcdef01\n").unwrap();
+    std::fs::write(
+        d.path().join(".git/HEAD"),
+        format!("ref: {}\n", outside.path().display()),
+    )
+    .unwrap();
+
+    assert_eq!(detect_project(d.path()).commit, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn project_detection_rejects_parent_symlinks_that_escape() {
+    use std::os::unix::fs::symlink;
+
+    let d = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside.path().join("SECURITY.md"),
+        "Report to outside-secret@example.invalid.",
+    )
+    .unwrap();
+    std::fs::create_dir(outside.path().join("git")).unwrap();
+    std::fs::write(
+        outside.path().join("git/config"),
+        "[remote \"origin\"]\n\turl = https://github.com/outside/secret.git\n",
+    )
+    .unwrap();
+    std::fs::write(
+        outside.path().join("git/HEAD"),
+        "abcdef0123456789abcdef0123456789abcdef01\n",
+    )
+    .unwrap();
+    symlink(outside.path(), d.path().join("docs")).unwrap();
+    symlink(outside.path().join("git"), d.path().join(".git")).unwrap();
+
+    let m = detect_project(d.path());
+    assert_eq!(m.security_policy, None);
+    assert!(m.security_emails.is_empty());
+    assert_eq!(m.github, None);
+    assert_eq!(m.commit, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn project_detection_keeps_leaf_symlinks_fail_closed() {
+    use std::os::unix::fs::symlink;
+
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join("policy.txt"),
+        "Report to internal@example.invalid.",
+    )
+    .unwrap();
+    symlink("policy.txt", d.path().join("SECURITY.md")).unwrap();
+
+    let m = detect_project(d.path());
+    assert_eq!(m.security_policy, None);
+    assert!(m.security_emails.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn project_detection_accepts_an_operator_selected_repo_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let d = repo();
+    let alias_dir = tempfile::tempdir().unwrap();
+    let alias = alias_dir.path().join("selected-repo");
+    symlink(d.path(), &alias).unwrap();
+
+    let m = detect_project(&alias);
+    assert_eq!(m.github.as_deref(), Some("acme/shop"));
+    assert_eq!(m.commit.as_deref(), Some("0123456789ab"));
+    assert_eq!(m.security_emails, ["security@acme.example"]);
+    assert_eq!(m.name.as_deref(), Some("shop"));
+    assert_eq!(m.version.as_deref(), Some("1.2.3"));
+}
+
 pub(super) fn opts(dir: &Path) -> DraftOptions {
     let reviewer = Reviewer::resolve(Some("night-owl"), None, None, day()).unwrap();
     DraftOptions::new(reviewer, dir)
