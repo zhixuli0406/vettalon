@@ -13,6 +13,9 @@ MODE="${NPM_PUBLISH_MODE:-stage}"
 case "$MODE" in stage|publish) ;; *) echo "NPM_PUBLISH_MODE must be stage or publish" >&2; exit 2;; esac
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-./artifacts}"
 
+echo "=== npm publish dry-run contract ==="
+node "${SCRIPT_DIR}/publish-dry-run.mjs"
+
 declare -A PLATFORM_MAP=(
   [vettalon-darwin-arm64]=darwin-arm64
   [vettalon-darwin-x64]=darwin-x64

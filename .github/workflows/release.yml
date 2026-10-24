@@ -202,14 +202,16 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          # Node 24 bundles npm 11; trusted publishing needs npm >= 11.5.1.
+          # Node 24 bundles npm 11; staged publishing needs npm >= 11.15.0.
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
           # No dependency cache in a publishing job (cache poisoning).
           package-manager-cache: false
-      - name: Require an npm that supports trusted publishing
+      - name: Install the pinned npm with staged publishing
+        run: npm install --global npm@11.15.0 --ignore-scripts --no-audit --no-fund
+      - name: Require an npm that supports staged publishing
         run: |
-          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number);if(a<11||(a===11&&(b<5||(b===5&&c<1)))){console.error("npm "+process.argv[1]+" < 11.5.1");process.exit(1)}' "$(npm --version)"
+          node -e 'const [a,b]=process.argv[1].split(".").map(Number);if(a<11||(a===11&&b<15)){console.error("npm "+process.argv[1]+" < 11.15.0");process.exit(1)}' "$(npm --version)"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           merge-multiple: true

@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- npm 入口套件現在附帶專用 README，避免 npm 套件頁只有空白說明。PR CI 與實際 staging 前都會用去除 token/OIDC 的最小環境、空白 npm user config 與暫存 cache 執行隔離、離線的 `npm publish --dry-run --offline --json`，關閉 provenance 與 lifecycle scripts，並拒絕缺少有效 README、manifest、CLI shim 或 installer 的 tarball；release workflow 會固定安裝 `npm@11.15.0` 後再驗最低版本門檻。
+
 ## [0.3.2] - 2026-10-24
 
 ### 升級須知 / Upgrade notes
