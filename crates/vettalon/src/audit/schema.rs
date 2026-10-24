@@ -1412,7 +1412,7 @@ impl Summary {
                     FindingStatus::NeedsHuman => ai_audit_needs_human += 1,
                     _ => {}
                 }
-                if f.precheck_failed() {
+                if f.precheck_failed() && f.status == FindingStatus::Refuted {
                     precheck_refuted += 1;
                 }
             }
@@ -1857,6 +1857,34 @@ mod tests {
             legacy.scanned, 0,
             "absence of evidence stays unknown for legacy reports"
         );
+    }
+
+    #[test]
+    fn unavailable_source_does_not_count_as_a_precheck_refutation() {
+        let mut finding = Finding::candidate(
+            AI_AUDIT_ENGINE_NAME,
+            FindingKind::Other,
+            Severity::High,
+            "unavailable claim",
+            "missing.py",
+            None,
+            "source unavailable",
+            "rule",
+            vec![],
+        );
+        finding.precheck = Some(PrecheckResult {
+            passed: false,
+            violations: vec!["referenced file is unavailable".into()],
+        });
+        let summary = Summary::from_findings(&[finding.clone()], 1, 0, GatePolicy::default(), &[]);
+        assert_eq!(summary.ai_audit_candidates, 1);
+        assert_eq!(summary.ai_audit_refuted, 0);
+        assert_eq!(summary.precheck_refuted, 0);
+
+        // A legacy report's explicit refutation still has its historical count.
+        finding.status = FindingStatus::Refuted;
+        let legacy = Summary::from_findings(&[finding], 1, 0, GatePolicy::default(), &[]);
+        assert_eq!(legacy.precheck_refuted, 1);
     }
 
     #[test]

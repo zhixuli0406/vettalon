@@ -14,9 +14,10 @@
 //!     serde (`ConditionKind` is closed, `deny_unknown_fields`), so a reply
 //!     with an unknown kind never reaches this module.
 //!
-//! A failing candidate becomes `Refuted` with `precheck.passed = false` and
+//! A failing candidate stays `Candidate` with `precheck.passed = false` and
 //! one `AdversarialReview` evidence item `precheck: <violations>`, and is not
-//! sent to the verifier.
+//! sent to the verifier. Invalid claim structure or unavailable source does
+//! not demonstrate that the underlying vulnerability is absent.
 //!
 //! Everything here is pure except [`DiskLines`], the filesystem-backed
 //! [`LineOracle`]; tests use an in-memory oracle.
@@ -220,7 +221,7 @@ pub fn check_candidate(
     out
 }
 
-/// Record the pre-check outcome on `finding`. Any violation ⇒ `Refuted`
+/// Record the pre-check outcome on `finding`. Any violation ⇒ `Candidate`
 /// with a `precheck:` evidence item; none ⇒ `precheck.passed = true` and the
 /// status is left alone.
 pub fn apply_precheck(finding: &mut Finding, violations: Vec<String>) {
@@ -232,7 +233,7 @@ pub fn apply_precheck(finding: &mut Finding, violations: Vec<String>) {
         return;
     }
     let joined = violations.join("; ");
-    finding.status = FindingStatus::Refuted;
+    finding.status = FindingStatus::Candidate;
     finding.evidence.push(EvidenceItem {
         kind: EvidenceKind::AdversarialReview,
         source: "precheck".to_string(),
@@ -416,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_precheck_refutes_with_evidence_or_marks_passed() {
+    fn source_unavailable_precheck_keeps_invalid_claim_with_evidence_or_marks_passed() {
         let base = Finding::candidate(
             "ai_audit",
             FindingKind::Other,
@@ -436,8 +437,9 @@ mod tests {
 
         let mut bad = base;
         apply_precheck(&mut bad, vec!["trace: empty".into(), "file: x".into()]);
-        assert_eq!(bad.status, FindingStatus::Refuted);
+        assert_eq!(bad.status, FindingStatus::Candidate);
         assert!(!bad.precheck.as_ref().unwrap().passed);
+        assert!(bad.verification.is_empty());
         let ev = bad.evidence.last().unwrap();
         assert_eq!(ev.kind, EvidenceKind::AdversarialReview);
         assert_eq!(ev.detail, "precheck: trace: empty; file: x");

@@ -54,14 +54,30 @@ pub const POC_MAX_RUNS: usize = 20;
 pub struct PocBudget {
     remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     max: usize,
+    image: String,
+    sandbox_session: std::sync::Arc<crate::sandbox::SandboxSession>,
 }
 
 impl PocBudget {
     pub fn new(max: usize) -> Self {
+        Self::with_image(max, &poc_image())
+    }
+
+    pub(crate) fn with_image(max: usize, image: &str) -> Self {
         PocBudget {
             remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(max)),
             max,
+            image: image.to_owned(),
+            sandbox_session: std::sync::Arc::new(crate::sandbox::SandboxSession::new()),
         }
+    }
+
+    pub(crate) fn image(&self) -> &str {
+        &self.image
+    }
+
+    pub(crate) async fn sandbox(&self) -> Result<crate::sandbox::DockerSandbox, String> {
+        self.sandbox_session.sandbox(self.image()).await
     }
 
     /// The configured cap (for the skip message), not the live remaining.
@@ -381,7 +397,7 @@ pub async fn maybe_run_poc<C: LlmCaller>(
         return;
     }
 
-    match execute_in_sandbox(&script, &language).await {
+    match execute_in_sandbox(&script, &language, budget).await {
         Ok((exit_code, output)) => {
             let masked_script = crate::util::mask_sensitive_text(&script);
             let masked_output = crate::util::mask_sensitive_text(&output);
@@ -450,12 +466,12 @@ pub fn set_poc_image(image: &str) {
 /// container running; callers treat `Err` as "could not run" and stop (never
 /// a host fallback). The live path is covered by the `#[ignore]`d Docker test
 /// in `crate::sandbox`.
-async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String), String> {
-    let image = POC_IMAGE
-        .get()
-        .map(String::as_str)
-        .unwrap_or(crate::sandbox::DEFAULT_POC_IMAGE);
-    let sandbox = crate::sandbox::DockerSandbox::detect(image).await?;
+async fn execute_in_sandbox(
+    script: &str,
+    language: &str,
+    budget: &PocBudget,
+) -> Result<(i64, String), String> {
+    let sandbox = budget.sandbox().await?;
     sandbox.run_script(script, language, POC_TIMEOUT).await
 }
 
@@ -740,6 +756,19 @@ pub fn attach_proof_evidence(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_operation_keeps_its_image_when_other_operations_choose_another() {
+        let first = super::PocBudget::with_image(4, "python:first");
+        let second = super::PocBudget::with_image(4, "python:second");
+        let continued = first.clone();
+        assert_eq!(first.image(), "python:first");
+        assert_eq!(second.image(), "python:second");
+        assert_eq!(continued.image(), "python:first");
+        assert!(continued.try_claim());
+        assert_eq!(first.remaining(), 3);
+        assert_eq!(second.remaining(), 4);
+    }
+
     use super::*;
     use crate::audit::schema::FindingKind;
 

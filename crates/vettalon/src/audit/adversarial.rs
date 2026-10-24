@@ -60,8 +60,9 @@
 //! base, so a hostile reply could make the verifier read `/etc/passwd`).
 //!
 //! Outcome mapping (fail-closed, never auto-Confirm):
-//! - unsafe path, unreadable file, or `line` out of range → zero-LLM
-//!   `Refuted` with evidence.
+//! - failed candidate pre-check, unsafe path, unreadable file, or `line`
+//!   out of range → zero-LLM unverified `Candidate` with `verify_error`.
+//!   Invalid or unavailable source is not evidence against the claim.
 //! - LLM call fails, or the reply violates the contract → `verify_error`
 //!   evidence, status stays `Candidate` (unknown). A contract violation is
 //!   first re-asked once with the violation named (verifier reflector,
@@ -89,8 +90,8 @@
 //! line numbers.
 //!
 //! Only `source_engine == "ai_audit"` findings still at `Candidate` are
-//! reviewed ([`is_eligible`]); pre-check refutations and statuses carried
-//! from a prior report are already settled.
+//! reviewed ([`is_eligible`]); failed pre-checks remain unverified without
+//! a model call. Settled statuses carried from a prior report stay settled.
 
 use std::path::Path;
 use std::time::Instant;
@@ -509,9 +510,15 @@ pub fn note_unverified(finding: &mut Finding, why: &str) {
     push_evidence(finding, format!("verify_error: {why}"));
 }
 
-fn refute_zero_llm(finding: &mut Finding, why: String) {
-    finding.status = FindingStatus::Refuted;
-    push_evidence(finding, format!("refuted (zero-LLM): {why}"));
+fn unverified_zero_llm(finding: &mut Finding, why: &str) {
+    finding.status = FindingStatus::Candidate;
+    note_unverified(
+        finding,
+        &format!(
+            "source validation failed (zero-LLM): {}",
+            crate::util::truncate_bytes(why, EVIDENCE_DETAIL_MAX_BYTES)
+        ),
+    );
 }
 
 /// Whether [`review_all`] will review this finding.
@@ -1259,10 +1266,11 @@ pub fn is_uncertain(f: &Finding) -> bool {
 }
 
 /// How one review ended, so the caller can tell model verdicts from a
-/// deterministic settlement or failed calls.
+/// source-validation failures or failed calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewOutcome {
-    /// Settled without any model call (file unreadable / line out of range).
+    /// Source or claim validation failed without a model call. The finding
+    /// remains an unverified `Candidate`; this is not a refutation or vote.
     ZeroLlm,
     /// At least one call was made. `votes` has one entry per call, in order.
     Reviewed {
@@ -1341,19 +1349,27 @@ pub async fn review_with<C: LlmCaller>(
     caller: &C,
     plan: ReviewPlan,
 ) -> ReviewOutcome {
+    if let Some(precheck) = finding.precheck.as_ref().filter(|p| !p.passed) {
+        let why = format!(
+            "candidate pre-check failed: {}",
+            precheck.violations.join("; ")
+        );
+        unverified_zero_llm(finding, &why);
+        return ReviewOutcome::ZeroLlm;
+    }
     let content = match read_safe(repo_root, &finding.file) {
         Ok(c) => c,
         Err(e) => {
-            // Deterministic, zero-LLM refutation: the claimed file cannot be
-            // re-read (or its path is not a safe repo path) — no call spent.
-            refute_zero_llm(finding, format!("referenced file: {e}"));
+            // Refuse unsafe/unavailable source without spending a call or
+            // confusing the read failure with evidence against the claim.
+            unverified_zero_llm(finding, &format!("referenced file: {e}"));
             return ReviewOutcome::ZeroLlm;
         }
     };
     if centered_window(&content, finding.line, VERIFIER_FILE_BUDGET_BYTES).is_none() {
-        refute_zero_llm(
+        unverified_zero_llm(
             finding,
-            format!("claimed line {:?} is outside the file", finding.line),
+            &format!("claimed line {:?} is outside the file", finding.line),
         );
         return ReviewOutcome::ZeroLlm;
     }
@@ -1963,18 +1979,52 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn review_one_missing_file_refutes_without_calling_llm() {
+    async fn source_unavailable_missing_file_stays_unverified_without_llm() {
         let dir = tempfile::tempdir().unwrap();
         let mut f = sample_finding(); // "src/db.py" does not exist under `dir`
-        review_one(dir.path(), &mut f, &PanicCaller).await;
-        assert_eq!(f.status, FindingStatus::Refuted);
-        assert!(f.evidence.last().unwrap().detail.contains("zero-LLM"));
+        let outcome = review_one(dir.path(), &mut f, &PanicCaller).await;
+        assert_source_unverified(&f, outcome);
+    }
+
+    fn assert_source_unverified(finding: &Finding, outcome: ReviewOutcome) {
+        assert_eq!(outcome, ReviewOutcome::ZeroLlm);
+        assert_eq!(finding.status, FindingStatus::Candidate);
+        assert!(finding.verification.is_empty());
+        assert!(
+            !is_uncertain(finding),
+            "unread source is not a model disagreement"
+        );
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|e| e.detail.starts_with("verify_error:"))
+        );
+        assert!(
+            !finding.evidence.iter().any(|e| {
+                e.detail.starts_with("refuted") || e.detail.starts_with("refute_basis:")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn source_unavailable_failed_claim_precheck_never_calls_the_verifier() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        // The main file is readable, but the finder's claimed trace did
+        // not satisfy the input contract. That is not a refuter verdict.
+        f.precheck = Some(crate::audit::schema::PrecheckResult {
+            passed: false,
+            violations: vec!["trace: empty".into()],
+        });
+        let outcome = review_one(dir.path(), &mut f, &PanicCaller).await;
+        assert_source_unverified(&f, outcome);
     }
 
     /// G1: a hostile `file` (absolute or `..`) never reaches the filesystem
     /// and never reaches the LLM.
     #[tokio::test]
-    async fn review_one_unsafe_paths_never_touch_filesystem_or_llm() {
+    async fn source_unavailable_unsafe_paths_never_touch_filesystem_or_llm() {
         let dir = repo_with_db();
         for hostile in [
             "../../etc/passwd",
@@ -1984,23 +2034,70 @@ pub(crate) mod tests {
         ] {
             let mut f = sample_finding();
             f.file = hostile.to_string();
-            review_one(dir.path(), &mut f, &PanicCaller).await;
-            assert_eq!(f.status, FindingStatus::Refuted, "{hostile}");
+            let outcome = review_one(dir.path(), &mut f, &PanicCaller).await;
+            assert_source_unverified(&f, outcome);
             let d = &f.evidence.last().unwrap().detail;
-            assert!(
-                d.contains("zero-LLM") && d.contains("unsafe path"),
-                "{hostile}: {d}"
-            );
+            assert!(d.contains("unsafe path"), "{hostile}: {d}");
         }
     }
 
     #[tokio::test]
-    async fn review_one_out_of_range_line_refutes_without_llm() {
+    async fn source_unavailable_out_of_range_line_stays_unverified_without_llm() {
         let dir = repo_with_db();
+        for line in [0, 40] {
+            let mut f = sample_finding();
+            f.line = Some(line);
+            let outcome = review_one(dir.path(), &mut f, &PanicCaller).await;
+            assert_source_unverified(&f, outcome);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_unavailable_unreadable_file_stays_unverified_without_llm() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/db.py")).unwrap();
         let mut f = sample_finding();
-        f.line = Some(40);
-        review_one(dir.path(), &mut f, &PanicCaller).await;
-        assert_eq!(f.status, FindingStatus::Refuted);
+        let outcome = review_one(dir.path(), &mut f, &PanicCaller).await;
+        assert_source_unverified(&f, outcome);
+        // An existing regular file with invalid UTF-8 is also unavailable
+        // to the verifier; decoding failure is no proof against the claim.
+        std::fs::remove_dir(dir.path().join("src/db.py")).unwrap();
+        std::fs::write(dir.path().join("src/db.py"), [0xff, 0xfe]).unwrap();
+        let mut f = sample_finding();
+        let outcome = review_one(dir.path(), &mut f, &PanicCaller).await;
+        assert_source_unverified(&f, outcome);
+    }
+
+    #[tokio::test]
+    async fn source_unavailable_secret_file_is_not_read_or_refuted() {
+        let dir = repo_with_db();
+        let secret = "UNIQUE_SOURCE_UNAVAILABLE_SECRET";
+        std::fs::write(dir.path().join("src/.env"), secret).unwrap();
+        let mut f = sample_finding();
+        f.file = "src/.env".into();
+        let outcome = review_one(dir.path(), &mut f, &PanicCaller).await;
+        assert_source_unverified(&f, outcome);
+        assert!(f.evidence.last().unwrap().detail.contains("holds secrets"));
+        assert!(!format!("{:?}", f.evidence).contains(secret));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_unavailable_outside_symlink_is_not_read_or_refuted() {
+        let dir = repo_with_db();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = "UNIQUE_OUTSIDE_SOURCE_SECRET";
+        std::fs::write(outside.path().join("private.py"), secret).unwrap();
+        std::fs::remove_file(dir.path().join("src/db.py")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("private.py"),
+            dir.path().join("src/db.py"),
+        )
+        .unwrap();
+        let mut f = sample_finding();
+        let outcome = review_one(dir.path(), &mut f, &PanicCaller).await;
+        assert_source_unverified(&f, outcome);
+        assert!(!format!("{:?}", f.evidence).contains(secret));
     }
 
     #[tokio::test]

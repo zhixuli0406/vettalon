@@ -1,6 +1,6 @@
 {
   "name": "vettalon",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Multi-model security audit for your own code: AI models from different vendors find bugs and a different-vendor model refutes each one. Local-first, bring your own model.",
   "license": "Apache-2.0",
   "author": {
@@ -40,9 +40,9 @@
     "postinstall": "node scripts/install.js"
   },
   "optionalDependencies": {
-    "@vettalon/darwin-arm64": "0.3.2",
-    "@vettalon/darwin-x64": "0.3.2",
-    "@vettalon/linux-x64": "0.3.2",
-    "@vettalon/linux-arm64": "0.3.2"
+    "@vettalon/darwin-arm64": "0.4.0",
+    "@vettalon/darwin-x64": "0.4.0",
+    "@vettalon/linux-x64": "0.4.0",
+    "@vettalon/linux-arm64": "0.4.0"
   }
 }
