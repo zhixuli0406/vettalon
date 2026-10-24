@@ -26,6 +26,7 @@ struct FakeSandbox {
     tests: Tests,
     harness_runs: AtomicUsize,
     test_runs: AtomicUsize,
+    image: Option<&'static str>,
 }
 
 impl FakeSandbox {
@@ -38,6 +39,7 @@ impl FakeSandbox {
             tests: Box::new(tests),
             harness_runs: AtomicUsize::new(0),
             test_runs: AtomicUsize::new(0),
+            image: Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         }
     }
 
@@ -73,6 +75,10 @@ fn between<'a>(s: &'a str, start: &str, end: &str) -> &'a str {
 
 #[async_trait::async_trait]
 impl FixSandbox for FakeSandbox {
+    fn image_identity(&self) -> Option<&str> {
+        self.image
+    }
+
     async fn run_harness(
         &self,
         tree: &Path,
@@ -307,12 +313,15 @@ fn fix_runner_reports_errors_and_benign_results_and_keeps_stdlib_first() {
     let cmd = build_fix_runner(OracleClass::CommandInjection, &s, SEMI);
     assert!(!cmd.contains("functional="));
     assert_eq!(
-        marked_flag("__VTL_ORACLE__ vtlmM error=true\n", "vtlmM", "error"),
-        Some(true)
+        super::super::target_poc::parse_verdict(
+            "__VTL_ORACLE__ vtlmM error=true\n__VTL_ORACLE__ vtlmM effect=false\n",
+            "vtlmM"
+        ),
+        Ok((false, None, true))
     );
-    assert_eq!(
-        marked_flag("__VTL_ORACLE__ other error=true\n", "vtlmM", "error"),
-        None
+    assert!(
+        super::super::target_poc::parse_verdict("__VTL_ORACLE__ other error=true\n", "vtlmM")
+            .is_err()
     );
 }
 
@@ -554,6 +563,174 @@ fn with_check(f: &mut Finding, c: &FixCheck) {
     });
 }
 
+#[tokio::test]
+async fn verification_binding_uses_the_prepared_snapshot_and_exact_execution_context() {
+    use super::super::verification_context::VerificationTarget;
+    let dir = repo();
+    let diff = correct_fix();
+    let file_hash = sha256_hex(APP.as_bytes());
+    let req = FixCheckRequest {
+        class: OracleClass::CommandInjection,
+        adapter: ADAPTER,
+        diff: &diff,
+        test_command: Some("python3 tests.py"),
+    };
+    let sb = FakeSandbox::standard(tests_pass);
+    let run = check_fix_bound(
+        dir.path(),
+        &req,
+        &sb,
+        VerificationTarget {
+            file: "app.py",
+            file_hash: Some(&file_hash),
+        },
+    )
+    .await;
+    assert_eq!(run.check.outcome(), FixOutcome::FixVerified);
+    let binding = run.binding.as_ref().unwrap();
+    assert_eq!(binding.target_file_sha256, file_hash);
+    assert_eq!(binding.adapter_sha256, sha256_hex(ADAPTER.as_bytes()));
+    assert_eq!(
+        binding.test_command_sha256.as_deref(),
+        Some(sha256_hex(b"python3 tests.py").as_str())
+    );
+    assert_eq!(binding.image_identity.as_deref(), sb.image_identity());
+    assert_ne!(binding.original.sha256, binding.fixed.sha256);
+    let mut f = finding("CWE-78");
+    f.file_hash = Some(file_hash);
+    f.suggested_fix = Some(diff);
+    record_fix_run(&mut f, &run);
+    let summary = f.fix_check().unwrap();
+    assert_eq!(summary.outcome, FixOutcome::FixVerified);
+    assert_eq!(summary.scope, "recorded_snapshot");
+    assert_eq!(summary.binding.as_ref().unwrap(), binding);
+    assert_eq!(f.status, FindingStatus::NeedsHuman);
+
+    // The same diff cannot promote a finding pinned to different bytes.
+    f.file_hash = Some(sha256_hex(b"different target"));
+    assert_eq!(f.fix_check().unwrap().outcome, FixOutcome::FixUnverified);
+}
+
+#[tokio::test]
+async fn verification_binding_missing_image_or_finding_hash_never_promotes_a_positive_check() {
+    use super::super::verification_context::VerificationTarget;
+    let dir = repo();
+    let diff = correct_fix();
+    let file_hash = sha256_hex(APP.as_bytes());
+    let req = FixCheckRequest {
+        class: OracleClass::CommandInjection,
+        adapter: ADAPTER,
+        diff: &diff,
+        test_command: None,
+    };
+    for missing_image in [true, false] {
+        let mut sb = FakeSandbox::standard(tests_pass);
+        if missing_image {
+            sb.image = None;
+        }
+        let run = check_fix_bound(
+            dir.path(),
+            &req,
+            &sb,
+            VerificationTarget {
+                file: "app.py",
+                file_hash: missing_image.then_some(file_hash.as_str()),
+            },
+        )
+        .await;
+        if !missing_image {
+            assert_eq!(run.check.reason.as_deref(), Some("target_hash_missing"));
+            assert_eq!(sb.runs(), (0, 0));
+        }
+        assert_eq!(run.outcome(), FixOutcome::FixUnverified);
+        let mut f = finding("CWE-78");
+        f.file_hash = missing_image.then_some(file_hash.clone());
+        f.suggested_fix = Some(diff.clone());
+        record_fix_run(&mut f, &run);
+        assert_eq!(f.fix_check().unwrap().outcome, FixOutcome::FixUnverified);
+    }
+}
+
+#[tokio::test]
+async fn verification_binding_refuses_a_stale_target_before_running_the_sandbox() {
+    use super::super::verification_context::VerificationTarget;
+    let dir = repo();
+    let diff = correct_fix();
+    let req = FixCheckRequest {
+        class: OracleClass::CommandInjection,
+        adapter: ADAPTER,
+        diff: &diff,
+        test_command: None,
+    };
+    let stale = sha256_hex(b"old source");
+    let run = check_fix_bound(
+        dir.path(),
+        &req,
+        &NeverRun,
+        VerificationTarget {
+            file: "app.py",
+            file_hash: Some(&stale),
+        },
+    )
+    .await;
+    assert_eq!(run.check.outcome(), FixOutcome::FixUnverified);
+    assert_eq!(run.check.reason.as_deref(), Some("target_hash_mismatch"));
+}
+
+#[test]
+fn verification_binding_legacy_positive_is_unverified_but_rejection_is_preserved() {
+    let mut f = finding("CWE-78");
+    let diff = correct_fix();
+    f.suggested_fix = Some(diff.clone());
+    f.file_hash = Some(sha256_hex(APP.as_bytes()));
+    let mut check = sample(CheckResult::Pass, CheckResult::Pass, 1, 1);
+    check.diff_sha256 = sha256_hex(diff.as_bytes());
+    with_check(&mut f, &check);
+    assert_eq!(f.fix_check().unwrap().outcome, FixOutcome::FixUnverified);
+    check.regression = CheckResult::Fail;
+    check.tests = CheckResult::NotRun;
+    check.inputs_blocked = 0;
+    with_check(&mut f, &check);
+    assert_eq!(f.fix_check().unwrap().outcome, FixOutcome::FixRejected);
+}
+
+#[tokio::test]
+async fn verification_binding_identity_changes_with_adapter_tests_image_or_tree() {
+    use super::super::verification_context::VerificationTarget;
+    let dir = repo();
+    let diff = correct_fix();
+    let hash = sha256_hex(APP.as_bytes());
+    let req = FixCheckRequest {
+        class: OracleClass::CommandInjection,
+        adapter: ADAPTER,
+        diff: &diff,
+        test_command: Some("true"),
+    };
+    let run = check_fix_bound(
+        dir.path(),
+        &req,
+        &FakeSandbox::standard(tests_pass),
+        VerificationTarget {
+            file: "app.py",
+            file_hash: Some(&hash),
+        },
+    )
+    .await;
+    let binding = run.binding.unwrap();
+    let original_id = binding.identity_sha256();
+    for field in ["adapter", "tests", "image", "tree", "policy"] {
+        let mut changed = binding.clone();
+        match field {
+            "adapter" => changed.adapter_sha256 = sha256_hex(b"other adapter"),
+            "tests" => changed.test_command_sha256 = None,
+            "image" => changed.image_identity = Some(format!("sha256:{}", "b".repeat(64))),
+            "tree" => changed.original.sha256 = sha256_hex(b"other tree"),
+            _ => changed.policy_version.push_str("-changed"),
+        }
+        assert_ne!(changed.identity_sha256(), original_id, "{field}");
+    }
+}
+
 #[test]
 fn a_suggested_fix_is_unverified_until_checked_for_that_exact_diff() {
     let mut f = finding("CWE-78");
@@ -581,9 +758,13 @@ fn a_suggested_fix_is_unverified_until_checked_for_that_exact_diff() {
     });
     assert_eq!(f.fix_check().unwrap().outcome, FixOutcome::FixUnverified);
 
-    // The matching check counts; the latest one wins.
+    // A legacy positive check is readable but has no execution binding.
     with_check(&mut f, &other);
-    assert_eq!(f.fix_check().unwrap().outcome, FixOutcome::FixVerified);
+    assert_eq!(f.fix_check().unwrap().outcome, FixOutcome::FixUnverified);
+    assert_eq!(
+        f.fix_check().unwrap().reason.as_deref(),
+        Some("legacy_binding_missing")
+    );
     with_check(&mut f, &FixCheck::not_run(&diff, 1, "sandbox_unavailable"));
     let label = f.fix_check().unwrap();
     assert_eq!(label.outcome, FixOutcome::FixUnverified);
@@ -591,6 +772,253 @@ fn a_suggested_fix_is_unverified_until_checked_for_that_exact_diff() {
     assert!(f.evidence_summary().ends_with(" fix_check=fix_unverified"));
     // A fix check never moves the evidence level or the status.
     assert_eq!(f.status, FindingStatus::NeedsHuman);
+}
+
+#[tokio::test]
+async fn verification_binding_pair_must_match_and_survives_report_round_trip() {
+    use super::super::verification_context::VerificationTarget;
+    let dir = repo();
+    let diff = correct_fix();
+    let hash = sha256_hex(APP.as_bytes());
+    let req = FixCheckRequest {
+        class: OracleClass::CommandInjection,
+        adapter: ADAPTER,
+        diff: &diff,
+        test_command: Some("true"),
+    };
+    let run = check_fix_bound(
+        dir.path(),
+        &req,
+        &FakeSandbox::standard(tests_pass),
+        VerificationTarget {
+            file: "app.py",
+            file_hash: Some(&hash),
+        },
+    )
+    .await;
+    let mut f = finding("CWE-78");
+    f.file_hash = Some(hash);
+    f.suggested_fix = Some(diff);
+    record_fix_run(&mut f, &run);
+    let round_trip: Finding = serde_json::from_value(serde_json::to_value(&f).unwrap()).unwrap();
+    assert_eq!(round_trip.fix_check(), f.fix_check());
+    let mut broken_pair = f.clone();
+    broken_pair
+        .evidence
+        .last_mut()
+        .unwrap()
+        .recorded_at
+        .push('x');
+    assert_eq!(
+        broken_pair.fix_check().unwrap().outcome,
+        FixOutcome::FixUnverified
+    );
+    let mut invalid_context = f.clone();
+    invalid_context
+        .evidence
+        .last_mut()
+        .unwrap()
+        .detail
+        .push_str(" trailing");
+    assert_eq!(
+        invalid_context.fix_check().unwrap().outcome,
+        FixOutcome::FixUnverified
+    );
+    let mut malformed_latest = f;
+    malformed_latest.evidence.push(EvidenceItem {
+        kind: EvidenceKind::FixCheck,
+        source: "fix_check".into(),
+        detail: "fix_check: incomplete receipt".into(),
+        recorded_at: "later".into(),
+    });
+    assert_eq!(
+        malformed_latest.fix_check().unwrap().outcome,
+        FixOutcome::FixUnverified
+    );
+}
+
+#[tokio::test]
+async fn typed_verification_binding_keeps_one_call_plan_with_two_bound_adapters() {
+    use super::super::target_poc::{TargetArgument, TargetCall};
+    use super::super::verification_context::VerificationTarget;
+    struct TypedSandbox;
+    #[async_trait::async_trait]
+    impl FixSandbox for TypedSandbox {
+        fn image_identity(&self) -> Option<&str> {
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        }
+        async fn run_harness(
+            &self,
+            tree: &Path,
+            runner: &str,
+            adapter: &str,
+        ) -> Result<String, String> {
+            let code = std::fs::read_to_string(tree.join("app.py")).unwrap();
+            assert!(adapter.contains(&sha256_hex(code.as_bytes())));
+            assert!(!runner.contains("sys.path.append('/workspace/tree')"));
+            let marker = between(runner, "MARKER = '", "'");
+            let payload = between(runner, "PAYLOAD = \"", "\"\n");
+            let effect = (payload.contains(';') || payload.contains("$("))
+                && code.contains("'echo ' + cmd)");
+            Ok(format!("__VTL_ORACLE__ {marker} effect={effect}\n"))
+        }
+        async fn run_tests(&self, _tree: &Path, _command: &str) -> Result<i64, String> {
+            Ok(0)
+        }
+    }
+    let dir = repo();
+    let diff = correct_fix();
+    let hash = sha256_hex(APP.as_bytes());
+    let call = TargetCall {
+        file: "app.py".into(),
+        function: "run".into(),
+        args: vec![TargetArgument::Payload],
+    };
+    let req = TargetFixRequest {
+        class: OracleClass::CommandInjection,
+        call: &call,
+        diff: &diff,
+        test_command: Some("true"),
+    };
+    let run = check_target_fix_bound(
+        dir.path(),
+        &req,
+        &TypedSandbox,
+        VerificationTarget {
+            file: "app.py",
+            file_hash: Some(&hash),
+        },
+    )
+    .await;
+    assert_eq!(
+        run.check.outcome(),
+        FixOutcome::FixVerified,
+        "{:?}",
+        run.check.reason
+    );
+    let binding = run.binding.unwrap();
+    assert_ne!(binding.adapter_sha256, binding.fixed_adapter_sha256);
+    assert_eq!(
+        binding.target_plan_sha256,
+        Some(sha256_hex(&serde_json::to_vec(&call).unwrap()))
+    );
+}
+
+#[tokio::test]
+async fn typed_fix_rejects_duplicate_marked_effects_instead_of_taking_the_first() {
+    use super::super::target_poc::{TargetArgument, TargetCall};
+    use super::super::verification_context::VerificationTarget;
+
+    struct DuplicateVerdictSandbox;
+    #[async_trait::async_trait]
+    impl FixSandbox for DuplicateVerdictSandbox {
+        fn image_identity(&self) -> Option<&str> {
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        }
+        async fn run_harness(
+            &self,
+            _tree: &Path,
+            runner: &str,
+            _adapter: &str,
+        ) -> Result<String, String> {
+            let marker = between(runner, "MARKER = '", "'");
+            Ok(format!(
+                "__VTL_ORACLE__ {marker} effect=false\n__VTL_ORACLE__ {marker} effect=true\n"
+            ))
+        }
+        async fn run_tests(&self, _tree: &Path, _command: &str) -> Result<i64, String> {
+            panic!("a duplicate verdict must stop before tests")
+        }
+    }
+
+    let dir = repo();
+    let diff = correct_fix();
+    let hash = sha256_hex(APP.as_bytes());
+    let call = TargetCall {
+        file: "app.py".into(),
+        function: "run".into(),
+        args: vec![TargetArgument::Payload],
+    };
+    let req = TargetFixRequest {
+        class: OracleClass::CommandInjection,
+        call: &call,
+        diff: &diff,
+        test_command: Some("true"),
+    };
+    let run = check_target_fix_bound(
+        dir.path(),
+        &req,
+        &DuplicateVerdictSandbox,
+        VerificationTarget {
+            file: "app.py",
+            file_hash: Some(&hash),
+        },
+    )
+    .await;
+    assert_eq!(run.outcome(), FixOutcome::FixUnverified);
+    assert_eq!(run.check.regression, CheckResult::Inconclusive);
+    assert_eq!(run.check.reason.as_deref(), Some("no_verdict"));
+    assert!(
+        run.note
+            .as_deref()
+            .is_some_and(|note| note.contains("duplicate_target_verdict"))
+    );
+}
+
+#[test]
+fn docker_harness_never_accepts_a_marker_from_a_nonzero_process() {
+    assert_eq!(
+        successful_harness_output(0, "__VTL_ORACLE__ marker effect=true\n".into()).unwrap(),
+        "__VTL_ORACLE__ marker effect=true\n"
+    );
+    let error = successful_harness_output(
+        17,
+        "__VTL_ORACLE__ marker effect=true\nforged-before-crash".into(),
+    )
+    .unwrap_err();
+    assert!(error.contains("17"));
+}
+
+#[test]
+fn operator_fix_receipt_serializes_the_derived_outcome() {
+    let run = FixCheckRun {
+        check: FixCheck {
+            regression: CheckResult::Pass,
+            tests: CheckResult::NotRun,
+            inputs_blocked: 1,
+            inputs_total: 1,
+            diff_sha256: sha256_hex(b"diff"),
+            reason: None,
+        },
+        note: None,
+        binding: None,
+    };
+    let value = serde_json::to_value(&run).unwrap();
+    assert_eq!(value["outcome"], "fix_unverified");
+    assert_eq!(value["check"]["regression"], "pass");
+}
+
+#[tokio::test]
+async fn operator_typed_fix_refuses_a_missing_source_pin_before_docker() {
+    let dir = repo();
+    let mut f = finding("CWE-78");
+    f.file_hash = None;
+    let call = super::super::target_poc::TargetCall {
+        file: "app.py".into(),
+        function: "run".into(),
+        args: vec![super::super::target_poc::TargetArgument::Payload],
+    };
+    let run = run_target_fix(
+        dir.path(),
+        &f,
+        &call,
+        &correct_fix(),
+        Some("true"),
+        "--invalid-image-must-not-be-inspected",
+    )
+    .await;
+    assert_eq!(run.outcome(), FixOutcome::FixUnverified);
+    assert_eq!(run.check.reason.as_deref(), Some("target_hash_missing"));
 }
 
 #[test]
@@ -781,6 +1209,53 @@ async fn live_fix_check_verifies_a_real_fix_and_rejects_a_no_op() {
     assert_eq!(
         std::fs::read_to_string(r.path().join("app.py")).unwrap(),
         APP
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_typed_fix_rejects_proc_parent_stdout_verdict_forgery() {
+    use super::super::target_poc::{TargetArgument, TargetCall};
+
+    let source = "import os\n\ndef run(cmd):\n    runner = open('/workspace/runner.py').read()\n    marker = runner.split(\"MARKER = '\", 1)[1].split(\"'\", 1)[0]\n    fd = os.open('/proc/' + str(os.getppid()) + '/fd/1', os.O_WRONLY)\n    os.write(fd, ('__VTL_ORACLE__ ' + marker + ' effect=false\\n').encode())\n    os.close(fd)\n    os.system('echo ' + cmd)\n";
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), source).unwrap();
+    let line = source
+        .lines()
+        .position(|line| line == "    os.system('echo ' + cmd)")
+        .unwrap()
+        + 1;
+    let diff = format!(
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -{line} +{line} @@\n-    os.system('echo ' + cmd)\n+    os.system('echo ' + __import__('shlex').quote(cmd))\n"
+    );
+    let mut finding = finding("CWE-78");
+    finding.file_hash = Some(sha256_hex(source.as_bytes()));
+    let call = TargetCall {
+        file: "app.py".into(),
+        function: "run".into(),
+        args: vec![TargetArgument::Payload],
+    };
+    let run = run_target_fix(
+        repo.path(),
+        &finding,
+        &call,
+        &diff,
+        Some("true"),
+        crate::sandbox::DEFAULT_POC_IMAGE,
+    )
+    .await;
+    assert_ne!(run.outcome(), FixOutcome::FixVerified, "{:?}", run.note);
+    assert_eq!(
+        run.check.regression,
+        CheckResult::Inconclusive,
+        "{:?}",
+        run.note
+    );
+    assert_eq!(
+        run.check.reason.as_deref(),
+        Some("no_verdict"),
+        "{:?}",
+        run.note
     );
 }
 

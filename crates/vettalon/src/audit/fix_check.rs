@@ -3,7 +3,11 @@
 //! A `suggested_fix` (unified diff) is never shown as verified on its own
 //! say-so. Every report derives a `fix_check` label for it from recorded
 //! [`EvidenceKind::FixCheck`] evidence; without such evidence for this exact
-//! diff the label is `fix_unverified`.
+//! diff and a complete paired execution context the label is
+//! `fix_unverified`. Legacy positive checks remain readable history but
+//! cannot supply that context. Rejected checks are never upgraded.
+//! A bound result describes the recorded prepared snapshot, not a live
+//! repository/configuration match or trusted provenance.
 //!
 //! The check itself runs only on temporary copies of the scanned tree (see
 //! [`super::fix_diff`]; the user's files are only read) and has two parts:
@@ -13,7 +17,9 @@
 //!   copy and the fixed copy, once per harness fixture input for the
 //!   weakness class. A small adapter module imports the project's own code
 //!   from the copy and calls the vulnerable function; the same adapter runs on
-//!   both sides, so a different verdict can only come from the diff. A passes
+//!   both sides. Structured target calls use generated adapters whose only
+//!   difference is the expected hash of each side's actual source bytes;
+//!   their call plan is identical and both adapter hashes are recorded. A passes
 //!   only when every fixture input shows the effect on the original and none
 //!   does on the fixed copy, and the harness's benign input still behaves
 //!   normally on the fixed copy (no exception, the expected result where the
@@ -43,9 +49,10 @@ use super::llm_util::escape_xml_tag;
 use super::poc::{POC_TIMEOUT, PocBudget, parse_poc_response, poc_eligible, push_skip};
 use super::poc_oracle::{
     OracleClass, OracleSecrets, anti_cheat_adapter, benign_input, build_fix_runner, classify,
-    fixture_inputs, parse_effect,
+    fixture_inputs,
 };
 use super::schema::{EvidenceItem, EvidenceKind, Finding, sha256_hex};
+use super::verification_context::{self, VerificationContext, VerificationTarget};
 
 /// Evidence `detail` prefix of an [`EvidenceKind::FixCheck`] item.
 pub const FIX_CHECK_PREFIX: &str = "fix_check:";
@@ -146,7 +153,7 @@ pub fn decide(regression: CheckResult, tests: CheckResult) -> FixOutcome {
 /// `regression=pass` needs `k == n > 0`, and `tests` other than `not_run`
 /// needs `regression=pass` (B only runs after A passed). Anything else parses
 /// to `None` and is ignored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FixCheck {
     pub regression: CheckResult,
     pub tests: CheckResult,
@@ -259,34 +266,107 @@ pub struct FixCheckSummary {
     pub tests: CheckResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Verification applies to the recorded prepared snapshot, not today's
+    /// live tree/configuration. Legacy checks have no binding.
+    pub scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<VerificationContext>,
 }
 
 impl Finding {
     /// The label for this finding's `suggested_fix`, or `None` when it has
-    /// none. Uses the latest valid `fix_check` item for this exact diff; with
-    /// none, the fix is `fix_unverified` (`not_checked`). Derived only.
+    /// none. Uses the latest receipt for this exact diff; an invalid later
+    /// receipt blocks fallback to an older success. Positive labels also
+    /// require an adjacent complete execution binding for the pinned file.
+    /// With no check, the fix is `fix_unverified` (`not_checked`). Derived only.
     pub fn fix_check(&self) -> Option<FixCheckSummary> {
         let diff = self.suggested_fix.as_deref()?;
         let sha = sha256_hex(diff.as_bytes());
-        let latest = self
-            .evidence
-            .iter()
-            .rev()
-            .filter(|e| e.kind == EvidenceKind::FixCheck)
-            .filter_map(|e| FixCheck::parse(&e.detail))
-            .find(|c| c.diff_sha256 == sha);
+        let mut latest = None;
+        for (i, evidence) in self.evidence.iter().enumerate().rev() {
+            if evidence.kind != EvidenceKind::FixCheck
+                || !evidence.detail.starts_with(FIX_CHECK_PREFIX)
+            {
+                continue;
+            }
+            let Some(check) = FixCheck::parse(&evidence.detail) else {
+                // A broken latest receipt must not expose an older success.
+                return Some(FixCheckSummary {
+                    outcome: FixOutcome::FixUnverified,
+                    regression: CheckResult::NotRun,
+                    tests: CheckResult::NotRun,
+                    reason: Some("invalid_check_receipt".into()),
+                    scope: "recorded_snapshot",
+                    binding: None,
+                });
+            };
+            if check.diff_sha256 == sha {
+                latest = Some((i, check));
+                break;
+            }
+        }
         Some(match latest {
-            Some(c) => FixCheckSummary {
-                outcome: c.outcome(),
-                regression: c.regression,
-                tests: c.tests,
-                reason: c.reason,
-            },
+            Some((i, c)) => {
+                let check_evidence = &self.evidence[i];
+                let binding = self
+                    .evidence
+                    .get(i + 1)
+                    .filter(|e| {
+                        e.kind == EvidenceKind::FixCheck
+                            && e.source == "fix_check"
+                            && check_evidence.source == "fix_check"
+                            && e.recorded_at == check_evidence.recorded_at
+                    })
+                    .and_then(|e| VerificationContext::parse(&e.detail))
+                    .filter(|b| {
+                        b.check_sha256 == sha256_hex(check_evidence.detail.as_bytes())
+                            && b.diff_sha256 == sha
+                    });
+                let positive = matches!(
+                    c.outcome(),
+                    FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+                );
+                let bound = binding.as_ref().is_some_and(|b| {
+                    b.complete()
+                        && b.target_file == self.file
+                        && self.file_hash.as_deref() == Some(b.target_file_sha256.as_str())
+                        && if c.tests == CheckResult::NotRun {
+                            b.test_command_sha256.is_none()
+                        } else {
+                            b.test_command_sha256.is_some()
+                        }
+                });
+                FixCheckSummary {
+                    outcome: if positive && !bound {
+                        FixOutcome::FixUnverified
+                    } else {
+                        c.outcome()
+                    },
+                    regression: c.regression,
+                    tests: c.tests,
+                    reason: if positive && !bound {
+                        Some(
+                            if binding.is_some() {
+                                "binding_incomplete_or_mismatched"
+                            } else {
+                                "legacy_binding_missing"
+                            }
+                            .into(),
+                        )
+                    } else {
+                        c.reason
+                    },
+                    scope: "recorded_snapshot",
+                    binding,
+                }
+            }
             None => FixCheckSummary {
                 outcome: FixOutcome::FixUnverified,
                 regression: CheckResult::NotRun,
                 tests: CheckResult::NotRun,
                 reason: Some(NOT_CHECKED.to_string()),
+                scope: "recorded_snapshot",
+                binding: None,
             },
         })
     }
@@ -313,6 +393,10 @@ pub fn validate_test_command(cmd: &str) -> Result<(), String> {
 /// drive the logic with a fake (no Docker).
 #[async_trait::async_trait]
 pub trait FixSandbox: Send + Sync {
+    /// Immutable execution image ID; missing identity is explicit unknown.
+    fn image_identity(&self) -> Option<&str> {
+        None
+    }
     /// Run the harness `runner.py` next to the adapter `sink.py`, with `tree`
     /// mounted read-only at `/workspace/tree`. Returns the combined output.
     async fn run_harness(&self, tree: &Path, runner: &str, adapter: &str)
@@ -333,11 +417,66 @@ pub struct FixCheckRequest<'a> {
     pub test_command: Option<&'a str>,
 }
 
+/// A structured target call, not arbitrary adapter code. The checker
+/// generates the adapters separately for the two prepared file hashes.
+pub struct TargetFixRequest<'a> {
+    pub class: OracleClass,
+    pub call: &'a super::target_poc::TargetCall,
+    pub diff: &'a str,
+    pub test_command: Option<&'a str>,
+}
+
 /// A check result plus the first free-text sandbox error, if any (for a
 /// human; never part of the strict detail).
 pub struct FixCheckRun {
+    /// Raw A/B check. Use [`Self::outcome`] for the public binding-aware result.
     pub check: FixCheck,
+    /// First bounded sandbox diagnostic, never part of the verdict grammar.
     pub note: Option<String>,
+    /// Exact prepared source, adapter, plan, image, harness and test-command
+    /// identity. Legacy runs have none and cannot produce a positive outcome.
+    pub binding: Option<VerificationContext>,
+}
+
+impl Serialize for FixCheckRun {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Receipt<'a> {
+            outcome: FixOutcome,
+            check: &'a FixCheck,
+            note: &'a Option<String>,
+            binding: &'a Option<VerificationContext>,
+        }
+        Receipt {
+            outcome: self.outcome(),
+            check: &self.check,
+            note: &self.note,
+            binding: &self.binding,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl FixCheckRun {
+    /// Public/operator outcome. A positive raw A/B result is not a verified
+    /// receipt unless its adjacent execution context is complete. Negative
+    /// results remain negative even when binding could not be produced.
+    pub fn outcome(&self) -> FixOutcome {
+        let raw = self.check.outcome();
+        if matches!(raw, FixOutcome::FixVerified | FixOutcome::FixCheckPartial)
+            && !self
+                .binding
+                .as_ref()
+                .is_some_and(VerificationContext::complete)
+        {
+            FixOutcome::FixUnverified
+        } else {
+            raw
+        }
+    }
 }
 
 /// Run checks A and B for `req` against temporary copies of `repo_root`.
@@ -349,16 +488,168 @@ pub async fn check_fix<S: FixSandbox>(
     check_fix_with(repo_root, req, fixture_inputs(req.class), sandbox).await
 }
 
+/// Check a finding pinned to source bytes. The binding is made from the
+/// actual prepared copies used by A/B, never a second read of the live repo.
+pub async fn check_fix_bound<S: FixSandbox>(
+    repo_root: &Path,
+    req: &FixCheckRequest<'_>,
+    sandbox: &S,
+    target: VerificationTarget<'_>,
+) -> FixCheckRun {
+    check_fix_with_target(
+        repo_root,
+        req,
+        fixture_inputs(req.class),
+        sandbox,
+        Some(target),
+        None,
+    )
+    .await
+}
+
+pub async fn check_target_fix_bound<S: FixSandbox>(
+    repo_root: &Path,
+    req: &TargetFixRequest<'_>,
+    sandbox: &S,
+    target: VerificationTarget<'_>,
+) -> FixCheckRun {
+    let base = FixCheckRequest {
+        class: req.class,
+        adapter: "",
+        diff: req.diff,
+        test_command: req.test_command,
+    };
+    check_fix_with_target(
+        repo_root,
+        &base,
+        fixture_inputs(req.class),
+        sandbox,
+        Some(target),
+        Some(req.call),
+    )
+    .await
+}
+
+/// Operator-facing typed fix check.  The diff is applied only to private
+/// temporary copies; the live repository is never modified.  A mutable image
+/// tag is pinned to one local immutable ID before any harness phase runs.
+pub async fn run_target_fix(
+    repo_root: &Path,
+    finding: &Finding,
+    call: &super::target_poc::TargetCall,
+    diff: &str,
+    test_command: Option<&str>,
+    image: &str,
+) -> FixCheckRun {
+    let Some(class) = classify(finding) else {
+        return FixCheckRun {
+            check: FixCheck::not_run(diff, 0, "no_harness_for_class"),
+            note: None,
+            binding: None,
+        };
+    };
+    let Some(file_hash) = finding.file_hash.as_deref() else {
+        return FixCheckRun {
+            check: FixCheck::not_run(
+                diff,
+                fixture_inputs(class).len() as u32,
+                "target_hash_missing",
+            ),
+            note: None,
+            binding: None,
+        };
+    };
+    if !verification_context::is_sha256(file_hash) {
+        return FixCheckRun {
+            check: FixCheck::not_run(
+                diff,
+                fixture_inputs(class).len() as u32,
+                "target_hash_invalid",
+            ),
+            note: None,
+            binding: None,
+        };
+    }
+    if let Err(reason) = call.validate() {
+        return FixCheckRun {
+            check: FixCheck::not_run(diff, fixture_inputs(class).len() as u32, reason),
+            note: None,
+            binding: None,
+        };
+    }
+    if call.file != finding.file {
+        return FixCheckRun {
+            check: FixCheck::not_run(
+                diff,
+                fixture_inputs(class).len() as u32,
+                "target_plan_file_mismatch",
+            ),
+            note: None,
+            binding: None,
+        };
+    }
+    // One fixture currently means two attack runs, two benign controls and,
+    // when configured, two project-test runs.  Keep a little bounded room
+    // for an additional shipped fixture without sharing a global pool.
+    let budget = PocBudget::with_image(8, image);
+    let sb = match budget.sandbox().await {
+        Ok(sb) => sb,
+        Err(error) => {
+            return FixCheckRun {
+                check: FixCheck::not_run(
+                    diff,
+                    fixture_inputs(class).len() as u32,
+                    "sandbox_unavailable",
+                ),
+                note: Some(error),
+                binding: None,
+            };
+        }
+    };
+    let sandbox = DockerFixSandbox {
+        sb,
+        budget: &budget,
+    };
+    let request = TargetFixRequest {
+        class,
+        call,
+        diff,
+        test_command,
+    };
+    check_target_fix_bound(
+        repo_root,
+        &request,
+        &sandbox,
+        VerificationTarget {
+            file: &finding.file,
+            file_hash: finding.file_hash.as_deref(),
+        },
+    )
+    .await
+}
+
 pub(super) async fn check_fix_with<S: FixSandbox>(
     repo_root: &Path,
     req: &FixCheckRequest<'_>,
     fixtures: &[&str],
     sandbox: &S,
 ) -> FixCheckRun {
+    check_fix_with_target(repo_root, req, fixtures, sandbox, None, None).await
+}
+
+async fn check_fix_with_target<S: FixSandbox>(
+    repo_root: &Path,
+    req: &FixCheckRequest<'_>,
+    fixtures: &[&str],
+    sandbox: &S,
+    target: Option<VerificationTarget<'_>>,
+    target_call: Option<&super::target_poc::TargetCall>,
+) -> FixCheckRun {
     let total = fixtures.len() as u32;
     let refuse = |reason: &str| FixCheckRun {
         check: FixCheck::not_run(req.diff, total, reason),
         note: None,
+        binding: None,
     };
     // Everything below is refused before any container runs.
     let patches = match fix_diff::parse(req.diff) {
@@ -368,29 +659,183 @@ pub(super) async fn check_fix_with<S: FixSandbox>(
     if fixtures.is_empty() {
         return refuse("no_fixture_inputs");
     }
-    if let Some(reason) = anti_cheat_adapter(req.adapter) {
+    if let Some(call) = target_call {
+        if let Err(reason) = call.validate() {
+            return refuse(reason);
+        }
+        if target.is_none_or(|target| call.file != target.file) {
+            return refuse("target_plan_file_mismatch");
+        }
+    } else if let Some(reason) = anti_cheat_adapter(req.adapter) {
         return refuse(&format!("adapter_{reason}"));
+    }
+    if req
+        .test_command
+        .is_some_and(|cmd| validate_test_command(cmd).is_err())
+    {
+        return refuse("invalid_test_command");
     }
     let copies = match fix_diff::prepare(repo_root, &patches) {
         Ok(c) => c,
         Err(reason) => return refuse(reason),
     };
 
-    let a = regression_check(req, fixtures, &copies, sandbox).await;
+    let prepared = if let Some(target) = target {
+        let actual = match verification_context::source_file_digest(&copies.original, target.file) {
+            Ok(hash) => hash,
+            Err(reason) => return refuse(reason),
+        };
+        let Some(expected) = target.file_hash else {
+            return refuse("target_hash_missing");
+        };
+        if !verification_context::is_sha256(expected) {
+            return refuse("target_hash_invalid");
+        }
+        if expected != actual {
+            return refuse("target_hash_mismatch");
+        }
+        let original = match verification_context::snapshot_digest(&copies.original) {
+            Ok(value) => value,
+            Err(reason) => return refuse(reason),
+        };
+        let fixed = match verification_context::snapshot_digest(&copies.fixed) {
+            Ok(value) => value,
+            Err(reason) => return refuse(reason),
+        };
+        Some((target, actual, original, fixed))
+    } else {
+        None
+    };
+
+    let adapters = if let Some(call) = target_call {
+        let original_hash =
+            match verification_context::source_file_digest(&copies.original, &call.file) {
+                Ok(hash) => hash,
+                Err(reason) => return refuse(reason),
+            };
+        let fixed_hash = match verification_context::source_file_digest(&copies.fixed, &call.file) {
+            Ok(hash) => hash,
+            Err(reason) => return refuse(reason),
+        };
+        let original = match super::target_poc::build_target_adapter(call, &original_hash) {
+            Ok(adapter) => adapter,
+            Err(reason) => return refuse(reason),
+        };
+        let fixed = match super::target_poc::build_target_adapter(call, &fixed_hash) {
+            Ok(adapter) => adapter,
+            Err(reason) => return refuse(reason),
+        };
+        let plan = match serde_json::to_vec(call) {
+            Ok(encoded) => sha256_hex(&encoded),
+            Err(_) => return refuse("invalid_target_plan"),
+        };
+        PreparedAdapters {
+            original,
+            fixed,
+            target_plan_sha256: Some(plan),
+        }
+    } else {
+        PreparedAdapters {
+            original: req.adapter.into(),
+            fixed: req.adapter.into(),
+            target_plan_sha256: None,
+        }
+    };
+    let image_identity = sandbox.image_identity().map(str::to_string);
+    let a = regression_check(req, fixtures, &copies, sandbox, &adapters).await;
     let b = match (a.result, req.test_command) {
         (CheckResult::Pass, Some(cmd)) => test_check(cmd, &copies, sandbox).await,
         _ => Step::new(CheckResult::NotRun),
     };
+    let check = FixCheck {
+        regression: a.result,
+        tests: b.result,
+        inputs_blocked: a.blocked,
+        inputs_total: total,
+        diff_sha256: sha256_hex(req.diff.as_bytes()),
+        reason: a.reason.or(b.reason),
+    };
+    let binding = if let Some((target, actual, original, fixed)) = prepared {
+        // Each sandbox phase sees read-only copies. Refuse a host-side
+        // change as well, rather than bind results to the wrong bytes.
+        if verification_context::snapshot_digest(&copies.original)
+            .ok()
+            .as_ref()
+            != Some(&original)
+            || verification_context::snapshot_digest(&copies.fixed)
+                .ok()
+                .as_ref()
+                != Some(&fixed)
+        {
+            return refuse("snapshot_changed");
+        }
+        if sandbox.image_identity() != image_identity.as_deref() {
+            return refuse("image_identity_changed");
+        }
+        let secrets = OracleSecrets {
+            canary: "vtlc00000000000000000000000000000000".into(),
+            marker: "vtlm00000000000000000000000000000000".into(),
+        };
+        let mut harness = String::new();
+        for payload in fixtures
+            .iter()
+            .copied()
+            .chain(std::iter::once(benign_input(req.class)))
+        {
+            harness.push_str(&adapters.runner(req.class, &secrets, payload));
+        }
+        Some(VerificationContext {
+            version: 1,
+            source_scope: verification_context::SOURCE_SCOPE.into(),
+            check_sha256: sha256_hex(check.to_detail().as_bytes()),
+            diff_sha256: check.diff_sha256.clone(),
+            target_file: target.file.into(),
+            target_file_sha256: actual,
+            finding_file_sha256: target.file_hash.map(str::to_string),
+            original,
+            fixed,
+            exclusions: copies.exclusions.clone(),
+            adapter_sha256: sha256_hex(adapters.original.as_bytes()),
+            fixed_adapter_sha256: sha256_hex(adapters.fixed.as_bytes()),
+            target_plan_sha256: adapters.target_plan_sha256,
+            test_command_sha256: req.test_command.map(|cmd| sha256_hex(cmd.as_bytes())),
+            image_identity: image_identity
+                .as_deref()
+                .filter(|image| {
+                    image
+                        .strip_prefix("sha256:")
+                        .is_some_and(verification_context::is_sha256)
+                })
+                .map(str::to_string),
+            harness_sha256: sha256_hex(harness.as_bytes()),
+            harness_version: verification_context::HARNESS_VERSION.into(),
+            policy_version: verification_context::POLICY_VERSION.into(),
+        })
+    } else {
+        None
+    };
     FixCheckRun {
-        check: FixCheck {
-            regression: a.result,
-            tests: b.result,
-            inputs_blocked: a.blocked,
-            inputs_total: total,
-            diff_sha256: sha256_hex(req.diff.as_bytes()),
-            reason: a.reason.or(b.reason),
-        },
+        check,
         note: a.note.or(b.note),
+        binding,
+    }
+}
+
+/// Only the typed entry point can produce the target-call variant; raw
+/// model adapters always go through the existing anti-cheat checks.
+struct PreparedAdapters {
+    original: String,
+    fixed: String,
+    target_plan_sha256: Option<String>,
+}
+
+impl PreparedAdapters {
+    fn runner(&self, class: OracleClass, secrets: &OracleSecrets, payload: &str) -> String {
+        if self.target_plan_sha256.is_some() {
+            super::target_poc::target_runner(class, secrets, payload)
+        } else {
+            build_fix_runner(class, secrets, payload)
+        }
     }
 }
 
@@ -438,43 +883,27 @@ impl HarnessRun {
     }
 }
 
-/// `key=<true|false>` on a harness line bearing `marker`.
-fn marked_flag(output: &str, marker: &str, key: &str) -> Option<bool> {
-    output.lines().find_map(|line| {
-        let mut parts = line
-            .trim()
-            .strip_prefix("__VTL_ORACLE__ ")?
-            .split_whitespace();
-        if parts.next() != Some(marker) {
-            return None;
-        }
-        parts.find_map(|p| match p.strip_prefix(key)?.strip_prefix('=')? {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        })
-    })
-}
-
 /// One harness run on one copy with fresh one-time secrets.
 async fn harness_run<S: FixSandbox>(
     sandbox: &S,
     tree: &Path,
     req: &FixCheckRequest<'_>,
     payload: &str,
+    adapters: &PreparedAdapters,
+    adapter: &str,
 ) -> Result<HarnessRun, (&'static str, String)> {
     let secrets = OracleSecrets::fresh();
-    let runner = build_fix_runner(req.class, &secrets, payload);
+    let runner = adapters.runner(req.class, &secrets, payload);
     let out = sandbox
-        .run_harness(tree, &runner, req.adapter)
+        .run_harness(tree, &runner, adapter)
         .await
         .map_err(|e| ("sandbox_error", e))?;
-    let effect = parse_effect(&out, &secrets.marker)
-        .ok_or(("no_verdict", "the harness printed no verdict".to_string()))?;
+    let (effect, functional, errored) = super::target_poc::parse_verdict(&out, &secrets.marker)
+        .map_err(|reason| ("no_verdict", format!("invalid harness verdict: {reason}")))?;
     Ok(HarnessRun {
         effect,
-        errored: marked_flag(&out, &secrets.marker, "error") == Some(true),
-        functional: marked_flag(&out, &secrets.marker, "functional"),
+        errored,
+        functional,
     })
 }
 
@@ -483,6 +912,7 @@ async fn regression_check<S: FixSandbox>(
     fixtures: &[&str],
     copies: &fix_diff::TreeCopies,
     sandbox: &S,
+    adapters: &PreparedAdapters,
 ) -> Step {
     let mut blocked = 0u32;
     let mut original_quiet = false;
@@ -492,13 +922,31 @@ async fn regression_check<S: FixSandbox>(
         s
     };
     for payload in fixtures {
-        let original = match harness_run(sandbox, &copies.original, req, payload).await {
+        let original = match harness_run(
+            sandbox,
+            &copies.original,
+            req,
+            payload,
+            adapters,
+            &adapters.original,
+        )
+        .await
+        {
             Ok(v) => v.effect,
             Err((reason, note)) => {
                 return stop(CheckResult::Inconclusive, reason, Some(note), blocked);
             }
         };
-        let fixed = match harness_run(sandbox, &copies.fixed, req, payload).await {
+        let fixed = match harness_run(
+            sandbox,
+            &copies.fixed,
+            req,
+            payload,
+            adapters,
+            &adapters.fixed,
+        )
+        .await
+        {
             Ok(v) => v.effect,
             Err((reason, note)) => {
                 return stop(CheckResult::Inconclusive, reason, Some(note), blocked);
@@ -526,8 +974,11 @@ async fn regression_check<S: FixSandbox>(
     // always raises or returns nothing). The benign input must still behave
     // normally on the fixed copy, judged against the original copy.
     let benign = benign_input(req.class);
-    for (tree, side) in [(&copies.original, "original"), (&copies.fixed, "fixed")] {
-        match harness_run(sandbox, tree, req, benign).await {
+    for (tree, side, adapter) in [
+        (&copies.original, "original", &adapters.original),
+        (&copies.fixed, "fixed", &adapters.fixed),
+    ] {
+        match harness_run(sandbox, tree, req, benign, adapters, adapter).await {
             Err((reason, note)) => {
                 return stop(CheckResult::Inconclusive, reason, Some(note), blocked);
             }
@@ -585,6 +1036,14 @@ struct DockerFixSandbox<'a> {
     budget: &'a PocBudget,
 }
 
+fn successful_harness_output(code: i64, output: String) -> Result<String, String> {
+    if code == 0 {
+        Ok(output)
+    } else {
+        Err(format!("fix harness exited with code {code}"))
+    }
+}
+
 impl DockerFixSandbox<'_> {
     fn claim(&self) -> Result<(), String> {
         if self.budget.try_claim() {
@@ -600,6 +1059,9 @@ impl DockerFixSandbox<'_> {
 
 #[async_trait::async_trait]
 impl FixSandbox for DockerFixSandbox<'_> {
+    fn image_identity(&self) -> Option<&str> {
+        Some(&self.sb.image)
+    }
     async fn run_harness(
         &self,
         tree: &Path,
@@ -608,7 +1070,7 @@ impl FixSandbox for DockerFixSandbox<'_> {
     ) -> Result<String, String> {
         self.claim()?;
         let cmd = vec!["python3".to_string(), "/workspace/runner.py".to_string()];
-        let (_code, out) = self
+        let (code, out) = self
             .sb
             .run_workspace_with_tree(
                 &[("runner.py", runner), ("sink.py", adapter)],
@@ -617,7 +1079,7 @@ impl FixSandbox for DockerFixSandbox<'_> {
                 POC_TIMEOUT,
             )
             .await?;
-        Ok(out)
+        successful_harness_output(code, out)
     }
 
     async fn run_tests(&self, tree: &Path, command: &str) -> Result<i64, String> {
@@ -637,6 +1099,26 @@ fn push_fix_check(finding: &mut Finding, check: &FixCheck) {
         detail: check.to_detail(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
     });
+}
+
+/// Attach adjacent paired evidence with a shared timestamp. A context
+/// without its exact check (or vice versa) never promotes a positive label.
+pub fn record_fix_run(finding: &mut Finding, run: &FixCheckRun) {
+    let recorded_at = chrono::Utc::now().to_rfc3339();
+    finding.evidence.push(EvidenceItem {
+        kind: EvidenceKind::FixCheck,
+        source: "fix_check".into(),
+        detail: run.check.to_detail(),
+        recorded_at: recorded_at.clone(),
+    });
+    if let Some(binding) = &run.binding {
+        finding.evidence.push(EvidenceItem {
+            kind: EvidenceKind::FixCheck,
+            source: "fix_check".into(),
+            detail: binding.to_detail(),
+            recorded_at,
+        });
+    }
 }
 
 /// Record that an eligible finding's suggested fix was not checked because
@@ -711,8 +1193,7 @@ pub async fn maybe_check_fix<C: LlmCaller>(
         Ok((_, _, note)) => return record(finding, "adapter_unavailable", Some(note)),
         Err(e) => return record(finding, "adapter_generation_failed", Some(e)),
     };
-    let image = super::poc::poc_image();
-    let sb = match crate::sandbox::DockerSandbox::detect(&image).await {
+    let sb = match budget.sandbox().await {
         Ok(sb) => sb,
         Err(e) => {
             let note = format!("sandbox unavailable: {e}");
@@ -726,11 +1207,20 @@ pub async fn maybe_check_fix<C: LlmCaller>(
         diff: &diff,
         test_command,
     };
-    let run = check_fix(repo_root, &req, &sandbox).await;
-    if let Some(note) = run.note {
-        push_skip(finding, "fix_check_skipped", &note);
+    let run = check_fix_bound(
+        repo_root,
+        &req,
+        &sandbox,
+        VerificationTarget {
+            file: &finding.file,
+            file_hash: finding.file_hash.as_deref(),
+        },
+    )
+    .await;
+    if let Some(note) = &run.note {
+        push_skip(finding, "fix_check_skipped", note);
     }
-    push_fix_check(finding, &run.check);
+    record_fix_run(finding, &run);
 }
 
 /// The adapter contract shown to the model (DATA-tagged excerpt, strict JSON

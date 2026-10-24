@@ -337,6 +337,137 @@ enum EvidenceAction {
     },
 }
 
+#[derive(Args)]
+struct ReproduceArgs {
+    /// Repository root whose bytes must match the validated report.
+    path: PathBuf,
+    /// Validator-clean scan report containing the pinned finding.
+    #[arg(long)]
+    report: PathBuf,
+    /// Exact finding id, or a unique prefix.
+    #[arg(long)]
+    finding: String,
+    /// Closed TargetCall JSON: file, top-level function and data-only args.
+    #[arg(long, value_name = "JSON")]
+    target: PathBuf,
+    /// Local sandbox image; never pulled automatically.
+    #[arg(long, default_value = vettalon::sandbox::DEFAULT_POC_IMAGE)]
+    poc_image: String,
+    /// Write the versioned target-PoC receipt here (0600).
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct FixCheckArgs {
+    /// Repository root whose bytes must match the validated report.
+    path: PathBuf,
+    /// Validator-clean scan report containing the pinned finding and,
+    /// unless --diff is used, its suggested fix.
+    #[arg(long)]
+    report: PathBuf,
+    /// Exact finding id, or a unique prefix.
+    #[arg(long)]
+    finding: String,
+    /// The same closed TargetCall JSON used by `reproduce`.
+    #[arg(long, value_name = "JSON")]
+    target: PathBuf,
+    /// Operator-supplied unified diff. Omit to check the report's suggested fix.
+    /// The live tree is never modified.
+    #[arg(long, value_name = "PATCH")]
+    diff: Option<PathBuf>,
+    /// Project test command run inside the same isolated sandbox, first on
+    /// the original prepared copy and then on the fixed copy.
+    #[arg(long, value_name = "CMD")]
+    test_command: Option<String>,
+    /// Local sandbox image; never pulled automatically.
+    #[arg(long, default_value = vettalon::sandbox::DEFAULT_POC_IMAGE)]
+    poc_image: String,
+    /// Write the versioned bound fix-check receipt here (0600).
+    #[arg(long)]
+    out: PathBuf,
+    /// Write the validator-clean report with this exact diff and its bound
+    /// fix-check evidence here (0600). The input report is never overwritten.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum FixAction {
+    /// Check a suggested/operator diff on private before/after copies. Never applies it.
+    Check(FixCheckArgs),
+}
+
+#[derive(Subcommand)]
+enum VerificationRegistryAction {
+    /// Add one immutable case descriptor. Existing identical content is idempotent.
+    Add {
+        #[arg(long)]
+        registry: PathBuf,
+        #[arg(long = "case")]
+        case_path: PathBuf,
+    },
+    /// Add one stable, content-addressed counterexample descriptor.
+    AddCell {
+        #[arg(long)]
+        registry: PathBuf,
+        #[arg(long = "cell")]
+        cell_path: PathBuf,
+    },
+    /// Record that an actor read a case for development, evaluation or audit.
+    Access {
+        #[arg(long)]
+        registry: PathBuf,
+        #[arg(long = "case")]
+        case_id: String,
+        #[arg(long, value_parser = ["development", "evaluation", "audit"])]
+        purpose: String,
+        #[arg(long)]
+        actor: String,
+    },
+    /// Recompute the effective split; development access permanently contaminates hidden cases.
+    Audit {
+        #[arg(long)]
+        registry: PathBuf,
+        #[arg(long = "case")]
+        case_id: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum VerificationAction {
+    /// Re-derive and validate a verification event; stored verdicts are never trusted.
+    Validate {
+        #[arg(long)]
+        event: PathBuf,
+    },
+    /// Compare two execution envelopes bound to the same Verification IR.
+    Compare {
+        #[arg(long)]
+        ir: PathBuf,
+        #[arg(long)]
+        first: PathBuf,
+        #[arg(long)]
+        second: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Recompute the seven engineering-moat denominator families from preregistered rows.
+    Scorecard {
+        #[arg(long)]
+        measurements: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Maintain a local, content-addressed evaluation registry.
+    Registry {
+        #[command(subcommand)]
+        action: VerificationRegistryAction,
+    },
+}
+
 // Parsed once at startup; boxing the big variant buys nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
@@ -353,6 +484,19 @@ enum Command {
     Evidence {
         #[command(subcommand)]
         action: EvidenceAction,
+    },
+    /// Reproduce one finding against the exact selected Python source in
+    /// three fresh, network-disabled containers. Never changes its status.
+    Reproduce(ReproduceArgs),
+    /// Inspect a fix candidate without applying it to the live repository.
+    Fix {
+        #[command(subcommand)]
+        action: FixAction,
+    },
+    /// Validate proof-carrying events, compare replays and track holdout lineage.
+    Verification {
+        #[command(subcommand)]
+        action: VerificationAction,
     },
     /// Show the model roster; --probe sends each model a one-line check.
     Models {
@@ -1205,7 +1349,6 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
                 fix_test_command,
             )
         };
-    audit::set_poc_image(&poc_image);
     let opts = ScanOptions {
         repo_path: path,
         profile,
@@ -1216,6 +1359,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         gates,
         max_modules,
         poc,
+        poc_image,
         save,
         cross_check_top,
         dual_finder_top,
@@ -1682,7 +1826,6 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
                 .join(", "),
         )
     );
-    vettalon::audit::set_poc_image(&args.poc_image);
 
     let draft_opts = draft_opts.map(|mut o| {
         o.roster = roster.clone();
@@ -1696,6 +1839,7 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
         roster,
         max_modules: args.max_modules,
         poc: args.poc,
+        poc_image: args.poc_image.clone(),
     };
     let fetcher = HttpSourceFetcher::new();
     // Each dependency takes up to --dep-timeout and up to --dep-concurrency run
@@ -2198,6 +2342,1023 @@ fn write_disclosure_drafts(
     Ok(written)
 }
 
+const REMEDIATION_INPUT_MAX_BYTES: u64 = 64 * 1024;
+
+fn remediation_fail(error: impl std::fmt::Display) -> i32 {
+    eprintln!("[vettalon] {error}");
+    2
+}
+
+fn read_regular_capped(path: &Path, cap: u64, label: &str) -> Result<String, String> {
+    use std::io::Read;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot inspect {label} {}: {e}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > cap {
+        return Err(format!(
+            "{label} must be a regular non-symlink file no larger than {cap} bytes"
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("cannot open {label} {}: {e}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+        .take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {label} {}: {e}", path.display()))?;
+    if bytes.len() as u64 > cap || file.metadata().map(|m| m.len()).ok() != Some(metadata.len()) {
+        return Err(format!("{label} changed while it was read"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{label} must be UTF-8"))
+}
+
+fn remediation_context(
+    repo: &Path,
+    report_path: &Path,
+    finding_id: &str,
+    target_path: &Path,
+) -> Result<
+    (
+        PathBuf,
+        vettalon::audit::schema::AuditReport,
+        vettalon::audit::schema::Finding,
+        vettalon::audit::target_poc::TargetCall,
+    ),
+    String,
+> {
+    let repo = std::fs::canonicalize(repo)
+        .map_err(|e| format!("cannot resolve repository {}: {e}", repo.display()))?;
+    if !repo.is_dir() {
+        return Err("repository path is not a directory".into());
+    }
+    let report = audit::load_report_for_delivery(report_path)?;
+    let reported_repo = std::fs::canonicalize(&report.repo).map_err(|e| {
+        format!(
+            "cannot resolve the report repository {:?}: {e}; reproduce/fix-check refuses a moved or unavailable tree",
+            report.repo
+        )
+    })?;
+    if repo != reported_repo {
+        return Err(format!(
+            "repository identity mismatch: report names {}, command names {}",
+            reported_repo.display(),
+            repo.display()
+        ));
+    }
+    let exact: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.id == finding_id)
+        .collect();
+    let matches = if exact.is_empty() {
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.id.starts_with(finding_id))
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    let finding = match matches.as_slice() {
+        [finding] => (*finding).clone(),
+        [] => return Err(format!("finding {finding_id:?} is not in the report")),
+        _ => return Err(format!("finding prefix {finding_id:?} is ambiguous")),
+    };
+    let target_raw = read_regular_capped(target_path, 8 * 1024, "target call")?;
+    let target = vettalon::audit::target_poc::parse_target_call(&target_raw)
+        .map_err(|reason| format!("target call refused: {reason}"))?;
+    if target.file != finding.file {
+        return Err(format!(
+            "target file {:?} does not match finding file {:?}",
+            target.file, finding.file
+        ));
+    }
+    Ok((repo, report, finding, target))
+}
+
+fn encode_remediation_output<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(value)
+        .map_err(|e| format!("cannot serialize remediation output: {e}"))
+}
+
+/// Resolve a brand-new output without following a symlink in its parent
+/// chain. Remediation outputs contain source evidence and must never replace
+/// an operator-owned file, symlink target or hardlink.
+fn preflight_new_output(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    if path.file_name().is_none()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!(
+            "unsafe output path {}; '..' is refused",
+            path.display()
+        ));
+    }
+    let raw_absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot resolve current directory: {e}"))?
+            .join(path)
+    };
+    let mut absolute = PathBuf::new();
+    for component in raw_absolute.components() {
+        if !matches!(component, Component::CurDir) {
+            absolute.push(component.as_os_str());
+        }
+    }
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| format!("output has no parent: {}", path.display()))?;
+    let mut cursor = PathBuf::new();
+    for component in parent.components() {
+        cursor.push(component.as_os_str());
+        if matches!(component, Component::CurDir) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&cursor)
+            .map_err(|e| format!("cannot inspect output parent {}: {e}", cursor.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "output parent must be a real directory, not a symlink: {}",
+                cursor.display()
+            ));
+        }
+    }
+    match std::fs::symlink_metadata(&absolute) {
+        Ok(_) => Err(format!(
+            "output already exists and will not be replaced: {}",
+            absolute.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
+        Err(error) => Err(format!(
+            "cannot inspect output {}: {error}",
+            absolute.display()
+        )),
+    }
+}
+
+fn create_new_private_output(path: &Path) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .map_err(|e| format!("cannot create new output {}: {e}", path.display()))
+}
+
+fn write_new_remediation_output<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    use std::io::Write;
+
+    let encoded = encode_remediation_output(value)?;
+    let path = preflight_new_output(path)?;
+    let mut file = create_new_private_output(&path)?;
+    if let Err(error) = file.write_all(&encoded).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("cannot write output {}: {error}", path.display()));
+    }
+    Ok(())
+}
+
+fn write_new_remediation_pair<A: serde::Serialize, B: serde::Serialize>(
+    first_path: &Path,
+    first: &A,
+    second_path: &Path,
+    second: &B,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let first_bytes = encode_remediation_output(first)?;
+    let second_bytes = encode_remediation_output(second)?;
+    let first_path = preflight_new_output(first_path)?;
+    let second_path = preflight_new_output(second_path)?;
+    if first_path == second_path {
+        return Err("--out and --report-out must be different paths".into());
+    }
+    let mut first_file = create_new_private_output(&first_path)?;
+    let mut second_file = match create_new_private_output(&second_path) {
+        Ok(file) => file,
+        Err(error) => {
+            drop(first_file);
+            let _ = std::fs::remove_file(&first_path);
+            return Err(error);
+        }
+    };
+    let write_result = first_file
+        .write_all(&first_bytes)
+        .and_then(|()| first_file.sync_all())
+        .and_then(|()| second_file.write_all(&second_bytes))
+        .and_then(|()| second_file.sync_all());
+    if let Err(error) = write_result {
+        drop(first_file);
+        drop(second_file);
+        let _ = std::fs::remove_file(&first_path);
+        let _ = std::fs::remove_file(&second_path);
+        return Err(format!("cannot write remediation outputs: {error}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod remediation_output_tests {
+    use super::*;
+
+    fn real_tempdir(prefix: &str) -> tempfile::TempDir {
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    #[test]
+    fn remediation_output_is_new_private_and_never_follows_existing_links() {
+        let dir = real_tempdir("vettalon-remediation-output-");
+        let fresh = dir.path().join("fresh.json");
+        write_new_remediation_output(&fresh, &serde_json::json!({"ok": true})).unwrap();
+        assert!(std::fs::read_to_string(&fresh).unwrap().contains("true"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "preserve").unwrap();
+        assert!(write_new_remediation_output(&victim, &0).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "preserve");
+
+        #[cfg(unix)]
+        {
+            let symlink = dir.path().join("receipt-symlink.json");
+            std::os::unix::fs::symlink(&victim, &symlink).unwrap();
+            assert!(write_new_remediation_output(&symlink, &1).is_err());
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "preserve");
+
+            let hardlink = dir.path().join("receipt-hardlink.json");
+            std::fs::hard_link(&victim, &hardlink).unwrap();
+            assert!(write_new_remediation_output(&hardlink, &2).is_err());
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "preserve");
+
+            let real_parent = dir.path().join("real-parent");
+            std::fs::create_dir(&real_parent).unwrap();
+            let linked_parent = dir.path().join("linked-parent");
+            std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+            assert!(write_new_remediation_output(&linked_parent.join("receipt.json"), &3).is_err());
+            assert!(!real_parent.join("receipt.json").exists());
+        }
+    }
+
+    #[test]
+    fn paired_outputs_preflight_both_and_leave_no_partial_first_file() {
+        let dir = real_tempdir("vettalon-remediation-pair-");
+        let first = dir.path().join("receipt.json");
+        let existing_second = dir.path().join("report.json");
+        std::fs::write(&existing_second, "preserve").unwrap();
+        assert!(write_new_remediation_pair(&first, &1, &existing_second, &2).is_err());
+        assert!(!first.exists());
+        assert_eq!(
+            std::fs::read_to_string(&existing_second).unwrap(),
+            "preserve"
+        );
+
+        let same = dir.path().join("same.json");
+        assert!(
+            write_new_remediation_pair(&same, &1, &dir.path().join("./same.json"), &2).is_err()
+        );
+        assert!(!same.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+    async fn live_fix_cli_writes_a_bound_validator_clean_report_without_touching_source() {
+        use vettalon::audit::schema::*;
+        use vettalon::audit::target_poc::{TargetArgument, TargetCall};
+
+        let dir = real_tempdir("vettalon-fix-cli-");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let source = "import os\n\ndef run(cmd):\n    os.system('echo ' + cmd)\n";
+        std::fs::write(repo.join("app.py"), source).unwrap();
+        let mut finding = Finding::candidate(
+            "ai_audit",
+            FindingKind::Other,
+            Severity::High,
+            "command injection",
+            "app.py",
+            Some(4),
+            source,
+            "ai-audit/command_injection",
+            vec![],
+        );
+        finding.cwe = Some("CWE-78".into());
+        finding.file_hash = Some(sha256_hex(source.as_bytes()));
+        let finding_id = finding.id.clone();
+        let findings = vec![finding];
+        let report = AuditReport {
+            schema_version: 2,
+            repo: std::fs::canonicalize(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            started_at: "2026-10-24T00:00:00Z".into(),
+            profile: ScanProfile {
+                mode: ProfileMode::Deep,
+                intake: None,
+            },
+            engines_run: vec![],
+            engines_missing: vec![],
+            summary: Summary::from_findings(&findings, 0, 0, GatePolicy::default(), &[]),
+            findings,
+            run_status: vettalon_contract::coverage::RunStatus::Complete,
+            incomplete_reason: None,
+            coverage: vec![],
+            prior_run: None,
+            verifier: VerifierInfo::default(),
+            ensemble: Default::default(),
+        };
+        let validation = audit::validation_errors(&report);
+        assert!(validation.is_empty(), "{validation:?}");
+        let report_path = dir.path().join("report.json");
+        std::fs::write(&report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        let target_path = dir.path().join("target.json");
+        std::fs::write(
+            &target_path,
+            serde_json::to_vec(&TargetCall {
+                file: "app.py".into(),
+                function: "run".into(),
+                args: vec![TargetArgument::Payload],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let diff_path = dir.path().join("fix.patch");
+        std::fs::write(
+            &diff_path,
+            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -3,2 +3,2 @@\n def run(cmd):\n-    os.system('echo ' + cmd)\n+    os.system('echo ' + __import__('shlex').quote(cmd))\n",
+        )
+        .unwrap();
+        let receipt_path = dir.path().join("fix-receipt.json");
+        let updated_path = dir.path().join("updated-report.json");
+        let before = std::fs::read(repo.join("app.py")).unwrap();
+        let code = cmd_fix_check(FixCheckArgs {
+            path: repo.clone(),
+            report: report_path,
+            finding: finding_id.clone(),
+            target: target_path,
+            diff: Some(diff_path),
+            test_command: Some("true".into()),
+            poc_image: vettalon::sandbox::DEFAULT_POC_IMAGE.into(),
+            out: receipt_path.clone(),
+            report_out: updated_path.clone(),
+        })
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read(repo.join("app.py")).unwrap(), before);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt["outcome"], "fix_verified");
+        let updated = audit::load_report_for_delivery(&updated_path).unwrap();
+        let finding = updated
+            .findings
+            .iter()
+            .find(|finding| finding.id == finding_id)
+            .unwrap();
+        assert_eq!(finding.status, FindingStatus::Candidate);
+        assert_eq!(
+            finding.fix_check().unwrap().outcome,
+            audit::fix_check::FixOutcome::FixVerified
+        );
+        assert!(finding.fix_check().unwrap().binding.is_some());
+    }
+}
+
+#[cfg(test)]
+mod verification_cli_tests {
+    use super::*;
+
+    use vettalon::audit::verification::{CompileInput, HostObservations, VerificationEvent};
+    use vettalon_contract::verification::{
+        BackendKind, CleanupState, CounterexampleKind, DataRights, ENGINEERING_MEASUREMENT_SCHEMA,
+        EVALUATION_CASE_SCHEMA, EngineeringMeasurement, EvaluationCase, EvaluationSplit, Language,
+        ReplayGrade, ReplayOutcome, SupportOutcome,
+    };
+
+    fn hash(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect()
+    }
+
+    fn event_fixture() -> VerificationEvent {
+        let ir = vettalon::audit::verification::compile_ir(&CompileInput {
+            finding_id: "finding-1".into(),
+            file: "app.py".into(),
+            line: Some(7),
+            symbol: "run".into(),
+            cwe: "CWE-78".into(),
+            source_sha256: hash('a'),
+            target_file_sha256: hash('b'),
+            target_plan_sha256: hash('c'),
+            harness_sha256: hash('d'),
+        })
+        .unwrap();
+        VerificationEvent::from_host_observations(
+            ir,
+            HostObservations {
+                backend_kind: BackendKind::Docker,
+                backend_identity: format!("sha256:{}", hash('e')),
+                platform: "linux/arm64".into(),
+                challenge_commitment: hash('f'),
+                capture_complete: true,
+                cleanup: CleanupState::Confirmed,
+                tampering: Vec::new(),
+                effect_observed: Some(true),
+                benign_control: Some(true),
+                fresh_challenge_control: Some(true),
+                exit_code: Some(0),
+                transcript_sha256: Some(hash('1')),
+                replay_grade: ReplayGrade::Exact,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verification_commands_have_closed_explicit_inputs() {
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "verification",
+            "validate",
+            "--event",
+            "event.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Verification {
+                action: VerificationAction::Validate { .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "verification",
+            "scorecard",
+            "--measurements",
+            "measurements.json",
+            "--out",
+            "scorecard.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Verification {
+                action: VerificationAction::Scorecard { .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "verification",
+            "registry",
+            "add-cell",
+            "--registry",
+            "registry",
+            "--cell",
+            "cell.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Verification {
+                action: VerificationAction::Registry {
+                    action: VerificationRegistryAction::AddCell { .. }
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "verification",
+            "compare",
+            "--ir",
+            "ir.json",
+            "--first",
+            "a.json",
+            "--second",
+            "b.json",
+            "--out",
+            "result.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Verification {
+                action: VerificationAction::Compare { .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "verification",
+            "registry",
+            "access",
+            "--registry",
+            "registry",
+            "--case",
+            "hidden-1",
+            "--purpose",
+            "development",
+            "--actor",
+            "builder",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Verification {
+                action: VerificationAction::Registry {
+                    action: VerificationRegistryAction::Access { .. }
+                }
+            }
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "vettalon",
+                "verification",
+                "registry",
+                "access",
+                "--registry",
+                "registry",
+                "--case",
+                "hidden-1",
+                "--purpose",
+                "train",
+                "--actor",
+                "builder",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verification_commands_validate_compare_and_track_holdout_contamination() {
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("vettalon-verification-cli-")
+            .tempdir_in(temp_root)
+            .unwrap();
+        let event = event_fixture();
+        let event_path = temp.path().join("event.json");
+        std::fs::write(&event_path, serde_json::to_vec_pretty(&event).unwrap()).unwrap();
+        assert_eq!(
+            cmd_verification(VerificationAction::Validate { event: event_path }),
+            0
+        );
+
+        let ir_path = temp.path().join("ir.json");
+        let first_path = temp.path().join("first.json");
+        let second_path = temp.path().join("second.json");
+        std::fs::write(&ir_path, serde_json::to_vec_pretty(&event.ir).unwrap()).unwrap();
+        std::fs::write(
+            &first_path,
+            serde_json::to_vec_pretty(&event.envelope).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_path,
+            serde_json::to_vec_pretty(&event.envelope).unwrap(),
+        )
+        .unwrap();
+        let comparison_path = temp.path().join("comparison.json");
+        assert_eq!(
+            cmd_verification(VerificationAction::Compare {
+                ir: ir_path,
+                first: first_path,
+                second: second_path,
+                out: comparison_path.clone(),
+            }),
+            0
+        );
+        assert!(comparison_path.is_file());
+
+        let mut incomplete = event.envelope.clone();
+        incomplete.cleanup = CleanupState::Unknown;
+        let incomplete_path = temp.path().join("incomplete.json");
+        std::fs::write(
+            &incomplete_path,
+            serde_json::to_vec_pretty(&incomplete).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cmd_verification(VerificationAction::Compare {
+                ir: temp.path().join("ir.json"),
+                first: incomplete_path.clone(),
+                second: incomplete_path,
+                out: temp.path().join("incomplete-comparison.json"),
+            }),
+            4
+        );
+
+        let measurements = vec![EngineeringMeasurement {
+            schema: ENGINEERING_MEASUREMENT_SCHEMA.into(),
+            measurement_id: "m-1".into(),
+            cohort: "day-30".into(),
+            project: "repo-a".into(),
+            effect: "command_execution".into(),
+            language: Language::Python,
+            framework: "stdlib".into(),
+            verifier_engineering_minutes: 60,
+            manual_trusted_loc: 100,
+            support: SupportOutcome::Supported,
+            prospective: true,
+            false_proof: false,
+            replay: ReplayOutcome::Equivalent,
+            tamper_attempt: true,
+            positive_forgery: false,
+            state_leak: false,
+            cleanup_residue: false,
+            build_ms: 10,
+            execution_ms: 20,
+            capture_ms: 30,
+            cleanup_ms: 40,
+            human_minutes: 5,
+            direct_cost_microunits: 1_000,
+            currency: "USD".into(),
+        }];
+        let measurements_path = temp.path().join("measurements.json");
+        std::fs::write(
+            &measurements_path,
+            serde_json::to_vec_pretty(&measurements).unwrap(),
+        )
+        .unwrap();
+        let scorecard_path = temp.path().join("scorecard.json");
+        assert_eq!(
+            cmd_verification(VerificationAction::Scorecard {
+                measurements: measurements_path,
+                out: scorecard_path.clone(),
+            }),
+            0
+        );
+        let scorecard: vettalon::audit::verification::EngineeringScorecard =
+            serde_json::from_slice(&std::fs::read(scorecard_path).unwrap()).unwrap();
+        assert_eq!(scorecard.roster_total, 1);
+        assert_eq!(scorecard.conclusive_proofs, 1);
+
+        let registry = temp.path().join("registry");
+        let case_path = temp.path().join("case.json");
+        let case = EvaluationCase {
+            schema: EVALUATION_CASE_SCHEMA.into(),
+            case_id: "holdout-1".into(),
+            content_sha256: hash('9'),
+            declared_split: EvaluationSplit::SealedHoldout,
+            rights: DataRights::ServiceOnly,
+            parents: Vec::new(),
+        };
+        std::fs::write(&case_path, serde_json::to_vec_pretty(&case).unwrap()).unwrap();
+        assert_eq!(
+            cmd_verification(VerificationAction::Registry {
+                action: VerificationRegistryAction::Add {
+                    registry: registry.clone(),
+                    case_path,
+                },
+            }),
+            0
+        );
+        let mut replay_envelope = event.envelope.clone();
+        replay_envelope.challenge_commitment = hash('2');
+        replay_envelope.transcript_sha256 = Some(hash('2'));
+        let replay_event =
+            VerificationEvent::new(event.ir.clone(), replay_envelope, None, None).unwrap();
+        let cell = vettalon::audit::verification::promote_counterexample(
+            &[event.clone(), replay_event],
+            "false-proof-1",
+            CounterexampleKind::FalseProof,
+            &hash('7'),
+            &hash('8'),
+            EvaluationSplit::Development,
+            DataRights::ServiceOnly,
+            Vec::new(),
+        )
+        .unwrap();
+        let cell_path = temp.path().join("cell.json");
+        std::fs::write(&cell_path, serde_json::to_vec_pretty(&cell).unwrap()).unwrap();
+        assert_eq!(
+            cmd_verification(VerificationAction::Registry {
+                action: VerificationRegistryAction::AddCell {
+                    registry: registry.clone(),
+                    cell_path,
+                },
+            }),
+            0
+        );
+        assert_eq!(
+            vettalon::audit::verification::RegistryStore::open(&registry)
+                .unwrap()
+                .load_counterexamples()
+                .unwrap(),
+            vec![cell]
+        );
+        assert_eq!(
+            cmd_verification(VerificationAction::Registry {
+                action: VerificationRegistryAction::Access {
+                    registry: registry.clone(),
+                    case_id: "holdout-1".into(),
+                    purpose: "development".into(),
+                    actor: "builder".into(),
+                },
+            }),
+            0
+        );
+        let audit_path = temp.path().join("audit.json");
+        assert_eq!(
+            cmd_verification(VerificationAction::Registry {
+                action: VerificationRegistryAction::Audit {
+                    registry,
+                    case_id: "holdout-1".into(),
+                    out: audit_path.clone(),
+                },
+            }),
+            1
+        );
+        let audit: vettalon::audit::verification::CaseAudit =
+            serde_json::from_slice(&std::fs::read(audit_path).unwrap()).unwrap();
+        assert!(audit.compromised);
+        assert_eq!(audit.effective_split, EvaluationSplit::Development);
+    }
+}
+
+async fn cmd_reproduce(args: ReproduceArgs) -> i32 {
+    let (repo, _report, finding, target) =
+        match remediation_context(&args.path, &args.report, &args.finding, &args.target) {
+            Ok(value) => value,
+            Err(error) => return remediation_fail(error),
+        };
+    let receipt =
+        audit::target_poc::run_target_poc(&repo, &finding, &target, &args.poc_image).await;
+    if let Err(error) = write_new_remediation_output(&args.out, &receipt) {
+        return remediation_fail(error);
+    }
+    eprintln!(
+        "[vettalon] target PoC: {:?}; status unchanged; receipt={}",
+        receipt.outcome,
+        args.out.display()
+    );
+    match receipt.outcome {
+        audit::target_poc::TargetPocOutcome::EffectObserved => 0,
+        audit::target_poc::TargetPocOutcome::EffectAbsent => 1,
+        audit::target_poc::TargetPocOutcome::Inconclusive => 2,
+    }
+}
+
+async fn cmd_fix_check(args: FixCheckArgs) -> i32 {
+    let (repo, mut report, finding, target) =
+        match remediation_context(&args.path, &args.report, &args.finding, &args.target) {
+            Ok(value) => value,
+            Err(error) => return remediation_fail(error),
+        };
+    if let Some(command) = args.test_command.as_deref()
+        && let Err(error) = audit::fix_check::validate_test_command(command)
+    {
+        return remediation_fail(format!("test command refused: {error}"));
+    }
+    let diff = match args.diff.as_deref() {
+        Some(path) => match read_regular_capped(path, REMEDIATION_INPUT_MAX_BYTES, "fix diff") {
+            Ok(diff) => diff,
+            Err(error) => return remediation_fail(error),
+        },
+        None => match finding.suggested_fix.clone() {
+            Some(diff) => diff,
+            None => return remediation_fail("the finding has no suggested fix; pass --diff"),
+        },
+    };
+    if let Err(reason) = audit::validate_fix_diff(&diff) {
+        return remediation_fail(format!("fix diff refused: {reason}"));
+    }
+    let run = audit::fix_check::run_target_fix(
+        &repo,
+        &finding,
+        &target,
+        &diff,
+        args.test_command.as_deref(),
+        &args.poc_image,
+    )
+    .await;
+    let Some(updated_finding) = report
+        .findings
+        .iter_mut()
+        .find(|candidate| candidate.id == finding.id)
+    else {
+        return remediation_fail("selected finding disappeared from the report");
+    };
+    updated_finding.suggested_fix = Some(diff);
+    audit::fix_check::record_fix_run(updated_finding, &run);
+    if let Some(error) = audit::validation_errors(&report).first() {
+        return remediation_fail(format!("updated report is invalid: {error}"));
+    }
+    if let Err(error) = write_new_remediation_pair(&args.out, &run, &args.report_out, &report) {
+        return remediation_fail(error);
+    }
+    eprintln!(
+        "[vettalon] fix check: {}; live tree unchanged; receipt={}; report={}",
+        run.outcome().key(),
+        args.out.display(),
+        args.report_out.display()
+    );
+    usize::from(run.outcome() != audit::fix_check::FixOutcome::FixVerified) as i32
+}
+
+const VERIFICATION_INPUT_MAX_BYTES: u64 = 128 * 1024;
+const REPLAY_COMPARISON_SCHEMA: &str = "vettalon.replay-comparison/1";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayComparisonReceipt {
+    schema: String,
+    verification_ir_sha256: String,
+    first_envelope_sha256: String,
+    second_envelope_sha256: String,
+    comparison: vettalon_contract::verification::ReplayComparison,
+}
+
+fn read_verification_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    label: &str,
+) -> Result<T, String> {
+    let raw = read_regular_capped(path, VERIFICATION_INPUT_MAX_BYTES, label)?;
+    vettalon_contract::strict_json::parse_strict_with_limit(
+        &raw,
+        VERIFICATION_INPUT_MAX_BYTES as usize,
+    )
+    .map_err(|error| format!("invalid {label} {}: {error:?}", path.display()))
+}
+
+fn verification_store(path: &Path) -> Result<audit::verification::RegistryStore, String> {
+    audit::verification::RegistryStore::open(path)
+        .map_err(|reason| format!("cannot open registry {}: {reason}", path.display()))
+}
+
+fn cmd_verification(action: VerificationAction) -> i32 {
+    use vettalon_contract::verification::{
+        AccessPurpose, EvaluationCase, ExecutionEnvelope, ReplayComparison, VerificationIr,
+        compare_replay,
+    };
+
+    let result: Result<i32, String> = (|| match action {
+        VerificationAction::Validate { event } => {
+            let event: audit::verification::VerificationEvent =
+                read_verification_json(&event, "verification event")?;
+            event
+                .validate()
+                .map_err(|reason| format!("verification event refused: {reason}"))?;
+            let identity = event
+                .identity_sha256()
+                .map_err(|reason| format!("verification event refused: {reason}"))?;
+            println!(
+                "verification_event_sha256={identity} verdict={:?}",
+                event.decision.verdict
+            );
+            Ok(0)
+        }
+        VerificationAction::Compare {
+            ir,
+            first,
+            second,
+            out,
+        } => {
+            let ir: VerificationIr = read_verification_json(&ir, "verification IR")?;
+            let first: ExecutionEnvelope =
+                read_verification_json(&first, "first execution envelope")?;
+            let second: ExecutionEnvelope =
+                read_verification_json(&second, "second execution envelope")?;
+            let comparison = compare_replay(&ir, &first, &second)
+                .map_err(|error| format!("replay comparison refused: {error:?}"))?;
+            let receipt = ReplayComparisonReceipt {
+                schema: REPLAY_COMPARISON_SCHEMA.into(),
+                verification_ir_sha256: ir
+                    .identity_sha256()
+                    .map_err(|error| format!("invalid verification IR: {error:?}"))?,
+                first_envelope_sha256: audit::schema::sha256_hex(
+                    &serde_json::to_vec(&first)
+                        .map_err(|error| format!("cannot encode first envelope: {error}"))?,
+                ),
+                second_envelope_sha256: audit::schema::sha256_hex(
+                    &serde_json::to_vec(&second)
+                        .map_err(|error| format!("cannot encode second envelope: {error}"))?,
+                ),
+                comparison,
+            };
+            write_new_remediation_output(&out, &receipt)?;
+            println!(
+                "comparison={:?} receipt={}",
+                receipt.comparison,
+                out.display()
+            );
+            Ok(match comparison {
+                ReplayComparison::Equivalent => 0,
+                ReplayComparison::Diverged => 1,
+                ReplayComparison::Inconclusive => 4,
+            })
+        }
+        VerificationAction::Scorecard { measurements, out } => {
+            let measurements: Vec<vettalon_contract::verification::EngineeringMeasurement> =
+                read_verification_json(&measurements, "engineering measurements")?;
+            let scorecard = audit::verification::build_scorecard(&measurements)
+                .map_err(|reason| format!("scorecard refused: {reason}"))?;
+            write_new_remediation_output(&out, &scorecard)?;
+            println!(
+                "samples={} conclusive_proofs={} receipt={}",
+                scorecard.roster_total,
+                scorecard.conclusive_proofs,
+                out.display()
+            );
+            Ok(0)
+        }
+        VerificationAction::Registry { action } => match action {
+            VerificationRegistryAction::Add {
+                registry,
+                case_path,
+            } => {
+                let case: EvaluationCase = read_verification_json(&case_path, "evaluation case")?;
+                verification_store(&registry)?
+                    .add_case(&case)
+                    .map_err(|reason| format!("evaluation case refused: {reason}"))?;
+                println!("case={} registry={}", case.case_id, registry.display());
+                Ok(0)
+            }
+            VerificationRegistryAction::AddCell {
+                registry,
+                cell_path,
+            } => {
+                let cell: vettalon_contract::verification::CounterexampleCell =
+                    read_verification_json(&cell_path, "counterexample cell")?;
+                verification_store(&registry)?
+                    .add_counterexample(&cell)
+                    .map_err(|reason| format!("counterexample cell refused: {reason}"))?;
+                println!("cell={} registry={}", cell.cell_id, registry.display());
+                Ok(0)
+            }
+            VerificationRegistryAction::Access {
+                registry,
+                case_id,
+                purpose,
+                actor,
+            } => {
+                let purpose = match purpose.as_str() {
+                    "development" => AccessPurpose::Development,
+                    "evaluation" => AccessPurpose::Evaluation,
+                    "audit" => AccessPurpose::Audit,
+                    _ => return Err("invalid registry access purpose".into()),
+                };
+                verification_store(&registry)?
+                    .record_access(&case_id, purpose, &actor)
+                    .map_err(|reason| format!("registry access refused: {reason}"))?;
+                println!("case={case_id} purpose={purpose:?} actor={actor}");
+                Ok(0)
+            }
+            VerificationRegistryAction::Audit {
+                registry,
+                case_id,
+                out,
+            } => {
+                let audit = verification_store(&registry)?
+                    .audit_case(&case_id)
+                    .map_err(|reason| format!("registry audit refused: {reason}"))?;
+                write_new_remediation_output(&out, &audit)?;
+                println!(
+                    "case={case_id} effective_split={:?} compromised={} receipt={}",
+                    audit.effective_split,
+                    audit.compromised,
+                    out.display()
+                );
+                Ok(i32::from(audit.compromised))
+            }
+        },
+    })();
+
+    match result {
+        Ok(code) => code,
+        Err(error) => remediation_fail(error),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -2212,6 +3373,11 @@ async fn main() -> ExitCode {
         Command::Scan(args) => cmd_scan(args).await,
         Command::Validate { report } => audit::cmd_validate(&report).await,
         Command::Verify(args) => cmd_verify(args).await,
+        Command::Reproduce(args) => cmd_reproduce(args).await,
+        Command::Fix {
+            action: FixAction::Check(args),
+        } => cmd_fix_check(args).await,
+        Command::Verification { action } => cmd_verification(action),
         Command::Evidence {
             action:
                 EvidenceAction::Attach {

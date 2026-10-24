@@ -385,6 +385,25 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 
 **AI 不會自動宣告「確認」。** AI 能做到的最高狀態是 `needs_human`，`confirmed` 只能由人來標。
 
+**用實際原始碼重現與檢查修補。** 已有 validator-clean 的 `report.json` 時，可把一次呼叫寫成封閉 JSON；目前只接受 `.py` 內同步、top-level 的函式，`args` 恰好一個 `payload`，其餘參數只能是有界 JSON literal：
+
+```json
+{"file":"app.py","function":"read_file","args":[{"kind":"payload"}]}
+```
+
+```bash
+vettalon reproduce . --report report.json --finding FINDING_ID \
+  --target target.json --out reproduce-receipt.json
+
+vettalon fix check . --report report.json --finding FINDING_ID \
+  --target target.json --diff fix.patch --test-command "python3 -m pytest -q" \
+  --out fix-receipt.json --report-out report-with-fix-check.json
+```
+
+兩個命令都核對 report 的 repo、finding、目標檔與原始碼 hash，只在 prepared copy／新容器執行；不改 live tree，也不自動改 finding status。`reproduce` 是三階段來源綁定收據；`fix check` 另把 exact diff 與相鄰的 check/context evidence 寫進 `--report-out`，更新後報告會再跑 validator。receipt 與 report-out 必須是不存在的新檔，父路徑不能含 symlink；這避免一般覆寫與 link 攻擊，但檢查未以 dirfd 錨定，不能宣稱消除所有並行 rename 競態。`fix_verified` 只描述收據綁定的 prepared snapshot、image 與測試設定，不代表今天的工作樹仍相同，也不會把漏洞改成 `confirmed`。
+
+`reproduce` 收據另可攜帶 language-neutral VerificationEvent：VIR 綁定來源、target、plan、實際 runner／adapter harness 與 policy；ExecutionEnvelope 記 capture、cleanup、tamper、effect、controls 與 replay grade；stored verdict 每次讀回都會重新推導。可用 `vettalon verification validate` 驗證 event、`verification compare` 比較兩次 execution envelope、`verification registry` 管理反例與 sealed holdout lineage、`verification scorecard` 重算包含 unsupported／inconclusive 分母的工程量尺。反例升格需要至少兩份不同 fresh challenge 的一致完整事件；holdout 污染沿 parent lineage 傳遞，registry 也會核對內容位址。完整格式、命令與限制見 [`docs/VERIFICATION-ENGINE.md`](../docs/VERIFICATION-ENGINE.md)。目前只支援 Python 的 command／path／SQL target 與 Docker reference backend，不代表跨語言或工程護城河已成立。
+
 **證據等級。** JSON 報告與 SARIF 的每筆發現都帶 `evidence_level`，由弱到強是 `static_only`、`refuter_survived`、`refuter_consistent`、`poc_effect_no_control`、`poc_differential`、`maintainer_confirmed`（只有人能給）。旁邊的 `proof_gaps` 列出還缺什麼（`no_refuter`、`refuter_inconsistent`、`no_poc`、`poc_not_harness_judged`、`no_control`、`no_fresh_rerun`、`reachability_unknown`、`no_maintainer_confirmation`），`strongest_counterevidence` 引用最不利的推翻理由或失敗的對照組，已遮罩、上限 300 位元組。三者都在寫報告時從證據鏈算出來，模型設定不了，報告檔裡存的值讀回時一律忽略，舊報告則依它本來有的證據推導。有 `verify_error` 時最高只到 `static_only`，有 `verify_uncertain` 時最高只到 `refuter_survived`。沙箱的 pattern PoC 不會提高等級，只有 harness 判定的 oracle 紀錄（`poc_oracle`）可以。
 
 **修補建議。** 發現可以帶 `suggested_fix`（unified diff，上限 64 KB，讀報告時超過就拒絕）。報告不會因為有這段 diff 就當它驗證過：凡是帶修補建議的發現，JSON 報告都有衍生欄位 `fix_check`，SARIF 有 `vettalon.fix_check`，其中 `outcome` 只有 `fix_verified`、`fix_check_partial`、`fix_rejected`、`fix_unverified` 四種。加了 `--poc` 時，對會跑 PoC 的同一批發現，vettalon 把掃描的目錄複製兩份到暫存目錄，只把 diff 套到其中一份，你的檔案只讀不寫。diff 碰到目錄外的路徑、二進位檔、符號連結、`.git` 或秘密檔，或是改名、刪檔、改權限，都在執行任何東西之前拒絕。檢查 A 在同一次執行裡，用 harness 對該類別的每個 fixture 輸入，分別在原始副本與修補副本跑上面的 oracle：原始副本要仍有效果，修補副本要沒有，而且 harness 的良性輸入在修補副本上要照常運作（不拋例外，讀檔與 SQL 類別還要拿到預期結果），只是把程式改壞的修補會被否決。連接 harness 與專案程式的 adapter 由模型撰寫，只能 import 並呼叫專案程式（自己執行危險操作、讀專案檔、檢視已 import 的模組、執行期組程式碼的 adapter 會被靜態檢查擋下），兩份副本用同一個 adapter，所以目前只適用可以 import 的 Python 程式。檢查 B 只在你明確設定測試指令時才跑（`--fix-test-command "python3 -m pytest -q"`，或設定檔 `[fix_check]` 的 `test_command`），vettalon 不會自己猜。它沿用 PoC 沙箱的限制（無網路、120 秒、目錄唯讀、只有 `/tmp` 可寫），先跑原始副本再跑修補副本；原始副本的測試就失敗時，B 記為無法判定。修補檢查和 PoC 共用時間預算（`--poc-budget`／`--time-budget`），預算用完而沒檢查到的修補記為 `fix_unverified`，`reason` 為 `time_budget_exhausted`。結果只看 A 和 B：兩者都通過才是 `fix_verified`；A 通過但沒設定測試指令是 `fix_check_partial`；修補副本仍有效果或測試失敗是 `fix_rejected`；其他情況（被拒絕、沒有沙箱、原始副本已重現不出效果、類別沒有 harness、從沒檢查過）都是 `fix_unverified`，並附 `reason`。結果存成固定格式的 `fix_check` 證據，綁定 diff 的 SHA-256，之後改了 diff，標籤就回到 `fix_unverified`。

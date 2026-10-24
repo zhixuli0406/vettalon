@@ -15,6 +15,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use super::verification_context::SnapshotExclusions;
 use vettalon_contract::safe_path::SafeRepoPath;
 
 /// Cap on a `suggested_fix` (unified diff text), on write and on read.
@@ -371,12 +372,40 @@ pub struct TreeCopies {
     _dir: tempfile::TempDir,
     pub original: PathBuf,
     pub fixed: PathBuf,
+    pub exclusions: SnapshotExclusions,
+}
+
+/// A single prepared source copy, removed on drop. Its path is only valid
+/// while this owner lives; excluded source is explicitly outside its scope.
+pub struct SourceSnapshot {
+    _dir: tempfile::TempDir,
+    pub path: PathBuf,
+    pub exclusions: SnapshotExclusions,
+}
+
+pub fn snapshot(repo_root: &Path) -> Result<SourceSnapshot, &'static str> {
+    let root = std::fs::canonicalize(repo_root).map_err(|_| "tree_copy_failed")?;
+    let dir = tempfile::Builder::new()
+        .prefix("vettalon-source-")
+        .tempdir()
+        .map_err(|_| "tree_copy_failed")?;
+    let path = dir.path().join("source");
+    let mut stats = CopyStats::default();
+    copy_dir(&root, &path, &mut stats)?;
+    Ok(SourceSnapshot {
+        _dir: dir,
+        path,
+        exclusions: stats.exclusions,
+    })
 }
 
 #[derive(Default)]
 struct CopyStats {
     files: usize,
     bytes: u64,
+    entries: usize,
+    depth: usize,
+    exclusions: SnapshotExclusions,
 }
 
 /// Validate the patched paths against `repo_root`, copy the tree twice into
@@ -392,7 +421,8 @@ pub fn prepare(repo_root: &Path, patches: &[FilePatch]) -> Result<TreeCopies, &'
         .map_err(|_| "tree_copy_failed")?;
     let original = dir.path().join("original");
     let fixed = dir.path().join("fixed");
-    copy_dir(&root, &original, &mut CopyStats::default())?;
+    let mut stats = CopyStats::default();
+    copy_dir(&root, &original, &mut stats)?;
     // Copy the copy, so both sides hold the same bytes even if the user's
     // tree changes meanwhile.
     copy_dir(&original, &fixed, &mut CopyStats::default())?;
@@ -421,6 +451,7 @@ pub fn prepare(repo_root: &Path, patches: &[FilePatch]) -> Result<TreeCopies, &'
         _dir: dir,
         original,
         fixed,
+        exclusions: stats.exclusions,
     })
 }
 
@@ -477,24 +508,35 @@ fn copy_dir(src: &Path, dst: &Path, stats: &mut CopyStats) -> Result<(), &'stati
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(FAIL);
     }
+    if stats.depth >= 128 {
+        return Err("tree_too_deep");
+    }
+    stats.depth += 1;
     std::fs::create_dir(dst).map_err(|_| FAIL)?;
     // The sandbox runs as nobody: the copy must be world-readable.
     set_mode(dst, 0o755);
     for entry in std::fs::read_dir(src).map_err(|_| FAIL)? {
         let entry = entry.map_err(|_| FAIL)?;
+        stats.entries += 1;
+        if stats.entries > 40_000 {
+            return Err("tree_too_large");
+        }
         let name = entry.file_name();
         let ty = entry.file_type().map_err(|_| FAIL)?;
         let (from, to) = (entry.path(), dst.join(&name));
         if ty.is_symlink() {
+            stats.exclusions.symlinks += 1;
             continue;
         }
         if ty.is_dir() {
             if name.to_string_lossy().eq_ignore_ascii_case(".git") {
+                stats.exclusions.git_directories += 1;
                 continue;
             }
             copy_dir(&from, &to, stats)?;
         } else if ty.is_file() {
             if crate::util::is_secret_file(&name.to_string_lossy()) {
+                stats.exclusions.secret_files += 1;
                 continue;
             }
             let meta = entry.metadata().map_err(|_| FAIL)?;
@@ -503,12 +545,19 @@ fn copy_dir(src: &Path, dst: &Path, stats: &mut CopyStats) -> Result<(), &'stati
             if stats.files > MAX_TREE_FILES || stats.bytes > MAX_TREE_BYTES {
                 return Err("tree_too_large");
             }
-            let mut input = open_nofollow(&from).map_err(|_| FAIL)?;
+            let input = open_nofollow(&from).map_err(|_| FAIL)?;
             let mut output = std::fs::File::create(&to).map_err(|_| FAIL)?;
-            std::io::copy(&mut input, &mut output).map_err(|_| FAIL)?;
+            let copied = std::io::copy(&mut input.take(meta.len().saturating_add(1)), &mut output)
+                .map_err(|_| FAIL)?;
+            if copied != meta.len() {
+                return Err("tree_changed_during_copy");
+            }
             set_mode(&to, if is_executable(&meta) { 0o755 } else { 0o644 });
+        } else {
+            stats.exclusions.special_files += 1;
         }
     }
+    stats.depth -= 1;
     Ok(())
 }
 

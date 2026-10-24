@@ -304,6 +304,9 @@ pub struct EngineAuditor {
     pub roster: Vec<crate::audit::schema::ModelInfo>,
     pub max_modules: usize,
     pub poc: bool,
+    /// Per-dependency-operation sandbox image. Callers upgrading struct
+    /// literals may use `crate::sandbox::DEFAULT_POC_IMAGE.into()`.
+    pub poc_image: String,
 }
 
 #[async_trait]
@@ -358,6 +361,7 @@ impl EngineAuditor {
             gates: Vec::new(),
             max_modules: self.max_modules,
             poc: self.poc,
+            poc_image: self.poc_image.clone(),
             save: false,
             cross_check_top: 0,
             dual_finder_top: 0,
@@ -1534,6 +1538,7 @@ mod tests {
             roster: Vec::new(),
             max_modules: 1,
             poc: false,
+            poc_image: crate::sandbox::DEFAULT_POC_IMAGE.into(),
         };
         let err = crate::lang::with(crate::lang::Lang::ZhTw, || {
             tokio::runtime::Builder::new_current_thread()
@@ -1797,6 +1802,7 @@ mod tests {
             roster: vec![],
             max_modules: 5,
             poc: false,
+            poc_image: crate::sandbox::DEFAULT_POC_IMAGE.into(),
         };
         let report = run_hunt(
             dir.path(),

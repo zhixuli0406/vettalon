@@ -63,6 +63,9 @@ mod jev;
 mod llm_util;
 mod poc;
 mod poc_oracle;
+pub mod target_poc;
+pub mod verification;
+pub mod verification_context;
 pub use poc::attach_proof_evidence;
 mod precheck;
 pub mod prescreen;
@@ -145,6 +148,9 @@ pub struct ScanOptions {
     /// `0` means every ranked module (full coverage).
     pub max_modules: usize,
     pub poc: bool,
+    /// Per-operation sandbox image. Never read from a process-global setting
+    /// after a scan has started; successful preflight pins its immutable ID.
+    pub poc_image: String,
     pub save: bool,
     /// The top N ranked modules get a second cross-family finder, on top of
     /// the always-cross-checked high-risk and injection-flagged ones.
@@ -1640,7 +1646,7 @@ async fn poc_step(
     }
     let total = findings.len() as u32;
     // P0-2: one run-wide PoC execution budget shared across every finding.
-    let budget = poc::PocBudget::new(poc::POC_MAX_RUNS);
+    let budget = poc::PocBudget::with_image(poc::POC_MAX_RUNS, &opts.poc_image);
     let mut skipped = false;
     for (nth, f) in findings.iter_mut().enumerate() {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1703,6 +1709,12 @@ pub fn validation_errors(report: &AuditReport) -> Vec<String> {
         .iter()
         .map(|v| v.to_string())
         .collect()
+}
+
+/// Validate an operator-supplied fix diff with the same closed parser used by
+/// fix checking, without applying it to any tree.
+pub fn validate_fix_diff(diff: &str) -> Result<(), &'static str> {
+    fix_diff::parse(diff).map(|_| ())
 }
 
 /// Read a saved report to build a deliverable from: size-capped,
@@ -1883,6 +1895,7 @@ mod tests {
             gates: Vec::new(),
             max_modules: 5,
             poc: false,
+            poc_image: crate::sandbox::DEFAULT_POC_IMAGE.into(),
             save: false,
             cross_check_top: 0,
             dual_finder_top: 0,

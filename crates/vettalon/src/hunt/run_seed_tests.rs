@@ -311,6 +311,7 @@ async fn engine_auditor_prepends_seeds_to_finder_prompts_only() {
         roster: vec![],
         max_modules: 1,
         poc: false,
+        poc_image: crate::sandbox::DEFAULT_POC_IMAGE.into(),
     };
     let ctx = SeedContext {
         record: SeedRecord::default(),

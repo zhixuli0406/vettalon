@@ -212,11 +212,13 @@ fn check_finding(f: &Finding, out: &mut Vec<ReportViolation>) {
         });
     }
     let id = || f.id.clone();
-    // A pre-check refutation keeps the model's claim verbatim (an unsafe
-    // path, line 0, a malformed trace) as the record of WHY it was refuted;
-    // the location rules apply to every other finding.
-    let refuted_by_precheck = f.precheck_failed() && f.status == FindingStatus::Refuted;
-    if !refuted_by_precheck {
+    // Failed pre-checks keep an invalid claim verbatim for manual review,
+    // not as a usable location. Legacy reports may have marked the same
+    // failure Refuted; keep reading them without rewriting their history.
+    // Neither exception grants a NeedsHuman/Confirmed finding a safe path.
+    let recorded_precheck_failure = f.precheck_failed()
+        && matches!(f.status, FindingStatus::Candidate | FindingStatus::Refuted);
+    if !recorded_precheck_failure {
         if let Err(e) = SafeRepoPath::parse(&f.file) {
             out.push(ReportViolation::UnsafeFindingPath {
                 id: id(),
@@ -230,7 +232,7 @@ fn check_finding(f: &Finding, out: &mut Vec<ReportViolation>) {
     if Fingerprint::parse(&f.root_fingerprint).is_err() {
         out.push(ReportViolation::InvalidRootFingerprint { id: id() });
     }
-    if !refuted_by_precheck {
+    if !recorded_precheck_failure {
         for (i, step) in f.trace.iter().enumerate() {
             if step.line == 0 {
                 out.push(ReportViolation::TraceShape {
@@ -935,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_shape_is_checked_unless_precheck_refuted() {
+    fn source_unavailable_trace_shape_is_retained_as_failed_precheck() {
         let mut f = ai("src/a.rs");
         f.trace[0].kind = TraceKind::Propagation;
         assert!(
@@ -944,15 +946,46 @@ mod tests {
                 .any(|x| matches!(x, ReportViolation::TraceShape { .. }))
         );
         crate::audit::precheck::apply_precheck(&mut f, vec!["trace[0].kind".into()]);
+        assert_eq!(f.status, FindingStatus::Candidate);
         assert_eq!(only(&report(vec![f], vec![])), vec![]);
     }
 
     #[test]
-    fn precheck_refuted_hostile_path_is_recorded_not_rejected() {
+    fn source_unavailable_precheck_retains_hostile_path_without_asserting_a_refutation() {
         let mut f = ai("/etc/passwd");
         f.line = Some(0);
         crate::audit::precheck::apply_precheck(&mut f, vec!["file: unsafe path".into()]);
+        assert_eq!(f.status, FindingStatus::Candidate);
         assert_eq!(only(&report(vec![f], vec![])), vec![]);
+    }
+
+    #[test]
+    fn source_unavailable_legacy_precheck_refuted_report_remains_readable() {
+        let mut f = ai("/etc/passwd");
+        f.line = Some(0);
+        crate::audit::precheck::apply_precheck(&mut f, vec!["file: unsafe path".into()]);
+        // Frozen reports from older binaries retain their original status.
+        f.status = FindingStatus::Refuted;
+        assert_eq!(only(&report(vec![f], vec![])), vec![]);
+    }
+
+    #[test]
+    fn source_unavailable_precheck_does_not_validate_a_confirmed_unsafe_location() {
+        let mut f = ai("/etc/passwd");
+        f.line = Some(0);
+        crate::audit::precheck::apply_precheck(&mut f, vec!["file: unsafe path".into()]);
+        f.status = FindingStatus::Confirmed;
+        let violations = only(&report(vec![f], vec![]));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, ReportViolation::UnsafeFindingPath { .. }))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, ReportViolation::LineZero { .. }))
+        );
     }
 
     #[test]

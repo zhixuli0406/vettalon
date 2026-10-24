@@ -532,6 +532,7 @@ async fn bounded_live_public_hunt_transport() {
             roster: vec![],
             max_modules: 1,
             poc: false,
+            poc_image: crate::sandbox::DEFAULT_POC_IMAGE.into(),
         },
         trees: trees.clone(),
     };

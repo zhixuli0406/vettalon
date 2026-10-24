@@ -245,8 +245,7 @@ pub async fn run_for_finding<C: LlmCaller>(
 
     // Docker detection is cheap and non-executing; an anti-cheat rejection is
     // reported even without a sandbox (it needs none), so do it first.
-    let image = super::poc::poc_image();
-    let sb = match crate::sandbox::DockerSandbox::detect(&image).await {
+    let sb = match budget.sandbox().await {
         Ok(sb) => sb,
         Err(e) => {
             // Still surface a rejection if the source is cheating — no sandbox needed.
@@ -665,6 +664,68 @@ pub(super) fn build_fix_runner(class: OracleClass, s: &OracleSecrets, payload: &
         ));
     }
     out
+}
+
+/// Harness runner for a product-owned, source-bound target adapter.  Unlike
+/// the legacy fix-check adapter, the generated adapter imports the exact
+/// `/workspace/tree/<file>` bytes itself, so the tree is deliberately not
+/// added to `sys.path`.  This also prevents a target file from shadowing a
+/// standard-library module used by the harness.
+pub(super) fn target_runner(class: OracleClass, secrets: &OracleSecrets, payload: &str) -> String {
+    let runner = build_fix_runner(class, secrets, payload)
+        .replace("sys.path.append('/workspace/tree')\n", "")
+        .replacen(
+            "import sys, os, traceback\n",
+            "import sys, os, traceback, subprocess, json, stat\n",
+            1,
+        );
+    let in_process = "try:\n    import sink\nexcept Exception:\n    raised()\n    verdict(False)\n    sys.exit(0)\nif not hasattr(sink, 'run'):\n    raised()\n    verdict(False)\n    sys.exit(0)\n";
+    let child_process = r#"def invoke(payload):
+    result_path = '/tmp/vtl_target_result'
+    try:
+        os.remove(result_path)
+    except FileNotFoundError:
+        pass
+    child_env = {'HOME': '/tmp'}
+    for key in ('VTL_BASE', 'VTL_DB'):
+        if key in os.environ:
+            child_env[key] = os.environ[key]
+    payload_hex = json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('utf-8').hex()
+    try:
+        child = subprocess.run(
+            [sys.executable, '-I', '-B', '/workspace/sink.py', payload_hex, result_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=child_env,
+            timeout=30,
+            check=False,
+        )
+        if child.returncode != 0:
+            raised()
+            return ''
+        info = os.lstat(result_path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+            raise RuntimeError('invalid target result')
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(result_path, flags)
+        with os.fdopen(fd, 'r', encoding='utf-8') as fh:
+            record = json.load(fh)
+        if set(record) != {'result'} or not isinstance(record['result'], str):
+            raise RuntimeError('invalid target result')
+        return record['result']
+    except Exception:
+        raised()
+        return ''
+    finally:
+        try:
+            os.remove(result_path)
+        except OSError:
+            pass
+"#;
+    runner
+        .replacen(in_process, child_process, 1)
+        .replace("sink.run(PAYLOAD)", "invoke(PAYLOAD)")
 }
 
 fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str) -> String {

@@ -4,8 +4,20 @@
 
 ## [Unreleased]
 
-### Fixed
-- npm 入口套件現在附帶專用 README，避免 npm 套件頁只有空白說明。PR CI 與實際 staging 前都會用去除 token/OIDC 的最小環境、空白 npm user config 與暫存 cache 執行隔離、離線的 `npm publish --dry-run --offline --json`，關閉 provenance 與 lifecycle scripts，並拒絕缺少有效 README、manifest、CLI shim 或 installer 的 tarball；release workflow 會固定安裝 `npm@11.15.0` 後再驗最低版本門檻。
+## [0.4.0] - 2026-10-25
+
+### 升級須知 / Upgrade notes
+- **Rust API 有不相容的 struct literal 變更。** `audit::ScanOptions` 與 `hunt::run::EngineAuditor` 新增必填 `poc_image: String`；可傳 `sandbox::DEFAULT_POC_IMAGE.into()`。`FixCheckRun` 新增 `binding` 並序列化 binding-aware `outcome`，`FixCheckSummary` 新增 `scope` 與選填 `binding`。舊報告仍可讀，但沒有完整相鄰 execution binding 的歷史正向 fix receipt 會降為 `fix_unverified`；負向結果保留。
+
+### Added
+- 新增 VIR、ExecutionEnvelope、VerificationEvent、CounterexampleCell 與 EngineeringMeasurement 公開合約，以及 `vettalon verification validate|compare|scorecard|registry`。Replay 的 unknown／inconclusive 使用結束碼 4；反例升格需要不同 fresh challenge 的完整一致事件；sealed holdout 污染沿 parent lineage 傳遞，registry 會核對內容位址，不能換 ID 洗回 hidden。現階段只涵蓋三類 Python target 與 Docker reference backend，不宣稱跨語言工程護城河已成立。
+- `vettalon reproduce` 與 `vettalon fix check`：從 validator-clean 報告選定 finding，以封閉的 Python `TargetCall` 呼叫 prepared copy 內雜湊固定的同步 top-level function。`fix check` 要求 `--report-out`，同時產生獨立 receipt 與附上同一 diff、相鄰 check/context 證據的 validator-clean 報告；不改 live tree 或 finding status。
+
+### Security
+- 來源綁定執行以不可變 image ID 與 prepared-tree/file/plan/adapter/harness 雜湊產生收據。`reproduce` 的三個 phase 各用新容器；fix 的原版／修補版回歸與明示專案測試 phase 也各用新容器。目標子程序不直接接收 marker，子程序 stdout/stderr 不作判決輸入；父 harness 產生並嚴格解析 verdict，重複或格式錯誤一律拒絕。新 CLI 輸出只准新建並拒絕既存檔、symlink、hardlink 與 symlink parent；父目錄檢查不是 dirfd 錨定，仍不宣稱消除所有並行 rename 競態。
+
+### Changed
+- PoC sandbox 的成功 preflight 只在一次有界操作內共用，image ID 固定，但每個 phase 仍使用新容器。n=30 的本機 microbenchmark 在九階段負載觀察到 6.50% paired-median 改善，1／3 階段則沒有改善；它只支持減少 metadata probe 次數，不是 full-scan、release 或 SPACE 效能主張。
 
 ## [0.3.2] - 2026-10-24
 

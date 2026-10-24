@@ -2335,7 +2335,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn run_ai_audit_precheck_refutes_a_candidate_pointing_outside_the_prompt() {
+    async fn source_unavailable_finder_precheck_retains_invalid_candidate() {
         let dir = tmp_repo_with_files(&[("a/main.rs", "fn a(){}\nfn b(){}\n")]);
         let modules = vec![ModuleTarget {
             module_path: "a".to_string(),
@@ -2360,7 +2360,7 @@ pub(crate) mod tests {
             } => {
                 assert_eq!(findings.len(), 1);
                 let f = &findings[0];
-                assert_eq!(f.status, crate::audit::schema::FindingStatus::Refuted);
+                assert_eq!(f.status, crate::audit::schema::FindingStatus::Candidate);
                 let pc = f.precheck.as_ref().unwrap();
                 assert!(!pc.passed);
                 assert!(
@@ -2373,7 +2373,7 @@ pub(crate) mod tests {
                         .any(|v| v.starts_with("trace[0].file: unsafe path")),
                     "{pc:?}"
                 );
-                // Refuted-by-precheck still makes the module a `candidate` module.
+                // An invalid claim remains in the candidate denominator.
                 assert_eq!(module_reports[0].candidate_ids.len(), 1);
             }
             AiAuditOutcome::Unavailable { reason, .. } => panic!("{reason}"),

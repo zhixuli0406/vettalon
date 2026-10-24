@@ -130,6 +130,7 @@ fn opts(repo: &Path, rank: crate::audit::RankStrategy) -> crate::audit::ScanOpti
         gates: vec![],
         max_modules: 2,
         poc: false,
+        poc_image: crate::sandbox::DEFAULT_POC_IMAGE.into(),
         save: false,
         cross_check_top: 0,
         dual_finder_top: 0,

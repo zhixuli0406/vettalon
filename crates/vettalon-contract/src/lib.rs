@@ -43,4 +43,5 @@ pub mod fingerprint;
 pub mod safe_path;
 pub mod severity;
 pub mod strict_json;
+pub mod verification;
 pub mod visible_text;

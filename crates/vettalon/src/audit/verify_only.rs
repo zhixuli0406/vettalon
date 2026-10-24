@@ -234,11 +234,14 @@ pub struct VerifyOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub title_truncated: Vec<String>,
     pub reviewed: usize,
-    /// Left unverified: the first call failed (any error, a timeout
-    /// included) before any reply, so the rest were not attempted. Same
-    /// rule as the scan's review step.
+    /// Eligible findings left Candidate without a completed uncertain
+    /// review: source/claim validation failures, failed/malformed calls,
+    /// incomplete runs, and findings skipped by the dead-verifier breaker.
+    /// Completed model disagreements follow the scan's rule and do not
+    /// count as unverified.
     pub unverified: usize,
-    /// Settled without a model call (file unreadable, line out of range).
+    /// Source/claim validation failed without a model call. These findings
+    /// also count as unverified; zero calls do not imply a settled verdict.
     pub zero_llm: usize,
     pub passed_through: usize,
     pub calls: usize,
@@ -280,7 +283,7 @@ pub async fn run_verify(
     let (mut reviewed, mut unverified, mut zero_llm, mut passed) = (0, 0, 0, 0);
     let (mut answered_once, mut dead) = (false, false);
     // Findings closed after a model reply: the only ones `--joern-keep` asks
-    // about (a zero-call pre-check closure has no line Joern could reach).
+    // about (a zero-call source failure is not a refutation).
     let mut model_refuted: Vec<usize> = Vec::new();
     for (idx, f) in findings.iter_mut().enumerate() {
         let eligible = match mode {
@@ -348,6 +351,9 @@ pub async fn run_verify(
                 cross_family,
                 same_model,
             });
+        }
+        if f.status == FindingStatus::Candidate && !adversarial::is_uncertain(f) {
+            unverified += 1;
         }
     }
     let joern_keep = match &o.joern {
@@ -524,6 +530,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_unavailable_claims_count_as_unverified_and_do_not_stop_valid_reviews() {
+        let d = repo();
+        std::fs::create_dir(d.path().join("src/unreadable.py")).unwrap();
+        std::fs::write(d.path().join("src/.env"), "UNIQUE_VERIFY_SECRET").unwrap();
+        let mut claims: Vec<Claim> = [
+            ("missing", "src/missing.py", 1),
+            ("unreadable", "src/unreadable.py", 1),
+            ("unsafe", "../outside.py", 1),
+            ("line", "src/app.py", 99),
+            ("secret", "src/.env", 1),
+        ]
+        .into_iter()
+        .map(|(id, file, line)| Claim {
+            id: id.into(),
+            file: file.into(),
+            line: Some(line),
+            title: "A claim whose source cannot be reviewed".into(),
+            severity: None,
+            cwe: None,
+            rule_id: None,
+            source: Some("fixture".into()),
+            locations: Vec::new(),
+        })
+        .collect();
+        let VerifyInput::Claims(mut valid) = VerifyInput::parse(&claims_json("")).unwrap() else {
+            panic!("claims expected")
+        };
+        claims.append(&mut valid);
+        let fam = HashMap::new();
+        let out = run_verify(
+            d.path(),
+            VerifyInput::Claims(claims),
+            VerifyOptions {
+                verifier: handle("g", "google", vec![Ok(REFUTED.into())]),
+                families: &fam,
+                refuter_runs: 1,
+                deadline: None,
+                parse_retries: 1,
+                policy: Default::default(),
+                score: false,
+                score_threshold: None,
+                joern: None,
+                trace: TraceLog::default(),
+            },
+        )
+        .await;
+        assert_eq!((out.calls, out.reviewed, out.zero_llm), (1, 1, 5));
+        assert_eq!(out.unverified, 5);
+        assert!(out.incomplete);
+        assert_eq!(out.passed_through, 0);
+        for f in &out.findings[..5] {
+            assert_eq!(f.status, FindingStatus::Candidate);
+            assert!(f.verification.is_empty());
+            assert!(
+                f.evidence
+                    .iter()
+                    .any(|e| e.detail.starts_with("verify_error:"))
+            );
+            assert!(!format!("{:?}", f.evidence).contains("UNIQUE_VERIFY_SECRET"));
+        }
+        assert_eq!(out.findings[5].status, FindingStatus::Refuted);
+        assert_eq!(out.findings[5].verification.len(), 1);
+    }
+
+    #[tokio::test]
     async fn joern_keep_without_an_image_records_the_error_and_closes_nothing_new() {
         let d = repo();
         let VerifyInput::Claims(mut claims) = VerifyInput::parse(&claims_json(
@@ -532,7 +603,7 @@ mod tests {
         .unwrap() else {
             panic!()
         };
-        claims[1].line = Some(99); // out of range: zero-call pre-check closure
+        claims[1].line = Some(99); // out of range: zero-call unverified source
         let fam = HashMap::new();
         let out = run_verify(
             d.path(),
@@ -556,11 +627,13 @@ mod tests {
         )
         .await;
         let info = out.joern_keep.as_ref().unwrap();
-        // Only the model-refuted finding is asked about; the pre-check
-        // closure is not.
+        // Only the model-refuted finding is asked about; unavailable source
+        // stays unverified and is not sent to Joern.
         assert_eq!((info.checked, info.kept), (1, 0));
         assert_eq!(out.findings[0].status, FindingStatus::Refuted);
-        assert_eq!(out.findings[1].status, FindingStatus::Refuted);
+        assert_eq!(out.findings[1].status, FindingStatus::Candidate);
+        assert_eq!((out.zero_llm, out.unverified), (1, 1));
+        assert!(out.incomplete);
         let joern_lines: Vec<&str> = out.findings[0]
             .evidence
             .iter()
@@ -647,8 +720,9 @@ mod tests {
             },
         )
         .await;
-        assert_eq!((out.calls, out.unverified), (1, 1));
+        assert_eq!((out.calls, out.unverified), (1, 2));
         assert!(out.incomplete);
+        assert_eq!(out.findings[0].status, FindingStatus::Candidate);
         assert_eq!(out.findings[1].status, FindingStatus::Candidate);
     }
 }
