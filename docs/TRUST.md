@@ -66,6 +66,20 @@ npm stage list vettalon          # and each @vettalon/* package
 npm stage approve <stage-id>     # platform packages first, then vettalon
 ```
 
+Before any package is staged, `npm/scripts/publish.sh` runs the same isolated
+`npm publish --dry-run --offline --json` contract used by pull-request CI. The
+check uses an empty npm user config and a disposable cache, then fails unless
+the public `vettalon` tarball contains a non-empty `README.md`, `package.json`,
+the CLI shim, and its installer. The check strips the child process environment
+down to non-credential runtime variables, disables provenance and lifecycle
+scripts, and removes GitHub OIDC and npm token variables by omission. The
+release job installs the exact `npm@11.15.0` with lifecycle scripts disabled,
+then independently refuses anything older than 11.15.0, the first version that
+supports staged publishing. A passing dry run proves the expected local files
+would be packed; it does not contact the registry or OIDC endpoint,
+authenticate, publish, execute package lifecycle scripts, or prove the platform
+binaries.
+
 Check a published version's provenance with `npm audit signatures` in a project
 that installs it, or on the package page on npmjs.com. Provenance shows which
 workflow run built the package; it does not prove the source is safe, and a

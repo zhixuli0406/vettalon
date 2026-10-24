@@ -32,6 +32,7 @@
     "vettalon": "bin/vettalon"
   },
   "files": [
+    "README.md",
     "bin",
     "scripts"
   ],
