@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-24
+
 ### 升級須知 / Upgrade notes
 - **codex 與 grok 的認證 CLI 後端改為 fail-closed。** 容器內的工具型模型可讀取可重用的 auth 檔，並可經允許的廠商網域將它送出，因此未設 `allow_agent_tools = true` 時現在會拒絕這類設定。請改用能完全關閉工具的 CLI、HTTP/OpenAI-compatible API 或 Ollama；只有在程式碼可信且明確接受 host 檔案與憑證可被讀取的風險時，才設 `allow_agent_tools = true`。
   Authenticated codex and grok CLI backends now fail closed. A tool-capable model in the container can read reusable auth and send it to an allowlisted vendor domain, so such configurations are rejected unless `allow_agent_tools = true` explicitly accepts host file and credential access. Prefer a fully tool-disabled CLI, an HTTP/OpenAI-compatible API, or Ollama.
