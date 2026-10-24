@@ -41,4 +41,4 @@ Formal transport 的 context 準備與 prepared 重新驗證也會用相同 byte
 
 自建 positive／safe 各有 dry-run、mock artifacts，每份都保留 baseline/functions/callchain，總 12 mode records、6 mock dispatches、真模型零次。這些結果只驗 pipeline／scheduling contract，不輸出 recall、每美元收益、token 節省或整庫效果；真正同 snapshot 的 finder 對照仍待 D01／D02。
 
-多語言 v3 的[來源封存、byte-range、來源範圍與語法事實元件](multilang/README.md)另行版本化；已加入隔離子程序 parser，但尚未加入跨檔語義解析、context selection 或正式 E1 樣本准入。
+多語言 v3 的來源封存、byte-range、來源範圍與語法事實元件另行版本化（不在公開 repo）；已加入隔離子程序 parser，但尚未加入跨檔語義解析、context selection 或正式 E1 樣本准入。

@@ -120,6 +120,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Windows executable-boundary test failed: $LASTEXITCODE" }
           cargo test --locked -p vettalon --lib llm::container::tests::windows_agent_owner_probe_distinguishes_live_and_absent_processes -- --exact --nocapture
           if ($LASTEXITCODE -ne 0) { throw "Windows owner-liveness test failed: $LASTEXITCODE" }
+      - name: Run Windows disclosure path-containment tests
+        shell: pwsh
+        run: |
+          cargo test --locked -p vettalon --lib disclose::tests::detects_project_locally -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "Windows disclosure control failed: $LASTEXITCODE" }
+          cargo test --locked -p vettalon --lib disclose::tests::project_detection_rejects_an_absolute_head_ref_outside_the_repo -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "Windows disclosure containment test failed: $LASTEXITCODE" }
 
   fuzz:
     name: fuzz (cargo-fuzz, bounded run per target)
