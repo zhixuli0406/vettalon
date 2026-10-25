@@ -42,6 +42,7 @@ pub const DEFAULT_FINDER_PARSE_RETRIES: usize = ai_audit::AI_AUDIT_PARSE_RETRIES
 mod ai_audit;
 mod assign;
 mod comment_strip;
+pub mod completeness;
 mod coverage;
 pub mod cve;
 mod dual_finder;

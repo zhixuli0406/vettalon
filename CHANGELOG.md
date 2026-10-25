@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
+### Added
+
+- 新增 `audit::completeness::diagnose` 公開、確定性的掃描完整性診斷：從報告既有的執行狀態、引擎、模組、模型嘗試與來源讀取證據，列出未完成、未知、受影響範圍與處理類型；不改 finding 判定、掃描政策或 CLI 結束碼。
+- 新增 `audit::target_poc::preflight_source` 唯讀來源預檢，讓本機介面在執行 Docker 前先拒絕不支援的 oracle 類別、缺少來源身分、雜湊過期或越界路徑。成功只代表目前來源與 finding 身分一致，不代表重現或修補檢查會通過。
+
 ## [0.4.0] - 2026-10-25
 
 ### 升級須知 / Upgrade notes
