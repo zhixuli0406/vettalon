@@ -347,8 +347,31 @@ impl TargetSandbox for DockerTargetSandbox<'_> {
     }
 }
 
-/// Production entry point.  Docker detection is fail-closed and the selected
-/// mutable tag is resolved to one immutable image ID for this operation.
+/// Read-only source preflight shared by GUI transports. Does not execute source,
+/// create containers, or claim that a function call will succeed at runtime.
+pub fn preflight_source(repo_root: &Path, finding: &Finding) -> Result<String, &'static str> {
+    TargetCall {
+        file: finding.file.clone(),
+        function: "target".into(),
+        args: vec![TargetArgument::Payload],
+    }
+    .validate()?;
+    if classify(finding).is_none() {
+        return Err("unsupported_oracle_class");
+    }
+    let expected = finding
+        .file_hash
+        .as_deref()
+        .filter(|hash| is_sha256(hash))
+        .ok_or("missing_finding_source_identity")?;
+    let (_, live_hash) = read_target_source(repo_root, &finding.file)?;
+    if expected != live_hash {
+        return Err("stale_source");
+    }
+    Ok(live_hash)
+}
+
+/// Docker detection binds the selected mutable tag to an immutable image ID.
 pub async fn run_target_poc(
     repo_root: &Path,
     finding: &Finding,

@@ -37,6 +37,31 @@ const SAFE: &str = "# SAFE\nimport os\ndef read_file(payload):\n    if '/' in pa
 const FORGED: &str = "import os\ndef read_file(payload):\n    import __main__\n    marker = getattr(__main__, 'MARKER', 'forged')\n    print('__VTL_ORACLE__ ' + marker + ' effect=true')\n    os._exit(0)\n";
 
 #[test]
+fn preflight_requires_supported_pinned_current_source_without_executing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), VULNERABLE).unwrap();
+    let mut f = finding(VULNERABLE);
+    assert_eq!(
+        preflight_source(dir.path(), &f).unwrap(),
+        f.file_hash.clone().unwrap()
+    );
+    std::fs::write(dir.path().join("app.py"), SAFE).unwrap();
+    assert_eq!(preflight_source(dir.path(), &f), Err("stale_source"));
+    f.file_hash = None;
+    assert_eq!(
+        preflight_source(dir.path(), &f),
+        Err("missing_finding_source_identity")
+    );
+    f.cwe = Some("CWE-79".into());
+    assert_eq!(
+        preflight_source(dir.path(), &f),
+        Err("unsupported_oracle_class")
+    );
+    f.file = "../app.py".into();
+    assert!(preflight_source(dir.path(), &f).is_err());
+}
+
+#[test]
 fn target_call_schema_is_closed_and_never_accepts_code_or_unbounded_data() {
     assert!(
         parse_target_call(
