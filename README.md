@@ -14,7 +14,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15717/badge)](https://www.bestpractices.dev/projects/15717)
 
-Vettalon finds security vulnerabilities in your own code: AI models from several vendors split up the review, then a model from a different vendor tries to refute each finding, and only the findings it can't refute are kept.
+Vettalon gives you an independent second opinion on security findings, whether they come from its own scan or from another tool: AI models from several vendors split up the review, a model from a different vendor tries to refute each finding, and every finding that survives carries its evidence level, the proof still missing and the strongest counterevidence. Anything unfinished stays marked unfinished, and a human makes the final call.
 
 ![Vettalon demo](docs/assets/demo.gif)
 
