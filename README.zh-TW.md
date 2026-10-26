@@ -14,7 +14,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15717/badge)](https://www.bestpractices.dev/projects/15717)
 
-Vettalon 找出你自己程式碼裡的安全漏洞。做法是讓多家 AI 模型分工審查，再交給另一家模型試著推翻每一個發現，留下推不翻的。
+Vettalon 替安全 finding 提供獨立的第二意見，來源可以是它自己的掃描，也可以是別的工具：多家 AI 模型分工審查，再由另一家模型試著推翻每一個發現；留下來的每一筆都帶著證據等級、還缺的證明與最強反證。沒做完的就標成沒做完，最後由人判定。
 
 ![Vettalon demo](docs/assets/demo.gif)
 
