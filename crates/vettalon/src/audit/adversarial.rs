@@ -54,6 +54,13 @@
 //! `tier_disagreement`. Across consistent runs the highest-friction list is
 //! kept. `conditions` on a `refuted` reply is a contract violation.
 //!
+//! Plausible replies are asked to independently assess impact (low to critical).
+//! Each usable run whose impact differs from the finder records
+//! `severity_disagreement`. Only a different-family, different-model refuter
+//! authorizes capping at the higher finder/refuter impact; otherwise the claim stays.
+//! Missing or unusable impact records `refuter_impact_missing` without changing
+//! the verdict or triggering a re-ask. Impact on refuted replies is ignored.
+//!
 //! Every path the model supplied is read only through
 //! [`SafeRepoPath::parse`] + [`SafeRepoPath::join_under`] (security fix G1:
 //! v1 did `repo_root.join(finding.file)`, and an absolute `file` replaced the
@@ -70,10 +77,10 @@
 //!   and in a multi-run review it counts as a missing run (incomplete),
 //!   not as a disagreement.
 //! - `"refuted"` → `Refuted`.
-//! - `"plausible"` with non-empty `blockers` and at least one
-//!   `validation_plan` field → `NeedsHuman`, blockers and plan copied onto
-//!   the finding. `"plausible"` without them → `verify_error: plausible
-//!   without blockers`, stays `Candidate`.
+//! - `"plausible"` with non-empty `blockers`, at least one
+//!   `validation_plan` field → `NeedsHuman`, blockers
+//!   and plan copied onto the finding. Missing requirements are contract
+//!   violations; exhausted correction retries keep the finding `Candidate`.
 //! - Corrections (Cloudflare Phase 3: "a corrected record replaces the
 //!   hunter's wording"): a `"plausible"` reply may carry `corrected_line`
 //!   and/or `corrected_trace` when the root cause is real but a cited
@@ -100,6 +107,7 @@ use serde::Deserialize;
 
 use crate::llm::LlmCaller;
 use vettalon_contract::safe_path::SafeRepoPath;
+use vettalon_contract::severity::Level;
 use vettalon_contract::strict_json;
 use vettalon_contract::visible_text::has_visible_content;
 
@@ -115,9 +123,9 @@ use super::refuter_policy::{self, BasisRecord, RefuterPolicy};
 use super::refuter_score::{self, ScoreRead};
 use super::schema::{
     COMMENT_SENSITIVITY_PREFIX, Condition, EvidenceItem, EvidenceKind, Finding, FindingStatus,
-    PLAUSIBLE_PREFIX, REFUTER_CONSISTENT_PREFIX, SNIPPET_MAX_BYTES, Severity,
-    TIER_DISAGREEMENT_PREFIX, TraceStep, VERIFIER_CORRECTED_PREFIX, VERIFY_UNCERTAIN_PREFIX,
-    ValidationPlan, VoteVerdict,
+    PLAUSIBLE_PREFIX, REFUTER_CONSISTENT_PREFIX, SEVERITY_DISAGREEMENT_PREFIX, SNIPPET_MAX_BYTES,
+    Severity, TIER_DISAGREEMENT_PREFIX, TraceStep, VERIFIER_CORRECTED_PREFIX,
+    VERIFY_UNCERTAIN_PREFIX, ValidationPlan, VoteVerdict,
 };
 
 /// Default `--refuter-runs`: independent refuter calls per finding at
@@ -191,6 +199,21 @@ pub struct VerifierReply {
     /// (no refuter tier); `Some([])` = the refuter sees none.
     #[serde(default)]
     pub conditions: Option<Vec<Condition>>,
+    /// Auxiliary independent impact; missing or unusable values do not affect the verdict.
+    #[serde(default, deserialize_with = "deserialize_refuter_impact")]
+    pub impact: Option<Level>,
+}
+
+/// Impact is auxiliary: only usable severity levels participate in comparisons.
+/// Ignore other JSON values so impact alone cannot invalidate a verdict.
+pub(super) fn deserialize_refuter_impact<'de, D>(deserializer: D) -> Result<Option<Level>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<Level>(value)
+        .ok()
+        .filter(|level| *level != Level::Informational))
 }
 
 /// Why a refuter says the claim fails.
@@ -478,7 +501,8 @@ code for an attacker to exploit it, judged on your own rather than copied from t
 claim's list: each with a kind from authentication_level, authorization_role, \
 user_interaction, system_configuration, network_routing, environmental_dependency, \
 data_state, timing_dependency, third_party_dependency, and a short description. Use [] \
-when nothing beyond sending the input is needed.\n\n\
+when nothing beyond sending the input is needed. Also assess impact independently: \
+low, medium, high or critical. Provide impact for plausible; use null for refuted. Impact is auxiliary: missing or unusable impact does not invalidate the reply or change the verdict.\n\n\
 Reply with ONLY one JSON object (a markdown fence around it is tolerated, nothing else, \
 no extra keys): {{\"verdict\": \"refuted\"|\"plausible\", \"reason\": \"<one or two \
 sentences>\", \"blockers\": [\"<what is still unknown>\"], \"validation_plan\": \
@@ -489,8 +513,8 @@ deployed system>\"}}, \"corrected_line\": null|<real line in the claimed file>, 
 \"<what happens>\"}}], \"refute_basis\": null|\"guarded\"|\"defect_absent\"|\"unreachable\"|\
 \"not_dangerous\", \"guard\": null|{{\"file\": \"<repo-relative path>\", \"line\": <line of \
 the guard>}}, \"conditions\": null|[{{\"kind\": \"<precondition kind>\", \"description\": \
-\"<what must hold>\"}}]}}. For \"refuted\" use an empty blockers array, null validation_plan \
-fields, null corrections and null conditions, and always set refute_basis. For \
+\"<what must hold>\"}}], \"impact\": null|\"low\"|\"medium\"|\"high\"|\"critical\"}}. For \"refuted\" use an empty blockers array, null validation_plan \
+fields, null corrections, null conditions and null impact, and always set refute_basis. For \
 \"plausible\" set refute_basis and guard to null. Leave corrected_line / corrected_trace null when the claim's locations are \
 already right; corrected_trace replaces the whole trace.\n"
     )
@@ -835,6 +859,7 @@ pub struct PlausibleRun {
     corrected_trace: Option<Vec<TraceStep>>,
     /// The refuter's own preconditions (O11), already capped.
     conditions: Option<Vec<Condition>>,
+    impact: Option<Level>,
 }
 
 /// One refuter run's outcome after every contract and disk check, before
@@ -997,6 +1022,7 @@ pub fn evaluate_reply(repo_root: &Path, finding: &Finding, reply: VerifierReply)
                 corrected_line: reply.corrected_line,
                 corrected_trace: reply.corrected_trace,
                 conditions: reply.conditions.as_deref().map(clean_conditions),
+                impact: reply.impact.filter(|level| *level != Level::Informational),
             }))
         }
     }
@@ -1015,6 +1041,109 @@ fn apply_plausible(repo_root: &Path, finding: &mut Finding, run: &PlausibleRun) 
     finding.blockers = run.blockers.clone();
     finding.validation_plan = Some(run.plan.clone());
     record_refuter_conditions(finding, run.conditions.clone());
+}
+
+/// Only an independently assigned plausible refuter can authorize a cap.
+/// `None` covers missing impacts, skipped/failed reviews and same-family models.
+pub(super) fn finalize_severity(finding: &mut Finding, independent_impact: Option<Level>) {
+    let (Some(claimed), Some(finder)) = (
+        finding.severity_claimed,
+        finding.impact.as_ref().map(|assessment| assessment.level),
+    ) else {
+        return;
+    };
+    finding.severity = claimed;
+    finding.evidence.retain(|e| {
+        !matches!(
+            e.kind,
+            EvidenceKind::SeverityCapped | EvidenceKind::SeverityCapUnconfirmed
+        )
+    });
+    if finding.status == FindingStatus::Refuted {
+        return;
+    }
+    let (kind, detail) = if let Some(refuter) = independent_impact {
+        let effective =
+            vettalon_contract::severity::cap_overall(claimed.into(), finder.max(refuter));
+        finding.severity = effective.into();
+        if finding.severity == claimed {
+            return;
+        }
+        (
+            EvidenceKind::SeverityCapped,
+            format!(
+                "{} {}→{} (finder impact={finder}, refuter impact={refuter})",
+                super::schema::SEVERITY_CAPPED_PREFIX,
+                claimed.as_str(),
+                finding.severity.as_str()
+            ),
+        )
+    } else {
+        let proposed: Severity =
+            vettalon_contract::severity::cap_overall(claimed.into(), finder).into();
+        if proposed == claimed {
+            return;
+        }
+        (
+            EvidenceKind::SeverityCapUnconfirmed,
+            format!(
+                "{} claimed={} proposed={} (finder impact={finder}; \
+                 no independent plausible refuter impact)",
+                super::schema::SEVERITY_CAP_UNCONFIRMED_PREFIX,
+                claimed.as_str(),
+                proposed.as_str()
+            ),
+        )
+    };
+    finding.evidence.push(EvidenceItem {
+        kind,
+        source: "adversarial".into(),
+        detail,
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    });
+}
+
+fn record_refuter_impacts(finding: &mut Finding, runs: &[RunVerdict]) {
+    let Some(finder) = finding.impact.as_ref().map(|assessment| assessment.level) else {
+        return;
+    };
+    // Preserve first-seen impact order and the original 1-based run numbers,
+    // including gaps from missing or non-plausible assessments.
+    let mut groups: Vec<(Level, Vec<usize>)> = Vec::new();
+    for (i, run) in runs.iter().enumerate() {
+        if let RunVerdict::Plausible(plausible) = run
+            && let Some(impact) = plausible.impact
+        {
+            if let Some((_, indices)) = groups.iter_mut().find(|(level, _)| *level == impact) {
+                indices.push(i + 1);
+            } else {
+                groups.push((impact, vec![i + 1]));
+            }
+        }
+    }
+    if groups.iter().any(|(impact, _)| *impact != finder) {
+        let impacts = groups
+            .iter()
+            .map(|(impact, indices)| {
+                let label = if indices.len() == 1 { "run" } else { "runs" };
+                let indices = indices
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{impact} ({label} {indices} of {})", runs.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        finding.evidence.push(EvidenceItem {
+            kind: EvidenceKind::SeverityDisagreement,
+            source: "adversarial".to_string(),
+            detail: format!(
+                "{SEVERITY_DISAGREEMENT_PREFIX} finder impact={finder}, refuter impact={impacts}"
+            ),
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+        });
+    }
 }
 
 /// O11: keep the refuter's own preconditions; the effective tier is the
@@ -1082,13 +1211,56 @@ pub fn settle(repo_root: &Path, finding: &mut Finding, runs: &[RunVerdict]) {
 
 /// [`settle`] where run `with_comments` (0-based) saw the excerpts with
 /// comments (O10); every other run saw them stripped.
+#[cfg(test)]
 pub fn settle_runs(
     repo_root: &Path,
     finding: &mut Finding,
     runs: &[RunVerdict],
     with_comments: Option<usize>,
 ) {
+    settle_runs_with_independence(repo_root, finding, runs, with_comments, false);
+}
+
+fn settle_runs_with_independence(
+    repo_root: &Path,
+    finding: &mut Finding,
+    runs: &[RunVerdict],
+    with_comments: Option<usize>,
+    independent_refuter: bool,
+) {
+    settle_verdicts(repo_root, finding, runs, with_comments);
+    let impact = independent_refuter
+        .then(|| {
+            runs.iter()
+                .filter_map(|run| match run {
+                    RunVerdict::Plausible(p) => p.impact,
+                    _ => None,
+                })
+                .max()
+        })
+        .flatten();
+    finalize_severity(finding, impact);
+}
+
+fn settle_verdicts(
+    repo_root: &Path,
+    finding: &mut Finding,
+    runs: &[RunVerdict],
+    with_comments: Option<usize>,
+) {
+    // Preserve all usable assessments even when verdicts disagree.
     let n = runs.len();
+    record_refuter_impacts(finding, runs);
+    for (i, run) in runs.iter().enumerate() {
+        if let RunVerdict::Plausible(plausible) = run
+            && plausible.impact.is_none()
+        {
+            push_evidence(
+                finding,
+                format!("refuter_impact_missing: run {}/{n}", i + 1),
+            );
+        }
+    }
     if n <= 1 {
         match runs.first() {
             Some(RunVerdict::Refuted { reason }) => {
@@ -1287,6 +1459,8 @@ pub enum ReviewOutcome {
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewPlan {
     pub runs: usize,
+    /// Trusted roster assignment: different finder family and not the same model.
+    pub independent_refuter: bool,
     /// Scan-wide `--time-budget` deadline. Run 1 always happens; runs 2..n
     /// are not started after it, and no correction call starts after it.
     pub deadline: Option<Instant>,
@@ -1309,6 +1483,7 @@ impl ReviewPlan {
     pub fn single() -> Self {
         ReviewPlan {
             runs: 1,
+            independent_refuter: false,
             deadline: None,
             parse_retries: DEFAULT_VERIFIER_PARSE_RETRIES,
             policy: RefuterPolicy::CURRENT,
@@ -1326,7 +1501,7 @@ pub fn build_verifier_reflector_prompt(base_prompt: &str, violation: &str) -> St
 Your previous reply was discarded because it broke the reply contract: {}\n\
 Answer again with ONLY the one JSON object described above. A \"plausible\" verdict needs a \
 non-empty blockers array and at least one validation_plan field; a \"refuted\" verdict needs \
-refute_basis and no corrections or conditions. Decide the verdict from the excerpts as before.\n",
+refute_basis and no corrections or conditions. Please also assess impact (low, medium, high or critical) for plausible; missing impact does not invalidate the reply. Impact on refuted replies is ignored. Decide the verdict from the excerpts as before.\n",
         crate::util::truncate_bytes(violation, 500)
     )
 }
@@ -1349,6 +1524,7 @@ pub async fn review_with<C: LlmCaller>(
     caller: &C,
     plan: ReviewPlan,
 ) -> ReviewOutcome {
+    finalize_severity(finding, None);
     if let Some(precheck) = finding.precheck.as_ref().filter(|p| !p.passed) {
         let why = format!(
             "candidate pre-check failed: {}",
@@ -1607,7 +1783,13 @@ pub async fn review_with<C: LlmCaller>(
             push_evidence(finding, b.evidence_line(i + 1, n, run_outcome(run)));
         }
     }
-    settle_runs(repo_root, finding, &runs, with_comments);
+    settle_runs_with_independence(
+        repo_root,
+        finding,
+        &runs,
+        with_comments,
+        plan.independent_refuter,
+    );
     // I2: a closure that rests on a guard or on "not attacker-controlled"
     // gets one blind prosecutor call. It sees the claim, the excerpts and the
     // cited line numbers only: never the refuter's reason or framing. A
@@ -1649,6 +1831,10 @@ pub async fn review_with<C: LlmCaller>(
             Ok(raw) => {
                 let outcome = refuter_policy::judge_prosecutor(repo_root, &raw, &shown);
                 refuter_policy::apply_prosecutor(finding, &outcome);
+                if finding.status != FindingStatus::Refuted {
+                    // A veto reopens a refuted claim, not a plausible impact assessment.
+                    finalize_severity(finding, None);
+                }
             }
         }
     }
@@ -1752,7 +1938,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) const REFUTED: &str = r#"{"verdict":"refuted","reason":"not reachable","blockers":[],"validation_plan":{"local":null,"deployment":null},"refute_basis":"unreachable"}"#;
-    pub(crate) const PLAUSIBLE: &str = r#"{"verdict":"plausible","reason":"raw execute confirmed","blockers":["is the endpoint exposed?"],"validation_plan":{"local":"curl the handler","deployment":null}}"#;
+    pub(crate) const PLAUSIBLE: &str = r#"{"verdict":"plausible","impact":"high","reason":"raw execute confirmed","blockers":["is the endpoint exposed?"],"validation_plan":{"local":"curl the handler","deployment":null}}"#;
 
     // ── parse_verdict ─────────────────────────────────────────────────
 
@@ -2226,7 +2412,7 @@ pub(crate) mod tests {
 
     fn corrected_reply(line: u32) -> String {
         format!(
-            r#"{{"verdict":"plausible","reason":"eval on request input exists at line {line}","blockers":["is the view routed?"],"validation_plan":{{"local":"call the view with q=1+1","deployment":null}},"corrected_line":{line},"corrected_trace":[{{"kind":"entrypoint","file":"app/views.py","line":3,"scope":"view","description":"reads q"}},{{"kind":"sink","file":"app/views.py","line":{line},"scope":"view","description":"eval"}}]}}"#
+            r#"{{"verdict":"plausible","impact":"high","reason":"eval on request input exists at line {line}","blockers":["is the view routed?"],"validation_plan":{{"local":"call the view with q=1+1","deployment":null}},"corrected_line":{line},"corrected_trace":[{{"kind":"entrypoint","file":"app/views.py","line":3,"scope":"view","description":"reads q"}},{{"kind":"sink","file":"app/views.py","line":{line},"scope":"view","description":"eval"}}]}}"#
         )
     }
 
@@ -2387,6 +2573,7 @@ pub(crate) mod tests {
     fn plan(runs: usize) -> ReviewPlan {
         ReviewPlan {
             runs,
+            independent_refuter: false,
             deadline: None,
             parse_retries: DEFAULT_VERIFIER_PARSE_RETRIES,
             policy: RefuterPolicy::CURRENT,
@@ -2571,7 +2758,7 @@ pub(crate) mod tests {
 
     // ── verifier reflector (malformed replies are not verdicts) ─────────
 
-    const NO_BLOCKERS: &str = r#"{"verdict":"plausible","reason":"input reaches the sink","blockers":[],"validation_plan":{"local":null,"deployment":null}}"#;
+    const NO_BLOCKERS: &str = r#"{"verdict":"plausible","impact":"high","reason":"input reaches the sink","blockers":[],"validation_plan":{"local":null,"deployment":null}}"#;
 
     fn reflector_note(f: &Finding) -> Option<String> {
         f.evidence
@@ -2679,6 +2866,7 @@ pub(crate) mod tests {
         let caller = SeqCaller::new(vec![ok(NO_BLOCKERS), ok(PLAUSIBLE)]);
         let no_retry = ReviewPlan {
             runs: 1,
+            independent_refuter: false,
             deadline: None,
             parse_retries: 0,
             policy: RefuterPolicy::CURRENT,
@@ -2747,6 +2935,7 @@ pub(crate) mod tests {
         let caller = SeqCaller::new(vec![ok(PLAUSIBLE), ok(PLAUSIBLE), ok(PLAUSIBLE)]);
         let past = ReviewPlan {
             runs: 3,
+            independent_refuter: false,
             deadline: Some(Instant::now()),
             parse_retries: DEFAULT_VERIFIER_PARSE_RETRIES,
             policy: RefuterPolicy::CURRENT,
@@ -3432,5 +3621,343 @@ pub(crate) mod tests {
         let p = &caller.prompts()[0];
         assert!(excerpts_of(p).contains("    3 |     system(q);"), "{p}");
         assert!(!p.contains("<stripped_comments>"));
+    }
+
+    #[test]
+    fn impact_does_not_replace_plausible_blockers_or_plan() {
+        let dir = repo_with_db();
+        for impact in [None, Some(Level::Informational), Some(Level::High)] {
+            for missing_blockers in [false, true] {
+                let mut reply = parse_verdict(PLAUSIBLE).unwrap();
+                reply.impact = impact;
+                if missing_blockers {
+                    reply.blockers.clear();
+                } else {
+                    reply.validation_plan = ValidationPlan::default();
+                }
+                assert!(matches!(
+                    evaluate_reply(dir.path(), &sample_finding(), reply),
+                    RunVerdict::Malformed(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn no_independent_impact_without_a_lower_proposal_keeps_claim_without_a_note() {
+        for claimed in [
+            Severity::Info,
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ] {
+            for impact in Level::ALL {
+                if impact < Level::from(claimed) {
+                    continue;
+                }
+                let mut f = sample_finding();
+                f.severity_claimed = Some(claimed);
+                f.impact = Some(crate::audit::schema::SeverityAssessment {
+                    level: impact,
+                    reason: "impact does not lower the claim".into(),
+                });
+                finalize_severity(&mut f, None);
+                assert_eq!(f.severity, claimed);
+                assert!(
+                    !f.evidence
+                        .iter()
+                        .any(|e| e.kind == EvidenceKind::SeverityCapUnconfirmed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_independent_impact_records_only_the_lower_proposal_and_keeps_claim() {
+        let mut f = sample_finding();
+        f.severity_claimed = Some(Severity::High);
+        f.impact = Some(crate::audit::schema::SeverityAssessment {
+            level: Level::Medium,
+            reason: "limited damage".into(),
+        });
+        finalize_severity(&mut f, None);
+        assert_eq!(f.severity, Severity::High);
+        let notes: Vec<_> = f
+            .evidence
+            .iter()
+            .filter(|e| e.kind == EvidenceKind::SeverityCapUnconfirmed)
+            .collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].detail,
+            "severity_cap_unconfirmed: claimed=high proposed=medium (finder impact=medium; \
+             no independent plausible refuter impact)"
+        );
+    }
+
+    #[test]
+    fn finalizing_an_unconfirmed_cap_twice_does_not_duplicate_evidence() {
+        let mut f = sample_finding();
+        f.severity_claimed = Some(Severity::High);
+        f.impact = Some(crate::audit::schema::SeverityAssessment {
+            level: Level::Medium,
+            reason: "limited damage".into(),
+        });
+        for _ in 0..2 {
+            finalize_severity(&mut f, None);
+            assert_eq!(f.severity, Severity::High);
+            assert_eq!(
+                f.evidence
+                    .iter()
+                    .filter(|e| e.kind == EvidenceKind::SeverityCapUnconfirmed)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn absent_or_failed_refuter_runs_keep_claimed_severity() {
+        let dir = repo_with_db();
+        for runs in [
+            vec![],
+            vec![RunVerdict::CallFailed {
+                error: "offline".into(),
+            }],
+            vec![RunVerdict::Malformed("bad reply".into())],
+            vec![RunVerdict::Invalid("bad correction".into())],
+            vec![RunVerdict::NotRun("budget exhausted")],
+        ] {
+            let mut f = sample_finding();
+            f.severity = Severity::Low;
+            f.severity_claimed = Some(Severity::Critical);
+            f.impact = Some(crate::audit::schema::SeverityAssessment {
+                level: Level::Low,
+                reason: "limited damage".into(),
+            });
+            settle_runs_with_independence(dir.path(), &mut f, &runs, None, true);
+            assert_eq!(f.severity, Severity::Critical);
+            assert!(
+                f.evidence
+                    .iter()
+                    .any(|e| e.detail.starts_with("severity_cap_unconfirmed:"))
+            );
+        }
+    }
+
+    #[test]
+    fn severity_cap_uses_highest_plausible_impact_and_never_caps_refutations() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        f.severity = Severity::Critical;
+        f.severity_claimed = Some(Severity::Critical);
+        f.impact = Some(crate::audit::schema::SeverityAssessment {
+            level: Level::Low,
+            reason: "limited damage".into(),
+        });
+        let high = evaluate_reply(dir.path(), &f, parse_verdict(PLAUSIBLE).unwrap());
+        let low = evaluate_reply(
+            dir.path(),
+            &f,
+            parse_verdict(&PLAUSIBLE.replace(r#""impact":"high""#, r#""impact":"low""#)).unwrap(),
+        );
+        let refuted = evaluate_reply(dir.path(), &f, parse_verdict(REFUTED).unwrap());
+        settle_runs_with_independence(
+            dir.path(),
+            &mut f,
+            &[low, high, refuted.clone()],
+            None,
+            true,
+        );
+        assert_eq!(f.severity, Severity::High);
+        assert!(f.evidence.iter().any(|e| e.detail
+            == "severity_capped: critical→high (finder impact=low, refuter impact=high)"));
+        settle_runs_with_independence(dir.path(), &mut f, &[refuted], None, true);
+        assert_eq!(f.status, FindingStatus::Refuted);
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(
+            !f.evidence
+                .iter()
+                .any(|e| e.kind == EvidenceKind::SeverityCapped)
+        );
+    }
+
+    #[tokio::test]
+    async fn refuter_impact_without_independence_keeps_claimed_severity() {
+        let dir = repo_with_db();
+        for impact in [Level::Low, Level::Medium, Level::High, Level::Critical] {
+            let mut f = sample_finding();
+            f.severity = Severity::Critical;
+            f.severity_claimed = Some(Severity::Critical);
+            f.impact = Some(crate::audit::schema::SeverityAssessment {
+                level: Level::Medium,
+                reason: "limited damage".into(),
+            });
+            let raw = PLAUSIBLE.replace("high", impact.as_str());
+            let caller = SeqCaller::new(vec![ok(&raw)]);
+            review_with(dir.path(), &mut f, &caller, plan(1)).await;
+            assert_eq!(caller.calls(), 1);
+            assert!(reflector_note(&f).is_none());
+            assert_eq!(f.severity, Severity::Critical);
+            assert_eq!(f.status, FindingStatus::NeedsHuman);
+            let disagreements: Vec<_> = f
+                .evidence
+                .iter()
+                .filter(|e| e.kind == EvidenceKind::SeverityDisagreement)
+                .collect();
+            if impact == Level::Medium {
+                assert!(disagreements.is_empty());
+            } else {
+                assert_eq!(disagreements.len(), 1);
+                assert_eq!(
+                    disagreements[0].detail,
+                    format!(
+                        "severity_disagreement: finder impact=medium, refuter impact={impact} (run 1 of 1)"
+                    )
+                );
+            }
+        }
+        let mut legacy = sample_finding();
+        apply_reply(dir.path(), &mut legacy, parse_verdict(PLAUSIBLE).unwrap());
+        assert!(
+            !legacy
+                .evidence
+                .iter()
+                .any(|e| e.kind == EvidenceKind::SeverityDisagreement)
+        );
+    }
+
+    #[test]
+    fn every_plausible_run_keeps_impact_disagreement_even_with_mixed_verdicts() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        f.impact = Some(crate::audit::schema::SeverityAssessment {
+            level: Level::Medium,
+            reason: "limited damage".into(),
+        });
+        let high = evaluate_reply(dir.path(), &f, parse_verdict(PLAUSIBLE).unwrap());
+        let low = evaluate_reply(
+            dir.path(),
+            &f,
+            parse_verdict(&PLAUSIBLE.replace(r#""impact":"high""#, r#""impact":"low""#)).unwrap(),
+        );
+        let refuted = evaluate_reply(dir.path(), &f, parse_verdict(REFUTED).unwrap());
+        settle(dir.path(), &mut f, &[high, low, refuted]);
+        assert_eq!(f.status, FindingStatus::Candidate);
+        assert_eq!(
+            f.evidence
+                .iter()
+                .filter(|e| e.kind == EvidenceKind::SeverityDisagreement)
+                .count(),
+            1
+        );
+        let note = f
+            .evidence
+            .iter()
+            .find(|e| e.kind == EvidenceKind::SeverityDisagreement)
+            .unwrap();
+        assert_eq!(
+            note.detail,
+            "severity_disagreement: finder impact=medium, refuter impact=high (run 1 of 3), low (run 2 of 3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn auxiliary_impact_never_triggers_a_reflector() {
+        let dir = repo_with_db();
+        for impact in [
+            None,
+            Some("null"),
+            Some(r#""info""#),
+            Some(r#""informational""#),
+            Some(r#""unknown""#),
+            Some("42"),
+        ] {
+            let mut raw: serde_json::Value = serde_json::from_str(PLAUSIBLE).unwrap();
+            if let Some(value) = impact {
+                raw["impact"] = serde_json::from_str(value).unwrap();
+            } else {
+                raw.as_object_mut().unwrap().remove("impact");
+            }
+            let mut f = sample_finding();
+            f.impact = Some(crate::audit::schema::SeverityAssessment {
+                level: Level::Medium,
+                reason: "limited damage".into(),
+            });
+            let severity = f.severity;
+            let caller = SeqCaller::new(vec![ok(&raw.to_string())]);
+            let out = review_with(dir.path(), &mut f, &caller, plan(1)).await;
+            assert_eq!(caller.calls(), 1, "{impact:?}");
+            assert_eq!(f.status, FindingStatus::NeedsHuman);
+            assert_eq!(votes_of(&out), vec![VoteVerdict::Plausible]);
+            assert_eq!(f.severity, severity);
+            assert_eq!(f.blockers, vec!["is the endpoint exposed?"]);
+            assert_eq!(
+                f.validation_plan.unwrap().local.as_deref(),
+                Some("curl the handler")
+            );
+            assert!(
+                f.evidence
+                    .iter()
+                    .any(|e| e.detail == "refuter_impact_missing: run 1/1")
+            );
+            assert!(
+                !f.evidence
+                    .iter()
+                    .any(|e| e.kind == EvidenceKind::SeverityDisagreement
+                        || e.detail.starts_with(VERIFIER_REFLECTOR_PREFIX))
+            );
+            let prompt = &caller.prompts.lock().unwrap()[0];
+            assert!(prompt.contains("Provide impact for plausible"));
+            assert!(prompt.contains("does not invalidate the reply"));
+        }
+        for impact in [r#""high""#, r#""info""#, "42"] {
+            let mut raw: serde_json::Value = serde_json::from_str(REFUTED).unwrap();
+            raw["impact"] = serde_json::from_str(impact).unwrap();
+            let mut f = sample_finding();
+            f.impact = Some(crate::audit::schema::SeverityAssessment {
+                level: Level::Low,
+                reason: "limited damage".into(),
+            });
+            let caller = SeqCaller::new(vec![ok(&raw.to_string())]);
+            review_with(dir.path(), &mut f, &caller, plan(1)).await;
+            assert_eq!(caller.calls(), 1);
+            assert_eq!(f.status, FindingStatus::Refuted);
+            assert!(reflector_note(&f).is_none());
+            assert!(
+                !f.evidence
+                    .iter()
+                    .any(|e| e.kind == EvidenceKind::SeverityDisagreement
+                        || e.detail.starts_with("refuter_impact_missing:"))
+            );
+        }
+        let prompt = build_verifier_reflector_prompt("base", "missing blockers");
+        assert!(prompt.contains("Please also assess impact"));
+        assert!(prompt.contains("missing impact does not invalidate the reply"));
+    }
+
+    #[test]
+    fn missing_impact_notes_keep_run_indices() {
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        let missing = PLAUSIBLE.replace(r#""impact":"high","#, "");
+        let runs = [REFUTED, &missing, PLAUSIBLE, &missing]
+            .map(|raw| evaluate_reply(dir.path(), &f, parse_verdict(raw).unwrap()));
+        settle(dir.path(), &mut f, &runs);
+        let notes: Vec<_> = f
+            .evidence
+            .iter()
+            .filter(|e| e.detail.starts_with("refuter_impact_missing:"))
+            .map(|e| e.detail.as_str())
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                "refuter_impact_missing: run 2/4",
+                "refuter_impact_missing: run 4/4"
+            ]
+        );
+        assert_eq!(f.status, FindingStatus::Candidate);
     }
 }

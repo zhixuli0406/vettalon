@@ -804,7 +804,7 @@ mod tests {
         );
         let summary =
             Summary::from_findings(std::slice::from_ref(&f), 0, 0, GatePolicy::default(), &[]);
-        let report = serde_json::json!({ "schema_version": 2, "repo": "synthetic-example", "started_at": "2026-10-16T00:00:00Z",
+        let report = serde_json::json!({ "schema_version": super::super::schema::CURRENT_SCHEMA_VERSION, "repo": "synthetic-example", "started_at": "2026-10-16T00:00:00Z",
             "profile": {"mode": "quick"}, "engines_run": [], "engines_missing": [], "findings": [f], "summary": summary });
         std::fs::write(
             dir.path().join("report.json"),

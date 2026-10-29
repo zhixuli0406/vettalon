@@ -184,6 +184,8 @@ impl std::error::Error for CoverageViolation {}
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Complete,
+    /// Requested scope completed; the repository was only partially in scope.
+    PartialByDesign,
     Incomplete,
 }
 
@@ -191,6 +193,7 @@ impl fmt::Display for RunStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Complete => "complete",
+            Self::PartialByDesign => "partial_by_design",
             Self::Incomplete => "incomplete",
         })
     }

@@ -38,9 +38,9 @@ use vettalon_contract::safe_path::SafeRepoPath;
 use super::precheck::trace_shape_violations;
 use super::schema::{
     AI_AUDIT_ENGINE_NAME, AuditReport, CURRENT_SCHEMA_VERSION, EvidenceKind, Finding,
-    FindingStatus, GatePolicy, ModuleCoverage, ModuleCoverageStatus, PLAUSIBLE_PREFIX,
-    SeverityBasis, Summary, VERIFIER_CORRECTED_PREFIX, VerifierIndependence, VoteVerdict,
-    has_operator_review,
+    FindingStatus, GatePolicy, MIN_SUPPORTED_SCHEMA_VERSION, ModuleCoverage, ModuleCoverageStatus,
+    PLAUSIBLE_PREFIX, SeverityBasis, Summary, VERIFIER_CORRECTED_PREFIX, VerifierIndependence,
+    VoteVerdict, has_operator_review, is_supported_schema_version,
 };
 
 /// Closed set of report violations.
@@ -127,7 +127,7 @@ impl fmt::Display for ReportViolation {
             SchemaVersion { found } => {
                 write!(
                     f,
-                    "schema_version is {found}, expected {CURRENT_SCHEMA_VERSION}"
+                    "schema_version is {found}, supported range is {MIN_SUPPORTED_SCHEMA_VERSION}..={CURRENT_SCHEMA_VERSION}"
                 )
             }
             DuplicateFindingId { id } => write!(f, "finding id {id} appears more than once"),
@@ -311,7 +311,7 @@ fn check_finding(f: &Finding, out: &mut Vec<ReportViolation>) {
     let is_ai = f.source_engine == AI_AUDIT_ENGINE_NAME;
     let basis_ok = match f.severity_basis {
         SeverityBasis::Operator => true,
-        SeverityBasis::ModelSelfReported => is_ai,
+        SeverityBasis::ModelSelfReported | SeverityBasis::ModelDecomposed => is_ai,
         SeverityBasis::ScannerRule => !is_ai,
     };
     if !basis_ok {
@@ -396,7 +396,10 @@ fn check_coverage(r: &AuditReport, ids: &HashSet<&str>, out: &mut Vec<ReportViol
     let modern = r.coverage.iter().any(ModuleCoverage::has_ledger);
     if modern
         && super::schema::CoverageSummary::from_coverage(&r.coverage).partial
-        && r.run_status == RunStatus::Complete
+        && matches!(
+            r.run_status,
+            RunStatus::Complete | RunStatus::PartialByDesign
+        )
     {
         out.push(ReportViolation::CoverageStatusShape {
             module_path: "(run)".into(),
@@ -466,6 +469,7 @@ fn check_coverage(r: &AuditReport, ids: &HashSet<&str>, out: &mut Vec<ReportViol
                 let valid_reply = matches!(
                     attempt.status,
                     ModuleCoverageStatus::Covered
+                        | ModuleCoverageStatus::ReviewedNoChecks
                         | ModuleCoverageStatus::Candidate
                         | ModuleCoverageStatus::PartiallyReviewed
                 );
@@ -617,7 +621,39 @@ fn check_coverage(r: &AuditReport, ids: &HashSet<&str>, out: &mut Vec<ReportViol
                 out.push(shape("reviewed_paths do not match valid finder replies"));
             }
         }
+        if m.status == ModuleCoverageStatus::Covered && m.missing_class_check_reason().is_some() {
+            out.push(shape(
+                "covered status requires a check for every selected attack class",
+            ));
+        }
+        if let Some(classes) = &m.attack_classes
+            && m.checks.iter().any(|check| {
+                check
+                    .attack_class
+                    .as_ref()
+                    .is_some_and(|class| !classes.selected.contains(class))
+            })
+        {
+            out.push(shape("check attack_class is not selected for this module"));
+        }
         match m.status {
+            ModuleCoverageStatus::OutOfScope if r.scope.is_none() || !m.is_diff_excluded() => {
+                out.push(shape("out_of_scope requires diff scope, diff_scope reason and no selection or review evidence"));
+            }
+            ModuleCoverageStatus::ReviewedNoChecks => {
+                let missing = m.missing_class_check_reason();
+                if !m.candidate_ids.is_empty() || (missing.is_none() && !m.checks.is_empty()) {
+                    out.push(shape(
+                        "reviewed_no_checks status with candidates or complete checks",
+                    ));
+                }
+                let expected = missing.as_deref().unwrap_or("shallow_no_checks");
+                if m.reason.as_deref() != Some(expected) {
+                    out.push(shape(
+                        "reviewed_no_checks requires the matching shallow check reason",
+                    ));
+                }
+            }
             ModuleCoverageStatus::Candidate if m.candidate_ids.is_empty() => {
                 out.push(shape("candidate status with no candidate_ids"))
             }
@@ -710,7 +746,10 @@ fn check_ensemble(r: &AuditReport, out: &mut Vec<ReportViolation>) {
                         f.id, v.family
                     )),
                     Some(fam) => {
-                        let expect = !f.found_by.iter().any(|m| family_of(m) == Some(fam));
+                        // A carried claim without finder provenance cannot establish
+                        // cross-family independence from its historical discovery.
+                        let expect = (!super::prior_run::is_carried(f) || !f.found_by.is_empty())
+                            && !f.found_by.iter().any(|m| family_of(m) == Some(fam));
                         if expect != v.cross_family {
                             bad(format!(
                                 "finding {} vote by {} has wrong cross_family",
@@ -755,7 +794,7 @@ fn check_ensemble(r: &AuditReport, out: &mut Vec<ReportViolation>) {
 /// Check every rule in the module doc. Empty ⇒ valid.
 pub fn validate_report(r: &AuditReport) -> Vec<ReportViolation> {
     let mut out = Vec::new();
-    if r.schema_version != CURRENT_SCHEMA_VERSION {
+    if !is_supported_schema_version(r.schema_version) {
         out.push(ReportViolation::SchemaVersion {
             found: r.schema_version,
         });
@@ -767,11 +806,45 @@ pub fn validate_report(r: &AuditReport) -> Vec<ReportViolation> {
         }
         check_finding(f, &mut out);
     }
+    if let Some(scope) = &r.scope {
+        if r.profile.mode != super::schema::ProfileMode::Deep
+            || r.run_status == RunStatus::Complete
+            || super::diff_scope::validate_ref(&scope.base).is_err()
+            || ![40, 64].contains(&scope.merge_base.len())
+            || !scope.merge_base.bytes().all(|b| b.is_ascii_hexdigit())
+            || scope.changed_during_scan > scope.changed_files
+        {
+            out.push(ReportViolation::CoverageStatusShape {
+                module_path: "(scope)".into(),
+                detail: "invalid diff scope metadata or run status".into(),
+            });
+        }
+    } else if r.run_status == RunStatus::PartialByDesign {
+        out.push(ReportViolation::CoverageStatusShape {
+            module_path: "(scope)".into(),
+            detail: "partial_by_design requires diff scope".into(),
+        });
+    }
+    for finding in &r.findings {
+        if finding
+            .evidence
+            .iter()
+            .any(|e| e.kind == super::schema::EvidenceKind::ScopeNote)
+            && (r.scope.is_none() || !super::diff_scope::outside_diff_scope(finding))
+        {
+            out.push(ReportViolation::ProofShape {
+                id: finding.id.clone(),
+                detail: "scope note requires a scanner finding and diff scope".into(),
+            });
+        }
+    }
     check_summary(r, &mut out);
     check_coverage(r, &ids, &mut out);
     match (r.run_status, r.incomplete_reason) {
         (RunStatus::Incomplete, None) => out.push(ReportViolation::IncompleteWithoutReason),
-        (RunStatus::Complete, Some(_)) => out.push(ReportViolation::CompleteWithReason),
+        (RunStatus::Complete | RunStatus::PartialByDesign, Some(_)) => {
+            out.push(ReportViolation::CompleteWithReason)
+        }
         _ => {}
     }
     check_verifier(r, &mut out);
@@ -853,6 +926,7 @@ mod tests {
             .any(|e| e.source == "adversarial");
         AuditReport {
             schema_version: CURRENT_SCHEMA_VERSION,
+            scope: None,
             repo: "/repo".into(),
             started_at: "t".into(),
             profile: ScanProfile {
@@ -885,11 +959,103 @@ mod tests {
     }
 
     #[test]
+    fn diff_scope_status_and_evidence_shapes_are_enforced() {
+        let module: ModuleCoverage = serde_json::from_value(serde_json::json!({
+            "module_path":"old", "status":"out_of_scope", "reason":"diff_scope"
+        }))
+        .unwrap();
+        let mut r = report(vec![], vec![module]);
+        assert!(
+            !only(&r).is_empty(),
+            "full scans cannot hide excluded modules"
+        );
+        r.scope = Some(super::super::schema::DiffScope {
+            mode: super::super::schema::DiffScopeMode::Diff,
+            base: "main".into(),
+            merge_base: "a".repeat(40),
+            head: "b".repeat(40),
+            base_oid: "a".repeat(40),
+            worktree_changes: 0,
+            untracked: 0,
+            changed_files: 1,
+            invalid_paths: 0,
+            changed_during_scan: 0,
+        });
+        r.run_status = RunStatus::PartialByDesign;
+        assert!(only(&r).is_empty());
+        r.scope.as_mut().unwrap().changed_during_scan = 2;
+        assert!(!only(&r).is_empty());
+        r.scope.as_mut().unwrap().changed_during_scan = 1;
+        assert!(only(&r).is_empty());
+        for field in [
+            "selected",
+            "reason",
+            "reviewed_paths",
+            "candidate_ids",
+            "checks",
+            "attack_classes",
+        ] {
+            let mut bad = r.clone();
+            let m = &mut bad.coverage[0];
+            match field {
+                "selected" => m.selected = true,
+                "reason" => m.reason = Some("max_modules".into()),
+                "reviewed_paths" => m.reviewed_paths.push("old/a.rs".into()),
+                "candidate_ids" => m.candidate_ids.push("id".into()),
+                "checks" => m.checks.push(super::super::schema::CoverageCheck {
+                    attack_class: None,
+                    invariant: "input validated".into(),
+                    paths: vec!["old/a.rs".into()],
+                    result: "holds".into(),
+                }),
+                "attack_classes" => {
+                    m.attack_classes = super::super::attack_classes::select(
+                        super::super::attack_classes::AttackClassMode::All,
+                        &[],
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(!only(&bad).is_empty(), "{field}");
+        }
+        let mut missing_scope = r.clone();
+        missing_scope.scope = None;
+        assert!(!only(&missing_scope).is_empty());
+        let mut wrong_status = r.clone();
+        wrong_status.run_status = RunStatus::Complete;
+        assert!(!only(&wrong_status).is_empty());
+        let mut reason = r.clone();
+        reason.incomplete_reason = Some(vettalon_contract::coverage::IncompleteReason::UnitsFailed);
+        assert!(!only(&reason).is_empty());
+        // Scope annotations cannot silence AI findings or full scans.
+        let mut f = ai("src/a.rs");
+        f.evidence.push(EvidenceItem {
+            kind: EvidenceKind::ScopeNote,
+            source: "diff_scope".into(),
+            detail: "outside_diff_scope".into(),
+            recorded_at: "t".into(),
+        });
+        let mut forged = report(vec![f], vec![]);
+        forged.scope = r.scope;
+        forged.run_status = RunStatus::PartialByDesign;
+        assert!(
+            only(&forged)
+                .iter()
+                .any(|v| matches!(v, ReportViolation::ProofShape { .. }))
+        );
+    }
+
+    #[test]
     fn a_well_formed_report_is_valid() {
         let mut refuted = ai("src/b.rs");
         refuted.status = FindingStatus::Refuted;
         refuted.evidence.push(ev("adversarial", "refuted: no"));
         let cov = vec![ModuleCoverage {
+            attack_classes: None,
+            prior_status: None,
+            checks: Vec::new(),
+            hardening: Vec::new(),
+            leads: Vec::new(),
             module_path: "src".into(),
             status: ModuleCoverageStatus::Candidate,
             reason: None,
@@ -908,10 +1074,37 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_must_be_2() {
+    fn schema_version_must_be_supported() {
         let mut r = report(vec![], vec![]);
-        r.schema_version = 1;
-        assert_eq!(only(&r), vec![ReportViolation::SchemaVersion { found: 1 }]);
+        for version in [MIN_SUPPORTED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION] {
+            r.schema_version = version;
+            assert!(only(&r).is_empty(), "supported schema {version}");
+        }
+        for version in [MIN_SUPPORTED_SCHEMA_VERSION - 1, CURRENT_SCHEMA_VERSION + 1] {
+            r.schema_version = version;
+            assert_eq!(
+                only(&r),
+                vec![ReportViolation::SchemaVersion { found: version }]
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v2_and_v3_are_accepted_v1_and_v4_are_rejected() {
+        let mut r = report(vec![], vec![]);
+        for version in [2, 3] {
+            r.schema_version = version;
+            assert!(only(&r).is_empty());
+        }
+        for version in [1, 4] {
+            r.schema_version = version;
+            let violation = ReportViolation::SchemaVersion { found: version };
+            assert_eq!(only(&r), vec![violation.clone()]);
+            assert_eq!(
+                violation.to_string(),
+                format!("schema_version is {version}, supported range is 2..=3")
+            );
+        }
     }
 
     #[test]
@@ -1179,6 +1372,11 @@ mod tests {
     #[test]
     fn coverage_paths_unique_ids_present_and_shapes() {
         let m = |p: &str, status, ids: Vec<String>| ModuleCoverage {
+            attack_classes: None,
+            prior_status: None,
+            checks: Vec::new(),
+            hardening: Vec::new(),
+            leads: Vec::new(),
             module_path: p.into(),
             status,
             reason: None,
@@ -1224,6 +1422,49 @@ mod tests {
                     "truncated": false, "reason": null}]}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn attack_class_coverage_validates_missing_checks_and_rejects_false_covered() {
+        use crate::audit::attack_classes::{AttackClassMode, select};
+        let mut module = complete_coverage_fixture();
+        module.attack_classes = select(
+            AttackClassMode::Auto,
+            &[("src/a.rs".into(), "eval( fetch(".into())],
+        );
+        module.checks.push(super::super::schema::CoverageCheck {
+            attack_class: Some("injection".into()),
+            invariant: "Input is separated from code".into(),
+            paths: vec!["src/a.rs".into()],
+            result: "The call passes input as data".into(),
+        });
+        assert!(!only(&report(vec![], vec![module.clone()])).is_empty());
+        module.status = ModuleCoverageStatus::ReviewedNoChecks;
+        module.reason = Some("shallow_missing_class_checks: ssrf".into());
+        assert!(only(&report(vec![], vec![module.clone()])).is_empty());
+        module.checks[0].attack_class = Some("path_file".into());
+        assert!(!only(&report(vec![], vec![module])).is_empty());
+    }
+
+    #[test]
+    fn attack_class_coverage_accepts_unclassified_checks() {
+        use crate::audit::attack_classes::{AttackClassMode, select};
+        for source in ["fn main() {}", "eval( fetch("] {
+            let mut module = complete_coverage_fixture();
+            module.attack_classes =
+                select(AttackClassMode::Auto, &[("src/a.rs".into(), source.into())]);
+            module.checks.push(super::super::schema::CoverageCheck {
+                attack_class: None,
+                invariant: "Input remains data".into(),
+                paths: vec!["src/a.rs".into()],
+                result: "Reviewed the call".into(),
+            });
+            if source.contains("eval") {
+                module.status = ModuleCoverageStatus::ReviewedNoChecks;
+                module.reason = Some("shallow_missing_class_checks: injection, ssrf".into());
+            }
+            assert!(only(&report(vec![], vec![module])).is_empty(), "{source}");
+        }
     }
 
     #[test]
@@ -1309,6 +1550,11 @@ mod tests {
     #[test]
     fn new_deferred_scope_without_attempts_cannot_claim_complete() {
         let module = ModuleCoverage {
+            attack_classes: None,
+            prior_status: None,
+            checks: Vec::new(),
+            hardening: Vec::new(),
+            leads: Vec::new(),
             module_path: "src".into(),
             status: ModuleCoverageStatus::Deferred,
             reason: Some("max_modules".into()),
@@ -1353,6 +1599,11 @@ mod tests {
             source_receipt: None,
         };
         let module = ModuleCoverage {
+            attack_classes: None,
+            prior_status: None,
+            checks: Vec::new(),
+            hardening: Vec::new(),
+            leads: Vec::new(),
             module_path: "src".into(),
             status: ModuleCoverageStatus::PartiallyReviewed,
             reason: None,

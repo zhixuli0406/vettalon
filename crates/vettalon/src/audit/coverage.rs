@@ -6,7 +6,8 @@
 //!
 //! | outcome | status |
 //! |---|---|
-//! | reviewed, zero findings | `covered` |
+//! | reviewed, zero findings, valid checks | `covered` |
+//! | reviewed, zero findings, no checks | `reviewed_no_checks` |
 //! | reviewed, ≥1 finding (pre-check refutations included) | `candidate` |
 //! | outside `--max-modules` | `deferred`, reason `max_modules` |
 //! | in the `--prescreen` pool but below its cut | `deferred`, reason `prescreen_cut` |
@@ -28,6 +29,16 @@ pub const DEFER_ENGINE_UNAVAILABLE: &str = "engine_unavailable";
 pub const DEFER_TIME_BUDGET: &str = "time_budget";
 
 fn from_report(r: &ModuleAuditReport) -> ModuleCoverage {
+    let missing = r
+        .attack_classes
+        .as_ref()
+        .map(|classes| classes.missing_checks(&r.checks))
+        .unwrap_or_default();
+    let shallow_reason = if missing.is_empty() {
+        "shallow_no_checks".to_string()
+    } else {
+        format!("shallow_missing_class_checks: {}", missing.join(", "))
+    };
     let (status, reason) = match &r.outcome {
         ModuleOutcome::Reviewed { note } => {
             if r.candidate_ids.is_empty() {
@@ -40,7 +51,9 @@ fn from_report(r: &ModuleAuditReport) -> ModuleCoverage {
                             )
                     });
                 (
-                    if incomplete {
+                    if r.checks.is_empty() || !missing.is_empty() {
+                        ModuleCoverageStatus::ReviewedNoChecks
+                    } else if incomplete {
                         ModuleCoverageStatus::PartiallyReviewed
                     } else {
                         ModuleCoverageStatus::Covered
@@ -65,6 +78,11 @@ fn from_report(r: &ModuleAuditReport) -> ModuleCoverage {
         }
     };
     ModuleCoverage {
+        attack_classes: r.attack_classes.clone(),
+        prior_status: None,
+        checks: r.checks.clone(),
+        hardening: r.hardening.clone(),
+        leads: r.leads.clone(),
         module_path: r.module_path.clone(),
         status,
         reason: reason.clone(),
@@ -77,13 +95,73 @@ fn from_report(r: &ModuleAuditReport) -> ModuleCoverage {
             model: r.model.clone(),
             family: r.family.clone(),
             status,
-            reason: reason.clone(),
+            reason: if status == ModuleCoverageStatus::ReviewedNoChecks {
+                Some(match &reason {
+                    Some(note) => format!("{shallow_reason}; {note}"),
+                    None => shallow_reason.clone(),
+                })
+            } else {
+                reason.clone()
+            },
             files: r.files.clone(),
             duration_ms: r.duration_ms,
             timed_out: r.timed_out,
             source_receipt: r.source_receipt.clone(),
         }],
     }
+}
+
+/// A module may be read by multiple finder attempts. Keep every selected class
+/// if the source changed between those reads; a later attempt cannot erase scope.
+fn merge_attack_classes(
+    current: &mut Option<super::attack_classes::AttackClassSelection>,
+    incoming: Option<super::attack_classes::AttackClassSelection>,
+) {
+    use super::attack_classes::{AttackClassMode, CLASSES, ExcludedClass};
+    let Some(incoming) = incoming else { return };
+    let Some(current) = current else {
+        *current = Some(incoming);
+        return;
+    };
+    if *current == incoming {
+        return;
+    }
+    if incoming.mode == AttackClassMode::All {
+        current.mode = AttackClassMode::All;
+    }
+    let selected: Vec<String> = CLASSES
+        .iter()
+        .map(|class| class.id)
+        .filter(|id| {
+            current
+                .selected
+                .iter()
+                .chain(&incoming.selected)
+                .any(|s| s == *id)
+        })
+        .map(str::to_string)
+        .collect();
+    let excluded = CLASSES
+        .iter()
+        .map(|class| class.id)
+        .filter(|id| !selected.iter().any(|s| s == *id))
+        .map(|id| ExcludedClass {
+            class: id.to_string(),
+            reason: if current
+                .excluded
+                .iter()
+                .chain(&incoming.excluded)
+                .any(|e| e.class == id && e.reason == "cap")
+            {
+                "cap"
+            } else {
+                "no_signal"
+            }
+            .into(),
+        })
+        .collect();
+    current.selected = selected;
+    current.excluded = excluded;
 }
 
 /// Build the coverage list from ALL ranked modules plus the per-module audit
@@ -101,6 +179,11 @@ pub fn build_module_coverage(
         .iter()
         .map(|m| {
             let mut coverage = ModuleCoverage {
+                attack_classes: None,
+                prior_status: None,
+                checks: Vec::new(),
+                hardening: Vec::new(),
+                leads: Vec::new(),
                 module_path: m.module_path.clone(),
                 status: ModuleCoverageStatus::Deferred,
                 reason: Some(DEFER_MAX_MODULES.into()),
@@ -118,10 +201,18 @@ pub fn build_module_coverage(
                 let mut ids = BTreeSet::new();
                 for report in reports {
                     let entry = from_report(report);
+                    merge_attack_classes(&mut coverage.attack_classes, entry.attack_classes);
                     reviewed.extend(entry.reviewed_paths);
                     truncated.extend(entry.truncated_paths);
                     ids.extend(entry.candidate_ids);
                     coverage.attempts.extend(entry.attempts);
+                    for check in entry.checks {
+                        if !coverage.checks.contains(&check) {
+                            coverage.checks.push(check);
+                        }
+                    }
+                    coverage.hardening.extend(entry.hardening);
+                    coverage.leads.extend(entry.leads);
                 }
                 coverage.reviewed_paths = reviewed.into_iter().collect();
                 coverage.truncated_paths = truncated.into_iter().collect();
@@ -129,7 +220,9 @@ pub fn build_module_coverage(
                 let all_complete = coverage.attempts.iter().all(|a| {
                     matches!(
                         a.status,
-                        ModuleCoverageStatus::Covered | ModuleCoverageStatus::Candidate
+                        ModuleCoverageStatus::Covered
+                            | ModuleCoverageStatus::ReviewedNoChecks
+                            | ModuleCoverageStatus::Candidate
                     ) && a.files.iter().all(|f| {
                         !f.truncated
                             && !matches!(
@@ -141,7 +234,12 @@ pub fn build_module_coverage(
                 coverage.status = if !coverage.candidate_ids.is_empty() {
                     ModuleCoverageStatus::Candidate
                 } else if !coverage.reviewed_paths.is_empty() {
-                    if all_complete {
+                    if (coverage.checks.is_empty()
+                        || coverage.missing_class_check_reason().is_some())
+                        && coverage.attempts.iter().any(|a| a.status.has_valid_reply())
+                    {
+                        ModuleCoverageStatus::ReviewedNoChecks
+                    } else if all_complete {
                         ModuleCoverageStatus::Covered
                     } else {
                         ModuleCoverageStatus::PartiallyReviewed
@@ -149,12 +247,39 @@ pub fn build_module_coverage(
                 } else {
                     coverage.attempts[0].status
                 };
-                let reasons: Vec<String> = coverage
+                let mut reasons: Vec<String> = coverage
                     .attempts
                     .iter()
                     .filter_map(|a| a.reason.clone())
                     .collect();
-                coverage.reason = if reasons.is_empty() {
+                for (name, count) in [
+                    ("hardening", coverage.hardening.len()),
+                    ("leads", coverage.leads.len()),
+                ] {
+                    if count > 5 {
+                        let note = format!(
+                            "{name}: {} extra item(s) truncated across finder attempts (max 5)",
+                            count - 5
+                        );
+                        // Keep aggregation notes even when the module reason is shallow_no_checks.
+                        if let Some(attempt) = coverage.attempts.last_mut() {
+                            attempt.reason = Some(match &attempt.reason {
+                                Some(reason) => format!("{reason}; {note}"),
+                                None => note.clone(),
+                            });
+                        }
+                        reasons.push(note);
+                    }
+                }
+                coverage.hardening.truncate(5);
+                coverage.leads.truncate(5);
+                coverage.reason = if coverage.status == ModuleCoverageStatus::ReviewedNoChecks {
+                    Some(
+                        coverage
+                            .missing_class_check_reason()
+                            .unwrap_or_else(|| "shallow_no_checks".into()),
+                    )
+                } else if reasons.is_empty() {
                     None
                 } else {
                     Some(reasons.join("; "))
@@ -180,6 +305,10 @@ mod tests {
 
     fn report(p: &str, outcome: ModuleOutcome, ids: &[&str]) -> ModuleAuditReport {
         ModuleAuditReport {
+            attack_classes: None,
+            checks: Vec::new(),
+            hardening: Vec::new(),
+            leads: Vec::new(),
             module_path: p.to_string(),
             outcome: outcome.clone(),
             reviewed_paths: if matches!(outcome, ModuleOutcome::Reviewed { .. }) {
@@ -236,7 +365,7 @@ mod tests {
         assert_eq!(
             statuses,
             vec![
-                ModuleCoverageStatus::Covered,
+                ModuleCoverageStatus::ReviewedNoChecks,
                 ModuleCoverageStatus::Candidate,
                 ModuleCoverageStatus::Unreadable,
                 ModuleCoverageStatus::LlmFailed,
@@ -251,7 +380,7 @@ mod tests {
         assert_eq!(cov[7].reason.as_deref(), Some(DEFER_MAX_MODULES));
         assert!(cov[7].reviewed_paths.is_empty());
         assert_eq!(cov[1].candidate_ids, vec!["id1".to_string()]);
-        assert!(cov[0].reason.is_none());
+        assert_eq!(cov[0].reason.as_deref(), Some("shallow_no_checks"));
     }
 
     #[test]
@@ -273,10 +402,133 @@ mod tests {
             }
             let cov = build_module_coverage(&ranked, &reports);
             assert_eq!(cov[0].attempts.len(), 2);
-            assert_eq!(cov[0].status, ModuleCoverageStatus::PartiallyReviewed);
+            assert_eq!(cov[0].status, ModuleCoverageStatus::ReviewedNoChecks);
             assert_eq!(cov[0].reviewed_paths, vec!["a/x.rs"]);
             assert!(super::super::schema::CoverageSummary::from_coverage(&cov).partial);
         }
+    }
+
+    #[test]
+    fn auxiliary_notes_are_capped_across_finders_with_visible_reason() {
+        let mut r = report("a", ModuleOutcome::Reviewed { note: None }, &[]);
+        r.hardening = vec![
+            super::super::schema::HardeningNote {
+                file: "a/x.rs".into(),
+                line: 1,
+                note: "advice".into()
+            };
+            4
+        ];
+        r.leads = vec![
+            super::super::schema::AuditLead {
+                path: "b/x.rs".into(),
+                reason: "flow".into()
+            };
+            4
+        ];
+        let coverage = build_module_coverage(&[target("a")], &[r.clone(), r]);
+        assert_eq!(coverage[0].hardening.len(), 5);
+        assert_eq!(coverage[0].leads.len(), 5);
+        let reason = coverage[0]
+            .attempts
+            .last()
+            .unwrap()
+            .reason
+            .as_ref()
+            .unwrap();
+        assert!(reason.contains("hardening: 3 extra"));
+        assert!(reason.contains("leads: 3 extra"));
+    }
+
+    fn class_check(class: &str) -> super::super::schema::CoverageCheck {
+        super::super::schema::CoverageCheck {
+            attack_class: Some(class.into()),
+            invariant: "Untrusted input cannot reach the sink without validation".into(),
+            paths: vec!["a/x.rs".into()],
+            result: "Reviewed the source and sink and their intervening checks".into(),
+        }
+    }
+
+    #[test]
+    fn attack_classes_require_every_selected_check_and_preserve_source_limits() {
+        use super::super::attack_classes::{AttackClassMode, select};
+        let mut r = report("a", ModuleOutcome::Reviewed { note: None }, &[]);
+        r.attack_classes = select(
+            AttackClassMode::Auto,
+            &[("a/x.rs".into(), "eval( fetch(".into())],
+        );
+        r.checks = vec![class_check("injection")];
+        let cov = build_module_coverage(&[target("a")], &[r.clone()]);
+        assert_eq!(cov[0].status, ModuleCoverageStatus::ReviewedNoChecks);
+        assert_eq!(
+            cov[0].reason.as_deref(),
+            Some("shallow_missing_class_checks: ssrf")
+        );
+        assert_eq!(cov[0].checks.len(), 1);
+        r.checks.push(class_check("ssrf"));
+        let cov = build_module_coverage(&[target("a")], &[r.clone()]);
+        assert_eq!(cov[0].status, ModuleCoverageStatus::Covered);
+        r.truncated_paths.push("a/x.rs".into());
+        let cov = build_module_coverage(&[target("a")], &[r]);
+        assert_eq!(cov[0].status, ModuleCoverageStatus::PartiallyReviewed);
+    }
+
+    #[test]
+    fn attack_class_checks_aggregate_across_finders_without_erasing_selection() {
+        use super::super::attack_classes::{AttackClassMode, select};
+        let mut first = report("a", ModuleOutcome::Reviewed { note: None }, &[]);
+        first.attack_classes = select(
+            AttackClassMode::Auto,
+            &[("a/x.rs".into(), "eval( fetch(".into())],
+        );
+        first.checks = vec![class_check("injection")];
+        let mut second = first.clone();
+        second.attack_classes =
+            select(AttackClassMode::Auto, &[("a/x.rs".into(), "fetch(".into())]);
+        second.checks = vec![class_check("ssrf")];
+        for reports in [
+            [first.clone(), second.clone()],
+            [second.clone(), first.clone()],
+        ] {
+            let cov = build_module_coverage(&[target("a")], &reports);
+            assert_eq!(cov[0].status, ModuleCoverageStatus::Covered);
+            assert_eq!(
+                cov[0].attack_classes.as_ref().unwrap().selected,
+                ["injection", "ssrf"]
+            );
+        }
+        second.checks.clear();
+        let cov = build_module_coverage(&[target("a")], &[first, second]);
+        assert_eq!(cov[0].status, ModuleCoverageStatus::ReviewedNoChecks);
+    }
+
+    #[test]
+    fn attack_class_report_serialization_and_no_signal_stay_shallow() {
+        use super::super::attack_classes::{AttackClassMode, select};
+        let mut r = report("a", ModuleOutcome::Reviewed { note: None }, &[]);
+        let cov = build_module_coverage(&[target("a")], &[r.clone()]);
+        let json = serde_json::to_value(&cov[0]).unwrap();
+        assert!(json.get("attack_classes").is_none());
+        assert_eq!(
+            serde_json::from_value::<ModuleCoverage>(json)
+                .unwrap()
+                .attack_classes,
+            None
+        );
+        r.attack_classes = select(
+            AttackClassMode::Auto,
+            &[("a/x.rs".into(), "plain text".into())],
+        );
+        let cov = build_module_coverage(&[target("a")], &[r]);
+        assert_eq!(cov[0].status, ModuleCoverageStatus::ReviewedNoChecks);
+        assert_eq!(cov[0].reason.as_deref(), Some("shallow_no_checks"));
+        let json = serde_json::to_value(&cov[0]).unwrap();
+        assert_eq!(json["attack_classes"]["mode"], "auto");
+        assert_eq!(json["attack_classes"]["selected"], serde_json::json!([]));
+        assert_eq!(
+            json["attack_classes"]["excluded"].as_array().unwrap().len(),
+            8
+        );
     }
 
     #[test]

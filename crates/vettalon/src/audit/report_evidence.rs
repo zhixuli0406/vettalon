@@ -229,6 +229,7 @@ mod tests {
 
     fn report(findings: Vec<Finding>) -> AuditReport {
         AuditReport {
+            scope: None,
             repo: "/tmp/repo".into(),
             started_at: "2026-10-21T00:00:00Z".into(),
             profile: ScanProfile {

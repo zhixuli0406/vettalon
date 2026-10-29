@@ -86,6 +86,7 @@ fn finding(engine: &str) -> Finding {
 fn plan(policy: &str) -> ReviewPlan {
     ReviewPlan {
         runs: 1,
+        independent_refuter: false,
         deadline: None,
         parse_retries: 1,
         policy: RefuterPolicy::parse(policy).unwrap(),
@@ -107,7 +108,7 @@ fn refuted(basis: &str, evidence: &str, extra: &str) -> String {
 }
 
 const UNRESOLVED: &str = r#"{"verdict":"unresolved","reason":"ZZ-UNSEEN","blockers":["what clean_name does"],"validation_plan":{"local":null,"deployment":null},"missing_code":["clean_name"]}"#;
-const PLAUSIBLE: &str = r#"{"verdict":"plausible","reason":"raw query","blockers":["is it reachable?"],"validation_plan":{"local":"run it","deployment":null}}"#;
+const PLAUSIBLE: &str = r#"{"verdict":"plausible","impact":"high","reason":"raw query","blockers":["is it reachable?"],"validation_plan":{"local":"run it","deployment":null}}"#;
 
 fn details(f: &Finding) -> Vec<String> {
     f.evidence.iter().map(|e| e.detail.clone()).collect()
@@ -482,6 +483,29 @@ async fn prosecutor_sees_no_refuter_text_and_its_veto_keeps_the_finding() {
             .any(|x| x == "verify_uncertain: prosecutor veto (checked bypass)")
     );
     assert!(crate::audit::adversarial::is_uncertain(&f));
+}
+
+#[tokio::test]
+async fn prosecutor_veto_keeps_claimed_severity_with_unconfirmed_cap() {
+    let dir = repo();
+    let mut f = finding(EXTERNAL_ENGINE);
+    f.severity = Severity::Critical;
+    f.severity_claimed = Some(Severity::Critical);
+    f.impact = Some(crate::audit::schema::SeverityAssessment {
+        level: Level::Low,
+        reason: "limited damage".into(),
+    });
+    let caller = Scripted::new(&[&guarded_refutation(), VETO]);
+    let mut review = plan("evidence+prosecutor");
+    review.independent_refuter = true;
+    review_with(dir.path(), &mut f, &caller, review).await;
+    assert_eq!(f.status, FindingStatus::Candidate);
+    assert_eq!(f.severity, Severity::Critical);
+    assert!(
+        details(&f)
+            .iter()
+            .any(|line| line.starts_with("severity_cap_unconfirmed:"))
+    );
 }
 
 #[tokio::test]
@@ -862,4 +886,235 @@ async fn without_a_threshold_a_high_score_does_not_block_a_refutation() {
     let caller = Scripted::new(&[&with_score(CURRENT_REFUTED, 90, "flow_shown")]);
     review_with(dir.path(), &mut f, &caller, scored(plan("current"))).await;
     assert_eq!(f.status, FindingStatus::Refuted);
+}
+
+#[tokio::test]
+async fn evidence_policies_share_the_independent_impact_cap() {
+    let dir = repo();
+    for policy in ["evidence", "evidence+retrieval"] {
+        for independent in [false, true] {
+            let mut f = finding(EXTERNAL_ENGINE);
+            f.severity = Severity::Critical;
+            f.severity_claimed = Some(Severity::Critical);
+            f.impact = Some(crate::audit::schema::SeverityAssessment {
+                level: Level::Low,
+                reason: "limited damage".into(),
+            });
+            let mut reply: serde_json::Value = serde_json::from_str(PLAUSIBLE).unwrap();
+            reply["impact"] = "low".into();
+            let caller = Scripted::new(&[&reply.to_string()]);
+            let mut review = plan(policy);
+            review.independent_refuter = independent;
+            review_with(dir.path(), &mut f, &caller, review).await;
+            assert_eq!(
+                f.severity,
+                if independent {
+                    Severity::Low
+                } else {
+                    Severity::Critical
+                }
+            );
+            let prefix = if independent {
+                "severity_capped:"
+            } else {
+                "severity_cap_unconfirmed:"
+            };
+            assert!(details(&f).iter().any(|line| line.starts_with(prefix)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn evidence_policy_impact_is_auxiliary_without_reflector_calls() {
+    let dir = repo();
+    for policy in ["evidence", "evidence+retrieval"] {
+        for impact in [
+            None,
+            Some("null"),
+            Some(r#""info""#),
+            Some(r#""informational""#),
+            Some(r#""unknown""#),
+            Some("42"),
+            Some(r#""low""#),
+            Some(r#""medium""#),
+            Some(r#""high""#),
+            Some(r#""critical""#),
+        ] {
+            let mut raw: serde_json::Value = serde_json::from_str(PLAUSIBLE).unwrap();
+            if let Some(value) = impact {
+                raw["impact"] = serde_json::from_str(value).unwrap();
+            } else {
+                raw.as_object_mut().unwrap().remove("impact");
+            }
+            let mut f = finding(EXTERNAL_ENGINE);
+            f.impact = Some(crate::audit::schema::SeverityAssessment {
+                level: Level::Medium,
+                reason: "limited damage".into(),
+            });
+            assert!(matches!(
+                judge_evidence(dir.path(), &f, &raw.to_string(), &shown_views()).0,
+                RunVerdict::Plausible(_)
+            ));
+            let caller = Scripted::new(&[&raw.to_string()]);
+            review_with(dir.path(), &mut f, &caller, plan(policy)).await;
+            assert_eq!(caller.prompts().len(), 1, "{policy}: {impact:?}");
+            assert_eq!(f.status, FindingStatus::NeedsHuman);
+            assert_eq!(f.severity, Severity::Medium);
+            assert_eq!(f.blockers, vec!["is it reachable?"]);
+            assert_eq!(
+                f.validation_plan.as_ref().unwrap().local.as_deref(),
+                Some("run it")
+            );
+            let usable = matches!(
+                impact,
+                Some(r#""low""# | r#""medium""# | r#""high""# | r#""critical""#)
+            );
+            let notes = details(&f);
+            assert_eq!(
+                notes.iter().any(|e| e == "refuter_impact_missing: run 1/1"),
+                !usable
+            );
+            let disagreements: Vec<_> = f
+                .evidence
+                .iter()
+                .filter(|e| e.kind == crate::audit::schema::EvidenceKind::SeverityDisagreement)
+                .collect();
+            assert_eq!(
+                disagreements.len(),
+                usize::from(usable && impact != Some(r#""medium""#))
+            );
+            if let Some(note) = disagreements.first() {
+                let level = raw["impact"].as_str().unwrap();
+                assert_eq!(
+                    note.detail,
+                    format!(
+                        "severity_disagreement: finder impact=medium, refuter impact={level} (run 1 of 1)"
+                    )
+                );
+            }
+            assert!(!notes.iter().any(|e| e.starts_with("verifier_reflector:")));
+            assert!(caller.prompts()[0].contains("Provide impact for plausible"));
+            assert!(caller.prompts()[0].contains("does not invalidate the reply"));
+            for missing_blockers in [false, true] {
+                let mut broken = raw.clone();
+                if missing_blockers {
+                    broken["blockers"] = serde_json::json!([]);
+                } else {
+                    broken["validation_plan"] =
+                        serde_json::json!({"local": null, "deployment": null});
+                }
+                assert!(matches!(
+                    judge_evidence(dir.path(), &f, &broken.to_string(), &shown_views()).0,
+                    RunVerdict::Malformed(_)
+                ));
+            }
+        }
+        for impact in [r#""high""#, r#""info""#, "42"] {
+            let raw = refuted(
+                "defect_absent",
+                r#"[{"file":"app/views.py","line":7,"shows":"query"}]"#,
+                &format!(r#", "impact":{impact}"#),
+            );
+            let mut f = finding(EXTERNAL_ENGINE);
+            f.impact = Some(crate::audit::schema::SeverityAssessment {
+                level: Level::Low,
+                reason: "limited damage".into(),
+            });
+            assert!(matches!(
+                judge_evidence(dir.path(), &f, &raw, &shown_views()).0,
+                RunVerdict::Refuted { .. }
+            ));
+            let caller = Scripted::new(&[&raw]);
+            review_with(dir.path(), &mut f, &caller, plan(policy)).await;
+            assert_eq!(f.status, FindingStatus::Refuted);
+            assert_eq!(caller.prompts().len(), 1);
+            assert!(!f.evidence.iter().any(|e| e.kind
+                == crate::audit::schema::EvidenceKind::SeverityDisagreement
+                || e.detail.starts_with("refuter_impact_missing:")
+                || e.detail.starts_with("verifier_reflector:")));
+        }
+    }
+    let prompt = build_evidence_reflector_prompt("base", "missing blockers");
+    assert!(prompt.contains("Please also assess impact"));
+    assert!(prompt.contains("missing impact does not invalidate the reply"));
+}
+
+#[test]
+fn unresolved_ignores_auxiliary_impact() {
+    let dir = repo();
+    let raw = UNRESOLVED.replace(r#""verdict""#, r#""impact":"high","verdict""#);
+    assert!(matches!(
+        judge_evidence(dir.path(), &finding(EXTERNAL_ENGINE), &raw, &shown_views()).0,
+        RunVerdict::Unresolved(_)
+    ));
+}
+
+#[tokio::test]
+async fn refuter_impact_runs_are_summarized_once_for_every_policy() {
+    let dir = repo();
+    for policy in ["current", "evidence", "evidence+retrieval"] {
+        for (impacts, expected) in [
+            (["high", "high", "high"], "high (runs 1,2,3 of 3)"),
+            (
+                ["high", "medium", "high"],
+                "high (runs 1,3 of 3), medium (run 2 of 3)",
+            ),
+            (
+                ["high", "critical", "high"],
+                "high (runs 1,3 of 3), critical (run 2 of 3)",
+            ),
+            (["high", "null", "high"], "high (runs 1,3 of 3)"),
+            (["critical", "critical", "critical"], ""),
+        ] {
+            let mut f = finding(EXTERNAL_ENGINE);
+            f.severity = Severity::High;
+            f.impact = Some(crate::audit::schema::SeverityAssessment {
+                level: Level::Critical,
+                reason: "critical damage".into(),
+            });
+            let replies: Vec<_> = impacts
+                .iter()
+                .map(|impact| {
+                    let mut raw: serde_json::Value = serde_json::from_str(PLAUSIBLE).unwrap();
+                    raw["impact"] = if *impact == "null" {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(impact)
+                    };
+                    raw.to_string()
+                })
+                .collect();
+            let caller = Scripted::new(&replies.iter().map(String::as_str).collect::<Vec<_>>());
+            let mut review_plan = plan(policy);
+            review_plan.runs = 3;
+            review_with(dir.path(), &mut f, &caller, review_plan).await;
+            assert_eq!(caller.prompts().len(), 3);
+            assert_eq!(f.severity, Severity::High);
+            assert_eq!(f.status, FindingStatus::NeedsHuman);
+            let disagreements: Vec<_> = f
+                .evidence
+                .iter()
+                .filter(|e| e.kind == EvidenceKind::SeverityDisagreement)
+                .collect();
+            assert_eq!(
+                disagreements.len(),
+                usize::from(!expected.is_empty()),
+                "{policy}: {impacts:?}"
+            );
+            if !expected.is_empty() {
+                assert_eq!(
+                    disagreements[0].detail,
+                    format!(
+                        "severity_disagreement: finder impact=critical, refuter impact={expected}"
+                    )
+                );
+            }
+            assert_eq!(
+                details(&f)
+                    .iter()
+                    .any(|s| s == "refuter_impact_missing: run 2/3"),
+                impacts[1] == "null"
+            );
+        }
+    }
 }

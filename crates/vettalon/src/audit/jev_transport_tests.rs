@@ -122,6 +122,7 @@ impl Loopback {
 fn opts(repo: &Path, rank: crate::audit::RankStrategy) -> crate::audit::ScanOptions {
     crate::audit::ScanOptions {
         repo_path: repo.into(),
+        diff_base: None,
         profile: "deep".into(),
         report: None,
         sarif: None,
@@ -138,6 +139,7 @@ fn opts(repo: &Path, rank: crate::audit::RankStrategy) -> crate::audit::ScanOpti
         no_prior: true,
         rank,
         trace: None,
+        attack_classes: Default::default(),
         source_receipts: false,
         time_budget: Some(Duration::from_secs(5)),
         refuter_runs: 1,
@@ -194,6 +196,8 @@ async fn tls_metadata_opt_in_and_explicit_fallback() {
             &opts(repo.path(), rank),
             &profile,
             crate::audit::AuditContext {
+                prior: None,
+                diff: None,
                 refusals: &Default::default(),
                 trace: &Default::default(),
                 progress: &crate::audit::NoProgress,
@@ -215,6 +219,8 @@ async fn tls_metadata_opt_in_and_explicit_fallback() {
         &opts(repo.path(), crate::audit::RankStrategy::Jev(cfg.clone())),
         &profile,
         crate::audit::AuditContext {
+            prior: None,
+            diff: None,
             refusals: &Default::default(),
             trace: &Default::default(),
             progress: &crate::audit::NoProgress,

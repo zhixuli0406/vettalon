@@ -10,6 +10,7 @@ pub mod audit;
 pub mod budget;
 pub mod config;
 pub mod disclose;
+pub mod explain;
 pub mod guard;
 pub mod hunt;
 pub mod joern;

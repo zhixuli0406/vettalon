@@ -195,7 +195,8 @@ pub fn upheld_cross_family(f: &Finding) -> bool {
 
 impl GateCondition {
     fn counts(&self, f: &Finding) -> bool {
-        f.severity >= self.min_severity
+        !super::diff_scope::outside_diff_scope(f)
+            && f.severity >= self.min_severity
             && self.statuses.contains(&f.status)
             && (!self.cross_family || upheld_cross_family(f))
     }

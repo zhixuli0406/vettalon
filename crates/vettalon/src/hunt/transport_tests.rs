@@ -525,6 +525,7 @@ async fn bounded_live_public_hunt_transport() {
     let home = tempfile::tempdir().unwrap();
     let auditor = ReadAndAudit {
         inner: run::EngineAuditor {
+            attack_classes: Default::default(),
             home: home.path().into(),
             finders: vec![finder],
             verifiers: vec![],

@@ -181,6 +181,7 @@ impl SeverityReview {
         }
         let basis = match f.severity_basis {
             SeverityBasis::ModelSelfReported => "model_self_reported",
+            SeverityBasis::ModelDecomposed => "model_decomposed",
             _ => "scanner_rule",
         };
         SeverityReview {

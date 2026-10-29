@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+pub mod facade;
 pub mod fetch;
 pub mod graph;
 pub mod mal_index;

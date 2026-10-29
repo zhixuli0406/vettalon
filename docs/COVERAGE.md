@@ -2,6 +2,13 @@
 
 Preview for the next release. A clean result applies only to the recorded scope. Complete execution is not a guarantee that source code is safe.
 
+Report readers accept schema versions 2 through 3; newly generated reports use
+version 3. Older and newer unsupported versions are rejected. A v2 baseline can
+be compared with a v3 report. Missing v3 likelihood, impact, checks and hardening
+records remain unknown; a saved v2 `covered` status stays `covered`, even without
+checks. For new runs, a prior `reviewed_no_checks` module is prioritized as a gap
+and recorded as `prior_status: "prior_gap:shallow_no_checks"`.
+
 ## OSS experiment harness tests (2026-10-19 local run)
 
 The Python context-selection adapter passed 39 unit tests and the formal
@@ -156,7 +163,11 @@ Checked-in examples: [index](../fixtures/coverage/samples/index.json), [complete
 
 Each file records read status, known source byte/line counts, actual submitted source bytes, 1-based submitted line range and truncation. Prompt wrapping is excluded from submitted byte counts. A truncated final line may be partial. Successful disk reads, refused calls and malformed replies do not establish model review.
 
-`summary.coverage.scanned` requires a valid reply containing nonzero source content with a nonempty, unique scope; `scanned + skipped = modules_total` for modern records. `covered` requires every scheduled finder to finish its complete scope without candidates. `candidate` is a finding state, not proof of complete source coverage. Always inspect `partial`, per-file omissions and per-finder attempts.
+`summary.coverage.scanned` requires a valid reply containing nonzero source content with a nonempty, unique scope; `scanned + skipped = modules_total` for modern records. `covered` requires every scheduled finder to finish its complete scope without candidates and at least one validated check across the finders. A zero-candidate reply without valid checks becomes `reviewed_no_checks`, with reason `shallow_no_checks` and a separate `summary.coverage.shallow` count. This is an informational gap ("reviewed but the model listed no checks"); by itself it does not make the run incomplete or change gates, exit codes, or `--allow-incomplete`. Source omissions and failed attempts still make coverage partial as before. `candidate` is a finding state, not proof of complete source coverage. Always inspect `partial`, per-file omissions and per-finder attempts.
+
+Finder objects accept optional `checks: [{attack_class, invariant, paths, result}]`. `attack_class` is nullable free text capped at 4096 characters; `invariant` and `result` must satisfy the contract's visible-text rule and 4096-character limit. Every check needs at least one path, and every path must match a file sent in that module's prompt. Invalid items are dropped independently; the first eight valid items are retained per finder reply. Dropped and truncated counts remain in `coverage[].attempts[].reason`. Stored prose uses the same secret masking as hardening notes and is revalidated after masking. `coverage[].checks` merges identical records across finder attempts and is omitted when empty. These are model self-reports, not proof that the invariants hold.
+
+Legacy bare arrays remain accepted and supply no checks. Schema remains v3; historical `covered` entries retain their original status when loaded, and missing check arrays and shallow counts default to empty/zero.
 
 Missing attempts, empty denominators, all-empty files and failed attempts cannot become complete coverage. Modern records mixed with historical covered rows lacking evidence are incomplete. A wholly historical JSON without the ledger remains readable; absent evidence stays unknown rather than being reconstructed as a verified run.
 

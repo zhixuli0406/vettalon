@@ -305,8 +305,17 @@ pub async fn run_verify(
             unverified += 1;
             continue;
         }
+        let finder_families: Vec<&str> = f
+            .found_by
+            .iter()
+            .filter_map(|id| o.families.get(id).map(String::as_str))
+            .collect();
+        let cross_family =
+            !finder_families.is_empty() && !finder_families.contains(&o.verifier.family.as_str());
+        let same_model = f.found_by.iter().any(|m| m == &o.verifier.id);
         let plan = adversarial::ReviewPlan {
             runs: adversarial::runs_for(f, o.refuter_runs),
+            independent_refuter: cross_family && !same_model,
             deadline: o.deadline,
             parse_retries: o.parse_retries,
             policy: o.policy,
@@ -335,14 +344,6 @@ pub async fn run_verify(
                 votes
             }
         };
-        let finder_families: Vec<&str> = f
-            .found_by
-            .iter()
-            .filter_map(|id| o.families.get(id).map(String::as_str))
-            .collect();
-        let cross_family =
-            !finder_families.is_empty() && !finder_families.contains(&o.verifier.family.as_str());
-        let same_model = f.found_by.iter().any(|m| m == &o.verifier.id);
         for verdict in votes {
             f.verification.push(VerifierVote {
                 model: o.verifier.id.clone(),

@@ -131,6 +131,9 @@ pub fn render_scan_summary(
         "Code security audit (vettalon)\n",
     ));
     out.push_str(&tr!("  掃描目標：{}\n", "  Target:  {}\n", report.repo));
+    if let Some(scope) = &report.scope {
+        out.push_str(&format!("  {}\n", scope.description()));
+    }
     out.push_str(&tr!(
         "  掃描模式：{}\n",
         "  Profile: {}\n",
@@ -185,6 +188,14 @@ pub fn render_scan_summary(
 
     out.push_str(pick("Findings 統計：\n", "Findings:\n"));
     let (gated, needs_human, inert) = finding_buckets(report);
+    if report.scope.is_some() {
+        let outside = report
+            .findings
+            .iter()
+            .filter(|f| super::diff_scope::outside_diff_scope(f))
+            .count();
+        out.push_str(&format!("  outside_diff_scope: {outside} scanner findings retained; excluded from --fail-on / --gate\n"));
+    }
     if needs_human + inert > 0 {
         out.push_str(&tr!(
             "  總計：{}（計入 fail-on {gated}、待人工判斷 {needs_human}、已證偽/已壓制 {inert}）\n",
@@ -236,6 +247,34 @@ pub fn render_scan_summary(
             "  Carried over from the previous report: {} (source unchanged, models not called again)\n",
             report.summary.carried_from_prior
         ));
+    }
+
+    if let Some(p) = &report.prior_run {
+        let not_rechecked = p
+            .changed_unrediscovered
+            .iter()
+            .filter(|f| f.reason == "quick_profile_not_rechecked")
+            .count();
+        if not_rechecked > 0 {
+            out.push_str(&tr!(
+                "  前次未重新發現：{not_rechecked} 筆未重新檢查；請使用 --profile deep 重新檢查\n",
+                "  Prior findings not rediscovered: {not_rechecked} not re-checked; use --profile deep to re-check them\n"
+            ));
+        }
+        let changed = p.changed_unrediscovered.len() - not_rechecked;
+        if report.profile.mode == ProfileMode::Deep
+            && (p.carried_not_rediscovered > 0
+                || changed > 0
+                || p.prior_gap_modules > 0
+                || p.carried_not_rediscovered_overflow > 0)
+        {
+            out.push_str(&tr!(
+                "  前次未重新發現：{} 筆帶入本次覆核、{} 筆來源已變更或無法承接、{} 筆超過帶入上限；優先處理 {} 個前次缺口模組\n",
+                "  Prior findings not rediscovered: {} carried for review, {} changed or unavailable, {} over the carry-in cap; {} prior gap modules prioritized\n",
+                p.carried_not_rediscovered, changed,
+                p.carried_not_rediscovered_overflow, p.prior_gap_modules
+            ));
+        }
     }
 
     if report.profile.mode == ProfileMode::Deep {
@@ -354,6 +393,9 @@ fn finding_buckets(report: &AuditReport) -> (usize, usize, usize) {
     let include_nh = report.summary.gate_includes_needs_human;
     let (mut gated, mut needs_human, mut inert) = (0, 0, 0);
     for f in &report.findings {
+        if super::diff_scope::outside_diff_scope(f) {
+            continue;
+        }
         match f.status {
             FindingStatus::Refuted | FindingStatus::Suppressed => inert += 1,
             FindingStatus::NeedsHuman if !include_nh => needs_human += 1,
@@ -436,12 +478,13 @@ fn incomplete_reason(r: vettalon_contract::coverage::IncompleteReason) -> &'stat
 fn render_coverage(report: &AuditReport, out: &mut String) {
     let c = &report.summary.coverage;
     out.push_str(&tr!(
-        "  模組覆蓋：共 {}　取得有效回覆 {}（完整無候選 {}、有候選 {}）　延後 {}　失敗 {}\n",
-        "  Module coverage: {} total, {} with valid replies ({} fully reviewed without candidates, {} with candidates), {} deferred, {} failed\n",
+        "  模組覆蓋：共 {}　取得有效回覆 {}（完整無候選 {}、有候選 {}、未列檢查 {}）　延後 {}　失敗 {}\n",
+        "  Module coverage: {} total, {} with valid replies ({} fully reviewed without candidates, {} with candidates, {} without checks), {} deferred, {} failed\n",
         c.modules_total,
-        c.covered + c.candidate + c.partially_reviewed,
+        c.covered + c.candidate + c.partially_reviewed + c.shallow,
         c.covered,
         c.candidate,
+        c.shallow,
         c.deferred,
         c.failed
     ));
@@ -452,6 +495,40 @@ fn render_coverage(report: &AuditReport, out: &mut String) {
             c.deferred + c.failed, c.partially_reviewed
         ));
     }
+    let hardening: usize = report.coverage.iter().map(|m| m.hardening.len()).sum();
+    let leads: usize = report.coverage.iter().map(|m| m.leads.len()).sum();
+    if hardening > 0 || leads > 0 {
+        out.push_str(&tr!(
+            "  強化建議：{hardening} 筆　跨模組線索：{leads} 筆（見 JSON coverage）\n",
+            "  Hardening notes: {hardening}; cross-module leads: {leads} (see JSON coverage)\n"
+        ));
+    }
+    for module in unreviewed_lead_modules(report) {
+        out.push_str(&tr!(
+            "  有線索指向未審模組 {module}\n",
+            "  a lead points at unreviewed module {module}\n"
+        ));
+    }
+}
+
+/// Match the scope ledger, including paginated modules, instead of guessing
+/// ownership from module-name prefixes (which can overlap).
+fn unreviewed_lead_modules(report: &AuditReport) -> std::collections::BTreeSet<&str> {
+    let mut modules = std::collections::BTreeSet::new();
+    for lead in report.coverage.iter().flat_map(|m| &m.leads) {
+        let directory_prefix = format!("{}/", lead.path.trim_end_matches('/'));
+        for module in &report.coverage {
+            if !module.has_effective_review()
+                && module
+                    .scope_paths
+                    .iter()
+                    .any(|path| path == &lead.path || path.starts_with(&directory_prefix))
+            {
+                modules.insert(module.module_path.as_str());
+            }
+        }
+    }
+    modules
 }
 
 fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
@@ -574,6 +651,13 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
         out.push_str(&tr!(
             "  可利用性判斷不一致：{tier_split} 筆發現的發現模型與反駁覆核給出不同可利用性等級，已採摩擦較高者（見 tier_disagreement）\n",
             "  Tier disagreement: {tier_split} findings got a different exploitability tier from the refuter than from the finder; the higher-friction tier is used (see tier_disagreement)\n"
+        ));
+    }
+    let severity_split = count_kind(super::schema::EvidenceKind::SeverityDisagreement);
+    if severity_split > 0 {
+        out.push_str(&tr!(
+            "  嚴重度判斷不一致：{severity_split} 筆發現的 finder 與 refuter 給出不同影響等級，只有獨立覆核可依雙方較高的 impact 降低嚴重度（見 severity_disagreement）\n",
+            "  Severity disagreement: {severity_split} findings got different impact levels from finder and refuter; only independent review can cap severity at the higher finder/refuter impact (see severity_disagreement)\n"
         ));
     }
     if !report.ensemble.suspected_injection.is_empty() {
@@ -845,6 +929,7 @@ mod tests {
 
     fn base_report(findings: Vec<Finding>) -> AuditReport {
         AuditReport {
+            scope: None,
             repo: "/tmp/repo".to_string(),
             started_at: "2026-08-17T00:00:00Z".to_string(),
             profile: ScanProfile {
@@ -938,6 +1023,7 @@ mod tests {
         // Dogfood requirement: a machine with zero scanners installed must
         // still produce exit 0 with an honest, non-empty engines_missing list.
         let report = AuditReport {
+            scope: None,
             repo: "/tmp/repo".to_string(),
             started_at: "2026-08-17T00:00:00Z".to_string(),
             profile: ScanProfile {
@@ -1069,6 +1155,50 @@ mod tests {
     }
 
     // ── write_json_report ────────────────────────────────────────────
+
+    #[test]
+    fn coverage_free_text_is_masked_in_json_saved_reports_and_sarif() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = format!("ghp_{}", "a".repeat(36));
+        let mut report = base_report(vec![]);
+        report.coverage = serde_json::from_value(serde_json::json!([{
+            "module_path":"src", "status":"covered", "reason":secret,
+            "reviewed_paths":["src/a.rs"],
+            "checks":[{"invariant":secret, "result":secret,
+                "attack_class":secret, "paths":["src/a.rs"]}],
+            "hardening":[{"file":"src/a.rs", "line":1, "note":secret}],
+            "leads":[{"path":"src/a.rs", "reason":secret}]
+        }]))
+        .unwrap();
+        report.summary = Summary::from_findings(&[], 1, 1, GatePolicy::default(), &report.coverage);
+        let path = dir.path().join("report.json");
+        write_json_report(&report, &path).unwrap();
+        let saved = save_report(dir.path(), &report).unwrap();
+        let outputs = [
+            std::fs::read_to_string(&path).unwrap(),
+            std::fs::read_to_string(saved).unwrap(),
+            super::super::sarif::to_sarif(&report).to_string(),
+        ];
+        for output in outputs {
+            assert!(!output.contains(&secret));
+            assert!(output.contains("***"));
+            assert!(output.contains("src/a.rs"));
+        }
+        // Also check each field, so dropping coverage cannot make the test pass.
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let coverage = &json["coverage"][0];
+        for value in [
+            &coverage["reason"],
+            &coverage["checks"][0]["invariant"],
+            &coverage["checks"][0]["result"],
+            &coverage["checks"][0]["attack_class"],
+            &coverage["hardening"][0]["note"],
+            &coverage["leads"][0]["reason"],
+        ] {
+            assert!(value.as_str().unwrap().contains("***"));
+        }
+    }
 
     #[test]
     fn write_json_report_round_trips() {
@@ -1402,8 +1532,9 @@ mod tests {
         let mut report = base_report(vec![]);
         report.profile.mode = ProfileMode::Deep;
         report.summary.coverage = CoverageSummary {
-            modules_total: 7,
+            modules_total: 8,
             covered: 2,
+            shallow: 1,
             candidate: 1,
             deferred: 3,
             failed: 1,
@@ -1421,9 +1552,12 @@ mod tests {
             carried_refuted: 2,
             revalidated_prior_confirmed: 0,
             changed_source: 4,
+            ..Default::default()
         });
         let text = render_summary(&report, Severity::High);
-        assert!(text.contains("模組覆蓋：共 7"));
+        assert!(text.contains("模組覆蓋：共 8"));
+        assert!(text.contains("取得有效回覆 4"));
+        assert!(text.contains("未列檢查 1"));
         assert!(text.contains("部分覆蓋：4 模組未審"));
         assert!(text.contains("獨立 agent 覆核（審計：auditor；覆核：checker）"));
         assert!(text.contains("20261001T000000Z.json"));
@@ -1434,6 +1568,93 @@ mod tests {
         let text = render_summary(&report, Severity::High);
         assert!(text.contains("先前報告承接：無"));
         assert!(text.contains("未執行覆核"));
+    }
+
+    #[test]
+    fn prior_gap_summary_is_localized_in_deep_mode() {
+        use crate::lang::{Lang, with};
+        let mut report = base_report(vec![]);
+        report.profile.mode = ProfileMode::Deep;
+        report.prior_run = Some(PriorRunInfo {
+            carried_not_rediscovered: 3,
+            prior_gap_modules: 2,
+            carried_not_rediscovered_overflow: 1,
+            ..Default::default()
+        });
+        let zh = with(Lang::ZhTw, || render_summary(&report, Severity::High));
+        let en = with(Lang::En, || render_summary(&report, Severity::High));
+        assert!(zh.contains("3 筆帶入本次覆核"));
+        assert!(en.contains("3 carried for review"));
+        assert!(en.contains("2 prior gap modules prioritized"));
+        assert!(!has_cjk(&en));
+    }
+
+    #[test]
+    fn coverage_notes_count_and_leads_warn_once_per_unreviewed_module() {
+        use crate::audit::schema::ModuleCoverage;
+        use serde_json::json;
+
+        let module = |name: &str, path: &str, reviewed: bool| -> ModuleCoverage {
+            serde_json::from_value(json!({
+                "module_path": name,
+                "status": if reviewed { "covered" } else { "deferred" },
+                "reason": null,
+                "scope_paths": [path],
+                "selected": reviewed,
+                "reviewed_paths": if reviewed { vec![path] } else { vec![] },
+                "attempts": if reviewed { vec![json!({
+                    "model": "mock", "family": "mock", "status": "covered",
+                    "reason": null, "duration_ms": 1, "timed_out": false,
+                    "files": [{"path": path, "read_status": "included",
+                        "submitted_bytes": 10, "truncated": false}]
+                })] } else { vec![] }
+            }))
+            .unwrap()
+        };
+        let mut report = base_report(vec![]);
+        report.profile.mode = ProfileMode::Deep;
+        report.coverage = vec![
+            module("a #1", "a/reviewed.rs", true),
+            module("a #2", "a/unreviewed.rs", false),
+            module("ab", "ab/other.rs", false),
+        ];
+        report.coverage[0].hardening = serde_json::from_value(json!([
+            {"file": "a/reviewed.rs", "line": 1, "note": "defense in depth"}
+        ]))
+        .unwrap();
+        report.coverage[0].leads = serde_json::from_value(json!([
+            {"path": "a/unreviewed.rs", "reason": "follow this call"},
+            {"path": "a", "reason": "follow this module"},
+            {"path": "a/reviewed.rs", "reason": "already reviewed"}
+        ]))
+        .unwrap();
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("強化建議：1 筆　跨模組線索：3 筆"));
+        assert_eq!(text.matches("有線索指向未審模組 a #2").count(), 1);
+        assert!(!text.contains("有線索指向未審模組 a #1"));
+        assert!(!text.contains("有線索指向未審模組 ab"));
+        assert_eq!(exit_code(&report, Severity::Low), 0);
+    }
+
+    #[test]
+    fn severity_disagreement_is_visible_without_changing_effective_severity() {
+        let mut f = high_candidate();
+        f.severity = Severity::Medium;
+        f.evidence.push(super::super::schema::EvidenceItem {
+            kind: super::super::schema::EvidenceKind::SeverityDisagreement,
+            source: "adversarial".into(),
+            detail: "severity_disagreement: finder impact=medium, refuter impact=high".into(),
+            recorded_at: String::new(),
+        });
+        // Old reports may still contain a line per run: count findings, not lines.
+        f.evidence
+            .extend(vec![f.evidence.last().unwrap().clone(); 2]);
+        let mut report = base_report(vec![f]);
+        report.profile.mode = ProfileMode::Deep;
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("嚴重度判斷不一致：1 筆"));
+        assert!(text.contains("severity_disagreement"));
+        assert_eq!(exit_code(&report, Severity::High), 0);
     }
 
     #[test]

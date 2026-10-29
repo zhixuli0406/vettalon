@@ -26,8 +26,15 @@ struct Cli {
 
 #[derive(Args)]
 struct ScanArgs {
+    /// Finder attack-class methodologies: auto selects up to three; all uses all eight (more tokens).
+    /// Overrides config attack_classes; defaults to off when neither is set.
+    #[arg(long, value_enum)]
+    attack_classes: Option<audit::attack_classes::AttackClassMode>,
     /// Repository root.
     path: PathBuf,
+    /// Deep PR scope relative to a Git ref. Quick accepts but ignores this flag.
+    #[arg(long, value_name = "REF", value_parser = vettalon::audit::diff_scope::validate_ref)]
+    diff_base: Option<String>,
     /// quick = OSS scanners only; deep = + AI audit and review.
     #[arg(long, default_value = "quick")]
     profile: String,
@@ -472,6 +479,18 @@ enum VerificationAction {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
+    /// Explain a Vettalon code offline (reference pages are in English).
+    Explain {
+        #[arg(
+            value_name = "CODE",
+            required_unless_present = "list",
+            conflicts_with = "list"
+        )]
+        code: Option<String>,
+        /// List all codes with English summaries.
+        #[arg(long)]
+        list: bool,
+    },
     /// Scan a repository.
     Scan(ScanArgs),
     /// Validate a saved JSON report.
@@ -660,6 +679,10 @@ enum AgentsAction {
 
 #[derive(clap::Args)]
 struct HuntArgs {
+    /// Finder attack-class methodologies: auto selects up to three; all uses all eight (more tokens).
+    /// Overrides config attack_classes; defaults to off when neither is set.
+    #[arg(long, value_enum)]
+    attack_classes: Option<audit::attack_classes::AttackClassMode>,
     /// Project directory holding the lockfile(s): Cargo.lock,
     /// package-lock.json, requirements.txt, go.sum.
     path: PathBuf,
@@ -1068,6 +1091,7 @@ async fn cmd_verify(a: VerifyArgs) -> i32 {
 async fn cmd_scan(args: ScanArgs) -> i32 {
     let ScanArgs {
         path,
+        diff_base,
         profile,
         config,
         finders,
@@ -1089,6 +1113,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         no_prior,
         trace,
         source_receipts,
+        attack_classes,
         time_budget,
         refuter_runs,
         finder_parse_retries,
@@ -1227,6 +1252,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         );
         return 2;
     }
+    let mut attack_classes = attack_classes;
     let (finders, verifiers, poc_models, roster, rank_strategy, prescreen, fix_test_command) =
         if deep {
             let (cfg, source) = match load_config(config.as_deref(), Some(&path)) {
@@ -1236,6 +1262,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
                     return 2;
                 }
             };
+            attack_classes = attack_classes.or(cfg.attack_classes);
             let all = match cfg.handles() {
                 Ok(h) => h,
                 Err(e) => {
@@ -1351,6 +1378,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         };
     let opts = ScanOptions {
         repo_path: path,
+        diff_base,
         profile,
         report,
         sarif,
@@ -1368,6 +1396,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         rank: rank_strategy,
         trace,
         source_receipts,
+        attack_classes: attack_classes.unwrap_or_default(),
         time_budget: budget.total,
         refuter_runs,
         finder_parse_retries: finder_parse_retries as usize,
@@ -1833,6 +1862,10 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
     });
     let auditor = EngineAuditor {
         home: home_dir(),
+        attack_classes: args
+            .attack_classes
+            .or(cfg.attack_classes)
+            .unwrap_or_default(),
         finders,
         verifiers,
         poc_models,
@@ -1897,6 +1930,20 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
                     )
                     .to_string()
                 }
+            };
+            let outcome = if !h.facade_of.is_empty() {
+                vettalon::tr!(
+                    "{outcome}；這是外殼套件，程式碼在 {}（見後續列）",
+                    "{outcome}; facade crate, its code is in {} (see below)",
+                    h.facade_of.join(", ")
+                )
+            } else if let Some(from) = &h.promoted_from {
+                vettalon::tr!(
+                    "{outcome}；{from} 的實作套件",
+                    "{outcome}; implementation crate of {from}"
+                )
+            } else {
+                outcome
             };
             // The index is the plan position; with parallel audits they finish
             // out of order, so the line counts completions instead.
@@ -2675,6 +2722,7 @@ mod remediation_output_tests {
         let findings = vec![finding];
         let report = AuditReport {
             schema_version: 2,
+            scope: None,
             repo: std::fs::canonicalize(&repo)
                 .unwrap()
                 .to_string_lossy()
@@ -2798,6 +2846,39 @@ mod verification_cli_tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn attack_classes_cli_scan_and_hunt_modes() {
+        use audit::attack_classes::AttackClassMode;
+        for command in ["scan", "hunt"] {
+            for (value, expected) in [
+                ("off", AttackClassMode::Off),
+                ("auto", AttackClassMode::Auto),
+                ("all", AttackClassMode::All),
+            ] {
+                let cli =
+                    Cli::try_parse_from(["vettalon", command, ".", "--attack-classes", value])
+                        .unwrap();
+                let actual = match cli.command {
+                    Command::Scan(a) => a.attack_classes,
+                    Command::Hunt(a) => a.attack_classes,
+                    _ => panic!("command"),
+                };
+                assert_eq!(actual, Some(expected));
+            }
+            let cli = Cli::try_parse_from(["vettalon", command, "."]).unwrap();
+            let actual = match cli.command {
+                Command::Scan(a) => a.attack_classes,
+                Command::Hunt(a) => a.attack_classes,
+                _ => panic!("command"),
+            };
+            assert_eq!(actual, None);
+            assert!(
+                Cli::try_parse_from(["vettalon", command, ".", "--attack-classes", "unknown"])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -3370,6 +3451,7 @@ async fn main() -> ExitCode {
     }
     vettalon::lang::set(vettalon::lang::detect(cli.lang.as_deref()));
     let code = match cli.command {
+        Command::Explain { code, list } => vettalon::explain::run(code.as_deref(), list),
         Command::Scan(args) => cmd_scan(args).await,
         Command::Validate { report } => audit::cmd_validate(&report).await,
         Command::Verify(args) => cmd_verify(args).await,

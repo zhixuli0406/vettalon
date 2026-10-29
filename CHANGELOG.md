@@ -4,6 +4,44 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-29
+
+### 升級須知 / Upgrade notes
+
+- **Rust API 有不相容的 struct literal 變更。** `hunt::run::DependencyHunt` 新增 `facade_of: Vec<String>` 與 `promoted_from: Option<String>`，`hunt::graph::DepGraph` 新增 `resolved`。自己用 struct literal 建 `DependencyHunt` 的程式要補上 `facade_of: vec![]`、`promoted_from: None`；`DepGraph` 可改用 `..Default::default()`。JSON 報告相容：兩個欄位空值時不輸出，舊報告照常讀取。
+  Rust struct literals must add `facade_of` and `promoted_from` to `hunt::run::DependencyHunt`; `hunt::graph::DepGraph` gains `resolved` (use `..Default::default()`). JSON reports stay compatible: both fields are omitted when empty and older reports still deserialize.
+
+- **報告 schema 升到 3。** 新版仍可讀 v2 報告：匯出、報告庫、比較和前次結果承接都照常運作。比較 v2 與 v3 報告時會附 `schema_difference` 說明，因為 v2 沒有嚴重度拆解與檢查紀錄。舊版 CLI／Pro 讀不了 v3 報告。
+  Report schema is now 3. v2 reports still export, open in the workspace, compare (with a `schema_difference` note) and feed prior-run carry-over; older binaries cannot read v3 reports.
+- **嚴重度可能被調降，`--fail-on`、`--gate` 用調降後的值。** finder 評的整體嚴重度高於影響時，只有另一家族的 verifier 也評了影響，才會截到兩者中較高的影響等級（`severity_capped`）；沒有獨立評等就維持原值；finder 的影響本來會調降時記 `severity_cap_unconfirmed`，不會調降就不記。原值保留在 `severity_claimed`。同一份程式碼可能比以前少觸發 CI 失敗。
+  Severity above the impact rating is lowered only when a verifier from another family also rated impact (`severity_capped`); otherwise the claimed value stands and `severity_cap_unconfirmed` is noted only when the finder's impact would have lowered it. `--fail-on` and `--gate` use the result, so the same code may fail CI less often.
+- **「covered」的意思變了。** 模型只回空結果、沒列出檢查過什麼的模組，現在記為 `reviewed_no_checks`，不再算 covered。這不影響 `run_status`、結束碼和 gate，只是報告與完整性診斷會列出來。
+  A module whose finder returned no candidates and listed no checks is now `reviewed_no_checks`, not `covered`. Run status, exit codes and gates are unchanged.
+- **finder 回覆格式改為物件**（`{"candidates", "checks", "hardening", "leads"}`）。舊的 JSON 陣列仍接受，但這類模組會記為 `reviewed_no_checks`。refuter 判 `plausible` 時另外回 `impact`，缺了不影響判決。
+  The finder reply is now an object; a legacy bare array is still accepted (its modules become `reviewed_no_checks`).
+- **Rust API 的 struct literal 又多了欄位。** `audit::schema::Finding` 新增 `severity_claimed`、`likelihood`、`impact`；`ModuleCoverage` 新增 `prior_status`、`checks`、`hardening`、`leads`；`CoverageSummary` 新增 `shallow`；`PriorRunInfo` 新增 `carried_not_rediscovered`、`carried_not_rediscovered_overflow`、`hash_budget_exhausted`、`changed_unrediscovered`、`prior_gap_modules`。
+  Rust struct literals must add the new fields on `Finding`, `ModuleCoverage`, `CoverageSummary` and `PriorRunInfo`.
+
+### Added
+
+- 嚴重度拆成可能性與影響：finder 對每筆候選分別評 `likelihood` 與 `impact`（各附理由），整體嚴重度不得高於影響，但要另一家族的 refuter 判 `plausible` 時也評了影響，才會截到兩者中較高的影響等級並記 `severity_capped`；沒有獨立評等時維持原值，finder 的影響本來會調降時記 `severity_cap_unconfirmed`（含提議的等級），finder 沒辦法自己把發現壓到門檻以下。兩邊影響評等不同時記 `severity_disagreement`，顯示在 CLI 與 SARIF（`vettalon.severity_disagreement`）。
+- 模組的檢查紀錄：finder 要列出檢查過的不變量和檔案（`coverage[].checks`，最多 8 筆，路徑必須是送進 prompt 的檔案）。零候選又沒有有效檢查的模組記為 `reviewed_no_checks`（`shallow_no_checks`），計入 `summary.coverage.shallow`，完整性診斷會列出。
+- Hardening 建議與線索另存：模型看到的強化建議（`coverage[].hardening`）和指向其他模組的線索（`coverage[].leads`）各最多 5 筆，不算 finding，不進 SARIF results 與 gate。線索路徑必須是這次掃描看得到的既有檔案，指向敏感路徑的線索會被丟棄；建議與線索的文字先遮罩、截斷後才保留。線索指向本次沒審的模組時，CLI 會逐一列出。
+- 前次缺口優先：前次報告裡延後、失敗、部分審查或 `reviewed_no_checks` 的模組，這次優先審（`coverage[].prior_status = prior_gap:<原因>`），最多佔模組上限的四分之一（無條件進位，上限非零時至少 1 個），其餘照一般風險排序。前次報告要先通過完整的報告驗證才會採用，沒通過就在 stderr 印一行並改找更早的報告。
+- `scan --diff-base <ref>`（deep）：只審 PR 改到的模組。base 與 HEAD 的 merge-base 透過唯讀、強化過的 git 路徑取得，找不到時 exit 2，不會偷偷改成全掃。改動範圍包含 merge-base 到 HEAD 的 commit，以及已 stage、未 stage 和未追蹤（未被 ignore）的檔案；報告記錄 HEAD 與 base 的 commit OID。git 列出不合法的路徑、或 repo 有 `info/grafts` 時一樣 exit 2，git 指令一律停用 replace objects。改到的模組優先入選，其餘記為 `out_of_scope`（`diff_scope`），不算 covered；`run_status` 為 `partial_by_design`，結束碼不變。改動檔案以外的掃描器發現帶 `outside_diff_scope`，不計入 `--fail-on` 與 `--gate`。cargo-audit 等依賴漏洞只要有 manifest 或 lockfile 改動、或所屬 lockfile 沒被 git 追蹤（例如被 `.gitignore` 排除、在 CI 裡才產生），就算在範圍內；判斷不出所屬檔案的掃描器發現一律算在範圍內。審查結束後會重算一次改動範圍：HEAD、base 或 merge-base 變了就 exit 2、不寫報告；掃描期間才改動的檔案併入範圍（`scope.changed_during_scan`），但開始時挑的模組不會重選。報告新增 `scope` 區塊，SARIF 帶 `vettalon.scope`。
+- `--attack-classes off|auto|all`（`scan` 與 `hunt`，預設 `off`，設定檔可用 `attack_classes`，Pro 與桌面版的掃描也照設定檔）：替每個模組挑攻擊類別，把該類的審查方法放進 finder prompt。共 8 類：injection、path_file、ssrf、deserialization、access_control、secrets_crypto、ci_workflow、llm_agent。`auto` 依原始碼裡固定字串的出現次數最多挑 3 類，不呼叫模型，同一份程式碼每次挑的都一樣；沒挑的類別會列出原因（`no_signal`、`cap`）。開啟後，零候選模組要每個選中的類別都有檢查紀錄才算 covered，否則記 `shallow_missing_class_checks`。報告新增 `coverage[].attack_classes`，SARIF 帶 `vettalon.attack_class`。
+- `vettalon explain <代碼>` 與 `vettalon explain --list`：Vettalon 自己的 90 個代碼（證據等級、證明缺口、覆蓋狀態與原因、未完成原因、證據種類、前次承接與 diff 範圍標記）各有一頁說明，內建在執行檔裡，離線可查；打錯字會提示最接近的代碼。SARIF 結果帶 `vettalon.explain_uri` 連到對應頁面。說明頁目前只有英文。
+
+### Changed
+
+- 深審的模組排序：沒有 git 歷史時原本只看檔案數，現在資料檔（`.json`、`.yaml`、`.eml` 等）不加分（`.github/` 等 CI 設定除外），`tests`／`benches`／`examples`／`fixtures` 這類輔助目錄一律排在原始碼模組之後（仍列入 coverage，沒有其他程式碼時照樣審）。
+
+### Fixed
+
+- `hunt` 把外殼 crate 報成審完：直接相依若只是 re-export 另一個 crate（xml-rs 1.0 → xml、liquid → liquid-core），實作所在的 crate 原本被當成 transitive 跳過，結果顯示 complete、實際沒審到解析器。現在自身程式碼少於 500 行、且整包 re-export 某個相依（`pub use dep::*;`／`pub extern crate dep;`）的 crate 會被標 `facade_of`，lockfile 實際連結的那個版本（每個外殼最多 3 個、只追一層，不含 derive／macro 輔助 crate）在計畫內的相依之後補審，記 `promoted_from`。補審另受 `--max-deps` 限制，`--hunt-budget` 下平分剩餘時間；有已知 advisory 時照一般政策略過；實作 crate 不在 lockfile 時 hunt 標為未完成（`facade_implementation_unresolved`）。
+- `hunt` 審套件原始碼包時，mail-parser 的 `resources/` 測試資料（數百個 `.json`／`.eml`）佔滿模組名額，`src/` 一個檔都沒審；同上排序修正。
+- 前次的 `needs_human`／`candidate` 這次沒被重新找到時，會從新報告靜默消失。現在 deep 掃描會把它們以 `Candidate` 帶回來重新驗證（`prior_not_rediscovered`），前提是檔案仍在 repo 內且內容沒變；檔案變了或不見了只列出不帶入，每次最多帶 50 筆。帶入檢查有自己的讀檔預算，和這次發現的檔案雜湊分開計算（各自最多 200 個檔案、合計 256 MiB，前次發現最多看 500 筆）；預算用完時，剩下的筆數記在 `prior_run.hash_budget_exhausted`，CLI 會警告，完整性診斷也會列出，但不改變執行狀態與結束碼。單一檔案超過 256 MiB 視為無法比對。quick 掃描不呼叫模型，只列出並提示改用 `--profile deep`（`quick_profile_not_rechecked`），也不影響 quick 的 gate。
+
 ## [0.5.0] - 2026-10-26
 
 ### Added
