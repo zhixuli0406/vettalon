@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-29
+
+### Fixed
+
+- CLI 0.6.0 的 agents-base 基底映像更新時，Node 授權的 `VERSION` 檔未同步更新，導致映像定義無法建置，`vettalon agents pull`／`vettalon agents build` 因而失敗。0.6.1 修正定義並產生新的映像標籤；CI 現在會在修改 `docker/` 的 PR 上建置 agents-base、agents 與 egress。不使用容器映像的掃描不受影響。
+  In CLI 0.6.0, the agents-base image definition could not build because the Node license `VERSION` file was not updated with the base image bump, causing `vettalon agents pull` / `vettalon agents build` to fail. 0.6.1 fixes the definition with a new image tag; CI now builds agents-base, agents and egress on PRs that touch `docker/`. Scanning without container images was unaffected.
+
 ## [0.6.0] - 2026-10-29
 
 ### 升級須知 / Upgrade notes
