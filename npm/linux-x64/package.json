@@ -1,6 +1,6 @@
 {
   "name": "@vettalon/linux-x64",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "vettalon binary for Linux x64",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/zhixuli0406/vettalon.git", "directory": "npm/linux-x64" },

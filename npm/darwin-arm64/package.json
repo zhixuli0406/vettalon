@@ -1,6 +1,6 @@
 {
   "name": "@vettalon/darwin-arm64",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "vettalon binary for macOS ARM64 (Apple Silicon)",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/zhixuli0406/vettalon.git", "directory": "npm/darwin-arm64" },

@@ -69,6 +69,39 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: python -m unittest discover -s benchmarks/query-refinement -p 'test_*.py'
 
+  images-build:
+    name: container image builds (no publishing)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check for image definition changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          # Compare the full PR/push range, including deletions. If the base
+          # is unavailable (e.g. a new branch), build rather than skip.
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] ||
+             ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif ! git diff --quiet "$BASE_SHA" HEAD -- docker/ .github/workflows/ci.yml; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build base, local agents layer and egress proxy
+        if: steps.changes.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          docker build --tag vettalon-agents-base:ci docker/agents-base
+          docker build --build-arg BASE_IMAGE=vettalon-agents-base:ci --tag vettalon-agents:ci docker/agents
+          docker build --tag vettalon-egress:ci docker/egress
+
   trust:
     name: trust tools (no signing or publishing)
     runs-on: ubuntu-24.04
