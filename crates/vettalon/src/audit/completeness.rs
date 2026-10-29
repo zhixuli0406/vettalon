@@ -14,6 +14,7 @@ const MAX_DETAIL_CHARS: usize = 1024;
 #[serde(rename_all = "snake_case")]
 pub enum CompletenessState {
     Complete,
+    PartialByDesign,
     Incomplete,
     Unknown,
 }
@@ -55,7 +56,12 @@ impl Completeness {
         self.total_issues += 1;
         if !matches!(
             code,
-            "coverage_unknown" | "coverage_unproven" | "engine_evidence_unknown"
+            "coverage_unknown"
+                | "coverage_unproven"
+                | "engine_evidence_unknown"
+                | "shallow_no_checks"
+                | "shallow_missing_class_checks"
+                | "diff_scope"
         ) {
             self.state = CompletenessState::Incomplete;
         }
@@ -98,6 +104,7 @@ fn module_code(status: S, reason: Option<&str>) -> (&'static str, RepairAction) 
         (_, Some("prescreen_cut")) => ("prescreen_cut", A::ConfigureScan),
         (_, Some("candidate_cap")) => ("candidate_limit", A::ConfigureScan),
         (_, Some("engine_unavailable")) => ("engine_unavailable", A::Models),
+        (S::ReviewedNoChecks, _) => ("shallow_no_checks", A::ManualReview),
         (S::Unreadable, _) => ("source_unreadable", A::Files),
         (S::LlmFailed, _) => ("model_failed", A::Models),
         (S::ParseFailed, _) => ("model_output", A::Models),
@@ -125,6 +132,19 @@ pub fn diagnose(report: &AuditReport) -> Completeness {
         out.push(code, &report.repo, Some(&reason.to_string()), action);
     } else if report.run_status == RunStatus::Incomplete {
         out.push("unknown_reason", &report.repo, None, A::Inspect);
+    }
+    if let Some(prior) = &report.prior_run
+        && prior.hash_budget_exhausted > 0
+    {
+        out.push(
+            "hash_budget_exhausted",
+            "prior_run",
+            Some(&format!(
+                "{} remaining prior entries were not processed",
+                prior.hash_budget_exhausted
+            )),
+            A::ManualReview,
+        );
     }
     for engine in &report.engines_missing {
         if engine.reason.starts_with("not applicable") {
@@ -165,7 +185,22 @@ pub fn diagnose(report: &AuditReport) -> Completeness {
             out.push("engine_output", &engine.engine, Some(error), A::Tools);
         }
     }
+    let mut informational_gaps = 0;
+    if let Some(scope) = &report.scope {
+        out.push(
+            "diff_scope",
+            &report.repo,
+            Some(&scope.description()),
+            A::Inspect,
+        );
+        // A deliberate scope restriction is informational, not a failure.
+        informational_gaps += 1;
+    }
     for module in &report.coverage {
+        if report.scope.is_some() && module.is_diff_excluded() {
+            out.modules_not_reviewed += 1;
+            continue;
+        }
         if module.has_full_review() {
             out.modules_fully_reviewed += 1;
         } else if module.has_effective_review() {
@@ -174,7 +209,24 @@ pub fn diagnose(report: &AuditReport) -> Completeness {
             out.modules_not_reviewed += 1;
         }
         let before = out.total_issues;
-        if !matches!(module.status, S::Covered | S::Candidate) {
+        if module.status == S::ReviewedNoChecks {
+            informational_gaps += 1;
+            if let Some(missing) = module.missing_class_check_reason() {
+                out.push(
+                    "shallow_missing_class_checks",
+                    &module.module_path,
+                    Some(&missing),
+                    A::ManualReview,
+                );
+            } else {
+                out.push(
+                    "shallow_no_checks",
+                    &module.module_path,
+                    Some("reviewed but the model listed no checks"),
+                    A::ManualReview,
+                );
+            }
+        } else if !matches!(module.status, S::Covered | S::Candidate) {
             let (code, action) = module_code(module.status, module.reason.as_deref());
             out.push(code, &module.module_path, module.reason.as_deref(), action);
         }
@@ -189,7 +241,7 @@ pub fn diagnose(report: &AuditReport) -> Completeness {
                 );
             } else if !matches!(
                 attempt.status,
-                S::Covered | S::Candidate | S::PartiallyReviewed
+                S::Covered | S::ReviewedNoChecks | S::Candidate | S::PartiallyReviewed
             ) {
                 let (code, action) = module_code(attempt.status, attempt.reason.as_deref());
                 out.push(code, &subject, attempt.reason.as_deref(), action);
@@ -220,7 +272,9 @@ pub fn diagnose(report: &AuditReport) -> Completeness {
                 out.push("source_truncated", path, None, A::ConfigureScan);
             }
         }
-        if !module.has_full_review() && out.total_issues == before {
+        if !module.has_full_review()
+            && out.total_issues == before + usize::from(module.status == S::ReviewedNoChecks)
+        {
             out.push(
                 "coverage_unproven",
                 &module.module_path,
@@ -237,7 +291,8 @@ pub fn diagnose(report: &AuditReport) -> Completeness {
             A::ManualReview,
         );
     }
-    let legacy = report.schema_version < 2 || (deep && report.coverage.is_empty());
+    let legacy =
+        report.schema_version < 2 || (deep && report.coverage.is_empty() && report.scope.is_none());
     let has_gap = out.state == CompletenessState::Incomplete
         || report.run_status == RunStatus::Incomplete
         || report.summary.coverage.partial;
@@ -259,8 +314,10 @@ pub fn diagnose(report: &AuditReport) -> Completeness {
     }
     out.state = if has_gap {
         CompletenessState::Incomplete
-    } else if legacy || out.total_issues > 0 {
+    } else if legacy || out.total_issues > informational_gaps {
         CompletenessState::Unknown
+    } else if report.scope.is_some() {
+        CompletenessState::PartialByDesign
     } else {
         CompletenessState::Complete
     };
@@ -277,6 +334,123 @@ mod tests {
         ))
         .unwrap()
     }
+
+    #[test]
+    fn shallow_modules_are_informational_and_old_covered_stays_covered() {
+        let mut r = report();
+        assert_eq!(r.coverage[0].status, S::Covered);
+        assert!(r.coverage[0].checks.is_empty());
+        assert_eq!(r.summary.coverage.shallow, 0);
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json["coverage"][0].get("checks").is_none());
+        let old: AuditReport = serde_json::from_value(json).unwrap();
+        assert_eq!(old.coverage[0].status, S::Covered);
+        r.engines_missing.clear();
+        assert_eq!(diagnose(&r).state, CompletenessState::Complete);
+        r.coverage[0].status = S::ReviewedNoChecks;
+        r.coverage[0].attempts[0].status = S::ReviewedNoChecks;
+        r.coverage[0].reason = Some("shallow_no_checks".into());
+        r.summary.coverage = super::super::schema::CoverageSummary::from_coverage(&r.coverage);
+        let d = diagnose(&r);
+        assert_eq!(d.state, CompletenessState::Complete);
+        assert_eq!(d.total_issues, 1);
+        assert_eq!(d.issues[0].code, "shallow_no_checks");
+        assert_eq!(d.issues[0].subject, r.coverage[0].module_path);
+        assert_eq!(
+            d.issues[0].detail.as_deref(),
+            Some("reviewed but the model listed no checks")
+        );
+        assert!(!r.summary.coverage.partial);
+        assert_eq!(r.run_status, RunStatus::Complete);
+    }
+
+    #[test]
+    fn missing_attack_class_checks_are_informational_and_name_actual_gaps() {
+        use crate::audit::attack_classes::{AttackClassMode, select};
+        use crate::audit::schema::CoverageCheck;
+        let mut r = report();
+        r.engines_missing.clear();
+        let module = &mut r.coverage[0];
+        module.status = S::ReviewedNoChecks;
+        module.attempts[0].status = S::ReviewedNoChecks;
+        // A stale display reason must not override the selected classes and checks.
+        module.reason = Some("shallow_no_checks".into());
+        module.attack_classes = select(
+            AttackClassMode::Auto,
+            &[("src/a.rs".into(), "eval( fetch(".into())],
+        );
+        module.checks.push(CoverageCheck {
+            attack_class: Some("injection".into()),
+            invariant: "Input stays separate from code".into(),
+            paths: module.reviewed_paths.clone(),
+            result: "The source passes arguments as data".into(),
+        });
+        r.summary.coverage = super::super::schema::CoverageSummary::from_coverage(&r.coverage);
+        let diagnosis = diagnose(&r);
+        assert_eq!(diagnosis.state, CompletenessState::Complete);
+        assert_eq!(diagnosis.total_issues, 1);
+        assert_eq!(diagnosis.issues[0].code, "shallow_missing_class_checks");
+        assert_eq!(
+            diagnosis.issues[0].detail.as_deref(),
+            Some("shallow_missing_class_checks: ssrf")
+        );
+        assert_eq!(diagnosis.issues[0].action, RepairAction::ManualReview);
+        assert!(!r.summary.coverage.partial);
+        let mut diff = r.clone();
+        diff.run_status = RunStatus::PartialByDesign;
+        diff.scope = Some(crate::audit::schema::DiffScope {
+            mode: crate::audit::schema::DiffScopeMode::Diff,
+            base: "main".into(),
+            merge_base: "a".repeat(40),
+            head: "b".repeat(40),
+            base_oid: "a".repeat(40),
+            worktree_changes: 0,
+            untracked: 0,
+            changed_files: 1,
+            invalid_paths: 0,
+            changed_during_scan: 0,
+        });
+        let diagnosis = diagnose(&diff);
+        assert_eq!(diagnosis.state, CompletenessState::PartialByDesign);
+        assert_eq!(diagnosis.total_issues, 2);
+        assert_eq!(diagnosis.issues[0].code, "diff_scope");
+        assert_eq!(diagnosis.issues[1].code, "shallow_missing_class_checks");
+        r.coverage[0].attempts[0].files[0].truncated = true;
+        assert_eq!(diagnose(&r).state, CompletenessState::Incomplete);
+    }
+
+    #[test]
+    fn prior_hash_exhaustion_is_a_gap_without_changing_status_or_gates() {
+        let mut r = report();
+        r.engines_missing.clear();
+        r.prior_run = Some(crate::audit::schema::PriorRunInfo {
+            hash_budget_exhausted: 3,
+            ..Default::default()
+        });
+        let before = serde_json::to_value(&r).unwrap();
+        let diagnosis = diagnose(&r);
+        assert_eq!(diagnosis.state, CompletenessState::Incomplete);
+        let gap = diagnosis
+            .issues
+            .iter()
+            .find(|gap| gap.code == "hash_budget_exhausted")
+            .unwrap();
+        assert_eq!(gap.subject, "prior_run");
+        assert_eq!(
+            gap.detail.as_deref(),
+            Some("3 remaining prior entries were not processed")
+        );
+        assert_eq!(gap.action, RepairAction::ManualReview);
+        assert_eq!(serde_json::to_value(&r).unwrap(), before);
+        r.prior_run.as_mut().unwrap().hash_budget_exhausted = 0;
+        assert!(
+            !diagnose(&r)
+                .issues
+                .iter()
+                .any(|gap| gap.code == "hash_budget_exhausted")
+        );
+    }
+
     #[test]
     fn engine_gaps_survive_complete_status_and_not_applicable_is_excluded() {
         let mut r = report();

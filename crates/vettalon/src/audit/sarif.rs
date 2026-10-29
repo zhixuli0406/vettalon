@@ -68,6 +68,28 @@ fn uri_path(p: &str) -> String {
     out
 }
 
+/// Class metadata is attached only when the module selection supports it.
+/// Exact evidence-path membership also covers findings from static scanners.
+fn result_attack_class(report: &AuditReport, finding: &Finding) -> Option<&'static str> {
+    let class = finding
+        .cwe
+        .as_deref()
+        .and_then(super::attack_classes::class_for_cwe)?;
+    report
+        .coverage
+        .iter()
+        .any(|module| {
+            (module.candidate_ids.contains(&finding.id)
+                || module.scope_paths.contains(&finding.file)
+                || module.reviewed_paths.contains(&finding.file))
+                && module.attack_classes.as_ref().is_some_and(|classes| {
+                    classes.mode != super::attack_classes::AttackClassMode::Off
+                        && classes.selected.iter().any(|selected| selected == class)
+                })
+        })
+        .then_some(class)
+}
+
 fn result(f: &Finding, taxa: &[String]) -> Value {
     // A pre-check-refuted finding keeps the model's claimed path verbatim,
     // which may be absolute or escape the repo: never emit it as a location.
@@ -99,6 +121,7 @@ fn result(f: &Finding, taxa: &[String]) -> Value {
             "vettalon.proof_limits": f.proof_summary(),
             "vettalon.evidence_level": f.evidence_level(),
             "vettalon.proof_gaps": f.proof_gaps(),
+            "vettalon.explain_uri": explanation_uris(f),
         }
     });
     if let Some(counter) = f.strongest_counterevidence() {
@@ -149,6 +172,12 @@ fn result(f: &Finding, taxa: &[String]) -> Value {
     }
     r["properties"]["vettalon.severity"] = json!(severity_key(f.severity));
     r["properties"]["vettalon.severity_basis"] = json!(f.severity_basis);
+    if f.evidence
+        .iter()
+        .any(|e| e.kind == EvidenceKind::SeverityDisagreement)
+    {
+        r["properties"]["vettalon.severity_disagreement"] = json!(true);
+    }
     // P1-2: deterministic exploitability tier from the finding's
     // preconditions; O11: the higher-friction of finder and refuter.
     let ex = crate::audit::exploitability::assess_finding(f);
@@ -187,6 +216,42 @@ fn result(f: &Finding, taxa: &[String]) -> Value {
         r["suppressions"] = json!([{ "kind": "external", "justification": why }]);
     }
     r
+}
+
+/// A finding has several codes at once. Preserve each link by code, rather
+/// than choosing one explanation and losing the remaining evidence context.
+fn explanation_uris(f: &Finding) -> BTreeMap<String, String> {
+    let mut links = BTreeMap::new();
+    let mut add = |code: &str| {
+        if let Some(uri) = crate::explain::uri(code) {
+            links.insert(code.to_string(), uri);
+        }
+    };
+    add(f.evidence_level().key());
+    for gap in f.proof_gaps() {
+        add(gap.key());
+    }
+    add(&f.rule_id);
+    for evidence in &f.evidence {
+        if let Ok(Value::String(kind)) = serde_json::to_value(evidence.kind) {
+            add(&kind);
+        }
+        // Evidence details start with a machine code followed by a colon,
+        // whitespace or end-of-string. Never search arbitrary prose for codes.
+        if let Some(code) = evidence.detail.split([':', ' ', '\n', '\t']).next() {
+            add(code);
+            if code == "refuter_run"
+                && let Some((_, verdict)) = evidence.detail.split_once(": ")
+                && let Some(verdict_code) = verdict.split([':', ' ', '\n', '\t']).next()
+            {
+                add(verdict_code);
+            }
+        }
+    }
+    if crate::audit::exploitability::assess_finding(f).disagreement() {
+        add("tier_disagreement");
+    }
+    links
 }
 
 /// `CWE-89` → `"89"` (SARIF taxon ids use the bare number, as in the spec's
@@ -241,6 +306,7 @@ pub fn to_sarif(report: &AuditReport) -> Value {
     // `security-severity` only from source-supplied CVSS vectors.
     struct RuleAgg {
         severity: Severity,
+        explain_uris: BTreeMap<String, String>,
         tags: std::collections::BTreeSet<String>,
         max: Option<crate::audit::cvss::CvssScore>,
         findings: usize,
@@ -251,12 +317,14 @@ pub fn to_sarif(report: &AuditReport) -> Value {
     for f in &report.findings {
         let e = rules.entry(f.rule_id.as_str()).or_insert_with(|| RuleAgg {
             severity: f.severity,
+            explain_uris: BTreeMap::new(),
             tags: std::collections::BTreeSet::new(),
             max: None,
             findings: 0,
             scored: 0,
         });
         e.findings += 1;
+        e.explain_uris.extend(explanation_uris(f));
         if f.severity > e.severity {
             e.severity = f.severity;
         }
@@ -287,6 +355,7 @@ pub fn to_sarif(report: &AuditReport) -> Value {
             let mut props = json!({
                 "tags": tags,
                 "vettalon.severity": severity_key(agg.severity),
+                "vettalon.explain_uri": agg.explain_uris,
             });
             match (&agg.max, agg.scored == agg.findings) {
                 // GitHub's range is >0.0–10.0: a 0.0 CVSS score has no
@@ -335,7 +404,13 @@ pub fn to_sarif(report: &AuditReport) -> Value {
         "version": "2.1.0",
         "runs": [{
             "tool": { "driver": driver },
-            "results": report.findings.iter().map(|f| result(f, &taxa)).collect::<Vec<_>>(),
+            "results": report.findings.iter().map(|f| {
+                let mut output = result(f, &taxa);
+                if let Some(class) = result_attack_class(report, f) {
+                    output["properties"]["vettalon.attack_class"] = json!(class);
+                }
+                output
+            }).collect::<Vec<_>>(),
             "properties": {
                 "vettalon.run_status": report.run_status,
                 "vettalon.incomplete_reason": report.incomplete_reason,
@@ -346,6 +421,9 @@ pub fn to_sarif(report: &AuditReport) -> Value {
             }
         }]
     });
+    if let Some(scope) = &report.scope {
+        out["runs"][0]["properties"]["vettalon.scope"] = json!(scope);
+    }
     if !run_taxonomies.is_empty() {
         out["runs"][0]["taxonomies"] = json!(run_taxonomies);
     }
@@ -383,6 +461,7 @@ mod tests {
     fn report(findings: Vec<Finding>) -> AuditReport {
         AuditReport {
             schema_version: 2,
+            scope: None,
             repo: "/r".into(),
             started_at: "2026-10-12T00:00:00Z".into(),
             profile: ScanProfile {
@@ -400,6 +479,105 @@ mod tests {
             verifier: VerifierInfo::default(),
             ensemble: Default::default(),
         }
+    }
+
+    #[test]
+    fn explanation_links_cover_each_result_and_the_union_for_a_shared_rule() {
+        use crate::audit::schema::EvidenceItem;
+        let mut a = finding(Severity::High, FindingStatus::Candidate, Some(1));
+        a.evidence.push(EvidenceItem {
+            kind: EvidenceKind::AdversarialReview,
+            detail: "verify_error: unavailable".into(),
+            source: "adversarial".into(),
+            recorded_at: String::new(),
+        });
+        let mut b = finding(Severity::High, FindingStatus::Candidate, Some(2));
+        b.evidence.push(EvidenceItem {
+            kind: EvidenceKind::ScopeNote,
+            detail: "outside_diff_scope".into(),
+            source: "scope".into(),
+            recorded_at: String::new(),
+        });
+        b.evidence.push(EvidenceItem {
+            kind: EvidenceKind::AdversarialReview,
+            detail: "refuter_run 1/2: refuted: input is escaped".into(),
+            source: "adversarial".into(),
+            recorded_at: String::new(),
+        });
+        let s = to_sarif(&report(vec![a, b]));
+        let first = &s["runs"][0]["results"][0]["properties"]["vettalon.explain_uri"];
+        let second = &s["runs"][0]["results"][1]["properties"]["vettalon.explain_uri"];
+        for code in [
+            "static_only",
+            "no_control",
+            "verify_error",
+            "outside_diff_scope",
+        ] {
+            // no_control requires an accepted PoC effect; these static findings
+            // have no_poc instead, so no unrelated page should be attached.
+            if code == "no_control" {
+                assert!(first.get(code).is_none());
+                continue;
+            }
+            let expected = crate::explain::uri(code).unwrap();
+            let rule =
+                &s["runs"][0]["tool"]["driver"]["rules"][0]["properties"]["vettalon.explain_uri"];
+            assert_eq!(rule[code], expected);
+        }
+        assert_eq!(
+            first["verify_error"],
+            crate::explain::uri("verify_error").unwrap()
+        );
+        assert!(first.get("outside_diff_scope").is_none());
+        assert_eq!(
+            second["outside_diff_scope"],
+            crate::explain::uri("outside_diff_scope").unwrap()
+        );
+        assert!(second.get("verify_error").is_none());
+        assert_eq!(second["refuted"], crate::explain::uri("refuted").unwrap());
+        assert_eq!(
+            second["refuter_run"],
+            crate::explain::uri("refuter_run").unwrap()
+        );
+        assert_eq!(first["no_poc"], crate::explain::uri("no_poc").unwrap());
+    }
+
+    #[test]
+    fn attack_class_property_requires_selected_module_and_known_cwe() {
+        use crate::audit::attack_classes::{AttackClassMode, select};
+        let mut finding = finding(Severity::High, FindingStatus::Candidate, Some(1));
+        finding.cwe = Some("CWE-89".into());
+        let mut report = report(vec![finding]);
+        let property = |report: &AuditReport| {
+            to_sarif(report)["runs"][0]["results"][0]["properties"]
+                .get("vettalon.attack_class")
+                .cloned()
+        };
+        assert_eq!(property(&report), None);
+        let mut module: super::super::schema::ModuleCoverage = serde_json::from_value(json!({
+            "module_path": "src", "status": "candidate", "reason": null,
+            "scope_paths": ["src/a.py"]
+        }))
+        .unwrap();
+        module.attack_classes = select(
+            AttackClassMode::Auto,
+            &[("src/a.py".into(), "eval(".into())],
+        );
+        report.coverage.push(module);
+        assert_eq!(property(&report), Some(json!("injection")));
+        report.findings[0].cwe = Some("CWE-918".into());
+        assert_eq!(property(&report), None);
+        report.findings[0].cwe = Some("CWE-999999".into());
+        assert_eq!(property(&report), None);
+        report.findings[0].cwe = Some("CWE-89".into());
+        report.findings[0].file = "src/unrelated.py".into();
+        assert_eq!(property(&report), None);
+        report.coverage[0]
+            .candidate_ids
+            .push(report.findings[0].id.clone());
+        assert_eq!(property(&report), Some(json!("injection")));
+        report.coverage[0].attack_classes = None;
+        assert_eq!(property(&report), None);
     }
 
     #[test]
@@ -722,5 +900,47 @@ mod tests {
         assert!(props.get("vettalon.exploitability_refuter").is_none());
         assert!(props.get("vettalon.tier_disagreement").is_none());
         assert!(props.get("vettalon.comment_sensitivity").is_none());
+    }
+
+    #[test]
+    fn severity_disagreement_is_a_result_property_and_keeps_effective_level() {
+        let mut f = finding(Severity::Medium, FindingStatus::Candidate, Some(1));
+        f.evidence.push(crate::audit::schema::EvidenceItem {
+            kind: EvidenceKind::SeverityDisagreement,
+            source: "adversarial".into(),
+            detail: "severity_disagreement: finder impact=medium, refuter impact=high (runs 1,3 of 3), low (run 2 of 3)".into(),
+            recorded_at: String::new(),
+        });
+        let s = to_sarif(&report(vec![f]));
+        let props = &s["runs"][0]["results"][0]["properties"];
+        assert_eq!(props["vettalon.severity_disagreement"], true);
+        assert_eq!(props["vettalon.severity"], "medium");
+        let plain = to_sarif(&report(vec![finding(
+            Severity::Medium,
+            FindingStatus::Candidate,
+            Some(1),
+        )]));
+        assert!(
+            plain["runs"][0]["results"][0]["properties"]
+                .get("vettalon.severity_disagreement")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn coverage_hardening_and_leads_never_become_sarif_results() {
+        let mut r = report(vec![]);
+        r.coverage = serde_json::from_value(json!([{
+            "module_path": "src", "status": "covered", "reason": null,
+            "hardening": [{"file": "src/a.py", "line": 1, "note": "harden"}],
+            "leads": [{"path": "other/b.py", "reason": "follow"}]
+        }]))
+        .unwrap();
+        let s = to_sarif(&r);
+        assert_eq!(s["runs"][0]["results"], json!([]));
+        assert_eq!(
+            s["runs"][0]["properties"]["vettalon.coverage"][0]["hardening"][0]["note"],
+            "harden"
+        );
     }
 }

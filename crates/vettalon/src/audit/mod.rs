@@ -41,10 +41,12 @@ mod refuter_score;
 pub const DEFAULT_FINDER_PARSE_RETRIES: usize = ai_audit::AI_AUDIT_PARSE_RETRIES;
 mod ai_audit;
 mod assign;
+pub mod attack_classes;
 mod comment_strip;
 pub mod completeness;
 mod coverage;
 pub mod cve;
+pub mod diff_scope;
 mod dual_finder;
 pub use dual_finder::{
     DedupeBasis, DualFinderReport, DualModule, FamilyYield, FinderSide, MarginalYield,
@@ -134,6 +136,8 @@ pub enum RankStrategy {
 /// Flags of `vettalon scan`, with the model roster already resolved.
 pub struct ScanOptions {
     pub repo_path: PathBuf,
+    /// Deep-only diff scope; validated before any scan subprocess.
+    pub diff_base: Option<String>,
     /// `"quick"` | `"deep"`, parsed here so a bad value maps to exit 2.
     pub profile: String,
     pub report: Option<PathBuf>,
@@ -169,6 +173,8 @@ pub struct ScanOptions {
     pub trace: Option<PathBuf>,
     /// Opt-in content-free source/prompt hashes for each deep finder call.
     pub source_receipts: bool,
+    /// Deterministic finder methodology selection; off preserves the generic prompt.
+    pub attack_classes: attack_classes::AttackClassMode,
     /// Wall-clock budget for the whole AI deep-audit. When it runs out, the
     /// modules still pending are deferred and the run is marked incomplete
     /// (`TimeBudgetExhausted`) instead of grinding on. `None` = no budget.
@@ -222,6 +228,8 @@ pub struct ScanOptions {
 pub enum ScanError {
     /// `--profile` was not `quick` | `deep`.
     BadProfile(String),
+    /// Invalid or unavailable diff scope (always exit 2).
+    DiffScope(String),
     /// The scan target could not be canonicalized.
     UnresolvablePath { path: String, detail: String },
     /// The scan target is not a directory.
@@ -239,6 +247,7 @@ impl ScanError {
     pub fn message(&self, lang: crate::lang::Lang) -> String {
         let zh = lang == crate::lang::Lang::ZhTw;
         match self {
+            ScanError::DiffScope(reason) => format!("--diff-base: {reason}"),
             ScanError::BadProfile(e) if zh => format!("無效的 --profile：{e}"),
             ScanError::BadProfile(e) => format!("invalid --profile: {e}"),
             ScanError::UnresolvablePath { path, detail } if zh => {
@@ -410,6 +419,25 @@ pub async fn run_scan_with_progress(
         .profile
         .parse()
         .map_err(|e: String| ScanError::BadProfile(e))?;
+    if opts.attack_classes == attack_classes::AttackClassMode::All
+        && profile_mode == ProfileMode::Deep
+    {
+        // Hunt invokes a deep scan per dependency; emit at most once per process.
+        static ALL_CLASSES_WARNING: std::sync::Once = std::sync::Once::new();
+        ALL_CLASSES_WARNING.call_once(|| eprintln!("[vettalon] {}", crate::lang::pick(
+            "提示：--attack-classes all 會在每個模組加入全部八類方法論，增加 prompt 與 token 用量。",
+            "note: --attack-classes all adds all eight methodologies to every module, increasing prompt size and token use."
+        )));
+    }
+
+    if let Some(base) = &opts.diff_base {
+        diff_scope::validate_ref(base).map_err(ScanError::DiffScope)?;
+        if profile_mode == ProfileMode::Quick {
+            eprintln!(
+                "[vettalon] note: --diff-base ignored with --profile quick; scanning and gates use full scope"
+            );
+        }
+    }
     if opts.poc && profile_mode != ProfileMode::Deep {
         eprintln!(
             "[vettalon] {}",
@@ -427,12 +455,30 @@ pub async fn run_scan_with_progress(
     if !repo_root.is_dir() {
         return Err(ScanError::NotADirectory(repo_root.display().to_string()));
     }
+    // Fail closed before scanners or intake can run any Git command.
+    let mut diff = match (&opts.diff_base, profile_mode) {
+        (Some(base), ProfileMode::Deep) => Some(
+            diff_scope::compute(&repo_root, base)
+                .await
+                .map_err(ScanError::DiffScope)?,
+        ),
+        _ => None,
+    };
     let repo_str = repo_root.to_string_lossy().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
+    // Load once before selection. --no-prior disables both priority and carry-in.
+    let mut prior = if opts.no_prior {
+        None
+    } else {
+        prior_run::load_prior(home_dir, &repo_str)
+    };
 
     progress.phase(Phase::Scanners, "running OSS scanners");
     let (mut engines_run, mut engines_missing, mut findings) = scanners::run_all(&repo_root).await;
     normalize_scanner_paths(&repo_root, &mut findings);
+    if let Some(diff) = &diff {
+        diff.annotate_findings(&mut findings);
+    }
 
     let intake_profile = if profile_mode == ProfileMode::Deep {
         progress.phase(Phase::Intake, "language census, entry points, git hotspots");
@@ -441,6 +487,9 @@ pub async fn run_scan_with_progress(
         None
     };
 
+    if let (Some(diff), Some(prior), Some(profile)) = (&diff, &mut prior, &intake_profile) {
+        prior.restrict_diff_scope(diff, &rank_snapshot::ranked_modules(&repo_root, profile));
+    }
     let refusals = RefusalLog::default();
     // P2-1: only a --trace run records; an ordinary run keeps a disabled log.
     let trace = if opts.trace.is_some() {
@@ -472,6 +521,8 @@ pub async fn run_scan_with_progress(
                 trace: &trace,
                 progress,
                 scan_deadline,
+                prior: prior.as_ref(),
+                diff: diff.as_ref(),
             },
         )
         .await;
@@ -504,18 +555,34 @@ pub async fn run_scan_with_progress(
     // Prior-run carry-over runs BEFORE review: carried Refuted/Suppressed
     // findings never cost a verifier call.
     prior_run::fill_file_hashes(&repo_root, &mut findings);
-    let prior_info = if opts.no_prior {
-        None
-    } else {
-        prior_run::load_prior(home_dir, &repo_str)
-            .map(|idx| prior_run::apply_prior(&mut findings, &idx))
-    };
+    let prior_info = prior.as_ref().map(|idx| {
+        let mut info = prior_run::apply_prior(&mut findings, idx);
+        if profile_mode == ProfileMode::Deep {
+            info.prior_gap_modules = idx.annotate_coverage(&mut coverage);
+            prior_run::carry_unrediscovered(&repo_root, &mut findings, idx, &mut info);
+        } else {
+            prior_run::record_quick_unrediscovered(&findings, idx, &mut info);
+        }
+        info
+    });
+    if let Some(info) = &prior_info {
+        let count = info.hash_budget_exhausted;
+        if count > 0 {
+            eprintln!(
+                "[vettalon] {}",
+                crate::tr!(
+                    "警告：歷史帶入雜湊預算已耗盡，{count} 筆剩餘歷史項目未處理。",
+                    "warning: prior carry hash budget exhausted; {count} remaining prior entries were not processed."
+                )
+            );
+        }
+    }
 
     let refuter_cap_hit = std::sync::atomic::AtomicBool::new(false);
     let mut poc_cap_hit = false;
     let mut poc_budget_skipped = false;
-    if ai_ran {
-        if findings.iter().any(adversarial::is_eligible) {
+    if profile_mode == ProfileMode::Deep && (ai_ran || findings.iter().any(prior_run::is_carried)) {
+        if findings.iter().any(review_eligible) {
             progress.phase(Phase::Review, "cross-family verifiers reviewing candidates");
             let review_start = std::time::Instant::now();
             findings = review_step(
@@ -538,6 +605,8 @@ pub async fn run_scan_with_progress(
             )
             .await;
         }
+        // Review (including the independent impact cap) is complete here.
+        // PoC High+ selection therefore uses effective severity, not the claim.
         if opts.poc {
             progress.phase(Phase::Poc, "sandboxed PoC generation");
             let poc_start = std::time::Instant::now();
@@ -562,6 +631,31 @@ pub async fn run_scan_with_progress(
     }
     let refuter_cap_hit = refuter_cap_hit.into_inner();
 
+    // Review and PoC can be lengthy. Refresh before deriving any final counts
+    // or gates, and reapply scope evidence to every scanner finding.
+    if let Some(diff) = &mut diff {
+        let final_selection = diff_scope::compute(&repo_root, &diff.scope.base)
+            .await
+            .map_err(|_| {
+                ScanError::DiffScope(
+                    "diff scope changed during the scan (recompute failed); rerun".into(),
+                )
+            })?;
+        diff.reconcile(final_selection)
+            .map_err(ScanError::DiffScope)?;
+        diff.annotate_findings(&mut findings);
+        let count = diff.scope.changed_during_scan;
+        if count > 0 {
+            eprintln!(
+                "[vettalon] {}",
+                crate::tr!(
+                    "提示：掃描期間新增變更的 {count} 個檔案已納入範圍；開始時的模組選擇未包含這些新增變更。",
+                    "note: {count} files changed during the scan were treated as in scope; modules selected at the start did not include these additional changes."
+                )
+            );
+        }
+    }
+
     let mut refusal_events = refusals.snapshot();
     refusal_events.sort_by(|a, b| (&a.step, &a.model).cmp(&(&b.step, &b.model)));
     // Precedence: whole shares lost > budget cap > refusals > other gaps.
@@ -569,7 +663,7 @@ pub async fn run_scan_with_progress(
     // only findings with no usable verdict make the run incomplete.
     let unverified = findings
         .iter()
-        .any(|f| adversarial::is_eligible(f) && !adversarial::is_uncertain(f));
+        .any(|f| review_eligible(f) && !adversarial::is_uncertain(f));
     let scanner_failed = scanners::runs_failed(&engines_run);
     let units_failed = coverage.iter().any(|c| {
         matches!(
@@ -626,6 +720,7 @@ pub async fn run_scan_with_progress(
     summary.policy = gate::evaluate_all(&opts.gates, &findings);
     let mut audit_report = AuditReport {
         schema_version: CURRENT_SCHEMA_VERSION,
+        scope: diff.as_ref().map(|d| d.scope.clone()),
         repo: repo_str,
         started_at,
         profile: ScanProfile {
@@ -638,6 +733,8 @@ pub async fn run_scan_with_progress(
         summary,
         run_status: if incomplete_reason.is_some() {
             RunStatus::Incomplete
+        } else if diff.is_some() {
+            RunStatus::PartialByDesign
         } else {
             RunStatus::Complete
         },
@@ -989,6 +1086,8 @@ struct AuditContext<'a> {
     progress: &'a dyn Progress,
     /// `--time-budget` deadline, set when the AI steps began.
     scan_deadline: Option<std::time::Instant>,
+    prior: Option<&'a prior_run::PriorIndex>,
+    diff: Option<&'a diff_scope::DiffSelection>,
 }
 
 /// Units in the prescreen pool that fell below its cut are deferred for
@@ -1027,9 +1126,22 @@ async fn run_audit_step(
         trace,
         progress,
         scan_deadline,
+        prior,
+        diff,
     } = ctx;
     // Shared with `rank_snapshot` (benchmark dump) so the two cannot drift.
     let ranked = rank_snapshot::ranked_modules(repo_root, intake_profile);
+    let (ranked, outside): (Vec<_>, Vec<_>) = ranked
+        .into_iter()
+        .partition(|m| diff.is_none_or(|d| d.contains_module(m)));
+    let outside_coverage = || {
+        let mut coverage = coverage::build_module_coverage(&outside, &[]);
+        for module in &mut coverage {
+            module.status = schema::ModuleCoverageStatus::OutOfScope;
+            module.reason = Some("diff_scope".into());
+        }
+        coverage
+    };
     // Opt-in metadata-only re-ranking (`--rank jev`). On any failure keep the
     // heuristic order and tell the operator; a ranker outage must not block a
     // scan. Only metadata leaves the machine, guarded inside `jev::rerank`.
@@ -1067,7 +1179,13 @@ async fn run_audit_step(
         ai_audit::paginate_modules(repo_root, ranked, ai_audit::MODULE_PROMPT_BUDGET_BYTES);
     // Opt-in second stage: a cheap model scores the head of the order and
     // only the top fraction goes on to the deep audit.
-    let (ranked, prescreen_record, prescreen_cut) = match &opts.prescreen {
+    if diff.is_some() && opts.prescreen.is_some() {
+        eprintln!(
+            "[vettalon] note: --prescreen bypassed in diff scope; changed modules use the module cap and budget"
+        );
+    }
+    let active_prescreen = opts.prescreen.as_ref().filter(|_| diff.is_none());
+    let (mut ranked, mut prescreen_record, prescreen_cut) = match active_prescreen {
         None => (ranked, None, None),
         // Nothing to audit, or no finder to audit it: do not send excerpts.
         Some(_) if ranked.is_empty() || opts.finders.is_empty() => (ranked, None, None),
@@ -1119,6 +1237,25 @@ async fn run_audit_step(
         None => requested,
     };
     let take = requested.min(ai_audit::MAX_AUDIT_MODULES_CEILING);
+    // Promote a bounded share of prior gaps after pagination and prescreen;
+    // all remaining units retain their normal risk ordering.
+    if let Some(prior) = prior {
+        let pool = prescreen_record.as_ref().map_or(ranked.len(), |r| r.pool);
+        prior.prioritize_modules(&mut ranked[..pool], take);
+        if let Some(record) = &mut prescreen_record {
+            let positions: std::collections::HashMap<&str, usize> = ranked[..pool]
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.module_path.as_str(), i))
+                .collect();
+            record
+                .units
+                .sort_by_key(|u| positions[u.module_path.as_str()]);
+            for unit in &mut record.units {
+                unit.selected = positions[unit.module_path.as_str()] < record.selected;
+            }
+        }
+    }
     if take < requested {
         eprintln!(
             "[vettalon] {}",
@@ -1130,6 +1267,23 @@ async fn run_audit_step(
         );
     }
 
+    if diff.is_some() && take == 0 {
+        return AuditStep {
+            engine_runs: vec![],
+            missing: vec![],
+            findings: vec![],
+            coverage: outside_coverage(),
+            incomplete: None,
+            ran: false,
+            injection: vec![],
+            cross_checked: 0,
+            ranker,
+            rank_degraded,
+            prescreen: prescreen_record,
+            finder_cap_hit: false,
+            dual: None,
+        };
+    }
     if take == 0 || opts.finders.is_empty() {
         let reason = if take == 0 {
             "no candidate modules found (empty repo, or no readable files under it)".to_string()
@@ -1142,6 +1296,7 @@ async fn run_audit_step(
             .collect();
         let mut coverage = coverage::build_module_coverage(&ranked, &reports);
         mark_prescreen_cut(&mut coverage, prescreen_cut);
+        coverage.extend(outside_coverage());
         return AuditStep {
             engine_runs: Vec::new(),
             missing: vec![EngineMissing {
@@ -1282,6 +1437,7 @@ async fn run_audit_step(
                             ask_fix,
                             deadline,
                             source_receipts: opts.source_receipts,
+                            attack_classes: opts.attack_classes,
                             parse_retries: opts.finder_parse_retries,
                         },
                     )
@@ -1372,6 +1528,7 @@ async fn run_audit_step(
     }
     step.coverage = coverage::build_module_coverage(&ranked, &reports);
     mark_prescreen_cut(&mut step.coverage, prescreen_cut);
+    step.coverage.extend(outside_coverage());
     step.finder_cap_hit = finder_cap_binds
         && step.coverage.iter().any(|c| {
             c.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET)
@@ -1421,6 +1578,10 @@ fn scan_modules_for_injection(
 
 fn deferred_report(m: &ModuleTarget, reason: &str) -> ModuleAuditReport {
     ModuleAuditReport {
+        attack_classes: None,
+        checks: Vec::new(),
+        hardening: Vec::new(),
+        leads: Vec::new(),
         module_path: m.module_path.clone(),
         outcome: ModuleOutcome::Deferred {
             reason: reason.to_string(),
@@ -1440,6 +1601,11 @@ fn deferred_report(m: &ModuleTarget, reason: &str) -> ModuleAuditReport {
 fn finder_of<'a>(f: &Finding, opts: &'a ScanOptions) -> Option<&'a ModelHandle> {
     let id = f.found_by.first()?;
     opts.finders.iter().find(|m| &m.id == id)
+}
+
+fn review_eligible(f: &Finding) -> bool {
+    adversarial::is_eligible(f)
+        || (f.status == schema::FindingStatus::Candidate && prior_run::is_carried(f))
 }
 
 /// Step 3c: every eligible finding gets one verifier, chosen by
@@ -1465,7 +1631,7 @@ struct ReviewLimits<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn review_step(
     repo_root: &Path,
-    findings: Vec<Finding>,
+    mut findings: Vec<Finding>,
     opts: &ScanOptions,
     limits: ReviewLimits<'_>,
     dual: Option<&dual_finder::DualRun>,
@@ -1473,6 +1639,9 @@ async fn review_step(
     trace: &TraceLog,
     progress: &dyn Progress,
 ) -> Vec<Finding> {
+    for finding in &mut findings {
+        adversarial::finalize_severity(finding, None);
+    }
     if opts.verifiers.is_empty() {
         eprintln!(
             "[vettalon] {}",
@@ -1489,19 +1658,24 @@ async fn review_step(
     // eligible verifier instead of always landing on the first one.
     let mut nth = 0usize;
     for (i, f) in findings.iter().enumerate() {
-        if !adversarial::is_eligible(f) {
+        if !review_eligible(f) {
             continue;
         }
-        let Some(finder) = finder_of(f, opts) else {
-            continue;
-        };
+        let pick = finder_of(f, opts)
+            .and_then(|finder| assign::verifier_for(finder, &opts.verifiers, nth))
+            .or_else(|| {
+                prior_run::is_carried(f).then(|| assign::VerifierPick {
+                    index: nth % opts.verifiers.len(),
+                    // Historical finder identity/family is not trusted provenance.
+                    cross_family: false,
+                })
+            });
         // O9: a dual-finder candidate goes to a refuter outside both finder
         // families when the roster has one.
         let dual_families = dual.and_then(|d| d.families_by_id.get(&f.id));
         let third =
             dual_families.and_then(|fams| assign::verifier_outside(fams, &opts.verifiers, nth));
-        if let Some(mut pick) = third.or_else(|| assign::verifier_for(finder, &opts.verifiers, nth))
-        {
+        if let Some(mut pick) = third.or(pick) {
             // Cross-family only when it differs from every finder family
             // that found this root cause.
             if dual_families.is_some() {
@@ -1579,6 +1753,8 @@ async fn review_step(
                 }
                 let plan = adversarial::ReviewPlan {
                     runs: adversarial::runs_for(&f, opts.refuter_runs),
+                    independent_refuter: pick.cross_family
+                        && !f.found_by.iter().any(|m| m == &verifier.id),
                     deadline: limits.extra_runs_deadline,
                     parse_retries: opts.verifier_parse_retries,
                     policy: opts.refuter_policy,
@@ -1888,6 +2064,7 @@ mod tests {
     fn opts(repo_path: PathBuf) -> ScanOptions {
         ScanOptions {
             repo_path,
+            diff_base: None,
             profile: "quick".to_string(),
             report: None,
             sarif: None,
@@ -1905,6 +2082,7 @@ mod tests {
             rank: RankStrategy::Heuristic,
             trace: None,
             source_receipts: false,
+            attack_classes: Default::default(),
             time_budget: None,
             refuter_runs: 1,
             finder_parse_retries: DEFAULT_FINDER_PARSE_RETRIES,
@@ -1978,6 +2156,323 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    fn save_prior_fixture(
+        home: &Path,
+        root: &Path,
+        mut findings: Vec<Finding>,
+        coverage: Vec<ModuleCoverage>,
+    ) {
+        for f in &mut findings {
+            if f.status == schema::FindingStatus::NeedsHuman {
+                f.evidence.push(schema::EvidenceItem {
+                    kind: schema::EvidenceKind::AdversarialReview,
+                    source: "fixture_review".into(),
+                    detail: format!("{} fixture", schema::PLAUSIBLE_PREFIX),
+                    recorded_at: "2026-10-01T00:00:00Z".into(),
+                });
+                f.blockers = vec!["fixture needs manual validation".into()];
+                f.validation_plan = Some(schema::ValidationPlan {
+                    local: Some("validate fixture claim".into()),
+                    deployment: None,
+                });
+            }
+        }
+        let report = AuditReport {
+            schema_version: schema::CURRENT_SCHEMA_VERSION,
+            scope: None,
+            repo: root.canonicalize().unwrap().to_string_lossy().into_owned(),
+            started_at: "2026-10-01T00:00:00Z".into(),
+            profile: ScanProfile {
+                mode: ProfileMode::Deep,
+                intake: None,
+            },
+            engines_run: vec![],
+            engines_missing: vec![],
+            summary: Summary::from_findings(&findings, 0, 0, GatePolicy::default(), &coverage),
+            findings,
+            coverage,
+            run_status: RunStatus::Complete,
+            incomplete_reason: None,
+            prior_run: None,
+            verifier: VerifierInfo::default(),
+            ensemble: Default::default(),
+        };
+        let violations = validator::validate_report(&report);
+        assert!(
+            violations.is_empty(),
+            "invalid prior fixture: {violations:?}"
+        );
+        std::fs::create_dir_all(home.join("reports")).unwrap();
+        std::fs::write(
+            home.join("reports/20261001T000000Z.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn quick_prior_skips_all_models_and_prior_gap_modules_even_with_injected_handles() {
+        let dir = repo_with_module();
+        let home = tempfile::tempdir().unwrap();
+        let mut f = Finding::candidate(
+            "semgrep",
+            schema::FindingKind::StaticAnalysis,
+            Severity::High,
+            "Prior claim",
+            "a/main.rs",
+            Some(3),
+            "db.execute(q);",
+            "prior",
+            vec![],
+        );
+        f.file_hash = prior_run::hash_repo_file(dir.path(), &f.file);
+        let gap = serde_json::from_value(serde_json::json!({
+            "module_path": "a", "status": "deferred", "reason": "time_budget"
+        }))
+        .unwrap();
+        save_prior_fixture(home.path(), dir.path(), vec![f], vec![gap]);
+        let (handle, calls) = model("unused", "test", vec![]);
+        let mut o = opts(dir.path().to_path_buf());
+        o.no_prior = false;
+        o.finders = vec![handle.clone()];
+        o.verifiers = vec![handle.clone()];
+        o.poc_models = vec![handle.clone()];
+        o.poc = true;
+        o.prescreen = Some(prescreen::PrescreenOptions {
+            model: handle,
+            pool: 10,
+            top_percent: 50,
+        });
+        let report = run_scan(home.path(), &o).await.unwrap();
+        assert!(calls.prompts.lock().unwrap().is_empty());
+        assert!(!report.findings.iter().any(prior_run::is_carried));
+        assert!(report.coverage.is_empty());
+        assert_eq!(
+            report.verifier.independence,
+            schema::VerifierIndependence::NotRun
+        );
+        let prior = report.prior_run.unwrap();
+        assert_eq!(prior.prior_gap_modules, 0);
+        assert_eq!(prior.carried_not_rediscovered, 0);
+        assert_eq!(prior.changed_unrediscovered.len(), 1);
+        assert_eq!(
+            prior.changed_unrediscovered[0].reason,
+            "quick_profile_not_rechecked"
+        );
+    }
+
+    #[tokio::test]
+    async fn prior_only_scanner_and_ai_are_reverified_and_can_be_refuted_without_a_finder() {
+        for engine in ["semgrep", "ai_audit"] {
+            let dir = repo_with_module();
+            let home = tempfile::tempdir().unwrap();
+            let mut f = Finding::candidate(
+                engine,
+                schema::FindingKind::StaticAnalysis,
+                Severity::High,
+                "SQL injection",
+                "a/main.rs",
+                Some(3),
+                "db.execute(q);",
+                "r",
+                vec![],
+            );
+            if engine == "ai_audit" {
+                let raw: serde_json::Value =
+                    serde_json::from_str(&ai_audit::tests::cand_json("a/main.rs", 3)).unwrap();
+                f.threat_model = serde_json::from_value(raw["threat_model"].clone()).unwrap();
+                f.trace = serde_json::from_value(raw["trace"].clone()).unwrap();
+            }
+            f.file_hash = prior_run::hash_repo_file(dir.path(), &f.file);
+            f.status = schema::FindingStatus::NeedsHuman;
+            f.found_by = vec!["retired-finder".into()];
+            save_prior_fixture(home.path(), dir.path(), vec![f], vec![]);
+            let (verifier, calls) = model(
+                "checker",
+                "checker-family",
+                vec![Ok(adversarial::tests::REFUTED.into())],
+            );
+            let mut o = opts(dir.path().to_path_buf());
+            o.profile = "deep".into();
+            o.no_prior = false;
+            o.roster = info(&[&verifier]);
+            o.verifiers = vec![verifier];
+            let report = run_scan(home.path(), &o).await.unwrap();
+            let violations = validator::validate_report(&report);
+            assert!(violations.is_empty(), "{violations:?}");
+            let carried: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|f| prior_run::is_carried(f))
+                .collect();
+            assert_eq!(carried.len(), 1);
+            assert_eq!(carried[0].source_engine, engine);
+            assert_eq!(carried[0].status, schema::FindingStatus::Refuted);
+            assert_eq!(carried[0].verification.len(), 1);
+            assert_eq!(calls.prompts.lock().unwrap().len(), 1);
+            assert_eq!(report.prior_run.unwrap().carried_not_rediscovered, 1);
+            assert!(
+                report.coverage.len() == 1 && report.coverage[0].module_path == "a",
+                "carry-in never creates fictitious coverage"
+            );
+            o.no_prior = true;
+            let disabled = run_scan(home.path(), &o).await.unwrap();
+            assert!(disabled.prior_run.is_none());
+            assert!(!disabled.findings.iter().any(prior_run::is_carried));
+            assert_eq!(calls.prompts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_prior_claims_keep_stored_severity_when_carried_into_a_v3_run() {
+        for engine in ["semgrep", "ai_audit"] {
+            for severity in [
+                Severity::Low,
+                Severity::Medium,
+                Severity::High,
+                Severity::Critical,
+            ] {
+                let dir = repo_with_module();
+                let home = tempfile::tempdir().unwrap();
+                let mut f = Finding::candidate(
+                    engine,
+                    schema::FindingKind::StaticAnalysis,
+                    severity,
+                    "SQL injection",
+                    "a/main.rs",
+                    Some(3),
+                    "db.execute(q);",
+                    "prior-v2",
+                    vec![],
+                );
+                if engine == "ai_audit" {
+                    let raw: serde_json::Value =
+                        serde_json::from_str(&ai_audit::tests::cand_json("a/main.rs", 3)).unwrap();
+                    f.threat_model = serde_json::from_value(raw["threat_model"].clone()).unwrap();
+                    f.trace = serde_json::from_value(raw["trace"].clone()).unwrap();
+                }
+                f.file_hash = prior_run::hash_repo_file(dir.path(), &f.file);
+                f.status = schema::FindingStatus::NeedsHuman;
+                save_prior_fixture(home.path(), dir.path(), vec![f], vec![]);
+                let path = home.path().join("reports/20261001T000000Z.json");
+                let mut raw: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                raw["schema_version"] = 2.into();
+                let row = raw["findings"][0].as_object_mut().unwrap();
+                for key in ["severity_claimed", "likelihood", "impact"] {
+                    row.remove(key);
+                }
+                std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+                let (verifier, calls) = model(
+                    "checker",
+                    "checker-family",
+                    vec![Ok(adversarial::tests::PLAUSIBLE.replace("high", "low"))],
+                );
+                let mut o = opts(dir.path().to_path_buf());
+                o.profile = "deep".into();
+                o.no_prior = false;
+                o.roster = info(&[&verifier]);
+                o.verifiers = vec![verifier];
+                let report = run_scan(home.path(), &o).await.unwrap();
+                assert_eq!(report.schema_version, 3);
+                let violations = validator::validate_report(&report);
+                assert!(violations.is_empty(), "{violations:?}");
+                let carried: Vec<_> = report
+                    .findings
+                    .iter()
+                    .filter(|f| prior_run::is_carried(f))
+                    .collect();
+                assert_eq!(carried.len(), 1);
+                let f = carried[0];
+                assert_eq!(f.severity, severity);
+                assert_eq!(f.status, schema::FindingStatus::NeedsHuman);
+                assert!(
+                    f.severity_claimed.is_none() && f.likelihood.is_none() && f.impact.is_none()
+                );
+                assert!(!f.evidence.iter().any(|e| matches!(
+                    e.kind,
+                    schema::EvidenceKind::SeverityCapped
+                        | schema::EvidenceKind::SeverityDisagreement
+                )));
+                assert_eq!(calls.prompts.lock().unwrap().len(), 1);
+                assert_eq!(report.prior_run.unwrap().carried_not_rediscovered, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prior_gap_selection_respects_cap_and_no_prior_and_does_not_duplicate_coverage() {
+        let dir = repo_with_modules(&["a", "z"]);
+        let home = tempfile::tempdir().unwrap();
+        let gap = serde_json::from_value(serde_json::json!({
+            "module_path": "z", "status": "partial", "reason": "shallow_no_checks"
+        }))
+        .unwrap();
+        save_prior_fixture(home.path(), dir.path(), vec![], vec![gap]);
+        for no_prior in [false, true] {
+            let (finder, _) = model("finder", "f", vec![Ok("[]".into())]);
+            let mut o = opts(dir.path().to_path_buf());
+            o.profile = "deep".into();
+            o.max_modules = 1;
+            o.no_prior = no_prior;
+            o.finders = vec![finder];
+            let report = run_scan(home.path(), &o).await.unwrap();
+            assert_eq!(report.coverage.len(), 2);
+            assert_eq!(report.summary.coverage.selected, 1);
+            assert_eq!(
+                report.coverage[0].module_path,
+                if no_prior { "a" } else { "z" }
+            );
+            assert!(report.coverage[0].selected);
+            if no_prior {
+                assert!(report.prior_run.is_none());
+            } else {
+                assert_eq!(report.prior_run.unwrap().prior_gap_modules, 1);
+                assert_eq!(
+                    report.coverage[0].prior_status.as_deref(),
+                    Some("prior_gap:shallow_no_checks")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prior_gap_priority_keeps_prescreen_selection_consistent() {
+        let dir = repo_with_modules(&["a", "z"]);
+        let home = tempfile::tempdir().unwrap();
+        let gap = serde_json::from_value(serde_json::json!({
+            "module_path": "z", "status": "deferred", "reason": "time_budget"
+        }))
+        .unwrap();
+        save_prior_fixture(home.path(), dir.path(), vec![], vec![gap]);
+        // Normal risk ranking enters prescreen first; z still gets bounded priority.
+        let (screen, _) = model(
+            "screen",
+            "s",
+            vec![Ok(r#"{"score":5}"#.into()), Ok(r#"{"score":1}"#.into())],
+        );
+        let (finder, _) = model("finder", "f", vec![Ok("[]".into())]);
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.max_modules = 1;
+        o.no_prior = false;
+        o.finders = vec![finder];
+        o.prescreen = Some(prescreen::PrescreenOptions {
+            model: screen,
+            pool: 2,
+            top_percent: 50,
+        });
+        let report = run_scan(home.path(), &o).await.unwrap();
+        assert_eq!(report.coverage[0].module_path, "z");
+        let record = report.ensemble.prescreen.unwrap();
+        assert!(!record.degraded);
+        assert_eq!(record.selected, 1);
+        assert_eq!(record.units[0].module_path, "z");
+        assert!(record.units[0].selected);
+        assert_eq!(record.units[0].score, Some(1));
+        assert!(!record.units[1].selected);
     }
 
     #[tokio::test]
@@ -2162,6 +2657,97 @@ mod tests {
         assert_eq!(v["run_status"], "incomplete");
         assert_eq!(v["incomplete_reason"], "engine_unavailable");
         assert_eq!(cmd_scan_with(home.path(), deep(), true).await, 0);
+    }
+
+    #[tokio::test]
+    async fn severity_caps_require_independent_plausible_impact_before_poc_and_gates() {
+        for (verifier_id, family, impact, expected, capped) in [
+            (None, "openai", None, Severity::Critical, false),
+            (Some("checker"), "openai", None, Severity::Critical, false),
+            (Some("checker"), "openai", Some("low"), Severity::Low, true),
+            (
+                Some("checker"),
+                "openai",
+                Some("high"),
+                Severity::High,
+                true,
+            ),
+            (
+                Some("checker"),
+                "anthropic",
+                Some("low"),
+                Severity::Critical,
+                false,
+            ),
+            // The finder itself never supplies an independent impact.
+            (
+                Some("finder"),
+                "anthropic",
+                Some("low"),
+                Severity::Critical,
+                false,
+            ),
+        ] {
+            let dir = repo_with_module();
+            let home = tempfile::tempdir().unwrap();
+            let mut candidate: serde_json::Value =
+                serde_json::from_str(&ai_audit::tests::cand_json("a/main.rs", 3)).unwrap();
+            candidate["severity"] = "critical".into();
+            candidate["likelihood"] = serde_json::json!({"level":"high", "reason":"reachable"});
+            candidate["impact"] =
+                serde_json::json!({"level":"low", "reason":"finder claims limited damage"});
+            let (finder, _) = model(
+                "finder",
+                "anthropic",
+                vec![Ok(serde_json::json!({"candidates":[candidate]}).to_string())],
+            );
+            let mut o = opts(dir.path().to_path_buf());
+            o.profile = "deep".into();
+            o.roster = info(&[&finder]);
+            if let Some(id) = verifier_id {
+                let mut reply: serde_json::Value =
+                    serde_json::from_str(adversarial::tests::PLAUSIBLE).unwrap();
+                reply["impact"] = serde_json::json!(impact);
+                let (verifier, _) = model(id, family, vec![Ok(reply.to_string())]);
+                o.roster = info(&[&finder, &verifier]);
+                o.verifiers = vec![verifier];
+            }
+            o.finders = vec![finder];
+            let report = run_scan(home.path(), &o).await.unwrap();
+            let f = report
+                .findings
+                .iter()
+                .find(|f| f.source_engine == "ai_audit")
+                .unwrap();
+            assert_eq!(f.severity_claimed, Some(Severity::Critical));
+            assert_eq!(f.severity_basis, schema::SeverityBasis::ModelDecomposed);
+            assert_eq!(f.severity, expected, "{verifier_id:?} {family} {impact:?}");
+            assert_eq!(
+                f.evidence
+                    .iter()
+                    .any(|e| e.kind == schema::EvidenceKind::SeverityCapped),
+                capped
+            );
+            assert_eq!(
+                f.evidence
+                    .iter()
+                    .any(|e| e.kind == schema::EvidenceKind::SeverityCapUnconfirmed),
+                !capped
+            );
+            if let Some(impact) = impact.filter(|_| capped) {
+                assert!(f.evidence.iter().any(|e| e.detail
+                    == format!(
+                        "severity_capped: critical→{} (finder impact=low, refuter impact={impact})",
+                        expected.as_str()
+                    )));
+            }
+            if verifier_id.is_none() {
+                // --fail-on high must still fail for an unreviewed critical claim.
+                assert_eq!(report::exit_code_with(&report, Some(Severity::High)), 1);
+            } else {
+                assert_eq!(poc::poc_eligible(f, true), expected >= Severity::High);
+            }
+        }
     }
 
     /// Finder (anthropic) finds one candidate; the only verifiers are the
@@ -2358,6 +2944,408 @@ mod tests {
     /// Two finders, two modules: each module goes to exactly one finder.
     /// Mock integration artifacts are opt-in and never call a paid provider.
     /// Each scenario is run through the real intake/ranking/audit/report path.
+
+    #[tokio::test]
+    async fn diff_scope_selects_changed_modules_and_retains_cap_deferrals() {
+        use diff_scope::tests::{commit, git};
+        let dir = repo_with_modules(&["a", "c", "z"]);
+        let home = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]).await;
+        commit(dir.path()).await;
+        let base = git(dir.path(), &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_owned();
+        for path in ["c/main.rs", "z/main.rs"] {
+            std::fs::write(dir.path().join(path), "fn main() { changed(); }\n").unwrap();
+        }
+        commit(dir.path()).await;
+        for cap in [1, 5] {
+            let (finder, calls) = model("finder", "f", vec![Ok("[]".into()), Ok("[]".into())]);
+            let mut options = opts(dir.path().into());
+            options.profile = "deep".into();
+            options.diff_base = Some(base.clone());
+            options.max_modules = cap;
+            options.finders = vec![finder];
+            // A configured prescreen cannot drop required changed modules.
+            let (screen, screen_calls) = model("screen", "s", vec![]);
+            options.prescreen = Some(prescreen::PrescreenOptions {
+                model: screen,
+                pool: 3,
+                top_percent: 1,
+            });
+            let report = run_scan(home.path(), &options).await.unwrap();
+            assert_eq!(report.scope.as_ref().unwrap().changed_files, 2);
+            assert_eq!(report.coverage.len(), 3);
+            assert_eq!(report.coverage.last().unwrap().module_path, "a");
+            let outside = report.coverage.last().unwrap();
+            assert_eq!(outside.status, schema::ModuleCoverageStatus::OutOfScope);
+            assert_eq!(outside.reason.as_deref(), Some("diff_scope"));
+            assert!(!outside.selected && !outside.has_effective_review());
+            assert_eq!(report.summary.coverage.covered, 0);
+            assert_eq!(screen_calls.prompts.lock().unwrap().len(), 0);
+            assert_eq!(calls.prompts.lock().unwrap().len(), cap.min(2));
+            if cap == 1 {
+                assert_eq!(
+                    report.coverage[1].status,
+                    schema::ModuleCoverageStatus::Deferred
+                );
+                assert_eq!(report.coverage[1].reason.as_deref(), Some("max_modules"));
+                assert_eq!(report.run_status, RunStatus::Incomplete);
+            } else {
+                assert_eq!(report.run_status, RunStatus::PartialByDesign);
+                assert_eq!(report.incomplete_reason, None);
+            }
+            assert!(validator::validate_report(&report).is_empty());
+            let summary = report::render_scan_summary(&report, None, false);
+            assert!(summary.contains("diff scope: 2 changed files; other modules out of scope"));
+            let diagnosis = completeness::diagnose(&report);
+            assert!(
+                diagnosis
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == "diff_scope"
+                        && issue.detail.as_deref()
+                            == Some("diff scope: 2 changed files; other modules out of scope"))
+            );
+            let sarif = sarif::to_sarif(&report);
+            assert_eq!(
+                sarif["runs"][0]["properties"]["vettalon.scope"]["changed_files"],
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_scope_attack_classes_apply_only_to_selected_changed_modules() {
+        use attack_classes::{AttackClassMode, CLASS_IDS};
+        use diff_scope::tests::{commit, git};
+        let dir = repo_with_modules(&["old", "changed"]);
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old/main.rs"), "fn old() { pickle(); }\n").unwrap();
+        git(dir.path(), &["init", "-q"]).await;
+        commit(dir.path()).await;
+        let base = git(dir.path(), &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_owned();
+        std::fs::write(
+            dir.path().join("changed/main.rs"),
+            "fn main() { File::open(path); }\n",
+        )
+        .unwrap();
+        commit(dir.path()).await;
+        for mode in [
+            AttackClassMode::Off,
+            AttackClassMode::Auto,
+            AttackClassMode::All,
+        ] {
+            let (finder, calls) = model("finder", "f", vec![Ok("[]".into())]);
+            let mut options = opts(dir.path().into());
+            options.profile = "deep".into();
+            options.diff_base = Some(base.clone());
+            options.attack_classes = mode;
+            options.finders = vec![finder];
+            let report = run_scan(home.path(), &options).await.unwrap();
+            assert_eq!(report.coverage.len(), 2);
+            let changed = report
+                .coverage
+                .iter()
+                .find(|m| m.module_path == "changed")
+                .unwrap();
+            assert!(changed.selected);
+            match mode {
+                AttackClassMode::Off => assert!(changed.attack_classes.is_none()),
+                AttackClassMode::Auto => assert_eq!(
+                    changed.attack_classes.as_ref().unwrap().selected,
+                    ["path_file"]
+                ),
+                AttackClassMode::All => {
+                    assert_eq!(changed.attack_classes.as_ref().unwrap().selected, CLASS_IDS)
+                }
+            }
+            let outside = report
+                .coverage
+                .iter()
+                .find(|m| m.module_path == "old")
+                .unwrap();
+            assert!(outside.is_diff_excluded());
+            assert!(outside.attack_classes.is_none());
+            assert!(
+                serde_json::to_value(outside)
+                    .unwrap()
+                    .get("attack_classes")
+                    .is_none()
+            );
+            let prompts = calls.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert!(!prompts[0].contains("fn old()"));
+            assert_eq!(
+                prompts[0].contains("Selected class: path_file"),
+                mode != AttackClassMode::Off
+            );
+            assert_eq!(report.run_status, RunStatus::PartialByDesign);
+            assert!(validator::validate_report(&report).is_empty());
+            // Scanner availability/policy can independently make the overall
+            // diagnosis incomplete; inspect the module notices here.
+            let diagnosis = completeness::diagnose(&report);
+            assert!(!diagnosis.issues.iter().any(|issue| issue.subject == "old"));
+            assert_eq!(
+                diagnosis
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == "shallow_missing_class_checks"
+                        && issue.subject == "changed"),
+                mode != AttackClassMode::Off
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_scope_prior_carry_and_priority_stay_within_changed_modules() {
+        use diff_scope::tests::{commit, git};
+        let dir = repo_with_modules(&["a", "c", "z"]);
+        let home = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]).await;
+        commit(dir.path()).await;
+        let base = git(dir.path(), &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_owned();
+        for path in ["c/main.rs", "z/main.rs"] {
+            std::fs::write(dir.path().join(path), "fn main() { changed(); }\n").unwrap();
+        }
+        commit(dir.path()).await;
+        let mut old_findings = vec![];
+        for file in ["a/main.rs", "z/main.rs"] {
+            let mut finding = Finding::candidate(
+                "semgrep",
+                schema::FindingKind::StaticAnalysis,
+                Severity::High,
+                "claim",
+                file,
+                Some(1),
+                "fn main()",
+                "rule",
+                vec![],
+            );
+            finding.file_hash = prior_run::hash_repo_file(dir.path(), file);
+            old_findings.push(finding);
+        }
+        let gaps = ["a", "z"]
+            .map(|module| {
+                serde_json::from_value(serde_json::json!({
+                    "module_path": module, "status": "deferred", "reason": "max_modules"
+                }))
+                .unwrap()
+            })
+            .into();
+        save_prior_fixture(home.path(), dir.path(), old_findings, gaps);
+        let (finder, _) = model("finder", "f", vec![Ok("[]".into())]);
+        let mut options = opts(dir.path().into());
+        options.profile = "deep".into();
+        options.diff_base = Some(base);
+        options.max_modules = 1;
+        options.no_prior = false;
+        options.finders = vec![finder];
+        let report = run_scan(home.path(), &options).await.unwrap();
+        assert_eq!(report.coverage[0].module_path, "z");
+        assert_eq!(report.prior_run.as_ref().unwrap().prior_gap_modules, 1);
+        let carried: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| prior_run::is_carried(f))
+            .collect();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].file, "z/main.rs");
+        assert!(
+            report
+                .coverage
+                .iter()
+                .find(|m| m.module_path == "a")
+                .unwrap()
+                .prior_status
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_scope_scanner_findings_outside_changed_files_do_not_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = opts(temp.path().into());
+        let home = tempfile::tempdir().unwrap();
+        let mut report = run_scan(home.path(), &options).await.unwrap();
+        let selection = diff_scope::DiffSelection {
+            scope: schema::DiffScope {
+                mode: schema::DiffScopeMode::Diff,
+                base: "main".into(),
+                merge_base: "a".repeat(40),
+                head: "b".repeat(40),
+                base_oid: "a".repeat(40),
+                worktree_changes: 0,
+                untracked: 0,
+                changed_files: 1,
+                invalid_paths: 0,
+                changed_during_scan: 0,
+            },
+            changed: std::collections::BTreeSet::from(["changed.rs".into()]),
+            tracked_dependencies: std::collections::BTreeSet::from(["Cargo.lock".into()]),
+        };
+        for engine in ["semgrep", "gitleaks", "cargo-audit"] {
+            let (kind, outside_file, inside_file) = if engine == "cargo-audit" {
+                (
+                    schema::FindingKind::DependencyVulnerability,
+                    "Cargo.lock (vulnerable 1.2.3)",
+                    "Cargo.lock",
+                )
+            } else {
+                (schema::FindingKind::StaticAnalysis, "old.rs", "changed.rs")
+            };
+            let mut findings = vec![Finding::candidate(
+                engine,
+                kind,
+                Severity::High,
+                "outside",
+                outside_file,
+                Some(1),
+                "",
+                "rule",
+                vec![],
+            )];
+            selection.annotate_findings(&mut findings);
+            report.scope = Some(selection.scope.clone());
+            report.findings = findings;
+            options.gates = gate::parse_all(&["severity>=high count>0".into()]).unwrap();
+            report.summary = Summary::from_findings(
+                &report.findings,
+                report.engines_run.len(),
+                report.engines_missing.len(),
+                GatePolicy::default(),
+                &[],
+            );
+            report.summary.policy = gate::evaluate_all(&options.gates, &report.findings);
+            assert_eq!(report.summary.total_findings, 1);
+            assert_eq!(report.summary.by_severity.high, 0);
+            assert_eq!(
+                report::scan_exit_code(&report, Some(Severity::High), false),
+                0
+            );
+            assert_eq!(report.summary.policy[0].count, 0);
+            assert!(diff_scope::outside_diff_scope(&report.findings[0]));
+            if engine == "cargo-audit" {
+                let mut unknown = report.findings.clone();
+                unknown[0].file = "old.rs".into();
+                selection.annotate_findings(&mut unknown);
+                assert!(!diff_scope::outside_diff_scope(&unknown[0]));
+                let policy = gate::evaluate_all(&options.gates, &unknown);
+                assert_eq!(policy[0].count, 1);
+                assert!(policy[0].failed);
+            }
+            // A genuine in-scope scanner hit must still fail both gates.
+            let in_scope_selection = diff_scope::DiffSelection {
+                scope: selection.scope.clone(),
+                changed: std::collections::BTreeSet::from([inside_file.into()]),
+                tracked_dependencies: selection.tracked_dependencies.clone(),
+            };
+            report.findings = vec![Finding::candidate(
+                engine,
+                kind,
+                Severity::High,
+                "inside",
+                if engine == "cargo-audit" {
+                    outside_file
+                } else {
+                    inside_file
+                },
+                Some(1),
+                "",
+                "rule",
+                vec![],
+            )];
+            in_scope_selection.annotate_findings(&mut report.findings);
+            report.scope = Some(in_scope_selection.scope);
+            assert!(!diff_scope::outside_diff_scope(&report.findings[0]));
+            report.summary = Summary::from_findings(
+                &report.findings,
+                report.engines_run.len(),
+                report.engines_missing.len(),
+                GatePolicy::default(),
+                &[],
+            );
+            report.summary.policy = gate::evaluate_all(&options.gates, &report.findings);
+            assert_eq!(report.summary.by_severity.high, 1);
+            assert_eq!(
+                report::scan_exit_code(&report, Some(Severity::High), false),
+                1
+            );
+            assert_eq!(report.summary.policy[0].count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_scope_zero_changes_is_deliberately_partial_without_ai_engine_gap() {
+        use diff_scope::tests::{commit, git};
+        let dir = repo_with_modules(&["a"]);
+        let home = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]).await;
+        commit(dir.path()).await;
+        let mut options = opts(dir.path().into());
+        options.profile = "deep".into();
+        options.diff_base = Some("HEAD".into());
+        let report = run_scan(home.path(), &options).await.unwrap();
+        assert_eq!(report.run_status, RunStatus::PartialByDesign);
+        assert_eq!(report.scope.as_ref().unwrap().changed_files, 0);
+        assert_eq!(
+            report.coverage[0].status,
+            schema::ModuleCoverageStatus::OutOfScope
+        );
+        assert!(
+            !report
+                .engines_missing
+                .iter()
+                .any(|e| e.engine == "ai_audit")
+        );
+        let diagnosis = completeness::diagnose(&report);
+        assert!(
+            !diagnosis.issues.iter().any(|g| g.code == "coverage_unknown"
+                || (g.code == "engine_missing" && g.subject == "ai_audit"))
+        );
+        assert!(validator::validate_report(&report).is_empty());
+    }
+
+    #[tokio::test]
+    async fn shallow_scan_keeps_run_status_exit_codes_and_gate_policy() {
+        for reply in [r#"{"candidates": []}"#, "[]"] {
+            let dir = repo_with_modules(&["a"]);
+            let home = tempfile::tempdir().unwrap();
+            let (finder, _) = model("mock", "mock-family", vec![Ok(reply.into())]);
+            let mut options = opts(dir.path().to_path_buf());
+            options.profile = "deep".into();
+            options.roster = info(&[&finder]);
+            options.finders = vec![finder];
+            let mut report = run_scan(home.path(), &options).await.unwrap();
+            assert_eq!(report.run_status, RunStatus::Complete);
+            assert_eq!(report.incomplete_reason, None);
+            assert_eq!(report.summary.coverage.shallow, 1);
+            assert!(!report.summary.coverage.partial);
+            assert!(validator::validate_report(&report).is_empty());
+            for allow in [false, true] {
+                assert_eq!(
+                    report::scan_exit_code(&report, Some(Severity::High), allow),
+                    0
+                );
+            }
+            let verdict = report::exit_code_with(&report, Some(Severity::High));
+            report.coverage[0].status = schema::ModuleCoverageStatus::Covered;
+            report.coverage[0].attempts[0].status = schema::ModuleCoverageStatus::Covered;
+            report.summary.coverage = schema::CoverageSummary::from_coverage(&report.coverage);
+            assert_eq!(
+                report::exit_code_with(&report, Some(Severity::High)),
+                verdict
+            );
+        }
+    }
+
     #[tokio::test]
     async fn coverage_evidence_complete_and_incomplete_reports() {
         for (name, module_count, cap, expected) in [
@@ -2520,7 +3508,10 @@ mod tests {
             "{statuses:?}"
         );
         assert_eq!(
-            statuses.iter().filter(|s| **s == "covered").count(),
+            statuses
+                .iter()
+                .filter(|s| **s == "reviewed_no_checks")
+                .count(),
             2,
             "{statuses:?}"
         );
@@ -2605,7 +3596,7 @@ mod tests {
         );
         let cov = v["coverage"].as_array().unwrap();
         assert_eq!(cov[0]["module_path"], "d");
-        assert_eq!(cov[0]["status"], "covered");
+        assert_eq!(cov[0]["status"], "reviewed_no_checks");
         assert!(
             cov[1..]
                 .iter()
@@ -2756,7 +3747,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|c| c["status"] == "covered")
+            .filter(|c| c["status"] == "reviewed_no_checks")
             .count();
         assert_eq!(covered, 4, "max_modules=0 covers all ranked modules");
     }

@@ -25,6 +25,9 @@ pub struct DepGraph {
     pub edges: HashMap<NodeKey, Vec<String>>,
     /// Ecosystems whose lockfile carried an edge graph that parsed.
     pub ecosystems: HashSet<Ecosystem>,
+    /// Version-resolved outgoing edges (Cargo.lock only): which version of
+    /// each dependency a package actually links.
+    pub resolved: HashMap<NodeKey, Vec<NodeKey>>,
 }
 
 impl DepGraph {
@@ -44,6 +47,15 @@ impl DepGraph {
                 .copied()
                 .unwrap_or(0),
         )
+    }
+
+    /// Version-resolved dependencies of `t`; empty when the lockfile gave
+    /// no edges for it.
+    pub fn resolved_deps_of(&self, t: &DependencyTarget) -> &[NodeKey] {
+        self.resolved
+            .get(&(t.ecosystem, t.name.clone(), t.version.clone()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn deps_of(&self, t: &DependencyTarget) -> &[String] {
@@ -152,6 +164,7 @@ pub(crate) fn add_cargo(graph: &mut DepGraph, text: &str) {
     }
     graph.ecosystems.insert(Ecosystem::Cargo);
     bfs(graph, roots, &children);
+    graph.resolved.extend(children);
 }
 
 /// Resolve `name` required from `path` the way Node does: nearest

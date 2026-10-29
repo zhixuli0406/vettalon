@@ -181,6 +181,14 @@ pub struct DependencyHunt {
     /// Variant-seed ledger when `--variant-seeds` ran for this dependency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seeds: Option<SeedRecord>,
+    /// Package names this dependency only re-exports: its own source is a
+    /// thin shell and the real code lives there (see [`super::facade`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facade_of: Vec<String>,
+    /// Set on a transitive crate audited because the named direct dependency
+    /// is a facade over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<String>,
 }
 
 impl DependencyHunt {
@@ -297,6 +305,7 @@ pub trait DirAuditor: Send + Sync {
 /// (each dependency is audited fresh), no gate / fail-on (hunt decides outcomes
 /// itself).
 pub struct EngineAuditor {
+    pub attack_classes: crate::audit::attack_classes::AttackClassMode,
     pub home: std::path::PathBuf,
     pub finders: Vec<crate::llm::ModelHandle>,
     pub verifiers: Vec<crate::llm::ModelHandle>,
@@ -353,6 +362,7 @@ impl EngineAuditor {
     ) -> Result<DirAuditResult, String> {
         let opts = crate::audit::ScanOptions {
             repo_path: dir.to_path_buf(),
+            diff_base: None,
             profile: "deep".into(),
             report: None,
             sarif: None,
@@ -370,6 +380,7 @@ impl EngineAuditor {
             rank: crate::audit::RankStrategy::Heuristic,
             trace: None,
             source_receipts: false,
+            attack_classes: self.attack_classes,
             time_budget: None,
             refuter_runs: crate::audit::DEFAULT_REFUTER_RUNS,
             finder_parse_retries: crate::audit::DEFAULT_FINDER_PARSE_RETRIES,
@@ -681,23 +692,8 @@ where
         futures::stream::iter(plan.selected.iter().enumerate())
             .map(|(i, row)| async move {
                 progress.start(i + 1, total, &row.target);
-                let (hunt, granted) = match allocator {
-                    None => (
-                        audit_dependency(row, opts.per_dep_timeout, fetcher, auditor, seeding)
-                            .await,
-                        Some(opts.per_dep_timeout),
-                    ),
-                    Some(budget) => match budget.allocate().await {
-                        None => (deferred_for_budget(row), None),
-                        Some(share) => {
-                            let hunt =
-                                audit_dependency(row, share, fetcher, auditor, seeding).await;
-                            budget
-                                .settle(share, std::time::Duration::from_millis(hunt.duration_ms));
-                            (hunt, Some(share))
-                        }
-                    },
-                };
+                let (hunt, granted) =
+                    audit_row(row, opts, fetcher, auditor, seeding, allocator).await;
                 progress.done(i + 1, total, &hunt);
                 (i, hunt, granted)
             })
@@ -705,6 +701,58 @@ where
             .collect()
             .await;
     finished.sort_by_key(|(i, ..)| *i);
+    // Facades: a direct dependency that only re-exports another crate was
+    // audited as a shell; audit the crate holding its code too (one level,
+    // in order, after the planned dependencies).
+    let mut skipped = plan.skipped;
+    let graph = finished
+        .iter()
+        .any(|(_, h, _)| !h.facade_of.is_empty())
+        .then(|| super::graph::graph_from_dir(project));
+    let facades = take_facade_implementations(&finished, &mut skipped, graph.as_ref());
+    // Promotions are capped at --max-deps on their own; the rest are recorded
+    // as over budget, never dropped.
+    let mut promoted = facades.promoted;
+    for (target, _) in promoted.split_off(promoted.len().min(opts.max_deps)) {
+        skipped.push(SkippedDep {
+            target,
+            reason: SkipReason::OverBudget,
+            known: Vec::new(),
+            osv: OsvEvidence::default(),
+        });
+    }
+    if !promoted.is_empty() {
+        let targets: Vec<DependencyTarget> = promoted.iter().map(|(t, _)| t.clone()).collect();
+        let mut queue = Vec::new();
+        for (row, (_, from)) in scan_known(&targets, osv).await.into_iter().zip(promoted) {
+            if !opts.reaudit_known && !row.known.is_empty() {
+                skipped.push(SkippedDep {
+                    target: row.target,
+                    reason: SkipReason::KnownCve,
+                    known: row.known,
+                    osv: row.osv,
+                });
+            } else {
+                queue.push((row, from));
+            }
+        }
+        // Under --hunt-budget the planned round's even split left no reserve:
+        // promoted crates share what it left unused, evenly.
+        let leftover = opts.rollover.map(|r| {
+            let spent = allocator.map_or(std::time::Duration::ZERO, |b| b.spent());
+            crate::budget::DepBudget::new(r.total.saturating_sub(spent), r.cap, queue.len())
+        });
+        let grand_total = total + queue.len();
+        for (k, (row, from)) in queue.into_iter().enumerate() {
+            let index = total + k + 1;
+            progress.start(index, grand_total, &row.target);
+            let (mut hunt, granted) =
+                audit_row(&row, opts, fetcher, auditor, seeding, leftover.as_ref()).await;
+            hunt.promoted_from = Some(from);
+            progress.done(index, grand_total, &hunt);
+            finished.push((index - 1, hunt, granted));
+        }
+    }
     let budget = budget_record(&mode, &finished);
     let audited: Vec<DependencyHunt> = finished.into_iter().map(|(_, hunt, _)| hunt).collect();
     let mut incomplete_reasons = Vec::new();
@@ -730,15 +778,14 @@ where
     {
         incomplete_reasons.push("variant_seed_lookup_failed".into());
     }
-    if plan
-        .skipped
-        .iter()
-        .any(|d| d.reason == SkipReason::OverBudget)
-    {
+    if skipped.iter().any(|d| d.reason == SkipReason::OverBudget) {
         incomplete_reasons.push("dependency_budget_exhausted".into());
     }
     if budget.deferred > 0 {
         incomplete_reasons.push("hunt_time_budget_exhausted".into());
+    }
+    if facades.unresolved {
+        incomplete_reasons.push("facade_implementation_unresolved".into());
     }
     let run_status = Some(if incomplete_reasons.is_empty() {
         RunStatus::Complete
@@ -750,7 +797,7 @@ where
         project: plan.project,
         total_targets: plan.total_targets,
         audited,
-        skipped: plan.skipped,
+        skipped,
         run_status,
         incomplete_reasons,
         dep_priority: plan.dep_priority,
@@ -758,6 +805,94 @@ where
         malicious: None,
         budget: Some(budget),
     })
+}
+
+/// Fetch and audit one row under the hunt's budget mode. Returns the record
+/// and the time granted (`None` when `--hunt-budget` could not fund it).
+async fn audit_row<F: SourceFetcher, A: DirAuditor>(
+    row: &DependencyAdvisories,
+    opts: &HuntOptions,
+    fetcher: &F,
+    auditor: &A,
+    seeding: Option<&SeedPlan<'_>>,
+    allocator: Option<&crate::budget::DepBudget>,
+) -> (DependencyHunt, Option<std::time::Duration>) {
+    match allocator {
+        None => (
+            audit_dependency(row, opts.per_dep_timeout, fetcher, auditor, seeding).await,
+            Some(opts.per_dep_timeout),
+        ),
+        Some(budget) => match budget.allocate().await {
+            None => (deferred_for_budget(row), None),
+            Some(share) => {
+                let hunt = audit_dependency(row, share, fetcher, auditor, seeding).await;
+                budget.settle(share, std::time::Duration::from_millis(hunt.duration_ms));
+                (hunt, Some(share))
+            }
+        },
+    }
+}
+
+struct FacadePromotions {
+    /// Implementation crates to audit, each with the facade that named it.
+    promoted: Vec<(DependencyTarget, String)>,
+    /// A facade named a crate found nowhere in the hunt (not audited, not
+    /// skipped, not promoted): its code was not reviewed.
+    unresolved: bool,
+}
+
+/// Cargo treats `-` and `_` in package names as the same name.
+fn same_crate(a: &str, b: &str) -> bool {
+    a.replace('_', "-") == b.replace('_', "-")
+}
+
+/// Move the implementation crates of audited facades out of `skipped`
+/// (where intake set them aside as transitive) and return them with the
+/// facade that named them. Only the version the facade links (per the
+/// lockfile graph) is taken; without graph edges every locked version is.
+/// A crate already audited or skipped for another reason (known advisory,
+/// budget) is left alone, per the normal policy.
+fn take_facade_implementations(
+    finished: &[(usize, DependencyHunt, Option<std::time::Duration>)],
+    skipped: &mut Vec<SkippedDep>,
+    graph: Option<&super::graph::DepGraph>,
+) -> FacadePromotions {
+    let mut promoted: Vec<(DependencyTarget, String)> = Vec::new();
+    let mut unresolved = false;
+    for (_, facade, _) in finished {
+        let linked = graph.map_or(&[][..], |g| g.resolved_deps_of(&facade.target));
+        for package in &facade.facade_of {
+            let pinned: Vec<&str> = linked
+                .iter()
+                .filter(|(_, name, _)| same_crate(name, package))
+                .map(|(_, _, version)| version.as_str())
+                .collect();
+            let wanted = |t: &DependencyTarget| {
+                t.ecosystem == facade.target.ecosystem
+                    && same_crate(&t.name, package)
+                    && (pinned.is_empty() || pinned.contains(&t.version.as_str()))
+            };
+            let mut found = finished.iter().any(|(_, h, _)| wanted(&h.target))
+                || promoted.iter().any(|(t, _)| wanted(t));
+            while let Some(pos) = skipped.iter().position(|s| {
+                wanted(&s.target)
+                    && matches!(
+                        s.reason,
+                        SkipReason::Transitive | SkipReason::DirectnessUnknown
+                    )
+            }) {
+                let dep = skipped.remove(pos);
+                promoted.push((dep.target, facade.target.name.clone()));
+                found = true;
+            }
+            found |= skipped.iter().any(|s| wanted(&s.target));
+            unresolved |= !found;
+        }
+    }
+    FacadePromotions {
+        promoted,
+        unresolved,
+    }
 }
 
 /// A dependency `--hunt-budget` could no longer fund: recorded, not started.
@@ -781,6 +916,8 @@ fn deferred_for_budget(row: &DependencyAdvisories) -> DependencyHunt {
         audit_evidence: DependencyAuditEvidence::default(),
         duration_ms: 0,
         seeds: None,
+        facade_of: Vec::new(),
+        promoted_from: None,
     }
 }
 
@@ -871,6 +1008,8 @@ async fn audit_dependency<F: SourceFetcher, A: DirAuditor>(
         audit_evidence: DependencyAuditEvidence::default(),
         duration_ms: 0,
         seeds: None,
+        facade_of: Vec::new(),
+        promoted_from: None,
     };
     let tmp = match tempfile::tempdir() {
         Ok(dir) => dir,
@@ -907,6 +1046,9 @@ async fn audit_dependency<F: SourceFetcher, A: DirAuditor>(
         return result;
     }
     result.upstream = detect_upstream(tmp.path(), &row.target);
+    if row.target.ecosystem == Ecosystem::Cargo {
+        result.facade_of = super::facade::cargo_implementation_crates(&package_root(tmp.path()));
+    }
     let context = match seeding {
         None => None,
         Some(plan) => Some(match plan.source {
@@ -965,7 +1107,7 @@ async fn audit_dependency<F: SourceFetcher, A: DirAuditor>(
             result.audit_evidence = audit.evidence;
             result.audit.status = match result.audit_evidence.run_status {
                 Some(RunStatus::Complete) => StageStatus::Succeeded,
-                Some(RunStatus::Incomplete) => StageStatus::Incomplete,
+                Some(RunStatus::Incomplete | RunStatus::PartialByDesign) => StageStatus::Incomplete,
                 None => StageStatus::Unknown,
             };
             result.audited = result.audit.status == StageStatus::Succeeded;
@@ -1531,6 +1673,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let missing = home.path().join("no-such-source");
         let auditor = EngineAuditor {
+            attack_classes: Default::default(),
             home: home.path().to_path_buf(),
             finders: Vec::new(),
             verifiers: Vec::new(),
@@ -1711,6 +1854,11 @@ mod tests {
         }
         async fn audit_with_evidence(&self, _: &Path) -> Result<DirAuditResult, String> {
             let coverage = vec![crate::audit::schema::ModuleCoverage {
+                attack_classes: None,
+                prior_status: None,
+                checks: Vec::new(),
+                hardening: Vec::new(),
+                leads: Vec::new(),
                 module_path: "omitted".into(),
                 status: crate::audit::schema::ModuleCoverageStatus::Deferred,
                 reason: Some("max_modules".into()),
@@ -1779,6 +1927,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_auditor_wires_attack_classes_to_dependency_finder_and_coverage() {
+        struct ClassModel;
+        #[async_trait]
+        impl crate::llm::LlmCaller for ClassModel {
+            async fn complete(&self, prompt: &str) -> crate::llm::Result<String> {
+                assert!(prompt.contains("Selected class: injection"));
+                assert!(prompt.contains("Selected class: llm_agent"));
+                let checks: Vec<_> = crate::audit::attack_classes::CLASS_IDS.iter().map(|id| serde_json::json!({
+                    "attack_class":id, "invariant":"input does not reach a privileged operation", "paths":["lib.rs"], "result":"the submitted function has no operations"
+                })).collect();
+                Ok(serde_json::json!({"candidates":[],"checks":checks}).to_string())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_cargo_project(dir.path());
+        let auditor = EngineAuditor {
+            attack_classes: crate::audit::attack_classes::AttackClassMode::All,
+            home: home.path().into(),
+            finders: vec![crate::llm::ModelHandle {
+                id: "class-model".into(),
+                family: "fixture".into(),
+                caller: std::sync::Arc::new(ClassModel),
+            }],
+            verifiers: vec![],
+            poc_models: vec![],
+            roster: vec![],
+            max_modules: 5,
+            poc: false,
+            poc_image: crate::sandbox::DEFAULT_POC_IMAGE.into(),
+        };
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &FakeFetcher,
+            &auditor,
+        )
+        .await
+        .unwrap();
+        let coverage = &report.audited[0].audit_evidence.coverage[0];
+        assert_eq!(coverage.attack_classes.as_ref().unwrap().selected.len(), 8);
+        assert_eq!(coverage.checks.len(), 8);
+        assert_eq!(
+            coverage.status,
+            crate::audit::schema::ModuleCoverageStatus::Covered
+        );
+    }
+
+    #[tokio::test]
     async fn engine_auditor_preserves_real_child_ledger_with_a_mock_model() {
         struct EmptyModel;
         #[async_trait]
@@ -1791,6 +1989,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cargo_project(dir.path());
         let auditor = EngineAuditor {
+            attack_classes: Default::default(),
             home: home.path().into(),
             finders: vec![crate::llm::ModelHandle {
                 id: "mock-model".into(),
@@ -1970,6 +2169,255 @@ mod tests {
         assert_eq!(novel[0].0.target.name, "good");
     }
 
+    /// Serves `shell` as a facade over the crates in `reexports` (one
+    /// `pub use <crate>::*;` each) and anything else as real code, wrapped
+    /// like a registry tarball.
+    struct FacadeFetcher {
+        reexports: &'static [&'static str],
+    }
+    const SHELL_OVER_ENGINE: FacadeFetcher = FacadeFetcher {
+        reexports: &["engine"],
+    };
+    #[async_trait]
+    impl SourceFetcher for FacadeFetcher {
+        async fn fetch_into(
+            &self,
+            t: &DependencyTarget,
+            dest: &Path,
+        ) -> Result<super::super::fetch::ExtractStats, String> {
+            let root = dest.join(format!("{}-{}", t.name, t.version));
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            let (manifest, lib) = if t.name == "shell" {
+                let deps: String = self
+                    .reexports
+                    .iter()
+                    .map(|d| format!("{d}=\"*\"\n"))
+                    .collect();
+                let uses: String = self
+                    .reexports
+                    .iter()
+                    .map(|d| format!("pub use {}::*;\n", d.replace('-', "_")))
+                    .collect();
+                (
+                    format!("[package]\nname=\"shell\"\nversion=\"1.0.0\"\n[dependencies]\n{deps}"),
+                    uses,
+                )
+            } else {
+                (
+                    format!(
+                        "[package]\nname=\"{}\"\nversion=\"{}\"\n",
+                        t.name, t.version
+                    ),
+                    "pub fn parse(input: &str) -> usize { input.len() }\n".to_string(),
+                )
+            };
+            std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+            std::fs::write(root.join("src/lib.rs"), lib).unwrap();
+            Ok(super::super::fetch::ExtractStats {
+                files: 2,
+                bytes: 64,
+            })
+        }
+    }
+
+    /// `app -> shell -> <shell_deps>`, plus any extra lock packages.
+    fn write_lock_project(dir: &Path, shell_deps: &[&str], extra: &str) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\n[dependencies]\nshell = \"1\"\n",
+        )
+        .unwrap();
+        let deps: Vec<String> = shell_deps.iter().map(|d| format!("\"{d}\"")).collect();
+        std::fs::write(
+            dir.join("Cargo.lock"),
+            format!(
+                "[[package]]\nname=\"app\"\nversion=\"0.1.0\"\ndependencies=[\"shell\"]\n\n\
+                 [[package]]\nname=\"shell\"\nversion=\"1.0.0\"\nsource=\"registry+x\"\ndependencies=[{}]\n\n{extra}",
+                deps.join(",")
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_facade_project(dir: &Path) {
+        write_lock_project(
+            dir,
+            &["engine"],
+            "[[package]]\nname=\"engine\"\nversion=\"2.0.0\"\nsource=\"registry+x\"\n",
+        );
+    }
+
+    /// Two versions of the implementation crate are locked; only the one the
+    /// facade links is promoted (the other is some unrelated crate's).
+    #[tokio::test]
+    async fn facade_promotes_only_the_version_it_links() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock_project(
+            dir.path(),
+            &["engine 2.0.0"],
+            "[[package]]\nname=\"engine\"\nversion=\"2.0.0\"\nsource=\"registry+x\"\n\n\
+             [[package]]\nname=\"engine\"\nversion=\"1.0.0\"\nsource=\"registry+x\"\n",
+        );
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &SHELL_OVER_ENGINE,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        let promoted: Vec<&str> = report
+            .audited
+            .iter()
+            .filter(|d| d.promoted_from.is_some())
+            .map(|d| d.target.version.as_str())
+            .collect();
+        assert_eq!(promoted, vec!["2.0.0"]);
+        assert!(report.skipped.iter().any(|s| s.target.name == "engine"
+            && s.target.version == "1.0.0"
+            && s.reason == SkipReason::Transitive));
+    }
+
+    /// A facade whose implementation crate is not in the lockfile cannot be
+    /// called complete: the parser was never reviewed.
+    #[tokio::test]
+    async fn facade_with_an_unresolved_implementation_marks_the_hunt_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock_project(dir.path(), &[], "");
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &SHELL_OVER_ENGINE,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.audited.len(), 1);
+        assert_eq!(report.run_status, Some(RunStatus::Incomplete));
+        assert!(
+            report
+                .incomplete_reasons
+                .contains(&"facade_implementation_unresolved".to_string())
+        );
+    }
+
+    /// Promotions are capped at --max-deps; the rest are recorded as over
+    /// budget, which marks the hunt incomplete.
+    #[tokio::test]
+    async fn facade_promotions_respect_max_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock_project(
+            dir.path(),
+            &["engine", "core-impl"],
+            "[[package]]\nname=\"engine\"\nversion=\"2.0.0\"\nsource=\"registry+x\"\n\n\
+             [[package]]\nname=\"core-impl\"\nversion=\"3.0.0\"\nsource=\"registry+x\"\n",
+        );
+        let opts = HuntOptions {
+            max_deps: 1,
+            ..Default::default()
+        };
+        let report = run_hunt(
+            dir.path(),
+            &opts,
+            &FakeOsv(HashMap::new()),
+            &FacadeFetcher {
+                reexports: &["engine", "core-impl"],
+            },
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.audited.len(), 2, "shell + one promotion");
+        assert_eq!(report.audited[0].facade_of, vec!["engine", "core-impl"]);
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.target.name == "core-impl" && s.reason == SkipReason::OverBudget)
+        );
+        assert!(
+            report
+                .incomplete_reasons
+                .contains(&"dependency_budget_exhausted".to_string())
+        );
+    }
+
+    /// Hunt batch 3 (2026-10-28): xml-rs and liquid reported "complete" while
+    /// their parsers sat in skipped transitive crates. A facade's
+    /// implementation crate is now promoted into the audit.
+    #[tokio::test]
+    async fn facade_dependency_promotes_its_implementation_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        write_facade_project(dir.path());
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(HashMap::new()),
+            &SHELL_OVER_ENGINE,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<&str> = report
+            .audited
+            .iter()
+            .map(|d| d.target.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["shell", "engine"]);
+        assert_eq!(report.audited[0].facade_of, vec!["engine".to_string()]);
+        let engine = &report.audited[1];
+        assert_eq!(engine.promoted_from.as_deref(), Some("shell"));
+        assert!(!engine.target.direct);
+        assert!(engine.audited);
+        assert_eq!(
+            engine.osv.status,
+            OsvStatus::Unmatched,
+            "OSV checked before audit"
+        );
+        assert!(
+            !report.skipped.iter().any(|s| s.target.name == "engine"),
+            "a promoted crate is no longer listed as skipped"
+        );
+        assert_eq!(report.run_status, Some(RunStatus::Complete));
+    }
+
+    /// Promotion follows the same known-CVE policy as any candidate: a
+    /// facade over a crate with a known advisory does not audit it.
+    #[tokio::test]
+    async fn facade_implementation_with_a_known_advisory_is_skipped_as_known() {
+        let dir = tempfile::tempdir().unwrap();
+        write_facade_project(dir.path());
+        let mut known = HashMap::new();
+        known.insert(
+            "engine".to_string(),
+            vec![KnownVuln {
+                id: "GHSA-test".into(),
+                aliases: vec![],
+            }],
+        );
+        let report = run_hunt(
+            dir.path(),
+            &HuntOptions::default(),
+            &FakeOsv(known),
+            &SHELL_OVER_ENGINE,
+            &FakeAuditor,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.audited.len(), 1);
+        assert_eq!(report.audited[0].facade_of, vec!["engine".to_string()]);
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.target.name == "engine" && s.reason == SkipReason::KnownCve)
+        );
+    }
+
     #[tokio::test]
     async fn disclosure_drafts_only_for_eligible_novelty_candidates() {
         let mut nh = Finding::candidate(
@@ -2012,6 +2460,8 @@ mod tests {
             },
             findings: vec![nh, nh2],
             seeds: None,
+            facade_of: Vec::new(),
+            promoted_from: None,
         };
         // A dependency with a known CVE is NOT a novelty candidate → no draft.
         let known_dep = DependencyHunt {
@@ -2047,6 +2497,8 @@ mod tests {
                 f
             }],
             seeds: None,
+            facade_of: Vec::new(),
+            promoted_from: None,
         };
         let report = HuntReport {
             intake: None,
@@ -2558,6 +3010,8 @@ mod tests {
             },
             findings: vec![smuggled],
             seeds: None,
+            facade_of: Vec::new(),
+            promoted_from: None,
         };
         let report = HuntReport {
             intake: None,

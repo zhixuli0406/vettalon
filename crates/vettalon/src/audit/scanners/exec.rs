@@ -382,7 +382,8 @@ async fn run_capped_direct(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
-        .env("GIT_OPTIONAL_LOCKS", "0");
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
 
     #[cfg(unix)]
     cmd.process_group(0);
@@ -532,11 +533,24 @@ mod tests {
     const FIXTURE_LOOP: &str = "(n=0; while [ -d \"$PWD\" ] && [ ! -e release ] && [ \"$n\" -lt 240 ]; do sleep 0.05; n=$((n+1)); done)";
 
     fn fixture_child(dir: &Path) -> FixtureCleanup {
-        let pid = std::fs::read_to_string(dir.join("child.pid")).unwrap();
-        FixtureCleanup {
-            pid: pid.trim().parse().unwrap(),
-            release: dir.join("release"),
-            armed: true,
+        let path = dir.join("child.pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(&path)
+                && let Ok(pid) = raw.trim().parse::<u32>()
+            {
+                return FixtureCleanup {
+                    pid,
+                    release: dir.join("release"),
+                    armed: true,
+                };
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out after 5 seconds waiting for a parseable fixture PID in {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

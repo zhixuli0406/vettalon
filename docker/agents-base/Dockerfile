@@ -3,7 +3,7 @@
 # part of a published image; `vettalon agents build|pull` adds it locally
 # (docker/agents/Dockerfile). Versions are pinned; bump them deliberately and
 # refresh licenses/ with them (the build checks the versions match).
-FROM node:26-bookworm-slim@sha256:298992629d69bbd5b2b03ad57094d8e4fcb3a8eeb7c4e25d29de656519568913
+FROM node:26-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe
 
 ARG CODEX_VERSION=0.162.1
 ARG CODEX_TARBALL_SHA512=NWZdi/kxyjv/8EUGFupziGU38YyleugZRM4JXgY5XFH7FUmaFA33NZS2Bmq0HPazf7S3jJQQWsZ/jAK9jsrV3Q==

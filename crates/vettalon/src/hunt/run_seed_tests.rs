@@ -300,6 +300,7 @@ async fn engine_auditor_prepends_seeds_to_finder_prompts_only() {
     let src = tempfile::tempdir().unwrap();
     std::fs::write(src.path().join("lib.rs"), "fn f(){}").unwrap();
     let auditor = EngineAuditor {
+        attack_classes: Default::default(),
         home: home.path().into(),
         finders: vec![crate::llm::ModelHandle {
             id: "mock".into(),

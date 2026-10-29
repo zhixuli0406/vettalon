@@ -105,6 +105,9 @@ fn default_roles() -> Vec<Role> {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Default finder methodologies for scan/hunt; explicit CLI flags take precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_classes: Option<crate::audit::attack_classes::AttackClassMode>,
     #[serde(default, rename = "model")]
     pub models: Vec<ModelConfig>,
     /// Optional metadata-only module ranker (TypeSafe Jev). Present only when
@@ -266,6 +269,7 @@ impl Config {
             .collect();
         (
             Config {
+                attack_classes: None,
                 models,
                 jev: None,
                 disclosure: None,
@@ -831,6 +835,21 @@ roles = ["finder", "verifier"]
         assert!(Config::parse("[disclosure]\nreviewer = \"a\\u202Eb\"\n").is_err());
         assert!(Config::parse("[disclosure]\nunknown = 1\n").is_err());
         assert_eq!(Config::parse("").unwrap().disclosure_reviewer(), None);
+    }
+
+    #[test]
+    fn attack_classes_config_is_opt_in_and_closed() {
+        use crate::audit::attack_classes::AttackClassMode;
+        assert_eq!(Config::parse("").unwrap().attack_classes, None);
+        for (value, mode) in [
+            ("off", AttackClassMode::Off),
+            ("auto", AttackClassMode::Auto),
+            ("all", AttackClassMode::All),
+        ] {
+            let cfg = Config::parse(&format!("attack_classes = \"{value}\"\n")).unwrap();
+            assert_eq!(cfg.attack_classes, Some(mode));
+        }
+        assert!(Config::parse("attack_classes = \"unknown\"").is_err());
     }
 
     #[test]

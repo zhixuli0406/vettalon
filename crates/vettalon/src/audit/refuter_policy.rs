@@ -39,6 +39,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use vettalon_contract::safe_path::SafeRepoPath;
+use vettalon_contract::severity::Level;
 use vettalon_contract::strict_json;
 use vettalon_contract::visible_text::has_visible_content;
 
@@ -446,6 +447,12 @@ pub struct EvidenceReply {
     pub missing_code: Option<Vec<String>>,
     #[serde(default)]
     pub conditions: Option<Vec<Condition>>,
+    /// Auxiliary independent impact; missing or unusable values do not affect the verdict.
+    #[serde(
+        default,
+        deserialize_with = "super::adversarial::deserialize_refuter_impact"
+    )]
+    pub impact: Option<Level>,
 }
 
 fn nonempty<T>(v: &Option<Vec<T>>) -> bool {
@@ -576,6 +583,7 @@ pub fn judge_evidence(
                 refute_basis: None,
                 guard: None,
                 conditions: reply.conditions,
+                impact: reply.impact,
             };
             (evaluate_reply(repo_root, finding, as_current), None)
         }
@@ -733,7 +741,8 @@ code for an attacker to exploit it, judged on your own rather than copied from t
 claim's list: each with a kind from authentication_level, authorization_role, \
 user_interaction, system_configuration, network_routing, environmental_dependency, \
 data_state, timing_dependency, third_party_dependency, and a short description. Use [] \
-when nothing beyond sending the input is needed.\n\n\
+when nothing beyond sending the input is needed. Also assess impact independently: \
+low, medium, high or critical. Provide impact for plausible; use null otherwise. Impact is auxiliary: missing or unusable impact does not invalidate the reply or change the verdict.\n\n\
 Reply with ONLY one JSON object (a markdown fence around it is tolerated, nothing else, \
 no extra keys): {{\"verdict\": \"refuted\"|\"plausible\"|\"unresolved\", \"reason\": \
 \"<one or two sentences>\", \"blockers\": [\"<what is still unknown>\"], \"validation_plan\": \
@@ -747,8 +756,8 @@ deployed system>\"}}, \"corrected_line\": null|<real line in the claimed file>, 
 blocks on every path>\", \"evidence\": null|[{{\"file\": \"<repo-relative path>\", \"line\": \
 <line>, \"shows\": \"<what this line shows>\"}}], \"missing_code\": null|[\"<identifier>\"], \
 \"conditions\": null|[{{\"kind\": \"<precondition kind>\", \"description\": \"<what must \
-hold>\"}}]}}. For \"refuted\": empty blockers, null validation_plan fields, null corrections, \
-conditions and missing_code; always set refute_basis and evidence. For \"plausible\": non-empty \
+hold>\"}}], \"impact\": null|\"low\"|\"medium\"|\"high\"|\"critical\"}}. For \"refuted\": empty blockers, null validation_plan fields, null corrections, \
+conditions, missing_code and impact; always set refute_basis and evidence. For \"plausible\": non-empty \
 blockers and at least one validation_plan field; refute_basis, guard, covers, evidence and \
 missing_code null. For \"unresolved\": non-empty blockers; missing_code may list identifiers; \
 everything else null. Leave corrected_line / corrected_trace null when the claim's locations \
@@ -765,7 +774,7 @@ Your previous reply was discarded because it broke the reply contract: {}\n\
 Answer again with ONLY the one JSON object described above. \"plausible\" needs a non-empty \
 blockers array and at least one validation_plan field; \"unresolved\" needs a non-empty \
 blockers array; \"refuted\" needs refute_basis and no corrections, conditions or \
-missing_code. Decide the verdict from the excerpts as before.\n",
+missing_code. Please also assess impact (low, medium, high or critical) for plausible; missing impact does not invalidate the reply. Impact on other verdicts is ignored. Decide the verdict from the excerpts as before.\n",
         crate::util::truncate_bytes(violation, 500)
     )
 }

@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use crate::llm::LlmCaller;
 use vettalon_contract::strict_json::{self, Violation};
 
+use super::attack_classes::{self, AttackClassMode, AttackClassSelection};
 use super::coverage::{DEFER_CANDIDATE_CAP, DEFER_ENGINE_UNAVAILABLE, DEFER_TIME_BUDGET};
 use super::intake::HotspotFile;
 use super::llm_util::{escape_xml_tag, extract_context_window, number_lines, slugify};
@@ -178,6 +179,55 @@ fn is_repo_metadata_file(name: &str) -> bool {
     DOTFILES.contains(&lower.as_str()) || PROSE.contains(&lower.as_str())
 }
 
+/// Structured data and captured samples (`.json`, `.eml`, ...). They stay in
+/// a module's file list, but add no base score: without git history the score
+/// is a file count, and a fixture corpus would otherwise outrank the source
+/// that parses it.
+fn is_data_file(path: &str) -> bool {
+    const DATA_EXT: &[&str] = &[
+        "json", "jsonl", "ndjson", "yaml", "yml", "toml", "xml", "eml", "mbox", "msg", "ini",
+        "snap", "golden",
+    ];
+    // CI definitions are YAML but carry real attack surface
+    // (`pull_request_target`, script injection): keep their weight.
+    const CI_DIRS: &[&str] = &[".github", ".circleci", ".gitlab", ".buildkite"];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if path.split('/').any(|c| CI_DIRS.contains(&c))
+        || matches!(
+            name,
+            ".gitlab-ci.yml" | "azure-pipelines.yml" | ".travis.yml"
+        )
+    {
+        return false;
+    }
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| DATA_EXT.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// Tests, benches, examples and fixtures are not the shipped attack surface.
+/// Such modules rank after every other module (a tier, not a filter, so a
+/// repo whose only code lives there is still audited).
+fn is_auxiliary_module(module_path: &str) -> bool {
+    const AUX_DIRS: &[&str] = &[
+        "tests",
+        "test",
+        "__tests__",
+        "testdata",
+        "test_data",
+        "test-data",
+        "fixtures",
+        "fixture",
+        "benches",
+        "bench",
+        "benchmarks",
+        "examples",
+        "example",
+    ];
+    module_path
+        .split('/')
+        .any(|c| AUX_DIRS.contains(&c.to_ascii_lowercase().as_str()))
+}
+
 fn module_key(file: &str) -> String {
     let comps: Vec<&str> = file.split('/').collect();
     match comps.len() {
@@ -228,7 +278,9 @@ pub fn rank_modules(
         let total_touches = hotspot.map(|h| h.total_touches).unwrap_or(0) as u64;
         let file_weight =
             security_touches * 1000 + total_touches * 10 + if is_entry { 500 } else { 0 };
-        entry.score += security_touches * 100 + total_touches + if is_entry { 50 } else { 0 } + 1;
+        let base = if is_data_file(f) { 0 } else { 1 };
+        entry.score +=
+            security_touches * 100 + total_touches + if is_entry { 50 } else { 0 } + base;
         entry.high_risk |= is_entry || security_touches > 0;
         entry.files.push((f.clone(), file_weight));
     }
@@ -247,8 +299,9 @@ pub fn rank_modules(
         })
         .collect();
     ranked.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
+        is_auxiliary_module(&a.module_path)
+            .cmp(&is_auxiliary_module(&b.module_path))
+            .then_with(|| b.score.cmp(&a.score))
             .then_with(|| a.module_path.cmp(&b.module_path))
     });
     ranked
@@ -325,6 +378,15 @@ pub fn paginate_modules(
 // ── prompt building ──────────────────────────────────────────────────
 
 pub fn build_ai_audit_prompt(module_path: &str, files: &[(String, String)]) -> String {
+    build_ai_audit_prompt_with_classes(module_path, files, None)
+}
+
+fn build_ai_audit_prompt_with_classes(
+    module_path: &str,
+    files: &[(String, String)],
+    classes: Option<&AttackClassSelection>,
+) -> String {
+    let class_instructions = classes.map(|c| c.prompt_instructions()).unwrap_or_default();
     let mut blocks = String::new();
     for (path, content) in files {
         let escaped_path = escape_xml_tag(path, "path");
@@ -351,21 +413,34 @@ Identify concrete, plausible security vulnerabilities that a deterministic \
 pattern-matching scanner would likely miss: business-logic flaws, auth/authz \
 gaps, unsafe cross-module data flow, injection via unusual sinks, race \
 conditions, and similar. Do not restate generic style nits a linter would \
-already catch. If you find nothing concrete and specific, reply with an empty \
-JSON array `[]` — never invent a finding just to have something to report.\n\n\
+already catch. If you find nothing concrete and specific, return an empty candidates array \
+and list what you checked in checks (invariants, files examined, and observed results); \
+never invent a finding just to have something to report.\n\n\
 {ANCHORS_ZH_TW}\n{ANTI_PATTERNS}\n{THREAT_MODEL_INSTRUCTIONS}\n{TRACE_CONDITIONS_INSTRUCTIONS}\n{LINE_NUMBER_INSTRUCTIONS}\n\
-Reply with ONLY a JSON array (a markdown fence around it is tolerated, nothing \
+Reply with ONLY a JSON object (a markdown fence around it is tolerated, nothing \
 else): no prose before or after, no extra keys. A reply that is not exactly this \
-shape is discarded as a whole. Each element has exactly these keys:\n\
+shape is discarded as a whole. The envelope is {{\"candidates\": [...], \"checks\": [], \"hardening\": [], \"leads\": []}}. \
+The optional checks, hardening and leads arrays default to empty. Checks have exactly \
+attack_class (string or null), invariant (what must hold), paths (a nonempty array of \
+repo-relative files supplied above), result (what you observed showing whether it holds). \
+Maximum 8 checks; invariant and result must be visible non-empty text, at most 4096 characters; \
+attack_class is free text, at most 4096 characters. Check records are source-review claims. \
+Hardening items have exactly \
+file (a path supplied above), line (positive integer), note (text). Lead items have exactly \
+path (repo-relative), reason (text). Maximum 5 each; neither is a finding. \
+Likelihood and impact are required together except for info; overall cannot exceed impact. \
+Each candidate has exactly these keys:\n\
 {{\"kind\": \"<short category, e.g. sql_injection|auth_bypass|ssrf|secret_exposure|race_condition|other>\", \
 \"cwe\": \"<the single best-matching CWE id such as CWE-89, or null if none fits>\", \
 \"severity\": \"critical\"|\"high\"|\"medium\"|\"low\"|\"info\", \"title\": \"<short title>\", \
+\"likelihood\": {{\"level\": \"low\"|\"medium\"|\"high\"|\"critical\", \"reason\": \"<text>\"}}, \
+\"impact\": {{\"level\": \"low\"|\"medium\"|\"high\"|\"critical\", \"reason\": \"<text>\"}}, \
 \"file\": \"<repo-relative path, exactly as shown in a <path> tag above>\", \
 \"line\": <line number or null>, \"reasoning\": \"<why this is a real, exploitable issue>\", \
 \"threat_model\": {{\"principal\": \"…\", \"input\": \"…\", \"control\": \"…\", \"boundary\": \"…\", \"affected\": \"…\", \"result\": \"…\"}}, \
 \"trace\": [{{\"kind\": \"entrypoint\", \"file\": \"…\", \"line\": 1, \"scope\": \"…\", \"description\": \"…\"}}], \
 \"conditions\": [{{\"kind\": \"authentication_level\", \"description\": \"…\"}}]}}\n\n\
-<module_files>\n{blocks}</module_files>\n"
+{class_instructions}<module_files>\n{blocks}</module_files>\n"
     )
 }
 
@@ -385,6 +460,10 @@ pub struct RawCandidate {
     #[serde(default)]
     pub cwe: Option<String>,
     pub severity: Severity,
+    #[serde(default)]
+    pub likelihood: Option<super::schema::SeverityAssessment>,
+    #[serde(default)]
+    pub impact: Option<super::schema::SeverityAssessment>,
     pub title: String,
     pub file: String,
     #[serde(default)]
@@ -401,10 +480,265 @@ pub struct RawCandidate {
     pub fix: Option<serde_json::Value>,
 }
 
-/// Parse an ai_audit reply with the strict contract: the whole reply must be
-/// exactly one JSON array of [`RawCandidate`]. Never repaired.
+/// Extensible finder envelope; checks are independent of candidates.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinderReply {
+    candidates: Vec<RawCandidate>,
+    #[serde(default)]
+    checks: Vec<serde_json::Value>,
+    // Auxiliary items are independently validated: bad advice cannot void findings.
+    #[serde(default)]
+    hardening: Vec<serde_json::Value>,
+    #[serde(default)]
+    leads: Vec<serde_json::Value>,
+    #[serde(skip)]
+    legacy: bool,
+}
+
+fn parse_finder_reply(raw: &str) -> Result<FinderReply, Violation> {
+    // Dispatch without a Value round-trip so duplicate struct keys stay errors.
+    let reply = if strict_json::strip_outer_fence(raw).starts_with('[') {
+        FinderReply {
+            candidates: strict_json::parse_strict(raw)?,
+            checks: Vec::new(),
+            hardening: Vec::new(),
+            leads: Vec::new(),
+            legacy: true,
+        }
+    } else {
+        strict_json::parse_strict::<FinderReply>(raw)?
+    };
+    for candidate in &reply.candidates {
+        let paired = candidate.likelihood.is_some() == candidate.impact.is_some();
+        if !paired
+            || (!reply.legacy && candidate.severity != Severity::Info && candidate.impact.is_none())
+        {
+            return Err(Violation::Schema {
+                detail: "candidates require both likelihood and impact (optional together for legacy arrays or info)".into(),
+            });
+        }
+        for dimension in [&candidate.likelihood, &candidate.impact]
+            .into_iter()
+            .flatten()
+        {
+            if dimension.level == vettalon_contract::severity::Level::Informational
+                || dimension.reason.trim().is_empty()
+            {
+                return Err(Violation::Schema {
+                    detail:
+                        "likelihood/impact require low|medium|high|critical and a non-empty reason"
+                            .into(),
+                });
+            }
+        }
+    }
+    Ok(reply)
+}
+
+/// Compatibility API for consumers that only need the candidates.
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn parse_ai_candidates(raw: &str) -> Result<Vec<RawCandidate>, Violation> {
-    strict_json::parse_strict::<Vec<RawCandidate>>(raw)
+    Ok(parse_finder_reply(raw)?.candidates)
+}
+
+/// Check lexical traversal and existing symlink ancestors without reading file data.
+fn safe_aux_path(repo_root: &Path, raw: &str) -> bool {
+    use vettalon_contract::safe_path::SafeRepoPath;
+    if SafeRepoPath::parse(raw).is_err() {
+        return false;
+    }
+    let Ok(root) = repo_root.canonicalize() else {
+        return false;
+    };
+    let mut path = root.clone();
+    for component in raw.split('/') {
+        path.push(component);
+        match path.symlink_metadata() {
+            Ok(_) => match path.canonicalize() {
+                Ok(resolved) if resolved.starts_with(&root) => {}
+                _ => return false,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Leads may name known files or directories containing known files, never
+/// arbitrary model-generated paths. Resolve symlinks before accepting either.
+fn safe_lead_path(repo_root: &Path, raw: &str, known_files: Option<&HashSet<String>>) -> bool {
+    if crate::util::mask_sensitive_text(raw) != raw || !safe_aux_path(repo_root, raw) {
+        return false;
+    }
+    let Ok(root) = repo_root.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = root.join(raw).canonicalize() else {
+        return false;
+    };
+    if !path.starts_with(&root) || !(path.is_file() || path.is_dir()) {
+        return false;
+    }
+    known_files.is_none_or(|files| {
+        if path.is_file() {
+            files.contains(raw)
+        } else {
+            let prefix = format!("{raw}/");
+            files.iter().any(|file| file.starts_with(&prefix))
+        }
+    })
+}
+
+/// Validate each check independently; malformed auxiliary data never voids findings.
+fn validate_checks(
+    reply: &FinderReply,
+    repo_root: &Path,
+    prompt_paths: &HashSet<String>,
+    classes: Option<&AttackClassSelection>,
+) -> (Vec<super::schema::CoverageCheck>, Vec<String>) {
+    use vettalon_contract::{coverage::MAX_TEXT_CHARS, visible_text::is_visible_text};
+    let mut checks = Vec::new();
+    let mut invalid = 0;
+    let mut truncated = 0;
+    let mut unclassified = 0;
+    for value in &reply.checks {
+        match serde_json::from_value::<super::schema::CoverageCheck>(value.clone()) {
+            Ok(mut item)
+                if !item.paths.is_empty()
+                    && item.paths.iter().all(|path| {
+                        prompt_paths.contains(path) && safe_aux_path(repo_root, path)
+                    })
+                    && is_visible_text(&item.invariant, MAX_TEXT_CHARS)
+                    && is_visible_text(&item.result, MAX_TEXT_CHARS)
+                    && item
+                        .attack_class
+                        .as_ref()
+                        .is_none_or(|class| class.chars().count() <= MAX_TEXT_CHARS) =>
+            {
+                if checks.len() < 8 {
+                    item.invariant = crate::util::mask_sensitive_text(&item.invariant);
+                    item.result = crate::util::mask_sensitive_text(&item.result);
+                    item.attack_class = item
+                        .attack_class
+                        .map(|class| crate::util::mask_sensitive_text(&class));
+                    if is_visible_text(&item.invariant, MAX_TEXT_CHARS)
+                        && is_visible_text(&item.result, MAX_TEXT_CHARS)
+                        && item
+                            .attack_class
+                            .as_ref()
+                            .is_none_or(|class| class.chars().count() <= MAX_TEXT_CHARS)
+                    {
+                        // Class selection controls coverage, not whether a valid
+                        // source-review claim survives. Count only retained items.
+                        if let Some(selection) = classes
+                            && item
+                                .attack_class
+                                .as_ref()
+                                .is_none_or(|id| !selection.selected.contains(id))
+                        {
+                            item.attack_class = None;
+                            if !selection.selected.is_empty() {
+                                unclassified += 1;
+                            }
+                        }
+                        checks.push(item);
+                    } else {
+                        invalid += 1;
+                    }
+                } else {
+                    truncated += 1;
+                }
+            }
+            _ => invalid += 1,
+        }
+    }
+    let mut notes = Vec::new();
+    if invalid > 0 {
+        notes.push(format!("checks: {invalid} invalid item(s) dropped"));
+    }
+    if truncated > 0 {
+        notes.push(format!(
+            "checks: {truncated} extra item(s) truncated (max 8)"
+        ));
+    }
+    if unclassified > 0 {
+        notes.push(format!(
+            "checks: {unclassified} with unselected class kept as unclassified"
+        ));
+    }
+    (checks, notes)
+}
+
+fn validate_auxiliary(
+    reply: &FinderReply,
+    repo_root: &Path,
+    prompt_paths: &HashSet<String>,
+    known_files: Option<&HashSet<String>>,
+) -> (
+    Vec<super::schema::HardeningNote>,
+    Vec<super::schema::AuditLead>,
+    Vec<String>,
+) {
+    let mut hardening = Vec::new();
+    let mut leads = Vec::new();
+    let mut invalid = [0usize; 2];
+    let mut truncated = [0usize; 2];
+    for value in &reply.hardening {
+        match serde_json::from_value::<super::schema::HardeningNote>(value.clone()) {
+            Ok(mut item)
+                if safe_aux_path(repo_root, &item.file)
+                    && prompt_paths.contains(&item.file)
+                    && item.line > 0
+                    && !item.note.trim().is_empty() =>
+            {
+                if hardening.len() < 5 {
+                    item.note = cap(&crate::util::mask_sensitive_text(&item.note));
+                    hardening.push(item);
+                } else {
+                    truncated[0] += 1;
+                }
+            }
+            _ => invalid[0] += 1,
+        }
+    }
+    for value in &reply.leads {
+        match serde_json::from_value::<super::schema::AuditLead>(value.clone()) {
+            Ok(mut item)
+                if safe_lead_path(repo_root, &item.path, known_files)
+                    && !item.reason.trim().is_empty() =>
+            {
+                if leads.len() < 5 {
+                    item.reason = cap(&crate::util::mask_sensitive_text(&item.reason));
+                    leads.push(item);
+                } else {
+                    truncated[1] += 1;
+                }
+            }
+            _ => invalid[1] += 1,
+        }
+    }
+    let mut notes = vec![format!(
+        "finder_reply_shape={}",
+        if reply.legacy {
+            "legacy_array"
+        } else {
+            "object"
+        }
+    )];
+    for (i, name) in ["hardening", "leads"].iter().enumerate() {
+        if invalid[i] > 0 {
+            notes.push(format!("{name}: {} invalid item(s) dropped", invalid[i]));
+        }
+        if truncated[i] > 0 {
+            notes.push(format!(
+                "{name}: {} extra item(s) truncated (max 5)",
+                truncated[i]
+            ));
+        }
+    }
+    (hardening, leads, notes)
 }
 
 /// P0-1 Reflector: build a correction prompt after a contract violation. The
@@ -418,9 +752,9 @@ pub fn build_reflector_prompt(base_prompt: &str, violation: &str) -> String {
          --- 格式修正要求 ---\n\
          你上一則回覆未通過格式合約，已被丟棄。違反原因：\n\
          {violation}\n\n\
-         請完全依照上面的 JSON 合約重新輸出：只輸出一個 JSON 陣列，\
+         請完全依照上面的 JSON 合約重新輸出：只輸出一個 JSON 物件，\
          不要任何前後說明文字、不要 markdown code fence、不要合約未定義的欄位。\
-         沒有發現時輸出空陣列 []。",
+         沒有發現時輸出 {{\"candidates\": []}}。",
         base_prompt = base_prompt,
         violation = crate::util::truncate_bytes(violation, 500),
     )
@@ -492,6 +826,32 @@ fn candidate_to_finding(
         rule_id.clone(),
         evidence,
     );
+    if let (Some(mut likelihood), Some(mut impact)) = (rc.likelihood, rc.impact) {
+        use vettalon_contract::severity::{cap_overall, overall_within_impact};
+        let claimed = rc.severity;
+        f.severity_claimed = Some(claimed);
+        f.severity = claimed;
+        f.severity_basis = super::schema::SeverityBasis::ModelDecomposed;
+        if !overall_within_impact(claimed.into(), impact.level) {
+            f.evidence.push(EvidenceItem {
+                kind: EvidenceKind::SeverityCapProposed,
+                source: AI_AUDIT_ENGINE.into(),
+                detail: format!(
+                    "{} {}→{} (finder impact={})",
+                    super::schema::SEVERITY_CAP_PROPOSED_PREFIX,
+                    claimed.as_str(),
+                    cap_overall(claimed.into(), impact.level),
+                    impact.level
+                ),
+                recorded_at: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+        likelihood.reason = cap(&likelihood.reason);
+        impact.reason = cap(&impact.reason);
+        f.likelihood = Some(likelihood);
+        f.impact = Some(impact);
+        super::adversarial::finalize_severity(&mut f, None);
+    }
     let scope = rc
         .trace
         .last()
@@ -547,6 +907,7 @@ fn candidate_to_finding(
 
 /// What one module's prompt actually contained.
 struct ModulePrompt {
+    attack_classes: Option<AttackClassSelection>,
     prompt: String,
     files: Vec<(String, String)>,
     /// Files that went in only partially (prompt byte budget).
@@ -560,13 +921,14 @@ fn sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 fn build_module_prompt(repo_root: &Path, module: &ModuleTarget) -> ModulePrompt {
-    build_module_prompt_with_receipts(repo_root, module, false)
+    build_module_prompt_with_receipts(repo_root, module, false, AttackClassMode::Off)
 }
 
 fn build_module_prompt_with_receipts(
     repo_root: &Path,
     module: &ModuleTarget,
     source_receipts: bool,
+    attack_classes: AttackClassMode,
 ) -> ModulePrompt {
     use super::schema::{FileCoverage, FileReadStatus};
     let mut files = Vec::new();
@@ -631,8 +993,15 @@ fn build_module_prompt_with_receipts(
         }
         evidence.push(file);
     }
+    let selection = attack_classes::select(attack_classes, &files);
     ModulePrompt {
-        prompt: build_ai_audit_prompt(&module.module_path, &files),
+        prompt: match selection.as_ref() {
+            Some(classes) => {
+                build_ai_audit_prompt_with_classes(&module.module_path, &files, Some(classes))
+            }
+            None => build_ai_audit_prompt(&module.module_path, &files),
+        },
+        attack_classes: selection,
         files,
         truncated,
         evidence,
@@ -665,6 +1034,10 @@ pub enum ModuleOutcome {
 /// Per-module data the coverage list is built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleAuditReport {
+    pub attack_classes: Option<AttackClassSelection>,
+    pub checks: Vec<super::schema::CoverageCheck>,
+    pub hardening: Vec<super::schema::HardeningNote>,
+    pub leads: Vec<super::schema::AuditLead>,
     pub module_path: String,
     pub outcome: ModuleOutcome,
     /// Paths whose content went into the prompt.
@@ -684,6 +1057,10 @@ pub struct ModuleAuditReport {
 impl ModuleAuditReport {
     fn bare(module: &ModuleTarget, outcome: ModuleOutcome) -> Self {
         ModuleAuditReport {
+            attack_classes: None,
+            checks: Vec::new(),
+            hardening: Vec::new(),
+            leads: Vec::new(),
             module_path: module.module_path.clone(),
             outcome,
             reviewed_paths: Vec::new(),
@@ -773,6 +1150,7 @@ pub async fn run_ai_audit_capped<C: LlmCaller>(
             ask_fix: &none,
             deadline: None,
             source_receipts: false,
+            attack_classes: AttackClassMode::Off,
             parse_retries: AI_AUDIT_PARSE_RETRIES,
         },
     )
@@ -799,6 +1177,7 @@ pub struct AuditProgress<'a> {
     pub deadline: Option<std::time::Instant>,
     /// Store content-free source and prompt hashes for this run.
     pub source_receipts: bool,
+    pub attack_classes: AttackClassMode,
     /// Reflector corrections per module (`--finder-parse-retries`, 0..=
     /// [`AI_AUDIT_PARSE_RETRIES`]). 0 = a reply that breaks the JSON
     /// contract is recorded as `ParseFailed` with no second call.
@@ -870,6 +1249,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         ask_fix,
         deadline,
         source_receipts,
+        attack_classes,
         parse_retries,
     } = progress;
     let parse_retries = parse_retries.min(AI_AUDIT_PARSE_RETRIES);
@@ -882,6 +1262,12 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         };
     }
 
+    // The module list is the known source-file set available to this finder
+    // batch. Include files omitted from prompts by the byte budget.
+    let known_files: HashSet<String> = modules
+        .iter()
+        .flat_map(|m| m.files.iter().cloned())
+        .collect();
     let oracle = DiskLines::new(repo_root);
     let mut engine_runs = Vec::new();
     let mut findings: Vec<Finding> = Vec::new();
@@ -945,7 +1331,8 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         }
 
         let started = std::time::Instant::now();
-        let mut mp = build_module_prompt_with_receipts(repo_root, module, source_receipts);
+        let mut mp =
+            build_module_prompt_with_receipts(repo_root, module, source_receipts, attack_classes);
         if ask_fix.contains(&module.module_path) {
             mp.prompt.push_str(super::dual_finder::FIX_REQUEST);
         }
@@ -960,6 +1347,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                 Some(reason.clone()),
             ));
             module_reports.push(ModuleAuditReport {
+                attack_classes: mp.attack_classes.clone(),
                 files: mp.evidence,
                 duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 ..ModuleAuditReport::bare(module, ModuleOutcome::Unreadable { reason })
@@ -994,6 +1382,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     // hammer a dead endpoint N more times). The modules not
                     // attempted are recorded as deferred.
                     module_reports.push(ModuleAuditReport {
+                        attack_classes: mp.attack_classes.clone(),
                         reviewed_paths: Vec::new(),
                         files: mp.evidence,
                         source_receipt: receipt,
@@ -1025,6 +1414,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     run.timed_out = timed_out;
                 }
                 module_reports.push(ModuleAuditReport {
+                    attack_classes: mp.attack_classes.clone(),
                     reviewed_paths: Vec::new(),
                     files: mp.evidence,
                     source_receipt: receipt,
@@ -1045,7 +1435,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         // for a formatting slip. The first `complete` above already proved the
         // LLM is reachable, so a failed correction call here is never treated
         // as engine-unreachable.
-        let mut parsed = parse_ai_candidates(&raw);
+        let mut parsed = parse_finder_reply(&raw);
         let mut retries_used = 0usize;
         let mut retry_note: Option<String> = None;
         while parsed.is_err() && retries_used < parse_retries {
@@ -1066,7 +1456,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
             match correction_result {
                 Ok(r2) => {
                     retries_used += 1;
-                    parsed = parse_ai_candidates(&r2);
+                    parsed = parse_finder_reply(&r2);
                 }
                 Err(e) => {
                     retry_note = Some(format!(
@@ -1108,6 +1498,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     run.timed_out = timed_out;
                 }
                 module_reports.push(ModuleAuditReport {
+                    attack_classes: mp.attack_classes.clone(),
                     reviewed_paths: Vec::new(),
                     files: mp.evidence,
                     source_receipt: receipt,
@@ -1117,13 +1508,19 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     ..ModuleAuditReport::bare(module, ModuleOutcome::ParseFailed { reason })
                 });
             }
-            Ok(raw_candidates) => {
+            Ok(reply) => {
                 let file_map: HashMap<&str, &str> = mp
                     .files
                     .iter()
                     .map(|(p, c)| (p.as_str(), c.as_str()))
                     .collect();
                 let prompt_paths: HashSet<String> = reviewed_paths.iter().cloned().collect();
+                let (hardening, leads, mut notes) =
+                    validate_auxiliary(&reply, repo_root, &prompt_paths, Some(&known_files));
+                let (checks, check_notes) =
+                    validate_checks(&reply, repo_root, &prompt_paths, mp.attack_classes.as_ref());
+                notes.extend(check_notes);
+                let raw_candidates = reply.candidates;
                 let total = raw_candidates.len();
                 let mut ids = Vec::new();
                 let mut taken = 0usize;
@@ -1145,7 +1542,6 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     taken += 1;
                 }
                 let capped = total.saturating_sub(taken + duplicates);
-                let mut notes = Vec::new();
                 if let Some(n) = retry_note {
                     notes.push(n);
                 }
@@ -1172,8 +1568,12 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     None,
                 ));
                 module_reports.push(ModuleAuditReport {
+                    attack_classes: mp.attack_classes.clone(),
                     module_path: module.module_path.clone(),
                     outcome: ModuleOutcome::Reviewed { note },
+                    checks,
+                    hardening,
+                    leads,
                     reviewed_paths,
                     truncated_paths: mp.truncated,
                     candidate_ids: ids,
@@ -1426,6 +1826,402 @@ pub(crate) mod tests {
         )
     }
 
+    fn decomposed_candidate() -> serde_json::Value {
+        let mut candidate: serde_json::Value =
+            serde_json::from_str(&cand_json("a/main.rs", 1)).unwrap();
+        candidate["likelihood"] = serde_json::json!({"level":"high", "reason":"public entry"});
+        candidate["impact"] = serde_json::json!({"level":"medium", "reason":"limited data"});
+        candidate
+    }
+
+    #[test]
+    fn envelope_and_legacy_shapes_are_strict() {
+        assert!(!parse_finder_reply(r#"{"candidates":[]}"#).unwrap().legacy);
+        assert!(parse_finder_reply("[]").unwrap().legacy);
+        assert!(parse_finder_reply(r#"{"candidates":[],"checks":[]}"#).is_ok());
+        for raw in [
+            r#"{"candidates":[],"checks":null}"#,
+            r#"{"candidates":[],"checks":[],"checks":[]}"#,
+            r#"{"candidates":[],"extra":1}"#,
+            r#"{"candidates":[],"candidates":[]}"#,
+            r#"{"hardening":[]}"#,
+        ] {
+            assert!(parse_finder_reply(raw).is_err(), "{raw}");
+        }
+        let mut c = decomposed_candidate();
+        assert!(
+            parse_finder_reply(&serde_json::json!({"candidates":[c.clone()]}).to_string()).is_ok()
+        );
+        c["impact"]["extra"] = true.into();
+        assert!(parse_finder_reply(&serde_json::json!({"candidates":[c]}).to_string()).is_err());
+    }
+
+    #[test]
+    fn severity_dimensions_required_except_legacy_or_info() {
+        for severity in ["low", "medium", "high", "critical", "info"] {
+            for legacy in [false, true] {
+                for likelihood in [false, true] {
+                    for impact in [false, true] {
+                        let mut c = decomposed_candidate();
+                        c["severity"] = severity.into();
+                        if !likelihood {
+                            c.as_object_mut().unwrap().remove("likelihood");
+                        }
+                        if !impact {
+                            c.as_object_mut().unwrap().remove("impact");
+                        }
+                        let raw = if legacy {
+                            serde_json::json!([c])
+                        } else {
+                            serde_json::json!({"candidates":[c]})
+                        };
+                        let expected = (likelihood && impact)
+                            || (!likelihood && !impact && (legacy || severity == "info"));
+                        assert_eq!(
+                            parse_finder_reply(&raw.to_string()).is_ok(),
+                            expected,
+                            "{raw}"
+                        );
+                    }
+                }
+            }
+        }
+        for level in ["info", "informational", "HIGH", "unknown"] {
+            let mut c = decomposed_candidate();
+            c["impact"]["level"] = level.into();
+            assert!(
+                parse_finder_reply(&serde_json::json!({"candidates":[c]}).to_string()).is_err()
+            );
+        }
+        let mut c = decomposed_candidate();
+        c["likelihood"]["reason"] = " ".into();
+        assert!(parse_finder_reply(&serde_json::json!({"candidates":[c]}).to_string()).is_err());
+    }
+
+    #[test]
+    fn severity_cap_proposal_preserves_claim_and_reasons() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn main() {}")]);
+        let paths = HashSet::from(["a/main.rs".to_string()]);
+        for (claimed, effective, capped) in [
+            ("critical", Severity::Critical, true),
+            ("high", Severity::High, true),
+            ("low", Severity::Low, false),
+            ("info", Severity::Info, false),
+        ] {
+            let mut c = decomposed_candidate();
+            c["severity"] = claimed.into();
+            let raw = serde_json::json!({"candidates":[c]}).to_string();
+            let rc = parse_ai_candidates(&raw).unwrap().remove(0);
+            let mut f =
+                candidate_to_finding(rc, &HashMap::new(), &paths, &DiskLines::new(dir.path()));
+            assert_eq!(f.severity, effective);
+            assert_eq!(f.severity_claimed.unwrap().as_str(), claimed);
+            assert_eq!(
+                f.severity_basis,
+                super::super::schema::SeverityBasis::ModelDecomposed
+            );
+            f.status = super::super::schema::FindingStatus::NeedsHuman;
+            assert_eq!(super::super::poc::poc_eligible(&f, true), capped);
+            let gate: super::super::gate::GateCondition =
+                "severity>=high status=needs_human count>0".parse().unwrap();
+            assert_eq!(gate.evaluate(std::slice::from_ref(&f)).failed, capped);
+            assert_eq!(f.impact.as_ref().unwrap().reason, "limited data");
+            assert_eq!(
+                f.evidence
+                    .iter()
+                    .any(|e| e.kind == EvidenceKind::SeverityCapProposed),
+                capped
+            );
+            if claimed == "high" {
+                assert!(f.evidence.iter().any(
+                    |e| e.detail == "severity_cap_proposed: high→medium (finder impact=medium)"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn auxiliary_validation_drops_bad_items_and_records_caps() {
+        let dir = tmp_repo_with_files(&[
+            ("a/main.rs", "fn main() {}"),
+            ("b/other.rs", "fn other() {}"),
+        ]);
+        let mut hardening = vec![];
+        let mut leads = vec![];
+        for path in [
+            "../escape",
+            "/tmp/absolute",
+            "a/../escape",
+            "C:\\escape",
+            "a\\escape",
+        ] {
+            hardening.push(serde_json::json!({"file":path,"line":1,"note":"note"}));
+            leads.push(serde_json::json!({"path":path,"reason":"reason"}));
+        }
+        hardening.push(serde_json::json!({"file":"not/sent.rs","line":1,"note":"note"}));
+        hardening.push(serde_json::json!({"file":"a/main.rs","line":0,"note":"note"}));
+        hardening.push(serde_json::json!({"file":"a/main.rs","line":1,"note":"note","extra":1}));
+        leads.push(serde_json::json!({"path":"a/other.rs","reason":""}));
+        for _ in 0..7 {
+            hardening.push(serde_json::json!({"file":"a/main.rs","line":1,"note":"note"}));
+            leads.push(serde_json::json!({"path":"b/other.rs","reason":"reason"}));
+        }
+        let raw =
+            serde_json::json!({"candidates":[],"hardening":hardening,"leads":leads}).to_string();
+        let reply = parse_finder_reply(&raw).unwrap();
+        let (h, l, notes) = validate_auxiliary(
+            &reply,
+            dir.path(),
+            &HashSet::from(["a/main.rs".into()]),
+            None,
+        );
+        assert_eq!((h.len(), l.len()), (5, 5));
+        assert!(notes.contains(&"hardening: 8 invalid item(s) dropped".into()));
+        assert!(notes.contains(&"leads: 6 invalid item(s) dropped".into()));
+        assert!(notes.contains(&"hardening: 2 extra item(s) truncated (max 5)".into()));
+        assert!(notes.contains(&"leads: 2 extra item(s) truncated (max 5)".into()));
+    }
+
+    #[test]
+    fn auxiliary_free_text_masks_secret_shaped_values() {
+        let dir =
+            tmp_repo_with_files(&[("a/main.rs", "fn main() {}"), ("b/x.rs", "fn other() {}")]);
+        let reply = parse_finder_reply(
+            r#"{"candidates":[],
+            "hardening":[{"file":"a/main.rs","line":1,"note":"password=example-secret-value"}],
+            "leads":[{"path":"b/x.rs","reason":"password=example-secret-value"}]}"#,
+        )
+        .unwrap();
+        let (hardening, leads, _) = validate_auxiliary(
+            &reply,
+            dir.path(),
+            &HashSet::from(["a/main.rs".into()]),
+            None,
+        );
+        assert!(!hardening[0].note.contains("example-secret-value"));
+        assert!(!leads[0].reason.contains("example-secret-value"));
+        assert!(hardening[0].note.contains("***"));
+        assert!(leads[0].reason.contains("***"));
+    }
+
+    #[test]
+    fn leads_require_existing_known_non_sensitive_paths() {
+        let secret = format!("ghp_{}", "a".repeat(36));
+        let secret_path = format!("a/{secret}.rs");
+        let dir = tmp_repo_with_files(&[
+            ("a/main.rs", "fn main() {}"),
+            ("unlisted.rs", "fn other() {}"),
+            (&secret_path, "fn secret() {}"),
+        ]);
+        let known = HashSet::from(["a/main.rs".into(), "missing.rs".into(), secret_path.clone()]);
+        let reply = parse_finder_reply(
+            &serde_json::json!({"candidates":[], "leads": [
+                {"path":"missing.rs", "reason":"missing"},
+                {"path":secret_path, "reason":"secret"},
+                {"path":"unlisted.rs", "reason":"unknown"},
+                {"path":"a/main.rs", "reason":"real file"},
+                {"path":"a", "reason":"known directory"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let (_, leads, notes) =
+            validate_auxiliary(&reply, dir.path(), &HashSet::new(), Some(&known));
+        assert_eq!(
+            leads.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(),
+            vec!["a/main.rs", "a"]
+        );
+        assert!(notes.contains(&"leads: 3 invalid item(s) dropped".into()));
+        assert!(!safe_lead_path(dir.path(), "missing.rs", None));
+        assert!(!safe_lead_path(dir.path(), &secret_path, None));
+        assert!(safe_lead_path(dir.path(), "a/main.rs", None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_paths_reject_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        assert!(!safe_aux_path(dir.path(), "escape/missing.rs"));
+        std::fs::write(outside.path().join("real.rs"), "fn main() {}").unwrap();
+        assert!(!safe_lead_path(dir.path(), "escape/real.rs", None));
+        assert!(!safe_lead_path(dir.path(), "escape", None));
+    }
+
+    #[tokio::test]
+    async fn envelope_reflector_preserves_auxiliary_coverage_and_effective_severity() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn main() {}")]);
+        let module = evidence_target(&["a/main.rs"]);
+        let corrected = serde_json::json!({"candidates":[decomposed_candidate()],
+            "hardening":[{"file":"a/main.rs","line":1,"note":"advice"}],
+            "leads":[{"path":"a/main.rs","reason":"follow flow"}]})
+        .to_string();
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![
+                Ok(format!(
+                    "{{\"candidates\":[{}]}}",
+                    cand_json("a/main.rs", 1)
+                )),
+                Ok(corrected),
+            ]),
+        };
+        let AiAuditOutcome::Ran {
+            findings,
+            module_reports,
+            ..
+        } = run_ai_audit(dir.path(), std::slice::from_ref(&module), &caller).await
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(findings[0].severity, Severity::High);
+        let coverage = super::super::coverage::build_module_coverage(&[module], &module_reports);
+        assert_eq!(coverage[0].hardening.len(), 1);
+        assert_eq!(coverage[0].leads.len(), 1);
+        let note = coverage[0].attempts[0].reason.as_ref().unwrap();
+        assert!(note.contains("finder_reply_shape=object"));
+        assert!(note.contains("recovered after 1 reflector"));
+    }
+
+    fn check_json() -> serde_json::Value {
+        serde_json::json!({"attack_class": null, "invariant": "queries use bound parameters",
+            "paths": ["a/main.rs"], "result": "the query calls execute_prepared"})
+    }
+
+    #[tokio::test]
+    async fn check_records_determine_zero_candidate_coverage_and_notes() {
+        use super::super::{
+            coverage::build_module_coverage,
+            schema::{CoverageSummary, ModuleCoverageStatus as S},
+        };
+        let mut foreign = check_json();
+        foreign["paths"] = serde_json::json!(["not/sent.rs"]);
+        for (raw, status, dropped, truncated) in [
+            (
+                serde_json::json!({"candidates": [], "checks": [check_json()]}).to_string(),
+                S::Covered,
+                0,
+                0,
+            ),
+            (r#"{"candidates": []}"#.into(), S::ReviewedNoChecks, 0, 0),
+            ("[]".into(), S::ReviewedNoChecks, 0, 0),
+            (
+                serde_json::json!({"candidates": [], "checks": [foreign]}).to_string(),
+                S::ReviewedNoChecks,
+                1,
+                0,
+            ),
+            (
+                serde_json::json!({"candidates": [], "checks": vec![check_json(); 10]}).to_string(),
+                S::Covered,
+                0,
+                2,
+            ),
+        ] {
+            let dir = tmp_repo_with_files(&[("a/main.rs", "fn main() {}")]);
+            let modules = vec![evidence_target(&["a/main.rs"])];
+            let caller = StubCaller {
+                replies: std::sync::Mutex::new(vec![Ok(raw)]),
+            };
+            let AiAuditOutcome::Ran { module_reports, .. } =
+                run_ai_audit(dir.path(), &modules, &caller).await
+            else {
+                panic!("expected run")
+            };
+            let coverage = build_module_coverage(&modules, &module_reports);
+            assert_eq!(coverage[0].status, status);
+            let summary = CoverageSummary::from_coverage(&coverage);
+            assert_eq!(summary.shallow, usize::from(status == S::ReviewedNoChecks));
+            assert!(!summary.partial);
+            assert_eq!((summary.scanned, summary.skipped), (1, 0));
+            if status == S::ReviewedNoChecks {
+                assert_eq!(coverage[0].reason.as_deref(), Some("shallow_no_checks"));
+                assert!(coverage[0].checks.is_empty());
+            } else {
+                assert_eq!(
+                    coverage[0].checks,
+                    vec![serde_json::from_value(check_json()).unwrap()]
+                );
+            }
+            let note = coverage[0].attempts[0].reason.as_ref().unwrap();
+            if dropped > 0 {
+                assert!(note.contains(&format!("checks: {dropped} invalid item(s) dropped")));
+            }
+            if truncated > 0 {
+                assert_eq!(module_reports[0].checks.len(), 8);
+                assert!(note.contains("checks: 2 extra item(s) truncated (max 8)"));
+            }
+        }
+    }
+
+    #[test]
+    fn checks_reject_bad_items_individually_and_mask_all_free_text() {
+        use vettalon_contract::coverage::MAX_TEXT_CHARS;
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn main() {}")]);
+        let mut invalid = vec![serde_json::json!(null), serde_json::json!("check")];
+        for (field, value) in [
+            ("invariant", serde_json::json!("\u{200b}")),
+            ("result", serde_json::json!(" ")),
+            ("result", serde_json::json!("x".repeat(MAX_TEXT_CHARS + 1))),
+            (
+                "attack_class",
+                serde_json::json!("x".repeat(MAX_TEXT_CHARS + 1)),
+            ),
+            ("attack_class", serde_json::json!(123)),
+            ("paths", serde_json::json!([])),
+            ("paths", serde_json::json!(["a/main.rs", "other.rs"])),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut item = check_json();
+            item[field] = value;
+            invalid.push(item);
+        }
+        let invalid_count = invalid.len();
+        let mut valid = check_json();
+        for field in ["attack_class", "invariant", "result"] {
+            valid[field] = serde_json::json!("password=example-secret-value");
+        }
+        invalid.push(valid);
+        let reply = parse_finder_reply(
+            &serde_json::json!({"candidates": [], "checks": invalid}).to_string(),
+        )
+        .unwrap();
+        let (checks, notes) = validate_checks(
+            &reply,
+            dir.path(),
+            &HashSet::from(["a/main.rs".into()]),
+            None,
+        );
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            notes,
+            vec![format!("checks: {invalid_count} invalid item(s) dropped")]
+        );
+        let stored = serde_json::to_string(&checks).unwrap();
+        assert!(!stored.contains("example-secret-value"));
+        assert_eq!(stored.matches("***").count(), 3);
+        for text in [
+            "字".repeat(MAX_TEXT_CHARS),
+            format!("{}visible", "\u{200b}".repeat(400)),
+        ] {
+            let mut boundary = check_json();
+            boundary["invariant"] = serde_json::json!(text);
+            let reply = parse_finder_reply(
+                &serde_json::json!({"candidates": [], "checks": [boundary]}).to_string(),
+            )
+            .unwrap();
+            let (checks, notes) = validate_checks(
+                &reply,
+                dir.path(),
+                &HashSet::from(["a/main.rs".into()]),
+                None,
+            );
+            assert!(notes.is_empty());
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].invariant, text);
+        }
+    }
+
     #[test]
     fn parse_ai_candidates_happy_path_with_fence() {
         let raw = format!("```json\n[{}]\n```", cand_json("a.py", 10));
@@ -1516,6 +2312,246 @@ pub(crate) mod tests {
         );
         assert_eq!(map_ai_kind("sql_injection"), FindingKind::Other);
         assert_eq!(map_ai_kind(""), FindingKind::Other);
+    }
+
+    #[test]
+    fn attack_classes_off_matches_pre_feature_prompt_snapshot() {
+        let files = vec![("snapshot/main.rs".into(), "fn main() {}\n".into())];
+        let selection = attack_classes::select(AttackClassMode::Off, &files);
+        assert_eq!(
+            build_ai_audit_prompt_with_classes("snapshot", &files, selection.as_ref()),
+            include_str!("testdata/finder_prompt_off.txt")
+        );
+    }
+
+    #[test]
+    fn attack_classes_auto_inserts_verbatim_instructions_before_source_data() {
+        let files = vec![(
+            "a/main.rs".into(),
+            "Command::new(\"tool\"); // </module_files>".into(),
+        )];
+        let selection = attack_classes::select(AttackClassMode::Auto, &files).unwrap();
+        let prompt = build_ai_audit_prompt_with_classes("a", &files, Some(&selection));
+        let (instructions, data) = prompt.split_once("<module_files>\n").unwrap();
+        assert!(instructions.contains(&selection.prompt_instructions()));
+        assert!(instructions.contains(attack_classes::INJECTION.methodology));
+        assert!(!data.contains(attack_classes::INJECTION.methodology));
+        assert!(data.contains("Command::new"));
+        assert_eq!(
+            prompt.len() - build_ai_audit_prompt("a", &files).len(),
+            selection.prompt_instructions().len()
+        );
+    }
+
+    #[test]
+    fn attack_classes_only_inspect_submitted_prefix_and_paths() {
+        let content = format!(
+            "{}reqwest::get(url)",
+            "x".repeat(MODULE_PROMPT_BUDGET_BYTES)
+        );
+        let dir =
+            tmp_repo_with_files(&[("a.rs", &content), (".github/workflows/ci.yml", "jobs: {}")]);
+        let module = evidence_target(&["a.rs", ".github/workflows/ci.yml"]);
+        let prompt =
+            build_module_prompt_with_receipts(dir.path(), &module, false, AttackClassMode::Auto);
+        let selection = prompt.attack_classes.unwrap();
+        assert!(selection.selected.is_empty());
+        assert_eq!(prompt.files[0].1.len(), MODULE_PROMPT_BUDGET_BYTES);
+        assert_eq!(prompt.evidence[1].source_bytes, None);
+    }
+
+    #[test]
+    fn attack_classes_keep_wrong_null_and_excluded_check_ids_as_unclassified() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "Command::new(\"tool\")")]);
+        let selection = attack_classes::select(
+            AttackClassMode::Auto,
+            &[("a/main.rs".into(), "Command::new(\"tool\")".into())],
+        )
+        .unwrap();
+        let items: Vec<_> = [Some("injection"), Some("ssrf"), None, Some("INJECTION")]
+            .into_iter()
+            .map(|id| {
+                let mut item = check_json();
+                item["attack_class"] = serde_json::json!(id);
+                item
+            })
+            .collect();
+        let reply =
+            parse_finder_reply(&serde_json::json!({"candidates":[],"checks":items}).to_string())
+                .unwrap();
+        let (checks, notes) = validate_checks(
+            &reply,
+            dir.path(),
+            &HashSet::from(["a/main.rs".into()]),
+            Some(&selection),
+        );
+        assert_eq!(checks.len(), 4);
+        assert_eq!(checks[0].attack_class.as_deref(), Some("injection"));
+        assert!(checks[1..].iter().all(|check| check.attack_class.is_none()));
+        assert_eq!(
+            notes,
+            ["checks: 3 with unselected class kept as unclassified"]
+        );
+    }
+
+    #[test]
+    fn attack_classes_normalization_preserves_validation_and_limits() {
+        for source in ["fn main() {}", "Command::new(\"x\")"] {
+            let dir = tmp_repo_with_files(&[("a/main.rs", source)]);
+            let selection = attack_classes::select(
+                AttackClassMode::Auto,
+                &[("a/main.rs".into(), source.into())],
+            )
+            .unwrap();
+            let mut valid = check_json();
+            valid["attack_class"] = serde_json::json!("ssrf");
+            let mut invalid_path = valid.clone();
+            invalid_path["paths"] = serde_json::json!(["../outside.rs"]);
+            let mut invalid_text = valid.clone();
+            invalid_text["result"] = serde_json::json!(" ");
+            let mut invalid_class = valid.clone();
+            invalid_class["attack_class"] =
+                serde_json::json!("x".repeat(vettalon_contract::coverage::MAX_TEXT_CHARS + 1));
+            let mut items = vec![invalid_path, invalid_text, invalid_class];
+            items.extend(vec![valid; 9]);
+            let reply = parse_finder_reply(
+                &serde_json::json!({
+                    "candidates": [], "checks": items
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let (checks, notes) = validate_checks(
+                &reply,
+                dir.path(),
+                &HashSet::from(["a/main.rs".into()]),
+                Some(&selection),
+            );
+            assert_eq!(checks.len(), 8);
+            assert!(checks.iter().all(|check| check.attack_class.is_none()));
+            assert!(notes.contains(&"checks: 3 invalid item(s) dropped".into()));
+            assert!(notes.contains(&"checks: 1 extra item(s) truncated (max 8)".into()));
+            assert_eq!(
+                notes
+                    .iter()
+                    .any(|note| note == "checks: 8 with unselected class kept as unclassified"),
+                !selection.selected.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn attack_classes_zero_selection_uses_general_prompt() {
+        let files = vec![(
+            "util/slug.py".into(),
+            "def slug(s): return s.lower()".into(),
+        )];
+        let selection = attack_classes::select(AttackClassMode::Auto, &files).unwrap();
+        assert!(selection.selected.is_empty());
+        assert_eq!(
+            build_ai_audit_prompt_with_classes("util", &files, Some(&selection)),
+            build_ai_audit_prompt("util", &files)
+        );
+        assert!(selection.prompt_instructions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attack_classes_unclassified_checks_preserve_coverage_rules() {
+        use crate::audit::{coverage::build_module_coverage, schema::ModuleCoverageStatus as S};
+        for (source, ids, expected, reason) in [
+            (
+                "fn main() {}",
+                vec![Some("injection"), None],
+                S::Covered,
+                None,
+            ),
+            ("fn main() {}", vec![Some("ssrf")], S::Covered, None),
+            ("fn main() {}", vec![None], S::Covered, None),
+            (
+                "Command::new(\"x\")",
+                vec![Some("ssrf")],
+                S::ReviewedNoChecks,
+                Some("shallow_missing_class_checks: injection"),
+            ),
+            (
+                "Command::new(\"x\")",
+                vec![None],
+                S::ReviewedNoChecks,
+                Some("shallow_missing_class_checks: injection"),
+            ),
+            (
+                "Command::new(\"x\")",
+                vec![Some("injection"), None],
+                S::Covered,
+                None,
+            ),
+        ] {
+            let dir = tmp_repo_with_files(&[("a/main.rs", source)]);
+            let modules = vec![evidence_target(&["a/main.rs"])];
+            let checks: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let mut check = check_json();
+                    check["attack_class"] = serde_json::json!(id);
+                    check["invariant"] =
+                        serde_json::json!(format!("Boundary {i} keeps input as data"));
+                    check
+                })
+                .collect();
+            let caller = StubCaller {
+                replies: std::sync::Mutex::new(vec![Ok(
+                    serde_json::json!({"candidates": [], "checks": checks}).to_string(),
+                )]),
+            };
+            let counter = std::sync::atomic::AtomicU32::new(0);
+            let none = HashSet::new();
+            let outcome = run_ai_audit_progress(
+                dir.path(),
+                &modules,
+                &caller,
+                MAX_TOTAL_AI_CANDIDATES,
+                AuditProgress {
+                    sink: &crate::audit::NoProgress,
+                    label: "fixture",
+                    audited: &counter,
+                    total: 1,
+                    cross_check: &none,
+                    ask_fix: &none,
+                    deadline: None,
+                    source_receipts: false,
+                    attack_classes: AttackClassMode::Auto,
+                    parse_retries: 0,
+                },
+            )
+            .await;
+            let AiAuditOutcome::Ran { module_reports, .. } = outcome else {
+                panic!("model reached")
+            };
+            let coverage = build_module_coverage(&modules, &module_reports);
+            let module = &coverage[0];
+            assert_eq!(module.status, expected, "{source}: {ids:?}");
+            if let Some(reason) = reason {
+                assert_eq!(module.reason.as_deref(), Some(reason));
+            }
+            assert_eq!(module.checks.len(), ids.len());
+            let selection = module.attack_classes.as_ref().unwrap();
+            for (check, id) in module.checks.iter().zip(&ids) {
+                assert_eq!(
+                    check.attack_class.as_deref(),
+                    id.filter(|id| selection.selected.iter().any(|s| s == id))
+                );
+            }
+            if !selection.selected.is_empty() && ids.contains(&Some("ssrf")) {
+                assert!(
+                    module.attempts[0]
+                        .reason
+                        .as_ref()
+                        .unwrap()
+                        .contains("checks: 1 with unselected class kept as unclassified")
+                );
+            }
+        }
     }
 
     // ── build_ai_audit_prompt (DATA-fencing) ─────────────────────────
@@ -1622,6 +2658,7 @@ pub(crate) mod tests {
                 ask_fix: &none,
                 deadline: None,
                 source_receipts: true,
+                attack_classes: AttackClassMode::Off,
                 parse_retries: AI_AUDIT_PARSE_RETRIES,
             },
         )
@@ -1629,11 +2666,91 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn attack_classes_pipeline_requires_every_selected_class_and_keeps_failures() {
+        use crate::audit::{coverage::build_module_coverage, schema::ModuleCoverageStatus as S};
+        let dir = tmp_repo_with_files(&[("a/main.rs", "Command::new(\"x\"); reqwest::get(url)")]);
+        let modules = vec![evidence_target(&["a/main.rs"])];
+        for (mode, ids, expected) in [
+            (AttackClassMode::Auto, vec!["injection", "ssrf"], S::Covered),
+            (
+                AttackClassMode::Auto,
+                vec!["injection", "wrong"],
+                S::ReviewedNoChecks,
+            ),
+            (
+                AttackClassMode::All,
+                attack_classes::CLASS_IDS.to_vec(),
+                S::Covered,
+            ),
+            (AttackClassMode::All, vec!["injection"], S::ReviewedNoChecks),
+        ] {
+            let checks: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let mut check = check_json();
+                    check["attack_class"] = serde_json::json!(id);
+                    check
+                })
+                .collect();
+            let caller = StubCaller {
+                replies: std::sync::Mutex::new(vec![Ok(
+                    serde_json::json!({"candidates":[],"checks":checks}).to_string(),
+                )]),
+            };
+            let counter = std::sync::atomic::AtomicU32::new(0);
+            let none = HashSet::new();
+            let outcome = run_ai_audit_progress(
+                dir.path(),
+                &modules,
+                &caller,
+                MAX_TOTAL_AI_CANDIDATES,
+                AuditProgress {
+                    sink: &crate::audit::NoProgress,
+                    label: "fixture",
+                    audited: &counter,
+                    total: 1,
+                    cross_check: &none,
+                    ask_fix: &none,
+                    deadline: None,
+                    source_receipts: false,
+                    attack_classes: mode,
+                    parse_retries: 0,
+                },
+            )
+            .await;
+            let AiAuditOutcome::Ran { module_reports, .. } = outcome else {
+                panic!("model reached")
+            };
+            let coverage = build_module_coverage(&modules, &module_reports);
+            assert_eq!(coverage[0].status, expected);
+            assert_eq!(coverage[0].attack_classes.as_ref().unwrap().mode, mode);
+            if expected == S::ReviewedNoChecks {
+                assert!(
+                    coverage[0]
+                        .reason
+                        .as_ref()
+                        .unwrap()
+                        .starts_with("shallow_missing_class_checks:")
+                );
+                assert!(coverage[0].reason.as_ref().unwrap().contains("ssrf"));
+            }
+            if ids.contains(&"wrong") {
+                assert_eq!(coverage[0].checks.len(), 2);
+                assert!(coverage[0].checks[1].attack_class.is_none());
+                assert!(
+                    matches!(&module_reports[0].outcome, ModuleOutcome::Reviewed {note: Some(note)} if note.contains("checks: 1 with unselected class kept as unclassified"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn opt_in_source_receipt_binds_snapshot_submitted_prefix_and_prompt() {
         let content = "fn main() { /* 界 */ }\n";
         let dir = tmp_repo_with_files(&[("a.rs", content)]);
         let modules = vec![evidence_target(&["a.rs"])];
-        let prompt = build_module_prompt_with_receipts(dir.path(), &modules[0], true);
+        let prompt =
+            build_module_prompt_with_receipts(dir.path(), &modules[0], true, AttackClassMode::Off);
         let caller = StubCaller {
             replies: std::sync::Mutex::new(vec![Ok("[]".into())]),
         };
@@ -1799,7 +2916,7 @@ pub(crate) mod tests {
             panic!("model reached")
         };
         let coverage = build_module_coverage(&modules, &module_reports);
-        assert_eq!(coverage[0].status, ModuleCoverageStatus::PartiallyReviewed);
+        assert_eq!(coverage[0].status, ModuleCoverageStatus::ReviewedNoChecks);
         let summary = CoverageSummary::from_coverage(&coverage);
         assert!(summary.partial);
         assert_eq!(
@@ -1842,6 +2959,7 @@ pub(crate) mod tests {
                 ask_fix: &none,
                 deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(20)),
                 source_receipts: false,
+                attack_classes: AttackClassMode::Off,
                 parse_retries: AI_AUDIT_PARSE_RETRIES,
             },
         )
@@ -2050,6 +3168,7 @@ pub(crate) mod tests {
                 ask_fix: &none,
                 deadline: None,
                 source_receipts: false,
+                attack_classes: AttackClassMode::Off,
                 parse_retries: 0,
             },
         )
@@ -2164,6 +3283,74 @@ pub(crate) mod tests {
         assert_eq!(src.files, vec!["src/app.rs".to_string()]);
     }
 
+    /// Hunt batch 3 (2026-10-28): a crate tarball has no git history, so the
+    /// file count decided the order and mail-parser's hundreds of `.json` /
+    /// `.eml` fixtures under `resources/` filled every slot while `src/` was
+    /// deferred. Data files must not outrank source code.
+    #[test]
+    fn rank_modules_puts_source_before_a_larger_data_fixture_module() {
+        let mut files: Vec<String> = (0..300)
+            .flat_map(|i| {
+                [
+                    format!("mail-parser-1.0.0/resources/eml/{i:03}.eml"),
+                    format!("mail-parser-1.0.0/resources/eml/{i:03}.json"),
+                ]
+            })
+            .collect();
+        files.push("mail-parser-1.0.0/src/lib.rs".to_string());
+        files.push("mail-parser-1.0.0/src/parsers/header.rs".to_string());
+        let ranked = rank_modules(&files, &[], &[]);
+        assert_eq!(ranked[0].module_path, "mail-parser-1.0.0/src");
+        // Still returned (recorded as deferred coverage), just not first.
+        assert!(
+            ranked
+                .iter()
+                .any(|m| m.module_path == "mail-parser-1.0.0/resources")
+        );
+    }
+
+    /// Tests, benches, examples and fixtures are not the shipped attack
+    /// surface: they rank after source modules even when they hold more files.
+    #[test]
+    fn rank_modules_puts_auxiliary_directories_after_source() {
+        let mut files: Vec<String> = Vec::new();
+        for dir in ["tests", "benches", "examples", "fixtures", "testdata"] {
+            for i in 0..20 {
+                files.push(format!("pkg-1.0.0/{dir}/case{i}.rs"));
+            }
+        }
+        files.push("pkg-1.0.0/src/lib.rs".to_string());
+        let ranked = rank_modules(&files, &[], &[]);
+        assert_eq!(ranked[0].module_path, "pkg-1.0.0/src");
+        assert_eq!(ranked.len(), 6, "auxiliary modules stay in the list");
+    }
+
+    /// CI workflows are YAML but not inert data: without git history they
+    /// keep the same per-file weight as code.
+    #[test]
+    fn rank_modules_keeps_ci_workflow_weight() {
+        let files = vec![
+            ".github/workflows/ci.yml".to_string(),
+            ".github/workflows/release.yml".to_string(),
+            "config/settings.yaml".to_string(),
+            "src/lib.rs".to_string(),
+        ];
+        let ranked = rank_modules(&files, &[], &[]);
+        assert_eq!(ranked[0].module_path, ".github/workflows");
+        let config = ranked.iter().find(|m| m.module_path == "config").unwrap();
+        assert_eq!(config.score, 0, "plain data adds no base weight");
+    }
+
+    /// The demotion is a tier, not a filter: a repository whose only code
+    /// lives in an auxiliary directory still gets it audited.
+    #[test]
+    fn rank_modules_audits_auxiliary_code_when_nothing_else_exists() {
+        let files = vec!["examples/demo.rs".to_string()];
+        let ranked = rank_modules(&files, &[], &[]);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].module_path, "examples");
+    }
+
     #[tokio::test]
     async fn time_budget_defers_remaining_modules_without_calling_the_model() {
         let dir = tmp_repo_with_files(&[("a/main.rs", "fn a(){}"), ("b/main.rs", "fn b(){}")]);
@@ -2202,6 +3389,7 @@ pub(crate) mod tests {
                 ask_fix: &none,
                 deadline: Some(std::time::Instant::now()),
                 source_receipts: false,
+                attack_classes: AttackClassMode::Off,
                 parse_retries: AI_AUDIT_PARSE_RETRIES,
             },
         )

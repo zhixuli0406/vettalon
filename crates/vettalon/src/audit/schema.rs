@@ -28,7 +28,14 @@ pub use super::evidence_level::{
 
 /// `schema_version` written by this pipeline. A report without the field is
 /// read as version 1 (the 2026-08 shape).
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+
+/// Oldest report schema this binary can validate and consume.
+pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+
+pub fn is_supported_schema_version(version: u32) -> bool {
+    (MIN_SUPPORTED_SCHEMA_VERSION..=CURRENT_SCHEMA_VERSION).contains(&version)
+}
 
 /// `source_engine` of AI deep-audit findings. Lives here (re-exported by
 /// `ai_audit`) so schema-level code (`severity_basis`, the validator) can
@@ -48,6 +55,31 @@ pub enum Severity {
     Medium,
     High,
     Critical,
+}
+
+impl From<Severity> for vettalon_contract::severity::Level {
+    fn from(value: Severity) -> Self {
+        match value {
+            Severity::Info => Self::Informational,
+            Severity::Low => Self::Low,
+            Severity::Medium => Self::Medium,
+            Severity::High => Self::High,
+            Severity::Critical => Self::Critical,
+        }
+    }
+}
+
+impl From<vettalon_contract::severity::Level> for Severity {
+    fn from(value: vettalon_contract::severity::Level) -> Self {
+        use vettalon_contract::severity::Level;
+        match value {
+            Level::Informational => Self::Info,
+            Level::Low => Self::Low,
+            Level::Medium => Self::Medium,
+            Level::High => Self::High,
+            Level::Critical => Self::Critical,
+        }
+    }
 }
 
 impl std::str::FromStr for Severity {
@@ -127,6 +159,8 @@ pub enum FindingStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
+    /// Harness-generated scope annotation; does not establish a verdict.
+    ScopeNote,
     /// A deterministic OSS scanner hit (semgrep/gitleaks/osv-scanner/cargo-audit).
     StaticHit,
     /// AI deep-audit narrative.
@@ -196,6 +230,10 @@ pub enum EvidenceKind {
     /// finder=<tier> refuter=<tier> effective=<tier>`; the effective tier is
     /// the higher-friction one.
     TierDisagreement,
+    SeverityCapProposed,
+    SeverityCapUnconfirmed,
+    SeverityCapped,
+    SeverityDisagreement,
     /// O9 (`--dual-finder-top`): another finder family reported the same
     /// root cause and its candidate was merged into this one. `detail` is
     /// `dual_finder_merge: merged <id> from <model> (<family>)
@@ -229,7 +267,16 @@ pub enum SeverityBasis {
     #[default]
     ScannerRule,
     ModelSelfReported,
+    ModelDecomposed,
     Operator,
+}
+
+/// A model-reported severity dimension, never a CVSS score.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeverityAssessment {
+    pub level: vettalon_contract::severity::Level,
+    pub reason: String,
 }
 
 /// The six-slot threat model an ai_audit candidate must declare. Every slot
@@ -448,6 +495,12 @@ pub struct Finding {
     pub file_hash: Option<String>,
     #[serde(default)]
     pub severity_basis: SeverityBasis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity_claimed: Option<Severity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub likelihood: Option<SeverityAssessment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<SeverityAssessment>,
     /// Required for ai_audit, `None` for scanners.
     #[serde(default)]
     pub threat_model: Option<ThreatModel>,
@@ -740,6 +793,9 @@ impl Finding {
             root_fingerprint,
             file_hash: None,
             severity_basis,
+            severity_claimed: None,
+            likelihood: None,
+            impact: None,
             threat_model: None,
             trace: Vec::new(),
             conditions: Vec::new(),
@@ -946,10 +1002,9 @@ pub const CARRIED_FROM_PRIOR_PREFIX: &str = "carried_from_prior:";
 /// Evidence `detail` prefix for a prior `Confirmed` finding that is being
 /// re-verified on unchanged source.
 pub const PRIOR_CONFIRMED_PREFIX: &str = "prior_confirmed_same_source";
-/// P2-2 episodic memory. Evidence `detail` prefix for a finding at a root
-/// fingerprint that a prior report judged, but whose source has since
-/// changed: the verdict is NOT carried, yet the prior judgement is surfaced
-/// so the operator re-examines a spot that mattered before.
+/// Evidence prefix for an open prior claim absent from current finder output.
+pub const PRIOR_NOT_REDISCOVERED_PREFIX: &str = "prior_not_rediscovered:";
+/// Prior verdict on changed source (display context only).
 pub const PRIOR_CHANGED_PREFIX: &str = "prior_changed_source";
 /// Evidence `detail` prefix for a deterministic pre-check refutation.
 pub const PRECHECK_PREFIX: &str = "precheck:";
@@ -961,6 +1016,14 @@ pub const VERIFIER_CORRECTED_PREFIX: &str = "verifier_corrected:";
 pub const PLAUSIBLE_PREFIX: &str = "plausible:";
 /// Evidence `detail` prefix of an [`EvidenceKind::CommentSensitivity`] item.
 pub const COMMENT_SENSITIVITY_PREFIX: &str = "comment_sensitivity:";
+/// Evidence `detail` prefix of an [`EvidenceKind::SeverityDisagreement`] item.
+pub const SEVERITY_DISAGREEMENT_PREFIX: &str = "severity_disagreement:";
+/// Evidence `detail` prefix of an [`EvidenceKind::SeverityCapped`] item.
+pub const SEVERITY_CAPPED_PREFIX: &str = "severity_capped:";
+/// Finder-only proposal; it never changes effective severity.
+pub const SEVERITY_CAP_PROPOSED_PREFIX: &str = "severity_cap_proposed:";
+/// No independent plausible impact authorized a severity reduction.
+pub const SEVERITY_CAP_UNCONFIRMED_PREFIX: &str = "severity_cap_unconfirmed:";
 /// Evidence `detail` prefix of an [`EvidenceKind::TierDisagreement`] item.
 pub const TIER_DISAGREEMENT_PREFIX: &str = "tier_disagreement:";
 /// Evidence `detail` prefix of an [`EvidenceKind::DualFinderMerge`] item.
@@ -1004,6 +1067,9 @@ pub fn severity_buckets(
     let mut by_severity = SeverityCounts::default();
     let mut needs_human_by_severity = SeverityCounts::default();
     for f in findings {
+        if super::diff_scope::outside_diff_scope(f) {
+            continue;
+        }
         match f.status {
             FindingStatus::Refuted | FindingStatus::Suppressed => {}
             FindingStatus::NeedsHuman => {
@@ -1038,9 +1104,12 @@ pub struct GatePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleCoverageStatus {
-    /// Reviewed, zero candidates.
+    /// Reviewed, zero candidates, with at least one validated check.
     Covered,
+    /// Valid review reply without candidates or checks; informational only.
+    ReviewedNoChecks,
     /// A valid model reply reviewed only part of the scoped files.
+    #[serde(alias = "partial")]
     PartiallyReviewed,
     /// Reviewed, at least one candidate (including ones the pre-check
     /// refuted).
@@ -1051,6 +1120,8 @@ pub enum ModuleCoverageStatus {
     /// (`time_budget`), or the engine became unavailable before this module
     /// (`engine_unavailable`).
     Deferred,
+    /// Outside the requested diff scope; never counts as covered.
+    OutOfScope,
     /// Attempted; no readable text content.
     Unreadable,
     /// Attempted; the LLM call failed.
@@ -1063,7 +1134,7 @@ impl ModuleCoverageStatus {
     pub fn has_valid_reply(self) -> bool {
         matches!(
             self,
-            Self::Covered | Self::Candidate | Self::PartiallyReviewed
+            Self::Covered | Self::ReviewedNoChecks | Self::Candidate | Self::PartiallyReviewed
         )
     }
 
@@ -1100,6 +1171,7 @@ pub struct FileCoverage {
     pub start_line: Option<usize>,
     pub end_line: Option<usize>,
     pub truncated: bool,
+    #[serde(serialize_with = "serialize_masked_optional_text")]
     pub reason: Option<String>,
     /// SHA-256 of the UTF-8 source bytes read for this attempt. Present only
     /// with opt-in source receipts; no source body is stored in the report.
@@ -1153,6 +1225,7 @@ pub struct ModuleAttempt {
     pub model: String,
     pub family: String,
     pub status: ModuleCoverageStatus,
+    #[serde(serialize_with = "serialize_masked_optional_text")]
     pub reason: Option<String>,
     pub files: Vec<FileCoverage>,
     pub duration_ms: u64,
@@ -1162,11 +1235,75 @@ pub struct ModuleAttempt {
     pub source_receipt: Option<SourceReceipt>,
 }
 
+/// Coverage text must be masked on every output path, including direct
+/// serialization of a report that did not pass through the scan pipeline.
+fn serialize_masked_text<S: serde::Serializer>(
+    text: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::util::mask_sensitive_text(text))
+}
+
+fn serialize_masked_optional_text<S: serde::Serializer>(
+    text: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    text.as_deref()
+        .map(crate::util::mask_sensitive_text)
+        .serialize(serializer)
+}
+
+/// Non-finding advice retained only in the coverage ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardeningNote {
+    pub file: String,
+    pub line: u32,
+    #[serde(serialize_with = "serialize_masked_text")]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditLead {
+    pub path: String,
+    #[serde(serialize_with = "serialize_masked_text")]
+    pub reason: String,
+}
+
+/// A model's source-review claim, not independent proof. Kept local because
+/// the contract ledger Check requires owner/method/artifact and has no attack class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageCheck {
+    #[serde(default)]
+    #[serde(serialize_with = "serialize_masked_optional_text")]
+    pub attack_class: Option<String>,
+    #[serde(serialize_with = "serialize_masked_text")]
+    pub invariant: String,
+    pub paths: Vec<String>,
+    #[serde(serialize_with = "serialize_masked_text")]
+    pub result: String,
+}
+
 /// One entry per ranked module, including the ones never sent to the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleCoverage {
+    /// Deterministic attack-class selection for the submitted source; absent when disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_classes: Option<super::attack_classes::AttackClassSelection>,
+    /// Previous incomplete review that raised this module in the selection order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CoverageCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hardening: Vec<HardeningNote>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leads: Vec<AuditLead>,
     pub module_path: String,
     pub status: ModuleCoverageStatus,
+    #[serde(serialize_with = "serialize_masked_optional_text")]
     pub reason: Option<String>,
     /// Complete file denominator for this module/page, including omitted files.
     #[serde(default)]
@@ -1188,6 +1325,31 @@ pub struct ModuleCoverage {
 }
 
 impl ModuleCoverage {
+    /// Missing class checks make a zero-candidate review shallow.
+    pub fn missing_class_check_reason(&self) -> Option<String> {
+        self.attack_classes.as_ref().and_then(|classes| {
+            let missing = classes.missing_checks(&self.checks);
+            (!missing.is_empty())
+                .then(|| format!("shallow_missing_class_checks: {}", missing.join(", ")))
+        })
+    }
+
+    /// An unassigned module intentionally excluded from a diff scan.
+    pub fn is_diff_excluded(&self) -> bool {
+        self.status == ModuleCoverageStatus::OutOfScope
+            && self.reason.as_deref() == Some("diff_scope")
+            && !self.selected
+            && self.reviewed_paths.is_empty()
+            && self.truncated_paths.is_empty()
+            && self.candidate_ids.is_empty()
+            && self.attempts.is_empty()
+            && self.checks.is_empty()
+            && self.hardening.is_empty()
+            && self.leads.is_empty()
+            && self.prior_status.is_none()
+            && self.attack_classes.is_none()
+    }
+
     pub fn has_ledger(&self) -> bool {
         self.selected || !self.scope_paths.is_empty() || !self.attempts.is_empty()
     }
@@ -1245,7 +1407,9 @@ impl ModuleCoverage {
                 let scope: HashSet<&str> = self.scope_paths.iter().map(String::as_str).collect();
                 matches!(
                     attempt.status,
-                    ModuleCoverageStatus::Covered | ModuleCoverageStatus::Candidate
+                    ModuleCoverageStatus::Covered
+                        | ModuleCoverageStatus::ReviewedNoChecks
+                        | ModuleCoverageStatus::Candidate
                 ) && !attempt.timed_out
                     && files == scope
                     && attempt.files.len() == scope.len()
@@ -1276,6 +1440,9 @@ pub struct CoverageSummary {
     #[serde(default)]
     pub partially_reviewed: usize,
     pub covered: usize,
+    /// Reviewed without candidates or check records; does not make a run partial.
+    #[serde(default)]
+    pub shallow: usize,
     pub candidate: usize,
     pub deferred: usize,
     pub failed: usize,
@@ -1292,10 +1459,14 @@ impl CoverageSummary {
         for m in coverage {
             match m.status {
                 ModuleCoverageStatus::Covered => s.covered += 1,
+                ModuleCoverageStatus::ReviewedNoChecks => s.shallow += 1,
                 ModuleCoverageStatus::Candidate => s.candidate += 1,
                 ModuleCoverageStatus::PartiallyReviewed => s.partially_reviewed += 1,
                 ModuleCoverageStatus::Deferred => s.deferred += 1,
-                _ => s.failed += 1,
+                ModuleCoverageStatus::OutOfScope => {}
+                ModuleCoverageStatus::Unreadable
+                | ModuleCoverageStatus::LlmFailed
+                | ModuleCoverageStatus::ParseFailed => s.failed += 1,
             }
         }
         let has_ledger = coverage.iter().any(ModuleCoverage::has_ledger);
@@ -1309,8 +1480,11 @@ impl CoverageSummary {
                 && coverage.iter().any(|module| {
                     module.status.has_valid_reply()
                         && (!module.has_effective_review()
-                            || (module.status == ModuleCoverageStatus::Covered
-                                && !module.has_full_review()))
+                            || (matches!(
+                                module.status,
+                                ModuleCoverageStatus::Covered
+                                    | ModuleCoverageStatus::ReviewedNoChecks
+                            ) && !module.has_full_review()))
                 }))
             || coverage.iter().any(|m| {
                 !m.attempts.is_empty()
@@ -1463,6 +1637,27 @@ pub struct PriorRunInfo {
     /// Findings whose root fingerprint matched a prior finding but whose
     /// file content changed (or could not be hashed) — not carried.
     pub changed_source: usize,
+    #[serde(default)]
+    pub carried_not_rediscovered: usize,
+    #[serde(default)]
+    pub carried_not_rediscovered_overflow: usize,
+    /// Remaining prior entries skipped when the prior carry file/byte budget is exhausted.
+    #[serde(default)]
+    pub hash_budget_exhausted: usize,
+    /// Display-only records, never findings or verifier inputs. Its length is the count.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_unrediscovered: Vec<ChangedUnrediscovered>,
+    /// Existing audit units prioritized because their previous review had gaps.
+    #[serde(default)]
+    pub prior_gap_modules: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedUnrediscovered {
+    pub id: String,
+    pub file: String,
+    pub title: String,
+    pub reason: String,
 }
 
 /// How independent the review was. vettalon emits `not_run`,
@@ -1501,11 +1696,54 @@ fn run_status_complete() -> RunStatus {
     RunStatus::Complete
 }
 
+/// Scope metadata is absent for full scans and quick scans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffScope {
+    pub mode: DiffScopeMode,
+    pub base: String,
+    pub merge_base: String,
+    #[serde(default)]
+    pub head: String,
+    #[serde(default)]
+    pub base_oid: String,
+    #[serde(default)]
+    pub worktree_changes: usize,
+    #[serde(default)]
+    pub untracked: usize,
+    pub changed_files: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub invalid_paths: usize,
+    /// Paths added by the final diff snapshot, beyond those selected at the start.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub changed_during_scan: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffScopeMode {
+    Diff,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+impl DiffScope {
+    pub fn description(&self) -> String {
+        format!(
+            "diff scope: {} changed files; other modules out of scope",
+            self.changed_files
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditReport {
     /// `2` for this pipeline; a report without the field reads as `1`.
     #[serde(default = "schema_version_v1")]
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<DiffScope>,
     /// Canonicalized absolute path of the scanned repo.
     pub repo: String,
     /// RFC3339 timestamp of when the scan started.
@@ -1925,6 +2163,11 @@ mod tests {
         });
         let coverage = vec![
             ModuleCoverage {
+                attack_classes: None,
+                prior_status: None,
+                checks: Vec::new(),
+                hardening: Vec::new(),
+                leads: Vec::new(),
                 module_path: "a".into(),
                 status: ModuleCoverageStatus::Covered,
                 reason: None,
@@ -1936,6 +2179,11 @@ mod tests {
                 attempts: vec![],
             },
             ModuleCoverage {
+                attack_classes: None,
+                prior_status: None,
+                checks: Vec::new(),
+                hardening: Vec::new(),
+                leads: Vec::new(),
                 module_path: "b".into(),
                 status: ModuleCoverageStatus::Deferred,
                 reason: Some("max_modules".into()),
@@ -1947,6 +2195,11 @@ mod tests {
                 attempts: vec![],
             },
             ModuleCoverage {
+                attack_classes: None,
+                prior_status: None,
+                checks: Vec::new(),
+                hardening: Vec::new(),
+                leads: Vec::new(),
                 module_path: "c".into(),
                 status: ModuleCoverageStatus::ParseFailed,
                 reason: Some("x".into()),
@@ -2013,6 +2266,37 @@ mod tests {
         assert!(f.precheck.is_none());
         assert_eq!(r.summary.needs_human_by_severity, SeverityCounts::default());
         assert!(!r.summary.gate_includes_needs_human);
+    }
+
+    #[test]
+    fn previous_schema_v2_report_deserializes_without_v3_fields() {
+        let raw = r#"{
+          "schema_version":2,"repo":"/tmp/repo","started_at":"2026-10-27T00:00:00Z",
+          "profile":{"mode":"deep","intake":null},"engines_run":[],"engines_missing":[],
+          "findings":[{"id":"old","source_engine":"ai_audit","kind":"other","severity":"high",
+            "severity_basis":"model_self_reported","title":"old","file":"src/a.rs","line":1,
+            "snippet":"","rule_id":"ai-audit/test","evidence":[],"status":"candidate"}],
+          "coverage":[{"module_path":"src","status":"deferred","reason":"max_modules"}],
+          "summary":{"total_findings":1,"by_severity":{"critical":0,"high":1,"medium":0,"low":0,"info":0},
+            "engines_run_count":0,"engines_missing_count":0}
+        }"#;
+        let report: AuditReport = serde_json::from_str(raw).unwrap();
+        assert_eq!(report.schema_version, CURRENT_SCHEMA_VERSION - 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.severity, Severity::High);
+        assert_eq!(finding.severity_basis, SeverityBasis::ModelSelfReported);
+        assert!(finding.severity_claimed.is_none());
+        assert!(finding.likelihood.is_none());
+        assert!(finding.impact.is_none());
+        assert!(report.coverage[0].hardening.is_empty());
+        assert!(report.coverage[0].leads.is_empty());
+        let serialized = serde_json::to_value(&report).unwrap();
+        for key in ["severity_claimed", "likelihood", "impact"] {
+            assert!(serialized["findings"][0].get(key).is_none());
+        }
+        for key in ["hardening", "leads"] {
+            assert!(serialized["coverage"][0].get(key).is_none());
+        }
     }
 
     #[test]
@@ -2111,6 +2395,7 @@ mod tests {
     #[test]
     fn audit_report_round_trips_through_json() {
         let report = AuditReport {
+            scope: None,
             repo: "/tmp/repo".to_string(),
             started_at: "2026-08-17T00:00:00Z".to_string(),
             profile: ScanProfile {

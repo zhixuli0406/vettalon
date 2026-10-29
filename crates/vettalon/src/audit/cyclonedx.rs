@@ -316,6 +316,7 @@ mod tests {
     fn report(findings: Vec<Finding>) -> AuditReport {
         AuditReport {
             schema_version: 2,
+            scope: None,
             repo: "/r".into(),
             started_at: "2026-10-20T00:00:00Z".into(),
             profile: ScanProfile {

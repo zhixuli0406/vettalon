@@ -243,16 +243,34 @@ impl DualRun {
                 if drop_ids.contains_key(b_id) {
                     continue;
                 }
-                let Some(bi) = live(b_id, findings) else {
+                // Same-id rows can carry different assessments from each finder.
+                // Read the second finder's actual row before any id-only dedupe.
+                let Some(bi) = findings
+                    .iter()
+                    .position(|f| {
+                        f.id == *b_id
+                            && f.status == FindingStatus::Candidate
+                            && f.found_by.contains(&m.second.model)
+                    })
+                    .or_else(|| live(b_id, findings))
+                else {
                     continue;
                 };
-                // The same id from both finders first: it is already one row
-                // here (`dedup_by_id` drops the copy later) and must not be
-                // merged into some other primary candidate.
+                // An identical claim wins over another candidate's patch match.
                 let identical = a_ids
                     .iter()
-                    .any(|a_id| live(a_id, findings) == Some(bi))
-                    .then_some((bi, DedupeBasis::IdenticalClaim));
+                    .find(|a_id| *a_id == b_id)
+                    .and_then(|a_id| {
+                        findings
+                            .iter()
+                            .position(|f| {
+                                f.id == *a_id
+                                    && f.status == FindingStatus::Candidate
+                                    && f.found_by.contains(&m.primary.model)
+                            })
+                            .or_else(|| live(a_id, findings))
+                    })
+                    .map(|ai| (ai, DedupeBasis::IdenticalClaim));
                 let hit = identical.or_else(|| {
                     a_ids.iter().find_map(|a_id| {
                         let ai = live(a_id, findings)?;
@@ -276,13 +294,12 @@ impl DualRun {
                 }
                 let b = findings[bi].clone();
                 let a = &mut findings[ai];
+                merge_severity_assessments(a, &b);
                 for model in &b.found_by {
                     if !a.found_by.contains(model) {
                         a.found_by.push(model.clone());
                     }
                 }
-                // Review depth follows the higher self-reported severity.
-                a.severity = a.severity.max(b.severity);
                 a.evidence.extend(
                     b.evidence
                         .iter()
@@ -513,6 +530,63 @@ pub fn same_root(
     (fa == fb && la.abs_diff(lb) <= LOCATION_WINDOW && same_cwe).then_some(DedupeBasis::LocationCwe)
 }
 
+/// Keep the higher claimed severity and its complete assessment. On a tie,
+/// retain the higher finder impact. Only independent review may lower severity.
+/// Both original assessments remain attributable, including proposed caps.
+fn merge_severity_assessments(a: &mut Finding, b: &Finding) {
+    let snapshot = |f: &Finding| {
+        serde_json::json!({
+            "id": f.id,
+            "found_by": f.found_by,
+            "severity": f.severity,
+            "severity_claimed": f.severity_claimed,
+            "severity_basis": f.severity_basis,
+            "likelihood": f.likelihood,
+            "impact": f.impact,
+            "cap_evidence": f.evidence.iter().filter(|e| matches!(e.kind, EvidenceKind::SeverityCapped | EvidenceKind::SeverityCapProposed)).collect::<Vec<_>>()
+        })
+    };
+    let a_claimed = a.severity_claimed.unwrap_or(a.severity);
+    let b_claimed = b.severity_claimed.unwrap_or(b.severity);
+    let adopt_second = b_claimed > a_claimed
+        || (b_claimed == a_claimed
+            && b.impact.as_ref().map(|i| i.level) > a.impact.as_ref().map(|i| i.level));
+    let adopted = if adopt_second { "second" } else { "primary" };
+    let detail = format!(
+        "{DUAL_FINDER_MERGE_PREFIX} severity_assessments={}",
+        serde_json::json!({"primary": snapshot(a), "second": snapshot(b), "adopted": adopted})
+    );
+    if adopt_second {
+        a.severity_claimed = b.severity_claimed;
+        a.severity_basis = b.severity_basis;
+        a.likelihood = b.likelihood.clone();
+        a.impact = b.impact.clone();
+        // Keep only the adopted proposal active; originals remain in the snapshot.
+        a.evidence
+            .retain(|e| e.kind != EvidenceKind::SeverityCapProposed);
+        a.evidence.extend(
+            b.evidence
+                .iter()
+                .filter(|e| e.kind == EvidenceKind::SeverityCapProposed)
+                .cloned(),
+        );
+    }
+    a.severity = a_claimed.max(b_claimed);
+    a.evidence.retain(|e| {
+        !matches!(
+            e.kind,
+            EvidenceKind::SeverityCapped | EvidenceKind::SeverityCapUnconfirmed
+        )
+    });
+    super::adversarial::finalize_severity(a, None);
+    a.evidence.push(EvidenceItem {
+        kind: EvidenceKind::DualFinderMerge,
+        source: "dual_finder".to_string(),
+        detail,
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    });
+}
+
 fn push_merge(f: &mut Finding, merged_id: &str, side: &FinderSide, basis: DedupeBasis) {
     f.evidence.push(EvidenceItem {
         kind: EvidenceKind::DualFinderMerge,
@@ -644,6 +718,10 @@ mod tests {
 
     fn report(model: &str, ids: &[&str]) -> ModuleAuditReport {
         ModuleAuditReport {
+            attack_classes: None,
+            checks: Vec::new(),
+            hardening: Vec::new(),
+            leads: Vec::new(),
             module_path: "a".into(),
             outcome: ModuleOutcome::Reviewed { note: None },
             reviewed_paths: vec!["a/main.rs".into()],
@@ -659,6 +737,69 @@ mod tests {
     }
 
     #[test]
+    fn dual_finder_checks_union_is_deduplicated_and_either_finder_can_cover() {
+        use crate::audit::{
+            ai_audit::ModuleTarget,
+            coverage::build_module_coverage,
+            schema::{CoverageCheck, ModuleCoverageStatus as S},
+        };
+        let check = CoverageCheck {
+            attack_class: Some("injection".into()),
+            invariant: "bound parameters".into(),
+            paths: vec!["a/main.rs".into()],
+            result: "execute_prepared".into(),
+        };
+        let other = CoverageCheck {
+            invariant: "authorization precedes query".into(),
+            ..check.clone()
+        };
+        for (primary, second, expected) in [
+            (vec![], vec![check.clone()], vec![check.clone()]),
+            (vec![check.clone()], vec![], vec![check.clone()]),
+            (
+                vec![check.clone()],
+                vec![check.clone()],
+                vec![check.clone()],
+            ),
+            (
+                vec![check.clone()],
+                vec![other.clone()],
+                vec![check.clone(), other.clone()],
+            ),
+        ] {
+            let mut reports = vec![report("claude", &[]), report("codex", &[])];
+            reports[0].checks = primary;
+            reports[1].checks = second;
+            let mut run = DualRun::new(1);
+            run.modules.push(DualModule {
+                module_path: "a".into(),
+                primary: FinderSide {
+                    model: "claude".into(),
+                    family: "anthropic".into(),
+                },
+                second: FinderSide {
+                    model: "codex".into(),
+                    family: "openai".into(),
+                },
+            });
+            let dir = tempfile::tempdir().unwrap();
+            run.merge(dir.path(), &mut vec![], &mut reports);
+            let coverage = build_module_coverage(
+                &[ModuleTarget {
+                    module_path: "a".into(),
+                    score: 1,
+                    high_risk: false,
+                    files: vec!["a/main.rs".into()],
+                }],
+                &reports,
+            );
+            assert_eq!(coverage[0].status, S::Covered);
+            assert_eq!(coverage[0].checks, expected);
+            assert_eq!(coverage[0].attempts.len(), 2);
+        }
+    }
+
+    #[test]
     fn an_identical_claim_wins_over_a_patch_match_and_no_other_row_is_removed() {
         let mut a1 = cand("sql-injection", 3, Some("CWE-89"));
         a1.found_by = vec!["claude".into()];
@@ -668,34 +809,58 @@ mod tests {
         a2.proposed_fix = fix(3, 3, "    db.execute_prepared(&[q]);");
         let mut b = a1.clone();
         b.found_by = vec!["codex".into()];
-        let ids = [a2.id.clone(), a1.id.clone()];
-        let mut findings = vec![a1.clone(), a2.clone(), b];
-        let mut reports = vec![
-            report("claude", &[ids[0].as_str(), ids[1].as_str()]),
-            report("codex", &[a1.id.as_str()]),
-        ];
-        let mut run = DualRun::new(1);
-        run.modules.push(DualModule {
-            module_path: "a".into(),
-            primary: FinderSide {
-                model: "claude".into(),
-                family: "anthropic".into(),
-            },
-            second: FinderSide {
-                model: "codex".into(),
-                family: "openai".into(),
-            },
+        a1.severity = Severity::Medium;
+        a1.impact = Some(crate::audit::schema::SeverityAssessment {
+            level: vettalon_contract::severity::Level::Medium,
+            reason: "primary impact".into(),
         });
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("a")).unwrap();
-        std::fs::write(dir.path().join("a/main.rs"), MAIN).unwrap();
-        run.merge(dir.path(), &mut findings, &mut reports);
-        assert_eq!(findings.len(), 3, "rows are only removed by dedup_by_id");
-        assert_eq!(findings[0].found_by, vec!["claude", "codex"]);
-        assert_eq!(findings[1].found_by, vec!["claude"]);
-        assert_eq!(run.merged_identical_claim, 1);
-        assert_eq!(run.merged_same_patch, 0);
-        assert_eq!(run.usable_fixes, 1);
+        b.impact = Some(crate::audit::schema::SeverityAssessment {
+            level: vettalon_contract::severity::Level::High,
+            reason: "second impact".into(),
+        });
+        b.severity_claimed = Some(Severity::High);
+        b.severity_basis = crate::audit::schema::SeverityBasis::ModelDecomposed;
+        let ids = [a2.id.clone(), a1.id.clone()];
+        for mut findings in [
+            vec![a1.clone(), a2.clone(), b.clone()],
+            vec![b, a2.clone(), a1.clone()],
+        ] {
+            let mut reports = vec![
+                report("claude", &[ids[0].as_str(), ids[1].as_str()]),
+                report("codex", &[a1.id.as_str()]),
+            ];
+            let mut run = DualRun::new(1);
+            run.modules.push(DualModule {
+                module_path: "a".into(),
+                primary: FinderSide {
+                    model: "claude".into(),
+                    family: "anthropic".into(),
+                },
+                second: FinderSide {
+                    model: "codex".into(),
+                    family: "openai".into(),
+                },
+            });
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("a")).unwrap();
+            std::fs::write(dir.path().join("a/main.rs"), MAIN).unwrap();
+            run.merge(dir.path(), &mut findings, &mut reports);
+            assert_eq!(
+                findings.len(),
+                2,
+                "the duplicate assessment is merged before id-only dedupe"
+            );
+            let merged = findings.iter().find(|f| f.id == a1.id).unwrap();
+            let unrelated = findings.iter().find(|f| f.id == a2.id).unwrap();
+            assert_eq!(merged.found_by, vec!["claude", "codex"]);
+            assert_eq!(merged.severity, Severity::High);
+            assert_eq!(merged.impact.as_ref().unwrap().reason, "second impact");
+            assert_eq!(merged.severity_claimed, Some(Severity::High));
+            assert_eq!(unrelated.found_by, vec!["claude"]);
+            assert_eq!(run.merged_identical_claim, 1);
+            assert_eq!(run.merged_same_patch, 0);
+            assert_eq!(run.usable_fixes, 1);
+        }
     }
 
     #[test]
@@ -722,5 +887,121 @@ mod tests {
         let big = serde_json::json!({"file":"big.rs","start_line":1,"end_line":MAX_FIX_LINES + 1,"replacement":"x"});
         assert!(clean_fix(Some(&big), &many, |_| Some(1000)).is_none());
         assert!(clean_fix(None, &shown, lines).is_none());
+    }
+    #[test]
+    fn merging_uses_claimed_severity_even_when_a_stored_cap_is_lower() {
+        let mut critical = cand("first", 3, Some("CWE-89"));
+        critical.severity = Severity::Low;
+        critical.severity_claimed = Some(Severity::Critical);
+        critical.impact = Some(crate::audit::schema::SeverityAssessment {
+            level: vettalon_contract::severity::Level::Low,
+            reason: "limited damage".into(),
+        });
+        let high = cand("second", 3, Some("CWE-89"));
+        for (mut a, b) in [(critical.clone(), high.clone()), (high, critical)] {
+            merge_severity_assessments(&mut a, &b);
+            assert_eq!(a.severity, Severity::Critical);
+            assert_eq!(a.severity_claimed, Some(Severity::Critical));
+            assert!(
+                a.evidence
+                    .iter()
+                    .any(|e| e.kind == EvidenceKind::SeverityCapUnconfirmed)
+            );
+        }
+    }
+
+    #[test]
+    fn merging_severity_keeps_the_winning_bundle_and_both_attributed_assessments() {
+        use crate::audit::schema::{SeverityAssessment, SeverityBasis};
+        use vettalon_contract::severity::Level;
+
+        let decomposed = |model: &str, severity: Severity, impact: Level, reason: &str| {
+            let mut f = cand(model, 3, Some("CWE-89"));
+            f.found_by = vec![model.into()];
+            f.severity = Severity::Critical;
+            f.severity_claimed = Some(Severity::Critical);
+            f.severity_basis = SeverityBasis::ModelDecomposed;
+            f.impact = Some(SeverityAssessment {
+                level: impact,
+                reason: reason.into(),
+            });
+            f.likelihood = Some(SeverityAssessment {
+                level: Level::Low,
+                reason: format!("{model} likelihood"),
+            });
+            f.evidence.push(EvidenceItem {
+                kind: EvidenceKind::SeverityCapProposed,
+                source: "ai_audit".into(),
+                detail: format!(
+                    "severity_cap_proposed: critical→{} (finder impact={impact})",
+                    severity.as_str()
+                ),
+                recorded_at: "2026-10-28T00:00:00Z".into(),
+            });
+            f
+        };
+        let primary = decomposed("first", Severity::Medium, Level::Medium, "limited damage");
+        let second = decomposed("second", Severity::High, Level::High, "control defeated");
+        for (mut a, b, selected_model) in [
+            (primary.clone(), second.clone(), "second"),
+            (second.clone(), primary.clone(), "second"),
+        ] {
+            merge_severity_assessments(&mut a, &b);
+            assert_eq!(a.severity, Severity::Critical);
+            assert_eq!(a.severity_claimed, Some(Severity::Critical));
+            assert_eq!(a.severity_basis, SeverityBasis::ModelDecomposed);
+            assert_eq!(a.impact.as_ref().unwrap().level, Level::High);
+            assert_eq!(a.impact.as_ref().unwrap().reason, "control defeated");
+            assert_eq!(
+                a.likelihood.as_ref().unwrap().reason,
+                format!("{selected_model} likelihood")
+            );
+            let active_caps: Vec<_> = a
+                .evidence
+                .iter()
+                .filter(|e| e.kind == EvidenceKind::SeverityCapProposed)
+                .collect();
+            assert_eq!(active_caps.len(), 1);
+            assert_eq!(
+                active_caps[0].detail,
+                "severity_cap_proposed: critical→high (finder impact=high)"
+            );
+            let saved = a
+                .evidence
+                .iter()
+                .find_map(|e| {
+                    e.detail
+                        .strip_prefix("dual_finder_merge: severity_assessments=")
+                })
+                .unwrap();
+            let saved: serde_json::Value = serde_json::from_str(saved).unwrap();
+            for side in ["primary", "second"] {
+                assert!(saved[side]["impact"]["reason"].is_string());
+                assert!(saved[side]["likelihood"]["reason"].is_string());
+                assert_eq!(saved[side]["cap_evidence"].as_array().unwrap().len(), 1);
+                assert_eq!(saved[side]["found_by"].as_array().unwrap().len(), 1);
+            }
+        }
+        let mut legacy = cand("legacy", 3, Some("CWE-89"));
+        legacy.found_by = vec!["legacy".into()];
+        let mut a = primary;
+        a.severity_claimed = Some(Severity::Medium);
+        a.severity = Severity::Medium;
+        merge_severity_assessments(&mut a, &legacy);
+        assert_eq!(a.severity, Severity::High);
+        assert_eq!(a.severity_basis, SeverityBasis::ModelSelfReported);
+        assert_eq!(a.severity_claimed, None);
+        assert_eq!(a.impact, None);
+        assert_eq!(a.likelihood, None);
+        assert!(
+            !a.evidence
+                .iter()
+                .any(|e| e.kind == EvidenceKind::SeverityCapProposed)
+        );
+        assert!(
+            a.evidence
+                .iter()
+                .any(|e| e.detail.contains("limited damage"))
+        );
     }
 }

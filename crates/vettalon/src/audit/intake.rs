@@ -501,6 +501,21 @@ async fn validate_git_configs(
     Ok(())
 }
 
+/// Resolve only a trusted executable and self-contained metadata, refusing
+/// includes and executable helpers before any repository read command.
+pub(super) async fn prepare_readonly_git(
+    repo_root: &Path,
+) -> Result<(String, std::path::PathBuf), String> {
+    let git_bin = crate::util::which_cli_for_scan("git", repo_root)
+        .ok_or("git not found on absolute PATH or common install locations")?;
+    let git_dir = crate::util::validate_local_git_metadata(repo_root)
+        .map_err(|reason| format!("Git metadata is not self-contained: {reason}"))?;
+    validate_git_configs(&git_bin, &git_dir, repo_root)
+        .await
+        .map_err(|reason| format!("Git metadata is not self-contained: {reason}"))?;
+    Ok((git_bin, git_dir))
+}
+
 fn git_history_from_outcome(out: crate::audit::scanners::SubprocessOutcome) -> GitHistoryStatus {
     let unavailable = |reason: String| GitHistoryStatus::Unavailable { reason };
     if let Some(error) = out.spawn_error {
@@ -534,24 +549,10 @@ fn git_history_from_outcome(out: crate::audit::scanners::SubprocessOutcome) -> G
 /// repo, empty history) degrades to `Unavailable { reason }` — never an
 /// `Err` that would abort the whole intake pass.
 pub async fn compute_git_history(repo_root: &Path) -> GitHistoryStatus {
-    let Some(git_bin) = crate::util::which_cli_for_scan("git", repo_root) else {
-        return GitHistoryStatus::Unavailable {
-            reason: "git not found on absolute PATH or common install locations".to_string(),
-        };
+    let (git_bin, git_dir) = match prepare_readonly_git(repo_root).await {
+        Ok(git) => git,
+        Err(reason) => return GitHistoryStatus::Unavailable { reason },
     };
-    let git_dir = match crate::util::validate_local_git_metadata(repo_root) {
-        Ok(git_dir) => git_dir,
-        Err(reason) => {
-            return GitHistoryStatus::Unavailable {
-                reason: format!("Git metadata is not self-contained: {reason}"),
-            };
-        }
-    };
-    if let Err(reason) = validate_git_configs(&git_bin, &git_dir, repo_root).await {
-        return GitHistoryStatus::Unavailable {
-            reason: format!("Git metadata is not self-contained: {reason}"),
-        };
-    }
 
     // Bound to locals first so every element of the `.args([...])` array
     // literal is a plain `&str` — mixing `&str` literals with a `&Cow<str>`

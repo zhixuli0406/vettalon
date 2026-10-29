@@ -65,7 +65,8 @@ fn spawn_job(program: &str, args: &[&str], cwd: &Path) -> io::Result<OwnedJob> {
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "NUL")
-            .env("GIT_OPTIONAL_LOCKS", "0");
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_NO_REPLACE_OBJECTS", "1");
     });
     // KillOnDrop must be registered as a wrapper: JobObject queries it before
     // enabling JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. A raw Command flag is not enough.

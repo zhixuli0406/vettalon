@@ -154,7 +154,8 @@ mod tests {
         f.id = "f1".into();
         let findings = vec![f];
         AuditReport {
-            schema_version: 2,
+            schema_version: super::super::schema::CURRENT_SCHEMA_VERSION,
+            scope: None,
             repo: "/r".into(),
             started_at: "2026-10-13T00:00:00Z".into(),
             profile: ScanProfile {
