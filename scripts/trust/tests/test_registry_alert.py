@@ -72,6 +72,97 @@ def check(responses):
 
 
 class RecordedRegistryTests(unittest.TestCase):
+    def test_version_count_is_bounded_without_truncation(self):
+        self.assertEqual(ra.MAX_VERSIONS, 1000)
+        responses = {PKG: {"versions": {f"invalid-{n}": {} for n in range(ra.MAX_VERSIONS)}}}
+        checker = ra.Checker(FixtureFetcher(responses), FakeVerifier())
+        rows, _ = checker.run(packages=("vettalon",))
+        self.assertEqual(len(rows), ra.MAX_VERSIONS)
+        responses[PKG]["versions"]["one-too-many"] = {}
+        with self.assertRaisesRegex(ra.CheckError, "more than 1000 versions"):
+            checker.run(packages=("vettalon",))
+
+    def test_tag_commit_on_main_passes(self):
+        for status in ("ahead", "identical"):
+            with self.subTest(status=status):
+                responses = load()
+                sha = responses[f"{API}/commits/refs/tags/v0.3.1"]["sha"]
+                responses[f"{API}/compare/{sha}...main?per_page=1"] = {"status": status}
+                row = check(responses)[0][("vettalon", "0.3.1")]
+                self.assertFalse(row.problems)
+
+    def test_missing_tag_skips_commit_lookup_and_continues(self):
+        for raise_on_commit in (False, True):
+            with self.subTest(raise_on_commit=raise_on_commit):
+                responses = load()
+                responses[f"{API}/git/ref/tags/v0.3.0"] = None
+                commit_url = f"{API}/commits/refs/tags/v0.3.0"
+                responses[commit_url] = None
+                fetcher = FixtureFetcher(responses)
+                get_json = fetcher.get_json
+
+                def fetch(url):
+                    if raise_on_commit and url == commit_url:
+                        raise ra.CheckError("HTTP 422: No commit found for SHA")
+                    return get_json(url)
+
+                with mock.patch.object(fetcher, "get_json", side_effect=fetch) as request:
+                    rows, _ = ra.Checker(fetcher, FakeVerifier()).run(packages=("vettalon",))
+                self.assertEqual([row.version for row in rows], ["0.3.0", "0.3.1"])
+                self.assertIn(f"(a) no tag `v0.3.0` in {ra.REPO}", rows[0].problems)
+                self.assertFalse(rows[1].problems)
+                self.assertNotIn(mock.call(commit_url), request.call_args_list)
+                self.assertIn(mock.call(f"{API}/releases/tags/v0.3.0"), request.call_args_list)
+
+    def test_malformed_tag_ref_cannot_check(self):
+        for response in ([], "tag", False, 0):
+            with self.subTest(response=response):
+                responses = load()
+                responses[f"{API}/git/ref/tags/v0.3.0"] = response
+                with self.assertRaisesRegex(ra.CheckError, "malformed tag ref response"):
+                    check(responses)
+
+    def test_malformed_tag_ref_fields_cannot_check(self):
+        valid = {"ref": "refs/tags/v0.3.0", "object": {
+            "type": "commit", "sha": "25dc109667b914353673ebdd7bc5ee50b324718b"}}
+        cases = ({}, {**valid, "ref": "refs/tags/other"},
+                 {"ref": valid["ref"]},
+                 {**valid, "object": {**valid["object"], "type": "tree"}},
+                 {**valid, "object": {**valid["object"], "sha": "z" * 40}},
+                 {**valid, "object": {**valid["object"], "sha": "a" * 39}})
+        for response in cases:
+            with self.subTest(response=response):
+                responses = load()
+                responses[f"{API}/git/ref/tags/v0.3.0"] = response
+                with self.assertRaisesRegex(ra.CheckError, "malformed tag ref response"):
+                    check(responses)
+
+    def test_malformed_commit_cannot_check(self):
+        for response in ({}, {"sha": "z" * 40}, {"sha": 1}, None):
+            with self.subTest(response=response):
+                responses = load()
+                responses[f"{API}/commits/refs/tags/v0.3.0"] = response
+                with self.assertRaisesRegex(ra.CheckError, "malformed commit response"):
+                    check(responses)
+
+    def test_tag_commit_off_main_is_a_mismatch(self):
+        for response in ({"status": "behind"}, {"status": "diverged"}, None):
+            with self.subTest(response=response):
+                responses = load()
+                sha = responses[f"{API}/commits/refs/tags/v0.3.1"]["sha"]
+                responses[f"{API}/compare/{sha}...main?per_page=1"] = response
+                row = check(responses)[0][("vettalon", "0.3.1")]
+                self.assertEqual(row.problems, ("(a) tag commit for `v0.3.1` is not on main",))
+
+    def test_malformed_compare_cannot_check(self):
+        for response in ({"status": "unknown"}, {}, {"status": []}, [], "ahead", False):
+            with self.subTest(response=response):
+                responses = load()
+                sha = responses[f"{API}/commits/refs/tags/v0.3.1"]["sha"]
+                responses[f"{API}/compare/{sha}...main?per_page=1"] = response
+                with self.assertRaisesRegex(ra.CheckError, "malformed compare response"):
+                    check(responses)
+
     def test_verifier_required_and_problems_propagate_once_per_package_version(self):
         responses = load()
         # Expand the recorded platform response to all five packages offline.
@@ -187,7 +278,7 @@ class RecordedRegistryTests(unittest.TestCase):
     def test_unreleased_version_fails_every_check(self):
         responses = load()
         responses[PKG]["versions"]["0.3.2"] = {"dist": {"integrity": "sha512-AAAA"}}
-        responses[f"{API}/commits/refs/tags/v0.3.2"] = None
+        responses[f"{API}/git/ref/tags/v0.3.2"] = None
         responses[f"{API}/releases/tags/v0.3.2"] = None
         problems = " ".join(check(responses)[0][("vettalon", "0.3.2")].problems)
         self.assertIn("(a) no tag", problems)
@@ -421,6 +512,11 @@ class VerifierTests(unittest.TestCase):
         self.download = mock.Mock(side_effect=lambda url, path: path.write_bytes(self.data))
         self.runner = mock.Mock(return_value=subprocess.CompletedProcess(
             [], 0, json.dumps([{"verificationResult": {"statement": self.decoded}}]), ""))
+        self.root_output = '{"mediaType":"test-root"}\n\n{"mediaType":"second-root"}\n'
+        self.root_result = subprocess.CompletedProcess([], 0, self.root_output, "")
+        self.runner.side_effect = lambda argv, **kwargs: (
+            self.root_result if argv[1:3] == ["attestation", "trusted-root"]
+            else self.runner.return_value)
         self.which = mock.patch.object(ra.shutil, "which", return_value="/usr/bin/gh").start()
         self.addCleanup(mock.patch.stopall)
         self.verifier = ra.ProvenanceVerifier(download=self.download, runner=self.runner)
@@ -434,12 +530,81 @@ class VerifierTests(unittest.TestCase):
         self.assertFalse((self.verifier.home / "tarball.tgz").exists())
         self.assertFalse((self.verifier.home / "bundle.json").exists())
 
+    def assert_root_error(self, calls):
+        with self.assertRaises(ra.CheckError) as caught:
+            self.verify()
+        self.assertEqual(str(caught.exception), "could not fetch the Sigstore trusted root")
+        self.assertNotIn("secret", str(caught.exception))
+        self.assertEqual(self.runner.call_count, calls)
+        for call in self.runner.call_args_list:
+            self.assertEqual(call.args[0][1:3], ["attestation", "trusted-root"])
+        self.download.assert_not_called()
+        self.assertFalse((self.verifier.home / "trusted_root.jsonl").exists())
+        self.assert_clean()
+
+    def test_trusted_root_fetched_once_and_reused(self):
+        path = self.verifier.home / "trusted_root.jsonl"
+        for _ in range(2):
+            self.assertEqual(self.verify(), [])
+            self.assertEqual(path.read_text(), self.root_output)
+            argv = self.runner.call_args.args[0]
+            self.assertEqual(argv[argv.index("--custom-trusted-root") + 1], str(path))
+            self.assert_clean()
+        self.assertEqual(self.runner.call_count, 3)
+        self.assertEqual(sum(call.args[0][2] == "trusted-root"
+                             for call in self.runner.call_args_list), 1)
+        self.assertEqual(self.download.call_count, 2)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file permissions")
+    def test_trusted_root_permissions(self):
+        self.assertEqual(self.verify(), [])
+        path = self.verifier.home / "trusted_root.jsonl"
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_trusted_root_nonzero_twice_raises(self):
+        self.runner.side_effect = None
+        self.runner.return_value = subprocess.CompletedProcess([], 1, "secret stdout", "secret stderr")
+        self.assert_root_error(2)
+
+    def test_trusted_root_timeout_raises(self):
+        self.runner.side_effect = subprocess.TimeoutExpired("gh", 120, output="secret stdout")
+        self.assert_root_error(1)
+
+    def test_trusted_root_oserror_raises(self):
+        self.runner.side_effect = OSError("secret error")
+        self.assert_root_error(1)
+
+    def test_trusted_root_empty_stdout_raises(self):
+        for output in ("", " \n\t\n"):
+            with self.subTest(output=output):
+                self.runner.reset_mock()
+                self.root_result.stdout = output
+                self.assert_root_error(1)
+
+    def test_trusted_root_invalid_json_or_nonobject_raises(self):
+        for output in ("secret stdout", '{}\nsecret stdout\n', '"secret"', "[]", "null", "42"):
+            with self.subTest(output=output):
+                self.runner.reset_mock()
+                self.root_result.stdout = output
+                self.assert_root_error(1)
+
+    def test_trusted_root_transient_failure_retries_once(self):
+        self.runner.side_effect = [subprocess.CompletedProcess([], 1, "secret stdout", "secret stderr"),
+                                   self.root_result, self.runner.return_value]
+        self.assertEqual(self.verify(), [])
+        self.assertEqual(self.runner.call_count, 3)
+        self.assertEqual([call.args[0][2] for call in self.runner.call_args_list],
+                         ["trusted-root", "trusted-root", "verify"])
+        self.assertEqual(self.download.call_count, 1)
+
     def test_argv_environment_permissions_and_cleanup(self):
         self.verifier.repo = "owner/custom-repo"
         home = self.verifier.home
 
         def run(argv, **kwargs):
             self.assertEqual(stat.S_IMODE(home.stat().st_mode), 0o700)
+            if argv[1:3] == ["attestation", "trusted-root"]:
+                return self.root_result
             bundle = Path(argv[argv.index("--bundle") + 1])
             self.assertEqual(stat.S_IMODE(bundle.stat().st_mode), 0o600)
             self.assertEqual(json.loads(bundle.read_text()), self.bundle)
@@ -453,7 +618,9 @@ class VerifierTests(unittest.TestCase):
             self.assertEqual(self.verify(), [])
         argv = self.runner.call_args.args[0]
         self.assertEqual(argv, ["/usr/bin/gh", "attestation", "verify", str(home / "tarball.tgz"),
-                               "--bundle", str(home / "bundle.json"), "--repo", "owner/custom-repo",
+                               "--bundle", str(home / "bundle.json"),
+                               "--custom-trusted-root", str(home / "trusted_root.jsonl"),
+                               "--repo", "owner/custom-repo",
                                "--digest-alg", "sha512", "--predicate-type", ra.SLSA_V1,
                                "--cert-identity", "https://github.com/owner/custom-repo/"
                                ".github/workflows/release.yml@refs/tags/v0.3.1",
@@ -465,6 +632,12 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(options["env"], {"PATH": os.environ.get("PATH", os.defpath),
                                          "HOME": str(home), "GH_CONFIG_DIR": str(home),
                                          "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"})
+        root_call = self.runner.call_args_list[0]
+        self.assertEqual(root_call.args[0], ["/usr/bin/gh", "attestation", "trusted-root"])
+        self.assertEqual(root_call.kwargs, options)
+        self.assertTrue(options["capture_output"])
+        self.assertTrue(options["text"])
+        self.assertFalse(options["check"])
         self.which.assert_called_once_with("gh")
         self.assert_clean()
         with self.verifier:
@@ -480,36 +653,38 @@ class VerifierTests(unittest.TestCase):
         self.download.assert_not_called()
         self.runner.assert_not_called()
 
-    def test_integrity_mismatch_never_runs_gh(self):
+    def test_integrity_mismatch_never_runs_verify(self):
         for integrity in ("sha512-AAAA", None, "sha512-!", "sha256-AAAA"):
             self.dist["integrity"] = integrity
             self.assertEqual(self.verify(), ["(c) downloaded tarball does not match the registry integrity"])
-        self.runner.assert_not_called()
+        self.assertEqual(self.runner.call_count, 1)
+        self.assertEqual(self.runner.call_args.args[0][1:3], ["attestation", "trusted-root"])
         self.assert_clean()
 
     def test_failed_verification_retries_once_without_stderr(self):
         self.runner.return_value = subprocess.CompletedProcess([], 1, "", "secret stderr")
         self.assertEqual(self.verify(), ["(c) provenance signature or signer identity did not verify"])
-        self.assertEqual(self.runner.call_count, 2)
+        self.assertEqual(self.runner.call_count, 3)
         self.assertEqual(self.download.call_count, 1)
         self.assert_clean()
 
     def test_second_verification_can_succeed(self):
-        self.runner.side_effect = [subprocess.CompletedProcess([], 1, "", ""), self.runner.return_value]
+        self.runner.side_effect = [self.root_result, subprocess.CompletedProcess([], 1, "", ""),
+                                   self.runner.return_value]
         self.assertEqual(self.verify(), [])
-        self.assertEqual(self.runner.call_count, 2)
+        self.assertEqual(self.runner.call_count, 3)
         self.assert_clean()
 
     def test_timeout_and_missing_gh_raise(self):
-        self.runner.side_effect = subprocess.TimeoutExpired("gh", 120)
+        self.runner.side_effect = [self.root_result, subprocess.TimeoutExpired("gh", 120)]
         with self.assertRaisesRegex(ra.CheckError, "timed out"):
             self.verify()
-        self.assertEqual(self.runner.call_count, 1)
+        self.assertEqual(self.runner.call_count, 2)
         self.assert_clean()
         self.which.return_value = None
         with self.assertRaisesRegex(ra.CheckError, "gh is required"):
             self.verify()
-        self.assertEqual(self.runner.call_count, 1)
+        self.assertEqual(self.runner.call_count, 2)
 
     def test_malformed_verifier_output_raises(self):
         for output in ("not JSON", "[]", "[{}, {}]", "{}", "[null]", "[{}]",
@@ -542,7 +717,8 @@ class VerifierTests(unittest.TestCase):
         with self.assertRaises(ra.CheckError):
             self.verify()
         self.assert_clean()
-        self.runner.assert_not_called()
+        self.assertEqual(self.runner.call_count, 1)
+        self.assertEqual(self.runner.call_args.args[0][1:3], ["attestation", "trusted-root"])
 
 
 class TarballDownloadTests(unittest.TestCase):
@@ -637,6 +813,54 @@ class TarballDownloadTests(unittest.TestCase):
 
 
 class ReportAndCliTests(unittest.TestCase):
+    def test_json_null_body_raises_without_retry_and_404_returns_none(self):
+        url = f"{API}/example"
+        with mock.patch.object(ra.urllib.request, "build_opener") as build, \
+                mock.patch.object(ra.time, "sleep") as sleep:
+            response = mock.MagicMock(wraps=io.BytesIO(b"null"))
+            response.__enter__.return_value = response
+            build.return_value.open.return_value = response
+            with self.assertRaisesRegex(
+                    ra.CheckError, f"^GET {url}: response body is null$"):
+                ra.HttpFetcher().get_json(url)
+            self.assertEqual(build.return_value.open.call_count, 1)
+            sleep.assert_not_called()
+
+            build.return_value.open.reset_mock()
+            not_found = ra.urllib.error.HTTPError(url, 404, "not found", {}, None)
+            self.addCleanup(not_found.close)
+            build.return_value.open.side_effect = not_found
+            self.assertIsNone(ra.HttpFetcher().get_json(url))
+            self.assertEqual(build.return_value.open.call_count, 1)
+
+    def test_json_size_cap_does_not_retry_or_expose_content(self):
+        self.assertEqual(ra.MAX_JSON_BYTES, 16 * 1024 * 1024)
+        for data in (b'"secret"', b'"secret" '):
+            with self.subTest(data=data), \
+                    mock.patch.object(ra, "MAX_JSON_BYTES", 8), \
+                    mock.patch.object(ra.urllib.request, "build_opener") as build, \
+                    mock.patch.object(ra.time, "sleep") as sleep:
+                response = mock.MagicMock(wraps=io.BytesIO(data))
+                response.__enter__.return_value = response
+                build.return_value.open.return_value = response
+                if len(data) == 8:
+                    self.assertEqual(ra.HttpFetcher().get_json(PKG), "secret")
+                else:
+                    with self.assertRaisesRegex(ra.CheckError, "size cap") as caught:
+                        ra.HttpFetcher().get_json(PKG)
+                    self.assertNotIn("secret", str(caught.exception))
+                response.read.assert_called_once_with(9)
+                self.assertEqual(build.return_value.open.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_json_decode_errors_still_retry(self):
+        with mock.patch.object(ra.urllib.request, "build_opener") as build, \
+                mock.patch.object(ra.time, "sleep") as sleep:
+            build.return_value.open.side_effect = [io.BytesIO(b"invalid"), io.BytesIO(b"{}")]
+            self.assertEqual(ra.HttpFetcher().get_json(PKG), {})
+            self.assertEqual(build.return_value.open.call_count, 2)
+            sleep.assert_called_once_with(2)
+
     def test_safe_neutralizes_markdown(self):
         rendered = ra.safe("`x`\n| <img src=a> [l](u)")
         self.assertNotRegex(rendered, r"[`\n|<>\[\]() ]")

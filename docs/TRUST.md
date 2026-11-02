@@ -92,7 +92,7 @@ manual dispatch) on the public repository. Its script,
 [`registry_alert.py`](../scripts/trust/registry_alert.py), lists every published
 version of the five packages and, for each version 0.3.0 or later, requires:
 
-1. a tag `v<version>` and a published GitHub release for it;
+1. a tag `v<version>` whose commit is on `main`, and a published GitHub release for it;
 2. a `release.yml` run for that tag, at the tag commit, with a successful `npm-publish` job;
 3. npm SLSA provenance naming this repository, `.github/workflows/release.yml`,
    that tag and commit, a GitHub-hosted runner, a run from step 2, and the exact
@@ -124,6 +124,37 @@ attempt of a run whose `npm-publish` job succeeded on an earlier attempt passes
 with a note: re-running `npm-publish` stages the packages that are not live yet,
 then fails on the one that already is (this is what happened to the 0.3.0
 platform packages).
+
+The workflow installs a pinned `gh` release and checks its SHA-256. Before the
+scan,
+[`test_registry_alert_gh.py`](../scripts/trust/tests/test_registry_alert_gh.py)
+runs that binary against the real 0.7.0 provenance: the genuine bundle must
+pass, and a tampered tarball, signature or payload must fail, as must the wrong
+tag, repository or issuer. If this step fails, the job reports "Registry alert
+could not check". The scan fetches Sigstore's trusted root once and then verifies
+offline against that file, so an outage during fetching also reports "could not
+check", and a `gh` rejection during the scan cannot come from a network failure.
+JSON responses are capped at 16 MiB and each package at 1000 versions; over
+either limit the check stops with exit 2 and never truncates.
+
+What the alert does not cover:
+
+- It trusts Sigstore's root and the GitHub Actions OIDC issuer. A compromise of
+  either could produce provenance that verifies, and a second verifier would
+  share that root.
+- `gh` is the only verifier. A second implementation would catch a parser or
+  policy bug in `gh` but would not help with a compromised root; we do not run
+  one. The pinned version and the tampered samples above are what covers `gh`.
+- A malicious commit that reaches `main` through a merged pull request is built
+  by the real workflow and gets valid provenance. The alert proves where a
+  package was built, not that its source is safe.
+- `protect-release-tags` lets repository admins bypass it, so a stolen admin
+  credential could tag an unreviewed commit. The "on `main`" rule detects a tag
+  whose commit is off `main`, on the next daily run. It does not detect an
+  attacker who can also get the commit onto `main` first.
+- The check runs once a day, so it detects a bad version; it does not prevent
+  one. Prevention comes from staged publishing: a version goes live only after
+  a maintainer runs `npm stage approve` with 2FA.
 
 ## Verify a downloaded CLI archive
 

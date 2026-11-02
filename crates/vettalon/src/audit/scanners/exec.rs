@@ -431,12 +431,15 @@ async fn run_capped_direct(
                 .take((max as u64).saturating_add(1))
                 .read_to_end(&mut stdout_buf)
                 .await;
+            // Keep draining after the cap so a live child cannot block writing.
+            let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
         };
         let stderr_fut = async {
             let _ = (&mut stderr)
                 .take(STDERR_TAIL_BYTES as u64)
                 .read_to_end(&mut stderr_buf)
                 .await;
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
         };
         tokio::join!(stdout_fut, stderr_fut);
         #[cfg(unix)]
@@ -838,6 +841,65 @@ mod tests {
             &RunLimits::default(),
         )
         .await;
+        assert_eq!(outcome.stderr_tail, "oops");
+    }
+
+    #[tokio::test]
+    async fn stderr_beyond_cap_is_drained_until_exit() {
+        let limits = RunLimits {
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 10,
+        };
+        let outcome = run_capped(
+            "sh",
+            &["-c", "printf '%0262144d' 0 >&2; exit 0"],
+            Path::new("."),
+            &limits,
+        )
+        .await;
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.stderr_tail.len(), STDERR_TAIL_BYTES);
+    }
+
+    #[tokio::test]
+    async fn stdout_beyond_cap_is_drained_until_exit() {
+        let limits = RunLimits {
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 10,
+        };
+        let outcome = run_capped(
+            "sh",
+            &["-c", "printf '%0262144d' 0; exit 0"],
+            Path::new("."),
+            &limits,
+        )
+        .await;
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.stdout_truncated);
+        assert_eq!(outcome.stdout.len(), limits.max_output_bytes);
+    }
+
+    #[tokio::test]
+    async fn endless_output_still_times_out_with_captured_bytes() {
+        let limits = RunLimits {
+            timeout: Duration::from_millis(200),
+            max_output_bytes: 10,
+        };
+        let outcome = run_capped(
+            "sh",
+            &[
+                "-c",
+                "printf oops >&2; while :; do printf '%04096d' 0; done",
+            ],
+            Path::new("."),
+            &limits,
+        )
+        .await;
+        assert!(outcome.timed_out);
+        assert!(outcome.stdout_truncated);
+        assert_eq!(outcome.stdout.len(), limits.max_output_bytes);
         assert_eq!(outcome.stderr_tail, "oops");
     }
 }

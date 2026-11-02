@@ -2,7 +2,7 @@
 """Alert when an npm version has no matching public release run.
 
 For each package and each published version in scope, require:
-  (a) a tag v<version> and a published GitHub release for it in the public repo;
+  (a) a tag v<version> on main and a published GitHub release in the public repo;
   (b) a release.yml run for that tag, built from the tag commit, with at least
       one successful npm-publish job;
   (c) an npm SLSA provenance statement naming this repository's release.yml at
@@ -23,7 +23,7 @@ Read-only: GET requests only; the GitHub token is sent to api.github.com only.
 It downloads each tarball and verifies its digest, provenance signature, exact
 workflow/tag certificate identity and GitHub OIDC issuer. Transparency-log and
 signature checks are delegated to `gh attestation verify`, whose trust root
-comes from Sigstore's TUF repository; they are not implemented by this script.
+comes from Sigstore's TUF repository through gh once per run, then verification is offline.
 
 Exit codes: 0 every in-scope version matched, 1 mismatch, 2 could not check.
 """
@@ -49,6 +49,7 @@ import urllib.request
 from typing import NamedTuple
 
 REPO = "zhixuli0406/vettalon"
+DEFAULT_BRANCH = "main"
 PACKAGES = (
     "vettalon",
     "@vettalon/darwin-arm64",
@@ -69,9 +70,12 @@ GITHUB_API = "https://api.github.com"
 ISSUE_TITLE = "Registry version without a matching release run"
 ERROR_TITLE = "Registry alert could not check"
 MAX_TARBALL_BYTES = 256 * 1024 * 1024
+MAX_JSON_BYTES = 16 * 1024 * 1024
+MAX_VERSIONS = 1000
 VERIFY_TIMEOUT = 120
 OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class CheckError(Exception):
@@ -86,6 +90,7 @@ class RunState(NamedTuple):
 class TagState(NamedTuple):
     sha: str | None
     published: bool
+    on_default_branch: bool
     runs: dict[int, RunState]  # run id -> successful npm-publish attempts and latest attempt
 
 
@@ -154,7 +159,13 @@ class HttpFetcher:
             try:
                 request = urllib.request.Request(url, headers=headers)
                 with opener.open(request, timeout=self.timeout) as response:
-                    return json.load(response)
+                    data = response.read(MAX_JSON_BYTES + 1)
+                    if len(data) > MAX_JSON_BYTES:
+                        raise CheckError("JSON response exceeds the download size cap")
+                    result = json.loads(data)
+                    if result is None:
+                        raise CheckError(f"GET {url}: response body is null")
+                    return result
             except urllib.error.HTTPError as err:
                 if err.code == 404:
                     return None
@@ -212,6 +223,7 @@ class ProvenanceVerifier:
         self.runner = runner if runner is not None else subprocess.run
         self._temp = tempfile.TemporaryDirectory(prefix="registry-alert-")
         self.home = Path(self._temp.name)  # TemporaryDirectory creates mode 0700.
+        self._trusted_root_path: Path | None = None
 
     def __enter__(self):
         return self
@@ -222,6 +234,35 @@ class ProvenanceVerifier:
     def close(self):
         self._temp.cleanup()
 
+    def _env(self):
+        return {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
+                "GH_CONFIG_DIR": str(self.home), "GH_PROMPT_DISABLED": "1",
+                "GH_NO_UPDATE_NOTIFIER": "1"}
+
+    def _trusted_root(self, gh: str) -> Path:
+        if self._trusted_root_path is not None:
+            return self._trusted_root_path
+        message = "could not fetch the Sigstore trusted root"
+        try:
+            for _ in range(2):
+                result = self.runner([gh, "attestation", "trusted-root"], capture_output=True,
+                                     text=True, env=self._env(), timeout=VERIFY_TIMEOUT, check=False)
+                if result.returncode == 0:
+                    break
+            else:
+                raise CheckError(message)
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            if not lines or any(not isinstance(json.loads(line), dict) for line in lines):
+                raise CheckError(message)
+            path = self.home / "trusted_root.jsonl"
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                           "w", encoding="utf-8") as handle:
+                handle.write(result.stdout)
+        except (subprocess.TimeoutExpired, OSError, UnicodeError, ValueError) as err:
+            raise CheckError(message) from err
+        self._trusted_root_path = path
+        return path
+
     def verify(self, version: str, dist: dict, bundle: dict, statement: dict) -> list[str]:
         if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
             return ["version is not a release version"]
@@ -231,6 +272,7 @@ class ProvenanceVerifier:
         gh = shutil.which("gh")
         if gh is None:
             raise CheckError("gh is required to verify npm provenance")
+        trusted_root = self._trusted_root(gh)
         tarball = self.home / "tarball.tgz"
         bundle_path = self.home / "bundle.json"
         try:
@@ -245,12 +287,11 @@ class ProvenanceVerifier:
                            "w", encoding="utf-8") as handle:
                 json.dump(bundle, handle)
             argv = [gh, "attestation", "verify", str(tarball), "--bundle", str(bundle_path),
+                    "--custom-trusted-root", str(trusted_root),
                     "--repo", self.repo, "--digest-alg", "sha512", "--predicate-type", SLSA_V1,
                     "--cert-identity", f"https://github.com/{self.repo}/{WORKFLOW_PATH}"
                     f"@refs/tags/v{version}", "--cert-oidc-issuer", OIDC_ISSUER, "--format", "json"]
-            env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
-                   "GH_CONFIG_DIR": str(self.home), "GH_PROMPT_DISABLED": "1",
-                   "GH_NO_UPDATE_NOTIFIER": "1"}
+            env = self._env()
             for _ in range(2):
                 try:
                     result = self.runner(argv, capture_output=True, text=True, env=env,
@@ -374,12 +415,35 @@ class Checker:
     def tag_state(self, tag: str) -> TagState:
         if tag not in self._tags:
             q = urllib.parse.quote(tag, safe="")
-            commit = self.api(f"commits/refs/tags/{q}")
+            ref = self.api(f"git/ref/tags/{q}")
+            if ref is not None and (
+                    not isinstance(ref, dict)
+                    or ref.get("ref") != f"refs/tags/{tag}"
+                    or not isinstance(ref.get("object"), dict)
+                    or ref["object"].get("type") not in ("commit", "tag")
+                    or not isinstance(ref["object"].get("sha"), str)
+                    or not SHA_RE.fullmatch(ref["object"]["sha"])):
+                raise CheckError(f"{tag}: malformed tag ref response")
+            commit = self.api(f"commits/refs/tags/{q}") if ref is not None else None
+            if ref is not None and (
+                    not isinstance(commit, dict)
+                    or not isinstance(commit.get("sha"), str)
+                    or not SHA_RE.fullmatch(commit["sha"])):
+                raise CheckError(f"{tag}: malformed commit response")
             release = self.api(f"releases/tags/{q}")
-            sha = commit.get("sha") if commit else None
+            sha = commit["sha"] if ref is not None else None
+            on_default_branch = False
+            if sha:
+                comparison = self.api(f"compare/{sha}...{DEFAULT_BRANCH}?per_page=1")
+                if comparison is not None:
+                    if (not isinstance(comparison, dict)
+                            or comparison.get("status") not in ("ahead", "identical", "behind", "diverged")):
+                        raise CheckError(f"{tag}: malformed compare response")
+                    on_default_branch = comparison["status"] in ("ahead", "identical")
             self._tags[tag] = TagState(
                 sha=sha,
                 published=bool(release) and release.get("draft") is False,
+                on_default_branch=on_default_branch,
                 runs=self.release_runs(tag, sha) if sha else {},
             )
         return self._tags[tag]
@@ -495,6 +559,8 @@ class Checker:
         problems = []
         if not state.sha:
             problems.append(f"(a) no tag `{safe(tag)}` in {self.repo}")
+        elif not state.on_default_branch:
+            problems.append(f"(a) tag commit for `{safe(tag)}` is not on main")
         if not state.published:
             problems.append(f"(a) no published GitHub release for `{safe(tag)}`")
         if state.sha and not any(run.successful for run in state.runs.values()):
@@ -508,6 +574,8 @@ class Checker:
             doc = self.fetch.get_json(f"{NPM}/{urllib.parse.quote(name, safe='@')}")
             if not doc or not isinstance(doc.get("versions"), dict):
                 raise CheckError(f"{name}: package not found on npm")
+            if len(doc["versions"]) > MAX_VERSIONS:
+                raise CheckError(f"{name}: more than {MAX_VERSIONS} versions")
             for version, meta in sorted(doc["versions"].items()):
                 if in_scope(version):
                     rows.append(self.check_version(name, version, meta))
