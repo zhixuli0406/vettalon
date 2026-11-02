@@ -1,5 +1,5 @@
 # Daily check that every npm version from 0.3.0 on has a matching GitHub
-# release, a release.yml run with a successful npm-publish job for its tag, and
+# release with its tag commit on main, a successful npm-publish job, and
 # verified npm provenance naming that run (scripts/trust/registry_alert.py).
 # Mismatches and check errors open or comment on separate alert issues. Runs
 # only on the public repo; read-only apart from that issue. Uses GITHUB_TOKEN only.
@@ -28,6 +28,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install the pinned gh
+        env:
+          GH_VERSION: 2.103.3
+          GH_SHA256: 4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+        run: |
+          archive="$RUNNER_TEMP/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 \
+            "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$GH_SHA256" "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gh_${GH_VERSION}_linux_amd64/bin" >> "$GITHUB_PATH"
+      - name: Prove gh accepts known-good and rejects tampered provenance
+        env:
+          VETTALON_GH_INTEGRATION: '1'
+          VETTALON_GH_VERSION: 2.103.3
+        run: python3 -B -I -S -m unittest discover -s scripts/trust/tests -p 'test_registry_alert_gh.py'
       - name: Compare registry versions with release runs
         id: scan
         env:

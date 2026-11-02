@@ -8,6 +8,8 @@
 
 - registry 警報現在會下載每個 npm tarball，核對摘要後用 `gh attestation verify` 驗證 provenance 簽章、綁定發版 tag 的 workflow 身分與 issuer；無法完成檢查時也會開獨立 issue。
   The registry alert now downloads each npm tarball, checks its digest, and uses `gh attestation verify` to verify the provenance signature, the workflow identity at the release tag and the issuer. A check that cannot finish now opens its own issue.
+- registry 警報要求 tag commit 在 `main` 上，以固定版本的 `gh` 掃描，掃描前先用真實 provenance 與竄改樣本驗證 `gh`；驗證器或 Sigstore 故障回報為無法檢查，不再算成不符。JSON 回應上限 16 MiB，每個套件上限 1000 個版本，超過就停止檢查，不會截斷。
+  The registry alert now requires the tag commit to be on `main`, scans with a pinned `gh`, and first tests that `gh` against real provenance and tampered copies. A broken verifier or Sigstore outage now reports "could not check" instead of a mismatch. JSON responses are capped at 16 MiB and each package at 1000 versions; over either limit the check stops and never truncates.
 
 ### Changed
 
@@ -18,6 +20,8 @@
 
 - 修正 registry 警報在 release run 僅有無關工作失敗時，仍將版本誤報為不符的問題。
   Fixed the registry alert reporting a version as mismatched when only an unrelated job of its release run failed.
+- 修正 macOS 與 Linux 上外部工具輸出超過擷取上限時會卡到逾時的問題。現在超過上限的部分會讀取後丟棄，工具可以正常結束。
+  Fixed external tools hanging until the timeout on macOS and Linux when their output exceeded the capture cap. Output past the cap is now read and discarded, so the tool can finish normally.
 
 ## [0.7.0] - 2026-11-02
 
