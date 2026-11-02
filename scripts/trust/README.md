@@ -217,8 +217,12 @@ rate limiting or timeout is not a successful assessment. See
 [Best Practices evidence/gaps](../../docs/TRUST-BEST-PRACTICES.md).
 
 Registry alert: `registry_alert.py` checks that every npm version from 0.3.0 on
-has a release, a successful `release.yml` run and provenance naming that run
-(read-only; GitHub token sent to api.github.com only). The daily workflow is
+has a release, a `release.yml` run with a successful `npm-publish` job and
+provenance naming that run. It downloads each tarball and verifies its digest,
+signature, exact workflow/tag certificate identity and issuer with
+`gh attestation verify` (`gh` is required locally and receives no token;
+the GitHub token is sent to api.github.com only). Mismatches and check errors
+open separate alert issues. The daily workflow is
 `registry-alert.yml`; checks and scope are in
 [TRUST.md](../../docs/TRUST.md#registry-alert). Its tests replay a recorded
 fixture offline:

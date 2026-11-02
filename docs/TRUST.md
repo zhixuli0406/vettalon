@@ -93,28 +93,37 @@ manual dispatch) on the public repository. Its script,
 version of the five packages and, for each version 0.3.0 or later, requires:
 
 1. a tag `v<version>` and a published GitHub release for it;
-2. a `release.yml` run for that tag, at the tag commit, with a successful attempt;
+2. a `release.yml` run for that tag, at the tag commit, with a successful `npm-publish` job;
 3. npm SLSA provenance naming this repository, `.github/workflows/release.yml`,
    that tag and commit, a GitHub-hosted runner, a run from step 2, and the exact
-   tarball digest the registry serves.
+   tarball digest the registry serves. The script downloads each tarball, checks
+   its SHA-512 against registry integrity, then uses `gh attestation verify` to
+   verify the signature, certificate identity for the workflow at that exact
+   tag, and the GitHub Actions OIDC issuer. The verified statement must match
+   the decoded bundle used for the semantic checks.
 
 On any mismatch the job fails and a second job, the only one with
 `issues: write`, opens or comments on the issue "Registry version without a
-matching release run". The check job has `contents: read` and `actions: read`
-and uses only `GITHUB_TOKEN`. Run it locally with
+matching release run". Errors (including a check that did not finish) open or
+update a separate issue titled "Registry alert could not check". The check job
+has `contents: read` and `actions: read` and uses only `GITHUB_TOKEN`.
+Local runs require `gh`; no token is sent to the `gh` verifier, which runs with
+an isolated home and config directory. The token is sent only to api.github.com.
+Run it locally with
 `GH_TOKEN=$(gh auth token) python3 scripts/trust/registry_alert.py` (exit 0
 matched, 1 mismatch, 2 could not check).
 
 Versions before 0.3.0 (0.1.0 through 0.2.1 and the `0.0.0-stage` placeholder)
 were published by hand or with a token before trusted publishing, so they have
 no provenance to match; the report lists them as not checked. That list is
-fixed in the script: any other version below 0.3.0 that appears is a mismatch. The script reads
-the provenance statement but does not verify its Sigstore signature: npm
-verifies provenance when it accepts a publish, and `npm audit signatures`
-re-checks it. A provenance statement from a later attempt of a run whose earlier
-attempt succeeded passes with a note: re-running `npm-publish` stages the
-packages that are not live yet, then fails on the one that already is (this is
-what happened to the 0.3.0 platform packages).
+fixed in the script: any other version below 0.3.0 that appears is a mismatch.
+Transparency-log and signature checks are delegated to `gh attestation verify`;
+the trust root comes from Sigstore's TUF repository, rather than being
+implemented or pinned in this script. A provenance statement from a later
+attempt of a run whose `npm-publish` job succeeded on an earlier attempt passes
+with a note: re-running `npm-publish` stages the packages that are not live yet,
+then fails on the one that already is (this is what happened to the 0.3.0
+platform packages).
 
 ## Verify a downloaded CLI archive
 
