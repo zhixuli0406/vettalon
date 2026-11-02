@@ -18,6 +18,7 @@ pub mod cli;
 pub mod container;
 pub mod http;
 pub mod refusal;
+pub mod usage_limit;
 
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +32,9 @@ pub enum LlmError {
     /// Transport / process / HTTP failure.
     #[error("{0}")]
     Executor(String),
+    /// Provider allowance exhausted, distinct from transient rate limiting.
+    #[error("provider_usage_limit: {0}")]
+    UsageLimit(String),
     /// The model answered, but with a refusal instead of the requested work.
     #[error("model refused: {0}")]
     Refused(String),
@@ -145,6 +149,7 @@ pub struct StepCaller {
     pub step: &'static str,
     pub log: RefusalLog,
     pub calls: std::sync::atomic::AtomicUsize,
+    usage_limited: std::sync::atomic::AtomicBool,
     /// P2-1: optional per-call trace. Default is an empty, unattached log.
     pub trace: TraceLog,
 }
@@ -156,6 +161,7 @@ impl StepCaller {
             step,
             log,
             calls: std::sync::atomic::AtomicUsize::new(0),
+            usage_limited: std::sync::atomic::AtomicBool::new(false),
             trace: TraceLog::default(),
         }
     }
@@ -164,6 +170,10 @@ impl StepCaller {
     pub fn with_trace(mut self, trace: TraceLog) -> Self {
         self.trace = trace;
         self
+    }
+
+    pub fn usage_limited(&self) -> bool {
+        self.usage_limited.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn call_count(&self) -> usize {
@@ -177,10 +187,14 @@ impl LlmCaller for StepCaller {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let started = std::time::Instant::now();
         let r = self.model.caller.complete(prompt).await;
+        if matches!(r, Err(LlmError::UsageLimit(_))) {
+            self.usage_limited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let (outcome, reply_bytes, error) = match &r {
             Ok(s) => ("ok", s.len(), None),
             Err(LlmError::Refused(_)) => ("refused", 0, None),
-            Err(LlmError::Executor(e)) => (
+            Err(LlmError::Executor(e) | LlmError::UsageLimit(e)) => (
                 "error",
                 0,
                 Some(

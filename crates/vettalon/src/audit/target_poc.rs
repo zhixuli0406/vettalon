@@ -21,6 +21,7 @@ use super::poc_oracle::{
     OracleClass, OracleSecrets, benign_input, classify, fixture_inputs,
     target_runner as oracle_target_runner,
 };
+use super::regression_test::{self, RegressionTestRecord};
 use super::schema::{Finding, sha256_hex};
 use super::verification::{CompileInput, HostObservations, VerificationEvent, compile_ir};
 use super::verification_context::{
@@ -288,6 +289,17 @@ pub struct TargetPocReceipt {
     /// pre-execution failures; stored verdicts are re-derived on validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_event: Option<VerificationEvent>,
+    /// Present only when a regression test was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_test: Option<RegressionTestRecord>,
+}
+
+/// A receipt plus the regression test source, which exists only when the
+/// sandbox saw that test fail on the unfixed snapshot.
+#[derive(Debug, Clone)]
+pub struct TargetPocWithTest {
+    pub receipt: TargetPocReceipt,
+    pub test_source: Option<String>,
 }
 
 impl TargetPocReceipt {
@@ -306,6 +318,7 @@ impl TargetPocReceipt {
             image_id: None,
             reason: Some(reason.into()),
             verification_event: None,
+            regression_test: None,
         }
     }
 }
@@ -378,34 +391,159 @@ pub async fn run_target_poc(
     call: &TargetCall,
     image: &str,
 ) -> TargetPocReceipt {
+    run_docker(repo_root, finding, call, image, false)
+        .await
+        .receipt
+}
+
+/// [`run_target_poc`], then generate a regression test and run it against
+/// the same snapshot. Without an observed effect and a red run, the receipt
+/// says why and there is no test.
+pub async fn run_target_poc_with_test(
+    repo_root: &Path,
+    finding: &Finding,
+    call: &TargetCall,
+    image: &str,
+) -> TargetPocWithTest {
+    run_docker(repo_root, finding, call, image, true).await
+}
+
+async fn run_docker(
+    repo_root: &Path,
+    finding: &Finding,
+    call: &TargetCall,
+    image: &str,
+    emit_test: bool,
+) -> TargetPocWithTest {
+    let refused = |reason| {
+        let mut receipt = TargetPocReceipt::inconclusive(call, reason);
+        if emit_test {
+            receipt.regression_test = Some(RegressionTestRecord::refused(reason));
+        }
+        TargetPocWithTest {
+            receipt,
+            test_source: None,
+        }
+    };
     if let Err(reason) = call.validate() {
-        return TargetPocReceipt::inconclusive(call, reason);
+        return refused(reason);
     }
     if finding.file != call.file {
-        return TargetPocReceipt::inconclusive(call, "finding_target_mismatch");
+        return refused("finding_target_mismatch");
     }
     if classify(finding).is_none() {
-        return TargetPocReceipt::inconclusive(call, "unsupported_oracle_class");
+        return refused("unsupported_oracle_class");
     }
-    let budget = PocBudget::with_image(3, image);
+    let budget = PocBudget::with_image(if emit_test { 4 } else { 3 }, image);
     let sandbox = match budget.sandbox().await {
         Ok(sandbox) => sandbox,
-        Err(_) => return TargetPocReceipt::inconclusive(call, "sandbox_unavailable"),
+        Err(_) => return refused("sandbox_unavailable"),
     };
     let runner = DockerTargetSandbox {
         sandbox,
         budget: &budget,
     };
-    run_target_poc_with_sandbox(repo_root, finding, call, &runner).await
+    run_with_sandbox(repo_root, finding, call, &runner, emit_test).await
 }
 
 /// Testable core.  The host only validates and copies bytes; target Python is
 /// executed exclusively by `TargetSandbox`.
+#[cfg(test)]
 pub(crate) async fn run_target_poc_with_sandbox<S: TargetSandbox>(
     repo_root: &Path,
     finding: &Finding,
     call: &TargetCall,
     sandbox: &S,
+) -> TargetPocReceipt {
+    run_with_sandbox(repo_root, finding, call, sandbox, false)
+        .await
+        .receipt
+}
+
+async fn run_with_sandbox<S: TargetSandbox>(
+    repo_root: &Path,
+    finding: &Finding,
+    call: &TargetCall,
+    sandbox: &S,
+    emit_test: bool,
+) -> TargetPocWithTest {
+    let mut snapshot = None;
+    let mut receipt = phases(repo_root, finding, call, sandbox, &mut snapshot).await;
+    if !emit_test {
+        return TargetPocWithTest {
+            receipt,
+            test_source: None,
+        };
+    }
+    let (record, test_source) = match (receipt.outcome, snapshot, classify(finding)) {
+        (TargetPocOutcome::EffectObserved, Some(snapshot), Some(class)) => {
+            red_check(finding, call, class, sandbox, &snapshot).await
+        }
+        _ => (RegressionTestRecord::refused("effect_not_observed"), None),
+    };
+    receipt.regression_test = Some(record);
+    TargetPocWithTest {
+        receipt,
+        test_source,
+    }
+}
+
+/// Run a freshly generated test on the unfixed snapshot. It must fail its
+/// attack assertion and pass its benign control, or it is not released.
+async fn red_check<S: TargetSandbox>(
+    finding: &Finding,
+    call: &TargetCall,
+    class: OracleClass,
+    sandbox: &S,
+    snapshot: &fix_diff::SourceSnapshot,
+) -> (RegressionTestRecord, Option<String>) {
+    let source = match regression_test::generate(finding, class, call) {
+        Ok(source) => source,
+        Err(reason) => return (RegressionTestRecord::refused(reason), None),
+    };
+    let marker = OracleSecrets::fresh().marker;
+    let runner = regression_test::red_runner(&marker);
+    let verdict = match sandbox.run(&snapshot.path, &runner, &source).await {
+        Ok((0, output)) => regression_test::parse_red_verdict(&output, &marker),
+        Ok(_) => Err("regression_test_execution_error"),
+        Err(_) => Err("incomplete_sandbox_capture"),
+    };
+    let sha256 = Some(sha256_hex(source.as_bytes()));
+    match verdict {
+        Ok((true, true)) => (
+            RegressionTestRecord {
+                sha256,
+                red_observed: true,
+                benign_passed: true,
+                reason: None,
+            },
+            Some(source),
+        ),
+        Ok((red_observed, benign_passed)) => (
+            RegressionTestRecord {
+                sha256,
+                red_observed,
+                benign_passed,
+                reason: Some("regression_test_not_red".into()),
+            },
+            None,
+        ),
+        Err(reason) => (
+            RegressionTestRecord {
+                sha256,
+                ..RegressionTestRecord::refused(reason)
+            },
+            None,
+        ),
+    }
+}
+
+async fn phases<S: TargetSandbox>(
+    repo_root: &Path,
+    finding: &Finding,
+    call: &TargetCall,
+    sandbox: &S,
+    kept: &mut Option<fix_diff::SourceSnapshot>,
 ) -> TargetPocReceipt {
     let mut receipt = TargetPocReceipt::inconclusive(call, "target_poc_incomplete");
     if let Err(reason) = call.validate() {
@@ -574,6 +712,7 @@ pub(crate) async fn run_target_poc_with_sandbox<S: TargetSandbox>(
         receipt.reason = Some("non_differential_result".into());
     }
     attach_verification_event(&mut receipt, finding, call, class);
+    *kept = Some(snapshot);
     receipt
 }
 

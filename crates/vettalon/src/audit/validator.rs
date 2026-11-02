@@ -26,7 +26,8 @@
 //!   is the record of why it was refuted), so the file / line / trace
 //!   location rules are not applied to it.
 //! - Coverage status shape: `candidate` ⇔ non-empty `candidate_ids`;
-//!   `covered` has none; `deferred` has no reviewed paths.
+//!   `covered` has none; `deferred` has no reviewed paths except when a
+//!   provider usage limit interrupts work after a successful finder reply.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -660,7 +661,10 @@ fn check_coverage(r: &AuditReport, ids: &HashSet<&str>, out: &mut Vec<ReportViol
             ModuleCoverageStatus::Covered if !m.candidate_ids.is_empty() => {
                 out.push(shape("covered status with candidate_ids"))
             }
-            ModuleCoverageStatus::Deferred if !m.reviewed_paths.is_empty() => {
+            ModuleCoverageStatus::Deferred
+                if !m.reviewed_paths.is_empty()
+                    && m.reason.as_deref() != Some(super::coverage::DEFER_PROVIDER_USAGE_LIMIT) =>
+            {
                 out.push(shape("deferred status with reviewed_paths"))
             }
             ModuleCoverageStatus::Deferred if m.reason.is_none() => {
@@ -925,6 +929,10 @@ mod tests {
             .flat_map(|f| f.evidence.iter())
             .any(|e| e.source == "adversarial");
         AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             schema_version: CURRENT_SCHEMA_VERSION,
             scope: None,
             repo: "/repo".into(),
@@ -1422,6 +1430,20 @@ mod tests {
                     "truncated": false, "reason": null}]}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn usage_limit_deferred_retains_successful_finder_evidence() {
+        let mut module = complete_coverage_fixture();
+        module.status = ModuleCoverageStatus::Deferred;
+        module.reason = Some("provider_usage_limit".into());
+        let mut r = report(vec![], vec![module.clone()]);
+        r.run_status = RunStatus::Incomplete;
+        r.incomplete_reason = Some(vettalon_contract::coverage::IncompleteReason::UnitsFailed);
+        let violations = only(&r);
+        assert!(violations.is_empty(), "{violations:?}");
+        module.reason = Some("max_modules".into());
+        assert!(!only(&report(vec![], vec![module])).is_empty());
     }
 
     #[test]

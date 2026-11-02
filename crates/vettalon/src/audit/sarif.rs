@@ -416,6 +416,7 @@ pub fn to_sarif(report: &AuditReport) -> Value {
                 "vettalon.incomplete_reason": report.incomplete_reason,
                 "vettalon.coverage": report.coverage,
                 "vettalon.coverage_summary": report.summary.coverage,
+                "vettalon.funnel": super::funnel::derive(report),
                 "vettalon.verifier_independence": report.verifier.independence,
                 "vettalon.refusals": report.ensemble.refusals,
             }
@@ -460,6 +461,10 @@ mod tests {
 
     fn report(findings: Vec<Finding>) -> AuditReport {
         AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             schema_version: 2,
             scope: None,
             repo: "/r".into(),

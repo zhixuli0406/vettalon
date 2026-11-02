@@ -38,6 +38,12 @@ Vettalon 替安全 finding 提供獨立的第二意見，來源可以是它自�
 
 兩者可以搭配：其他工具的 finding 可以寫成 `vettalon.claims/1` 檔交給 `vettalon verify`，取得你設定的另一家廠商的第二意見。
 
+## 證據漏斗與模型用量上限
+
+掃描摘要列出 `candidates → refuted → needs_human → poc_differential → fix_verified → human_confirmed`，掃描器發現另計。SARIF run property `vettalon.funnel` 使用相同的推導結果。各層統計報告中保留的 AI 發現，計數可能重疊。報告未保存重現收據，因此不計算目標重現。各層定義見[證據漏斗說明](docs/explain/evidence_funnel.md)，也可執行 `vettalon explain evidence_funnel`。
+
+CLI 非零結束或 HTTP 錯誤明確回報額度耗盡時，本次掃描會停止對同一模型 id 的後續呼叫。正常回覆與暫時性 429 限流不會觸發。受影響模組記為 `deferred`，reason 為 `provider_usage_limit`；執行狀態沿用 `incomplete`／`units_failed`。覆核遇到上限時，發現保留未驗證狀態。請加上 `--save` 保存報告，待額度恢復後重跑同一指令；既有缺口優先機制會在模組與範圍上限內優先處理這些模組，需保持歷史報告載入啟用。詳見[用量上限說明](docs/explain/provider_usage_limit.md)。
+
 ## 輸出範例
 
 ```
@@ -190,6 +196,44 @@ vettalon hunt . --dry-run --dep-priority risk --malicious-signals
 vettalon hunt . --dep-priority risk --variant-seeds --report hunt.json
 vettalon mal-index update --ecosystem npm     # 給 --malicious-signals 用的本機 MAL-* 索引
 vettalon rule-draft hunt.json --finding <id>  # 從人工確認的 finding 產 Semgrep 規則草稿
+```
+
+### 定期增量掃描（`--since-last`）
+
+`vettalon scan . --profile deep --since-last --save` 會找出同 repo 最新通過驗證、掃描開始時工作樹乾淨、profile 與 `attack_classes` 設定相同，且 commit 是 HEAD 祖先的保存報告，透過 `--diff-base` 審查改動模組，並承接未變更檔案的基準 finding。未解的 Candidate、NeedsHuman、Confirmed finding 會保留狀態、嚴重度、證據與 ID；Refuted、Suppressed 則須有符合目前檔案的 `file_hash`。任何狀態的變更檔案 finding 都不走此承接路徑。變更檔案中未重新找到的 Candidate、NeedsHuman finding 交由 prior-run 處理：來源未變時重新列入，來源已變或無法讀取時記在 `prior_run.changed_unrediscovered`。承接不呼叫模型，選填的 `since_last.carried_findings` 記錄數量；coverage 只描述本輪審查，維持部分範圍狀態。沒有可用基準時會完整掃描。未完成的掃描不推進基準，下一次仍會涵蓋尚未完成的改動，並保留 prior coverage 缺口的優先序。
+
+HEAD 相同且工作樹乾淨時，沿用基準報告，不執行掃描器、模型或沙箱。這次的 `--fail-on` 與 `--gate` 會重新計算，舊的未解 finding 仍會影響結果。指定的輸出檔照常寫出；跳過時省略 `--save`，保留原本歷史。只支援 deep，與 `--no-prior`、`--diff-base` 衝突。掃描期間請保持 checkout 不受其他程式寫入；Git 狀態必須可讀，會隱藏改動的 index 旗標也會阻止跳過。
+
+增量與跳過路徑都會檢查 git-ignored 檔案；只要有 intake 會讀取的檔案，就改做完整掃描。清單有數量上限，超限或 Git 失敗也完整掃描，stderr 只報數量。任何 assume-unchanged 或 skip-worktree 項目也會觸發完整掃描。關閉項目須具備與目前檔案相符的 `file_hash`，讀取失敗或雜湊預算耗盡就不承接。跳過前發現關閉項目的 hash 缺少或不符會完整掃描。prior-run 索引使用同一份選定基準。增量掃描會在開始與最後核對時，比較變更路徑與內容雜湊、ignored intake 數量，以及 Git commit 與乾淨狀態的有界快照。任一差異、讀取失敗或雜湊預算耗盡，本輪標示 `incomplete`／`scope_not_fully_reviewed`，依既有未完成處理回傳 exit code，並保留舊基準。一般 `--diff-base` 行為維持原樣。
+
+基準來自 `VETTALON_HOME`，屬於受信任的本機狀態，能寫入這個目錄的人就能影響哪些範圍被跳過。**不受信任的 CI 不要使用 `--since-last`，也不要與不受信任的工作共用報告快取。** 以下範例假設 repo、runner 均可信，且已設定模型憑證。排程工作將報告快取放在 checkout 外，避免弄髒工作樹。請在掃描步驟前沿用既有的安裝與憑證設定。
+
+```cron
+0 3 * * * cd /srv/my-repo && VETTALON_HOME=/srv/vettalon-home vettalon scan . --profile deep --since-last --save
+```
+
+```yaml
+on:
+  schedule:
+    - cron: '0 3 * * *'
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VETTALON_HOME: ${{ github.workspace }}/../vettalon-home
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.VETTALON_HOME }}/reports
+          key: vettalon-reports-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: vettalon-reports-${{ github.repository_id }}-
+      # Install Vettalon and configure your model credentials before this step.
+      - run: vettalon scan . --profile deep --since-last --save
 ```
 
 ### 供應鏈獵捕（`vettalon hunt`）
@@ -432,6 +476,8 @@ vettalon fix check . --report report.json --finding FINDING_ID \
 
 兩個命令都核對 report 的 repo、finding、目標檔與原始碼 hash，只在 prepared copy／新容器執行；不改 live tree，也不自動改 finding status。`reproduce` 是三階段來源綁定收據；`fix check` 另把 exact diff 與相鄰的 check/context evidence 寫進 `--report-out`，更新後報告會再跑 validator。receipt 與 report-out 必須是不存在的新檔，父路徑不能含 symlink；這避免一般覆寫與 link 攻擊，但檢查未以 dirfd 錨定，不能宣稱消除所有並行 rename 競態。`fix_verified` 只描述收據綁定的 prepared snapshot、image 與測試設定，不代表今天的工作樹仍相同，也不會把漏洞改成 `confirmed`。
 
+`reproduce` 觀察到效果時，也可以留下一支測試。加上 `--emit-test tests/test_vettalon_FINDING.py`，Vettalon 會寫出一個獨立的 Python `unittest` 檔，不依賴 Vettalon。它用的輸入和效果判定與 harness 相同，而且要先在沙箱裡對這份原始碼失敗過才會寫出。效果還在時攻擊測試失敗，這個輸入不再有效果後通過；另一支測試確認良性輸入仍然正常，所以把函式刪掉過不了。在 repo 根目錄用 `python3 -m unittest` 執行，它會建立並清除 `/tmp/vtl_*`，需要 POSIX 環境。固定的 `/tmp` 路徑可能讓同一使用者的並行程序互相干擾，請依序執行這些測試。測試變綠只涵蓋這一個輸入，不代表漏洞已經消失，finding 狀態也不會改變。沒有觀察到效果，或測試沒有失敗時，不會寫檔，指令以非 0 結束，原因記在 receipt 的 `regression_test`。
+
 `reproduce` 收據另可攜帶 language-neutral VerificationEvent：VIR 綁定來源、target、plan、實際 runner／adapter harness 與 policy；ExecutionEnvelope 記 capture、cleanup、tamper、effect、controls 與 replay grade；stored verdict 每次讀回都會重新推導。可用 `vettalon verification validate` 驗證 event、`verification compare` 比較兩次 execution envelope、`verification registry` 管理反例與 sealed holdout lineage、`verification scorecard` 重算包含 unsupported／inconclusive 分母的工程量尺。反例升格需要至少兩份不同 fresh challenge 的一致完整事件；holdout 污染沿 parent lineage 傳遞，registry 也會核對內容位址。完整格式、命令與限制見 [`docs/VERIFICATION-ENGINE.md`](../docs/VERIFICATION-ENGINE.md)。目前只支援 Python 的 command／path／SQL target 與 Docker reference backend，不代表跨語言或工程護城河已成立。
 
 **證據等級。** JSON 報告與 SARIF 的每筆發現都帶 `evidence_level`，由弱到強是 `static_only`、`refuter_survived`、`refuter_consistent`、`poc_effect_no_control`、`poc_differential`、`maintainer_confirmed`（只有人能給）。旁邊的 `proof_gaps` 列出還缺什麼（`no_refuter`、`refuter_inconsistent`、`no_poc`、`poc_not_harness_judged`、`no_control`、`no_fresh_rerun`、`reachability_unknown`、`no_maintainer_confirmation`），`strongest_counterevidence` 引用最不利的推翻理由或失敗的對照組，已遮罩、上限 300 位元組。三者都在寫報告時從證據鏈算出來，模型設定不了，報告檔裡存的值讀回時一律忽略，舊報告則依它本來有的證據推導。有 `verify_error` 時最高只到 `static_only`，有 `verify_uncertain` 時最高只到 `refuter_survived`。沙箱的 pattern PoC 不會提高等級，只有 harness 判定的 oracle 紀錄（`poc_oracle`）可以。
@@ -487,6 +533,31 @@ Pro 需要授權金鑰，詳見 [官網](https://vettalon.dudustudio.monster/#ed
 參閱[coverage 與 proof 契約](docs/COVERAGE.md)及[公開合成範例](fixtures/coverage/README.md)。`vettalon evidence attach` 核對本機 artifact hash 並保留操作人提供的 run／修補對照／control 紀錄，不執行任何命令，也不會將 finding 改為 confirmed。歷史證據缺失維持 unknown；既有沙箱 PoC 仍是獨立模式示範。
 
 [實驗工具（預覽）](docs/EXPERIMENTAL-TOOLS.md)：自建樣本、有限離線原型與重現限制；未證明模型效能優勢。
+
+## Coding agent 修補流程
+
+將本機 MCP server 綁定到 repo 與保存報告：
+
+```bash
+claude mcp add vettalon -- vettalon mcp --repo .
+# 也可以直接啟動，指定報告與專案測試指令：
+vettalon mcp --repo . --report report.json --test-command "python3 -m pytest -q"
+```
+
+未指定 `--report` 時，server 選取這個 repo 最新的保存報告。找不到時，先執行 `vettalon scan . --save`，再重新啟動 server。每次工具呼叫都會重新讀取並驗證綁定報告。
+
+七個工具為 `vettalon_report_summary`、`vettalon_list_findings`、`vettalon_get_finding`、`vettalon_fix_brief`、`vettalon_reproduce`、`vettalon_check_fix`、`vettalon_suggest_noise`。先讀修補說明、修改原始碼，再把 diff 交給隔離副本檢查。請保留測試與 harness，避免為了過關修改它們。重現可回傳獨立回歸測試的文字，不會寫入 repo。修補檢查只在本機狀態目錄留下 receipt 與另一份更新報告，不會套用到工作樹；通過也不改 finding 狀態。雜訊提案同樣不改報告與 gate。
+
+人工判定另用 CLI，輸出必須是新報告：
+
+```bash
+vettalon triage --report report.json --proposals
+vettalon triage --report report.json --finding FINDING_ID \
+  --decision refuted --reason "已檢閱綁定證據並確認防護條件" \
+  --out report-triaged.json
+```
+
+`vettalon triage` 套用決策時，stdin 與 stdout 都必須是互動終端，否則 exit 2。畫面會顯示 ID、標題、目前狀態及決策，操作者須完整輸入 finding ID，輸入不符就中止且不寫檔；沒有旗標、環境變數或設定可略過。這是 guard-rail，安全邊界仍須由作業系統權限提供；相同 UID 的軟體仍能操作終端或編輯報告。`--proposals` 維持非互動、唯讀。MCP `vettalon_check_fix` 只接受 finding 本身檔案的 diff，回傳 `touched_paths`；其他路徑與 rename 在執行前拒絕。跨檔修正由人使用 `vettalon fix check` 處理。序列化工具結果上限 1 MiB，超限回傳 `isError` 並建議縮小分頁；單筆詳情超限也直接報錯。狀態目錄每種 `reproduce-`、`fix-receipt-`、`fix-report-` 前綴最多保留 100 個一般檔案，依 mtime 清除最舊項目，保留 symlink 與 `proposals.jsonl`。Repo 與報告內容都視為不可信資料，finding 文字中的指令也包含在內。工具 schema 與安全邊界見 [MCP 參考文件](docs/MCP.md)。
 
 ## License
 

@@ -281,8 +281,16 @@ fn validate_git_tree_has_no_symlinks(git_dir: &Path) -> Result<(), String> {
         if depth > MAX_GIT_METADATA_DEPTH {
             return Err("Git metadata exceeds the validation depth limit".to_string());
         }
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("cannot inspect Git metadata {}: {e}", dir.display()))?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && depth > 0 => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect Git metadata {}: {error}",
+                    dir.display()
+                ));
+            }
+        };
         for entry in entries {
             let entry = entry.map_err(|e| format!("cannot inspect Git metadata entry: {e}"))?;
             visited += 1;
@@ -290,8 +298,9 @@ fn validate_git_tree_has_no_symlinks(git_dir: &Path) -> Result<(), String> {
                 return Err("Git metadata exceeds the validation entry limit".to_string());
             }
             let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|e| format!("cannot inspect Git metadata {}: {e}", path.display()))?;
+            let Some(metadata) = inspect_entry(&path)? else {
+                continue;
+            };
             if metadata.file_type().is_symlink() {
                 return Err(format!(
                     "Git metadata symlink is not allowed: {}",
@@ -304,6 +313,17 @@ fn validate_git_tree_has_no_symlinks(git_dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn inspect_entry(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot inspect Git metadata {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 /// Read `r` to EOF, keeping at most `cap` bytes and discarding the rest, so
@@ -592,6 +612,40 @@ pub fn mask_sensitive_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn inspect_entry_skips_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            super::inspect_entry(&dir.path().join("gone"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_walk_rejects_an_existing_symlink() {
+        let git_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), git_dir.path().join("objects-link")).unwrap();
+        assert!(
+            super::validate_git_tree_has_no_symlinks(git_dir.path())
+                .unwrap_err()
+                .contains("symlink")
+        );
+    }
+
+    #[test]
+    fn git_metadata_walk_errors_when_root_is_missing() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing-git-dir");
+        let error = super::validate_git_tree_has_no_symlinks(&missing).unwrap_err();
+        assert!(error.contains("cannot inspect Git metadata"));
+        assert!(Path::new(&missing).is_absolute() || error.contains("missing-git-dir"));
+    }
+
     #[test]
     fn secret_files_cover_cloud_and_infra_credentials() {
         for s in [

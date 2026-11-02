@@ -80,7 +80,7 @@ pub fn walk_repo_files(root: &Path) -> Vec<String> {
 /// subset of gitignore: patterns with wildcards or negation are not
 /// interpreted (they only ever skip less, never more).
 #[derive(Debug, Default)]
-struct RootIgnoredDirs {
+pub(super) struct RootIgnoredDirs {
     /// Patterns containing a `/`: relative to the root.
     anchored: Vec<String>,
     /// Bare names: match a directory of that name at any depth.
@@ -88,7 +88,7 @@ struct RootIgnoredDirs {
 }
 
 impl RootIgnoredDirs {
-    fn load(root: &Path) -> Self {
+    pub(super) fn load(root: &Path) -> Self {
         if !root.join(".git").exists() {
             return Self::default();
         }
@@ -120,6 +120,41 @@ impl RootIgnoredDirs {
             }
         }
         out
+    }
+
+    fn reads_dir(&self, root: &Path, rel: &str) -> bool {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        !SKIP_DIR_NAMES.contains(&name)
+            && !root.join(rel).join(".git").is_dir()
+            && !self.matches(rel)
+    }
+
+    /// The same path predicate used by intake, independent of Git's ignore rules.
+    pub(super) fn reads_file(&self, root: &Path, rel: &str) -> bool {
+        let parts: Vec<_> = rel.split('/').collect();
+        if parts.len() > MAX_WALK_DEPTH + 1
+            || parts.is_empty()
+            || is_os_metadata_file(parts.last().unwrap())
+        {
+            return false;
+        }
+        let mut path = String::new();
+        for (index, part) in parts.iter().enumerate() {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(part);
+            let Ok(meta) = std::fs::symlink_metadata(root.join(&path)) else {
+                return false;
+            };
+            if index + 1 == parts.len() {
+                return meta.is_file();
+            }
+            if !meta.is_dir() || !self.reads_dir(root, &path) {
+                return false;
+            }
+        }
+        false
     }
 
     /// `rel` is the directory's repo-relative POSIX path.
@@ -161,20 +196,16 @@ fn walk_dir(
             Err(_) => continue,
         };
         if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if SKIP_DIR_NAMES.contains(&name.as_ref()) || path.join(".git").is_dir() {
+            let Ok(rel) = path.strip_prefix(root) else {
                 continue;
-            }
-            if let Ok(rel) = path.strip_prefix(root)
-                && ignored.matches(&rel.to_string_lossy().replace('\\', "/"))
-            {
+            };
+            if !ignored.reads_dir(root, &rel.to_string_lossy().replace('\\', "/")) {
                 continue;
             }
             walk_dir(root, &path, depth + 1, ignored, out);
         } else if file_type.is_file()
-            && !is_os_metadata_file(&entry.file_name().to_string_lossy())
             && let Ok(rel) = path.strip_prefix(root)
+            && ignored.reads_file(root, &rel.to_string_lossy().replace('\\', "/"))
         {
             out.push(rel.to_string_lossy().replace('\\', "/"));
         }

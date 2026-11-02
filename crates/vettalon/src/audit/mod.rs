@@ -58,14 +58,17 @@ pub mod cyclonedx;
 pub mod evidence_level;
 pub mod exploitability;
 pub mod fix_check;
-mod fix_diff;
+pub(crate) mod fix_diff;
+pub use fix_diff::SUGGESTED_FIX_MAX_BYTES;
+pub mod funnel;
 pub mod gate;
 mod injection;
 mod intake;
 mod jev;
 mod llm_util;
 mod poc;
-mod poc_oracle;
+pub(crate) mod poc_oracle;
+pub mod regression_test;
 pub mod target_poc;
 pub mod verification;
 pub mod verification_context;
@@ -75,11 +78,12 @@ pub mod prescreen;
 mod prior_run;
 mod prompts;
 pub mod rank_snapshot;
-mod report;
+pub(crate) mod report;
 mod report_evidence;
 mod report_verdict;
 pub mod sarif;
 mod scanners;
+mod since_last;
 /// Bounded subprocess capture and owned-process cleanup, shared with local renderers.
 /// Unix owns a private process group with an unreaped leader; this does not contain
 /// processes that escape via setsid. Windows uses a kill-on-close Job Object, whose
@@ -134,10 +138,12 @@ pub enum RankStrategy {
 }
 
 /// Flags of `vettalon scan`, with the model roster already resolved.
+#[derive(Clone)]
 pub struct ScanOptions {
     pub repo_path: PathBuf,
     /// Deep-only diff scope; validated before any scan subprocess.
     pub diff_base: Option<String>,
+    pub since_last: bool,
     /// `"quick"` | `"deep"`, parsed here so a bad value maps to exit 2.
     pub profile: String,
     pub report: Option<PathBuf>,
@@ -415,6 +421,28 @@ pub async fn run_scan_with_progress(
     opts: &ScanOptions,
     progress: &dyn Progress,
 ) -> std::result::Result<AuditReport, ScanError> {
+    let mode = opts
+        .profile
+        .parse::<ProfileMode>()
+        .map_err(ScanError::BadProfile)?;
+    since_last::validate_options(opts, mode).map_err(ScanError::DiffScope)?;
+    let usage_limits = crate::llm::usage_limit::UsageLimits::default();
+    let mut run_opts = opts.clone();
+    run_opts.finders = opts.finders.iter().map(|m| usage_limits.wrap(m)).collect();
+    run_opts.verifiers = opts
+        .verifiers
+        .iter()
+        .map(|m| usage_limits.wrap(m))
+        .collect();
+    run_opts.poc_models = opts
+        .poc_models
+        .iter()
+        .map(|m| usage_limits.wrap(m))
+        .collect();
+    if let Some(prescreen) = &mut run_opts.prescreen {
+        prescreen.model = usage_limits.wrap(&prescreen.model);
+    }
+    let opts = &run_opts;
     let profile_mode: ProfileMode = opts
         .profile
         .parse()
@@ -455,7 +483,73 @@ pub async fn run_scan_with_progress(
     if !repo_root.is_dir() {
         return Err(ScanError::NotADirectory(repo_root.display().to_string()));
     }
-    // Fail closed before scanners or intake can run any Git command.
+    let repo_state = diff_scope::repo_state(&repo_root).await.ok();
+    let mut since_last = None;
+    let mut since_last_base = None;
+    let mut since_last_supplements = Vec::new();
+    if opts.since_last {
+        if let Some(selected) =
+            since_last::select(home_dir, &repo_root, mode, opts.attack_classes).await
+        {
+            let since_last::Selection {
+                name,
+                mut base,
+                diff: selection,
+                supplements,
+            } = selected;
+            let commit = selection.scope.base_oid.clone();
+            let skipped = selection.changed.is_empty()
+                && selection.scope.head == commit
+                && repo_state
+                    .as_ref()
+                    .is_some_and(|s| s.commit == commit && s.clean == Some(true));
+            since_last = Some(schema::SinceLast {
+                base_report: name.clone(),
+                base_commit: commit.clone(),
+                skipped,
+                carried_findings: 0,
+            });
+            let skipped = skipped
+                && diff_scope::repo_state(&repo_root)
+                    .await
+                    .is_ok_and(|s| s.commit == commit && s.clean == Some(true));
+            if skipped
+                && !since_last::skip_intake_safe(diff_scope::ignored_intake_count(&repo_root).await)
+            {
+                since_last = None;
+                eprintln!(
+                    "[vettalon] --since-last: ignored intake changed or unavailable before skip; running full scan"
+                );
+            } else {
+                if let Some(info) = &mut since_last {
+                    info.skipped = skipped;
+                }
+                if skipped {
+                    base.findings = since_last::merged_findings(&base, &supplements);
+                    since_last::remove_outside_diff_scope(&mut base.findings);
+                    base.since_last = since_last;
+                    recompute_summary(&mut base, opts);
+                    let safe_name: String = name
+                        .chars()
+                        .map(|c| if c.is_control() { '?' } else { c })
+                        .collect();
+                    eprintln!(
+                        "[vettalon] --since-last: skipped; reusing {safe_name}; --save omitted to preserve history"
+                    );
+                    return Ok(base);
+                }
+                since_last_supplements = supplements;
+                since_last_base = Some(base);
+                run_opts.diff_base = Some(commit);
+            }
+        } else {
+            eprintln!(
+                "[vettalon] --since-last: no usable base (missing, incompatible or Git state unavailable); running full scan"
+            );
+        }
+    }
+    let opts = &run_opts;
+    // Resolve deep diff scope before scanners or intake start.
     let mut diff = match (&opts.diff_base, profile_mode) {
         (Some(base), ProfileMode::Deep) => Some(
             diff_scope::compute(&repo_root, base)
@@ -464,11 +558,23 @@ pub async fn run_scan_with_progress(
         ),
         _ => None,
     };
+    let since_last_snapshot = if since_last_base.is_some() {
+        Some(since_last::snapshot(&repo_root, diff.as_ref().unwrap()).await)
+    } else {
+        None
+    };
+    let mut since_last_drift = false;
     let repo_str = repo_root.to_string_lossy().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
     // Load once before selection. --no-prior disables both priority and carry-in.
     let mut prior = if opts.no_prior {
         None
+    } else if let (Some(base), Some(info)) = (&since_last_base, &since_last) {
+        let mut index = prior_run::PriorIndex::from_report(&info.base_report, base);
+        for (name, supplement) in &since_last_supplements {
+            index.merge(prior_run::PriorIndex::from_report(name, supplement));
+        }
+        Some(index)
     } else {
         prior_run::load_prior(home_dir, &repo_str)
     };
@@ -634,15 +740,18 @@ pub async fn run_scan_with_progress(
     // Review and PoC can be lengthy. Refresh before deriving any final counts
     // or gates, and reapply scope evidence to every scanner finding.
     if let Some(diff) = &mut diff {
-        let final_selection = diff_scope::compute(&repo_root, &diff.scope.base)
-            .await
-            .map_err(|_| {
-                ScanError::DiffScope(
-                    "diff scope changed during the scan (recompute failed); rerun".into(),
-                )
-            })?;
-        diff.reconcile(final_selection)
-            .map_err(ScanError::DiffScope)?;
+        let reconciled = match diff_scope::compute(&repo_root, &diff.scope.base).await {
+            Ok(final_selection) => diff.reconcile(final_selection),
+            Err(_) => Err("diff scope changed during the scan (recompute failed); rerun".into()),
+        };
+        if since_last_snapshot.is_some() {
+            let final_snapshot = since_last::snapshot(&repo_root, diff).await;
+            since_last_drift = reconciled.is_err()
+                || final_snapshot.is_none()
+                || since_last_snapshot.as_ref() != Some(&final_snapshot);
+        } else {
+            reconciled.map_err(ScanError::DiffScope)?;
+        }
         diff.annotate_findings(&mut findings);
         let count = diff.scope.changed_during_scan;
         if count > 0 {
@@ -654,6 +763,40 @@ pub async fn run_scan_with_progress(
                 )
             );
         }
+    }
+
+    let limited_models = usage_limits.models();
+    if !limited_models.is_empty() {
+        for module in &mut coverage {
+            if prescreen_record.as_ref().is_some_and(|p| {
+                p.units.iter().any(|u| {
+                    u.module_path == module.module_path
+                        && u.error.as_deref() == Some(coverage::DEFER_PROVIDER_USAGE_LIMIT)
+                })
+            }) || findings.iter().any(|f| {
+                (module.candidate_ids.contains(&f.id) || module.scope_paths.contains(&f.file))
+                    && f.evidence.iter().any(|e| {
+                        e.detail.starts_with("verify_error: provider_usage_limit:")
+                            || e.detail.starts_with("poc_skipped: provider_usage_limit:")
+                    })
+            }) {
+                module.status = schema::ModuleCoverageStatus::Deferred;
+                module.reason = Some(coverage::DEFER_PROVIDER_USAGE_LIMIT.into());
+            }
+        }
+        incomplete_reason = Some(IncompleteReason::UnitsFailed);
+        eprintln!(
+            "[vettalon] {}",
+            crate::tr!(
+                "模型用量已達上限：{}；使用 --save 保存報告，額度恢復後重跑同一指令會優先處理這些模組。",
+                "Provider usage limit: {}; save the report with --save, then rerun the same command after allowance resets to prioritize these modules.",
+                limited_models
+                    .iter()
+                    .map(|id| crate::util::mask_sensitive_text(id).replace(['\n', '\r'], " "))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        );
     }
 
     let mut refusal_events = refusals.snapshot();
@@ -697,6 +840,15 @@ pub async fn run_scan_with_progress(
         };
     }
 
+    if since_last_drift
+        || (since_last_base.is_some()
+            && diff
+                .as_ref()
+                .is_some_and(|d| d.scope.changed_during_scan > 0))
+    {
+        incomplete_reason = Some(IncompleteReason::ScopeNotFullyReviewed);
+    }
+
     let verifier = verifier_info(&findings, opts, profile_mode);
     // O9: what the second family added, measured after review.
     let dual_report = dual_run.as_ref().map(|d| {
@@ -707,18 +859,11 @@ pub async fn run_scan_with_progress(
                 .map(|f| f.family.clone())
         })
     });
-    let gate = GatePolicy {
-        include_needs_human: opts.fail_on_needs_human,
-    };
-    let mut summary = Summary::from_findings(
-        &findings,
-        engines_run.len(),
-        engines_missing.len(),
-        gate,
-        &coverage,
-    );
-    summary.policy = gate::evaluate_all(&opts.gates, &findings);
     let mut audit_report = AuditReport {
+        repo_commit: repo_state.as_ref().map(|s| s.commit.clone()),
+        repo_tree_clean: repo_state.as_ref().and_then(|s| s.clean),
+        since_last,
+        attack_classes: Some(opts.attack_classes),
         schema_version: CURRENT_SCHEMA_VERSION,
         scope: diff.as_ref().map(|d| d.scope.clone()),
         repo: repo_str,
@@ -730,7 +875,7 @@ pub async fn run_scan_with_progress(
         engines_run,
         engines_missing,
         findings,
-        summary,
+        summary: Summary::from_findings(&[], 0, 0, GatePolicy::default(), &[]),
         run_status: if incomplete_reason.is_some() {
             RunStatus::Incomplete
         } else if diff.is_some() {
@@ -757,6 +902,26 @@ pub async fn run_scan_with_progress(
 
     progress.phase(Phase::Report, "sanitizing and validating the report");
     sanitize_findings(&mut audit_report.findings);
+    // Carry only after all model work and current-run metadata are final.
+    // The validated baseline is copied verbatim, including operator decisions.
+    if let (Some(base), Some(diff), Some(info)) =
+        (&since_last_base, &diff, &mut audit_report.since_last)
+    {
+        info.carried_findings = since_last::carry_findings(
+            &repo_root,
+            &since_last::merged_findings(base, &since_last_supplements),
+            diff,
+            &mut audit_report.findings,
+        );
+        since_last::remove_outside_diff_scope(&mut audit_report.findings);
+        if info.carried_findings > 0 {
+            eprintln!(
+                "[vettalon] --since-last: carried {} findings from baseline",
+                info.carried_findings
+            );
+        }
+    }
+    recompute_summary(&mut audit_report, opts);
     let violations = validator::validate_report(&audit_report);
     if !violations.is_empty() {
         return Err(ScanError::ReportInvalid(
@@ -828,9 +993,21 @@ pub async fn cmd_scan(home_dir: &Path, opts: ScanOptions) -> i32 {
     cmd_scan_with(home_dir, opts, false).await
 }
 
+fn recompute_summary(report: &mut AuditReport, opts: &ScanOptions) {
+    report.summary = Summary::from_findings(
+        &report.findings,
+        report.engines_run.len(),
+        report.engines_missing.len(),
+        GatePolicy {
+            include_needs_human: opts.fail_on_needs_human,
+        },
+        &report.coverage,
+    );
+    report.summary.policy = gate::evaluate_all(&opts.gates, &report.findings);
+}
+
 /// [`cmd_scan`] with `--allow-incomplete`: a deep scan whose AI audit could
-/// not run exits on the gate result instead of
-/// [`report::AI_UNAVAILABLE_EXIT`].
+/// not run exits on the gate result instead of [`report::AI_UNAVAILABLE_EXIT`].
 pub async fn cmd_scan_with(home_dir: &Path, opts: ScanOptions, allow_incomplete: bool) -> i32 {
     let fail_on: Option<Severity> = if opts.fail_on.eq_ignore_ascii_case("none") {
         None
@@ -918,7 +1095,7 @@ pub async fn cmd_scan_with(home_dir: &Path, opts: ScanOptions, allow_incomplete:
             )
         );
     }
-    if opts.save {
+    if opts.save && !audit_report.since_last.as_ref().is_some_and(|s| s.skipped) {
         match report::save_report(home_dir, &audit_report) {
             Ok(path) => println!(
                 "{}",
@@ -1771,7 +1948,7 @@ async fn review_step(
                     } => {
                         answered_once |= answered;
                         if call_failed {
-                            dead = !refused && !answered_once;
+                            dead = !refused && !answered_once && !caller.usage_limited();
                         }
                         votes
                     }
@@ -1858,6 +2035,14 @@ async fn poc_step(
         let caller = StepCaller::new(opts.poc_models[pick].clone(), "poc", refusals.clone())
             .with_trace(trace.clone());
         poc::maybe_run_poc(repo_root, f, &caller, opts.poc, &budget).await;
+        if caller.usage_limited() {
+            poc::push_skip(
+                f,
+                "poc_skipped",
+                &format!("provider_usage_limit: {}", caller.model.id),
+            );
+            continue;
+        }
         // O19: the fix check shares the PoC role's time budget; the PoC above
         // may have used it up.
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1873,6 +2058,13 @@ async fn poc_step(
             &budget,
         )
         .await;
+        if caller.usage_limited() {
+            poc::push_skip(
+                f,
+                "poc_skipped",
+                &format!("provider_usage_limit: {}", caller.model.id),
+            );
+        }
     }
     skipped
 }
@@ -1898,6 +2090,14 @@ pub fn validate_fix_diff(diff: &str) -> Result<(), &'static str> {
 /// schema-checked and validator-clean. An inconsistent report is refused —
 /// a client deliverable must not be built on one.
 pub fn load_report_for_delivery(path: &Path) -> Result<AuditReport, String> {
+    load_report_for_delivery_with_sha256(path).map(|(report, _)| report)
+}
+
+/// Validate and hash the same bounded report snapshot for local proposals.
+pub(crate) fn load_report_for_delivery_with_sha256(
+    path: &Path,
+) -> Result<(AuditReport, String), String> {
+    use std::io::Read;
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
     let meta = std::fs::metadata(path)
         .map_err(|e| crate::tr!("無法讀取 {}：{e}", "cannot read {}: {e}", path.display()))?;
@@ -1908,8 +2108,15 @@ pub fn load_report_for_delivery(path: &Path) -> Result<AuditReport, String> {
             meta.len()
         ));
     }
-    let raw = std::fs::read(path)
+    let file = std::fs::File::open(path)
         .map_err(|e| crate::tr!("無法讀取 {}：{e}", "cannot read {}: {e}", path.display()))?;
+    let mut raw = Vec::new();
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| crate::tr!("無法讀取 {}：{e}", "cannot read {}: {e}", path.display()))?;
+    if raw.len() as u64 > MAX_BYTES {
+        return Err("report file too large".into());
+    }
     let report: AuditReport = serde_json::from_slice(&raw).map_err(|e| {
         crate::tr!(
             "不是有效的 vettalon 報告：{e}",
@@ -1926,7 +2133,7 @@ pub fn load_report_for_delivery(path: &Path) -> Result<AuditReport, String> {
             head.join(crate::lang::pick("；", "; "))
         ));
     }
-    Ok(report)
+    Ok((report, schema::sha256_hex(&raw)))
 }
 
 pub async fn cmd_validate(report_path: &Path) -> i32 {
@@ -2065,6 +2272,7 @@ mod tests {
         ScanOptions {
             repo_path,
             diff_base: None,
+            since_last: false,
             profile: "quick".to_string(),
             report: None,
             sarif: None,
@@ -2180,6 +2388,10 @@ mod tests {
             }
         }
         let report = AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             schema_version: schema::CURRENT_SCHEMA_VERSION,
             scope: None,
             repo: root.canonicalize().unwrap().to_string_lossy().into_owned(),
@@ -3756,6 +3968,171 @@ mod tests {
     /// (independence not_run, run incomplete), and it is called once, not
     /// once per finding.
     #[tokio::test]
+    async fn usage_limit_large_modules_keep_truncation_and_source_receipts() {
+        for reflector in [false, true] {
+            let dir = repo_with_modules(&["a", "b"]);
+            for module in ["a", "b"] {
+                std::fs::write(
+                    dir.path().join(module).join("main.rs"),
+                    "fn example() {}\n".repeat(20000),
+                )
+                .unwrap();
+            }
+            let home = tempfile::tempdir().unwrap();
+            let mut replies = Vec::new();
+            if reflector {
+                replies.push(Ok("invalid json".into()));
+            }
+            replies.push(Err(LlmError::UsageLimit("finder".into())));
+            let (finder, calls) = model("finder", "family", replies);
+            let mut o = opts(dir.path().to_path_buf());
+            o.profile = "deep".into();
+            o.source_receipts = true;
+            o.finder_parse_retries = 1;
+            o.roster = info(&[&finder]);
+            o.finders = vec![finder];
+            let report = run_scan(home.path(), &o).await.unwrap();
+            assert_eq!(
+                calls.prompts.lock().unwrap().len(),
+                if reflector { 2 } else { 1 }
+            );
+            assert_eq!(
+                report.incomplete_reason,
+                Some(IncompleteReason::UnitsFailed)
+            );
+            assert!(report.coverage.iter().all(|m| m.status
+                == schema::ModuleCoverageStatus::Deferred
+                && m.reason.as_deref() == Some("provider_usage_limit")
+                && !m.truncated_paths.is_empty()
+                && m.attempts[0].source_receipt.is_some()));
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_limit_poc_preserves_existing_differential_evidence() {
+        let dir = repo_with_modules(&["a"]);
+        let mut f = Finding::candidate(
+            "ai_audit",
+            schema::FindingKind::Other,
+            Severity::High,
+            "claim",
+            "a/main.rs",
+            Some(1),
+            "s",
+            "r",
+            vec![],
+        );
+        f.status = schema::FindingStatus::NeedsHuman;
+        f.evidence.push(schema::EvidenceItem {
+            kind: schema::EvidenceKind::PocOracle,
+            source: "poc".into(),
+            detail:
+                "poc_oracle: effect=true control=false rerun=true nonce_bound=true rejected=none"
+                    .into(),
+            recorded_at: "t".into(),
+        });
+        let level = f.evidence_level();
+        let (model, script) = model("m", "family", vec![Err(LlmError::UsageLimit("m".into()))]);
+        let breaker = crate::llm::usage_limit::UsageLimits::default();
+        let mut o = opts(dir.path().to_path_buf());
+        o.poc = true;
+        o.poc_models = vec![breaker.wrap(&model)];
+        let mut findings = vec![f];
+        poc_step(
+            dir.path(),
+            &mut findings,
+            &o,
+            None,
+            &RefusalLog::default(),
+            &TraceLog::default(),
+            &NoProgress,
+        )
+        .await;
+        assert_eq!(script.prompts.lock().unwrap().len(), 1);
+        assert_eq!(findings[0].evidence_level(), level);
+        assert!(
+            findings[0]
+                .evidence
+                .iter()
+                .any(|e| e.kind == schema::EvidenceKind::PocSkipped
+                    && e.detail == "poc_skipped: provider_usage_limit: m")
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_limit_verifier_defers_all_findings_and_preserves_reads() {
+        let dir = repo_with_modules(&["a"]);
+        std::fs::write(
+            dir.path().join("a/main.rs"),
+            "fn main() {\n    let q = read();\n    db.execute(q);\n    db.execute(q);\n}\n",
+        )
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let two = format!(
+            "[{},{}]",
+            ai_audit::tests::cand_json("a/main.rs", 3),
+            ai_audit::tests::cand_json("a/main.rs", 4)
+                .replace("sql_injection", "command_injection")
+        );
+        let (finder, _) = model("claude", "anthropic", vec![Ok(two)]);
+        let (ver, ver_s) = model(
+            "codex",
+            "openai",
+            vec![Err(LlmError::UsageLimit("codex".into()))],
+        );
+        let report_path = dir.path().join("r.json");
+        let mut o = opts(dir.path().to_path_buf());
+        o.profile = "deep".into();
+        o.report = Some(report_path.clone());
+        o.roster = info(&[&finder, &ver]);
+        o.finders = vec![finder];
+        o.verifiers = vec![ver];
+        let report = run_scan(home.path(), &o).await.unwrap();
+        assert!(validator::validate_report(&report).is_empty());
+        assert_eq!(
+            report.coverage[0].status,
+            schema::ModuleCoverageStatus::Deferred
+        );
+        assert_eq!(
+            report.coverage[0].reason.as_deref(),
+            Some("provider_usage_limit")
+        );
+        assert!(!report.coverage[0].reviewed_paths.is_empty());
+        assert!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.source_engine == "ai_audit")
+                .all(|f| f
+                    .evidence
+                    .iter()
+                    .any(|e| e.detail == "verify_error: provider_usage_limit: codex"))
+        );
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            ver_s.prompts.lock().unwrap().len(),
+            1,
+            "breaker after the first failure"
+        );
+
+        assert_eq!(v["verifier"]["independence"], "not_run");
+        assert_eq!(v["run_status"], "incomplete");
+        assert_eq!(v["incomplete_reason"], "units_failed");
+        let ai: Vec<&serde_json::Value> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["source_engine"] == "ai_audit")
+            .collect();
+        assert_eq!(ai.len(), 2);
+        assert!(ai.iter().all(|f| f["status"] == "candidate"));
+    }
+
+    /// A deep scan whose finders all fail before reaching a model exits
+    /// [`report::AI_UNAVAILABLE_EXIT`] with the report written;
+    /// `--allow-incomplete` restores the gate exit. One reachable finder
+    /// makes it a partial run that keeps the gate exit.
+    #[tokio::test]
     async fn unreachable_verifier_is_not_a_review_and_trips_the_breaker() {
         let dir = repo_with_modules(&["a"]);
         std::fs::write(
@@ -4391,5 +4768,46 @@ mod tests {
         assert_eq!(d["modules"], serde_json::json!([]));
         // No fix request without a second family.
         assert!(!s1.prompts.lock().unwrap()[0].contains("\"fix\""));
+    }
+    #[tokio::test]
+    async fn repo_commit_and_clean_state_are_recorded_at_scan_start() {
+        use super::diff_scope::tests::{commit, git};
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let options = opts(root.path().to_path_buf());
+        let plain = run_scan(home.path(), &options).await.unwrap();
+        assert!(plain.repo_commit.is_none());
+        assert!(plain.repo_tree_clean.is_none());
+        git(root.path(), &["init", "-q"]).await;
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "ignored\n").unwrap();
+        commit(root.path()).await;
+        let oid = git(root.path(), &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_owned();
+        std::fs::write(root.path().join("ignored"), "ignored").unwrap();
+        let clean = run_scan(home.path(), &options).await.unwrap();
+        assert_eq!(clean.repo_commit.as_deref(), Some(oid.as_str()));
+        assert_eq!(clean.repo_tree_clean, Some(true));
+        for scenario in ["untracked", "unstaged", "staged"] {
+            match scenario {
+                "untracked" => std::fs::write(root.path().join("new.rs"), "new").unwrap(),
+                _ => std::fs::write(root.path().join("a.rs"), "fn changed() {}\n").unwrap(),
+            }
+            if scenario == "staged" {
+                git(root.path(), &["add", "a.rs"]).await;
+            }
+            let dirty = run_scan(home.path(), &options).await.unwrap();
+            assert_eq!(dirty.repo_commit.as_deref(), Some(oid.as_str()));
+            assert_eq!(dirty.repo_tree_clean, Some(false), "{scenario}");
+            if scenario == "untracked" {
+                std::fs::remove_file(root.path().join("new.rs")).unwrap();
+            }
+        }
+        std::fs::write(root.path().join("untracked\n.rs"), "untracked").unwrap();
+        let unusual = run_scan(home.path(), &options).await.unwrap();
+        assert_eq!(unusual.repo_commit.as_deref(), Some(oid.as_str()));
+        assert_eq!(unusual.repo_tree_clean, Some(false));
     }
 }

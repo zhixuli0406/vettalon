@@ -24,10 +24,11 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | [complete](complete.md) | The run did everything it was asked to do |
 | [covered](covered.md) | The module was reviewed, found nothing, and listed what it checked |
 | [critic_budget_exhausted](critic_budget_exhausted.md) | The time cap for the refuter step ran out |
-| [deferred](deferred.md) | The module was ranked but never sent to a model |
+| [deferred](deferred.md) | The module has unfinished review work |
 | [diff_scope](diff_scope.md) | The module has no changed files, so a diff scan skipped it |
 | [dual_finder_merge](dual_finder_merge.md) | Two finder models reported the same root cause and were merged |
 | [engine_unavailable](engine_unavailable.md) | A model or tool the scan needed could not be used |
+| [evidence_funnel](evidence_funnel.md) | Evidence counts derived from the report |
 | [fix_check](fix_check.md) | The result of testing the finding's suggested fix |
 | [fix_check_skipped](fix_check_skipped.md) | A step of the fix check could not run |
 | [fix_context_v1](fix_context_v1.md) | The exact files and settings a fix check or reproduction used |
@@ -68,6 +69,7 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | [prompt_byte_budget](prompt_byte_budget.md) | This file did not fit in the module's prompt |
 | [prompt_byte_budget_utf8_boundary](prompt_byte_budget_utf8_boundary.md) | Too little prompt space was left for even one character of this file |
 | [prosecutor](prosecutor.md) | A third call tried to break the refuter's reason for closing a finding |
+| [provider_usage_limit](provider_usage_limit.md) | Provider allowance exhausted for this scan |
 | [quick_profile_not_rechecked](quick_profile_not_rechecked.md) | A quick scan could not tell whether an old finding is still there |
 | [reachability_unknown](reachability_unknown.md) | Nothing has shown that an attacker can actually reach this code |
 | [read_failed_or_outside_repository](read_failed_or_outside_repository.md) | A file could not be read safely |

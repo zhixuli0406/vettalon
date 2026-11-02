@@ -103,6 +103,7 @@ fn module_code(status: S, reason: Option<&str>) -> (&'static str, RepairAction) 
         (_, Some("time_budget")) => ("time_budget", A::ConfigureScan),
         (_, Some("prescreen_cut")) => ("prescreen_cut", A::ConfigureScan),
         (_, Some("candidate_cap")) => ("candidate_limit", A::ConfigureScan),
+        (_, Some("provider_usage_limit")) => ("provider_usage_limit", A::Models),
         (_, Some("engine_unavailable")) => ("engine_unavailable", A::Models),
         (S::ReviewedNoChecks, _) => ("shallow_no_checks", A::ManualReview),
         (S::Unreadable, _) => ("source_unreadable", A::Files),

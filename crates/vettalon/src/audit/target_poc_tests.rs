@@ -371,6 +371,142 @@ async fn async_target_and_broken_benign_control_never_claim_an_absence() {
     assert_eq!(report.reason.as_deref(), Some("non_differential_result"));
 }
 
+/// Phases come from the fake above; the fourth run is the regression test.
+struct RedCheckSandbox {
+    phases: FakeTargetSandbox,
+    red: Option<&'static str>,
+    tests_seen: Mutex<Vec<String>>,
+}
+
+impl RedCheckSandbox {
+    fn with(red: Option<&'static str>) -> Self {
+        Self {
+            phases: FakeTargetSandbox::default(),
+            red,
+            tests_seen: Mutex::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TargetSandbox for RedCheckSandbox {
+    fn image_id(&self) -> &str {
+        self.phases.image_id()
+    }
+
+    async fn run(&self, tree: &Path, runner: &str, adapter: &str) -> Result<(i64, String), String> {
+        let Some(marker) = runner
+            .split("MARKER = '")
+            .nth(1)
+            .filter(|_| runner.contains("__VTL_REGRESSION__"))
+        else {
+            return self.phases.run(tree, runner, adapter).await;
+        };
+        let marker = marker.split('\'').next().unwrap();
+        self.tests_seen.lock().unwrap().push(adapter.to_owned());
+        match self.red {
+            Some(verdict) => Ok((0, format!("__VTL_REGRESSION__ {marker} {verdict}\n"))),
+            None => Err("fixture incomplete capture".into()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_regression_test_is_released_only_after_the_sandbox_sees_it_fail() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), VULNERABLE).unwrap();
+    let sandbox = RedCheckSandbox::with(Some("ran=2 skipped=0 attack=fail benign=pass"));
+    let result = run_with_sandbox(repo.path(), &finding(VULNERABLE), &call(), &sandbox, true).await;
+    assert_eq!(result.receipt.outcome, TargetPocOutcome::EffectObserved);
+    let record = result.receipt.regression_test.unwrap();
+    let source = result.test_source.unwrap();
+    assert_eq!(record.sha256, Some(sha256_hex(source.as_bytes())));
+    assert!(record.red_observed && record.benign_passed && record.reason.is_none());
+    assert_eq!(sandbox.tests_seen.lock().unwrap().as_slice(), [source]);
+}
+
+#[tokio::test]
+async fn a_test_that_is_not_red_is_withheld_with_a_reason() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), VULNERABLE).unwrap();
+    for (verdict, reason) in [
+        (
+            Some("ran=2 skipped=0 attack=pass benign=pass"),
+            "regression_test_not_red",
+        ),
+        (
+            Some("ran=2 skipped=0 attack=fail benign=fail"),
+            "regression_test_not_red",
+        ),
+        (
+            Some("ran=2 skipped=0 attack=error benign=error"),
+            "regression_test_not_red",
+        ),
+        (
+            Some("ran=2 skipped=2 attack=pass benign=pass"),
+            "invalid_regression_verdict",
+        ),
+        (None, "incomplete_sandbox_capture"),
+    ] {
+        let sandbox = RedCheckSandbox::with(verdict);
+        let result =
+            run_with_sandbox(repo.path(), &finding(VULNERABLE), &call(), &sandbox, true).await;
+        assert_eq!(result.test_source, None, "{verdict:?}");
+        let record = result.receipt.regression_test.unwrap();
+        assert_eq!(record.reason.as_deref(), Some(reason), "{verdict:?}");
+        assert_eq!(result.receipt.outcome, TargetPocOutcome::EffectObserved);
+    }
+}
+
+#[tokio::test]
+async fn no_observed_effect_means_no_test_and_no_fourth_run() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), SAFE).unwrap();
+    let sandbox = RedCheckSandbox::with(Some("ran=2 skipped=0 attack=fail benign=pass"));
+    let result = run_with_sandbox(repo.path(), &finding(SAFE), &call(), &sandbox, true).await;
+    assert_eq!(result.receipt.outcome, TargetPocOutcome::EffectAbsent);
+    assert_eq!(result.test_source, None);
+    assert!(sandbox.tests_seen.lock().unwrap().is_empty());
+    assert_eq!(
+        result.receipt.regression_test.unwrap().reason.as_deref(),
+        Some("effect_not_observed")
+    );
+}
+
+#[test]
+fn a_receipt_without_a_test_serializes_as_before() {
+    let receipt = TargetPocReceipt::inconclusive(&call(), "x");
+    assert!(
+        !serde_json::to_string(&receipt)
+            .unwrap()
+            .contains("regression_test")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_regression_test_is_red_in_the_sandbox() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), VULNERABLE).unwrap();
+    let result = run_target_poc_with_test(
+        repo.path(),
+        &finding(VULNERABLE),
+        &call(),
+        crate::sandbox::DEFAULT_POC_IMAGE,
+    )
+    .await;
+    assert_eq!(
+        result.receipt.outcome,
+        TargetPocOutcome::EffectObserved,
+        "{:?}",
+        result.receipt
+    );
+    let record = result.receipt.regression_test.clone().unwrap();
+    assert_eq!(record.reason, None, "{record:?}");
+    assert!(record.red_observed && record.benign_passed);
+    assert!(result.test_source.is_some());
+}
+
 #[tokio::test]
 #[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
 async fn live_target_poc_observes_real_source_then_rejects_the_safe_variant() {

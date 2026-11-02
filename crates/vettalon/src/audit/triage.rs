@@ -154,6 +154,10 @@ mod tests {
         f.id = "f1".into();
         let findings = vec![f];
         AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             schema_version: super::super::schema::CURRENT_SCHEMA_VERSION,
             scope: None,
             repo: "/r".into(),

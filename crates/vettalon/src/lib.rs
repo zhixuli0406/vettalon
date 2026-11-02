@@ -19,3 +19,6 @@ pub mod lang;
 pub mod llm;
 pub mod sandbox;
 pub mod util;
+
+pub mod mcp;
+pub mod remediation;

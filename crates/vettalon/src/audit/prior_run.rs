@@ -62,6 +62,7 @@ const MAX_HASH_BYTES: u64 = 256 * 1024 * 1024;
 /// One prior finding, reduced to what the carry rules need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriorEntry {
+    pub id: String,
     pub file: String,
     pub status: FindingStatus,
     pub file_hash: Option<String>,
@@ -74,6 +75,7 @@ pub struct PriorIndex {
     pub by_fingerprint: HashMap<String, Vec<PriorEntry>>,
     pub gap_modules: HashMap<String, String>,
     open_findings: Vec<Finding>,
+    finding_ids: HashSet<String>,
 }
 
 impl PriorIndex {
@@ -87,6 +89,7 @@ impl PriorIndex {
                 .entry(f.root_fingerprint.clone())
                 .or_default()
                 .push(PriorEntry {
+                    id: f.id.clone(),
                     file: f.file.clone(),
                     status: f.status,
                     file_hash: f.file_hash.clone(),
@@ -121,6 +124,7 @@ impl PriorIndex {
                     ))
                 })
                 .collect(),
+            finding_ids: report.findings.iter().map(|f| f.id.clone()).collect(),
             open_findings: report
                 .findings
                 .iter()
@@ -133,6 +137,57 @@ impl PriorIndex {
                 .cloned()
                 .collect(),
         }
+    }
+
+    /// Merge a newer source while preserving the selected base's identity.
+    pub fn merge(&mut self, newer: Self) {
+        let existing_statuses: HashMap<String, FindingStatus> = self
+            .by_fingerprint
+            .values()
+            .flatten()
+            .map(|entry| (entry.id.clone(), entry.status))
+            .chain(self.open_findings.iter().map(|f| (f.id.clone(), f.status)))
+            .collect();
+        let incoming_statuses: HashMap<String, FindingStatus> = newer
+            .by_fingerprint
+            .values()
+            .flatten()
+            .map(|entry| (entry.id.clone(), entry.status))
+            .chain(newer.open_findings.iter().map(|f| (f.id.clone(), f.status)))
+            .collect();
+        let protected: HashSet<String> = newer
+            .finding_ids
+            .iter()
+            .filter(|id| {
+                existing_statuses.get(*id) == Some(&FindingStatus::Confirmed)
+                    && incoming_statuses
+                        .get(*id)
+                        .is_some_and(|status| status != &FindingStatus::Confirmed)
+            })
+            .cloned()
+            .collect();
+        let ids = &newer.finding_ids;
+        self.by_fingerprint.retain(|_, entries| {
+            entries.retain(|e| !ids.contains(e.id.as_str()) || protected.contains(&e.id));
+            !entries.is_empty()
+        });
+        self.open_findings
+            .retain(|f| !ids.contains(f.id.as_str()) || protected.contains(&f.id));
+        for (fingerprint, entries) in newer.by_fingerprint {
+            self.by_fingerprint.entry(fingerprint).or_default().extend(
+                entries
+                    .into_iter()
+                    .filter(|entry| !protected.contains(&entry.id)),
+            );
+        }
+        self.finding_ids.extend(newer.finding_ids);
+        self.gap_modules.extend(newer.gap_modules);
+        self.open_findings.extend(
+            newer
+                .open_findings
+                .into_iter()
+                .filter(|finding| !protected.contains(&finding.id)),
+        );
     }
 
     /// Limit all carry decisions and prior-gap priority to this PR scope.
@@ -652,9 +707,46 @@ impl Default for HashBudget {
 }
 
 impl HashBudget {
-    fn hash(&mut self, repo_root: &Path, file: &str) -> Result<Option<String>, ()> {
+    pub(super) fn hash(&mut self, repo_root: &Path, file: &str) -> Result<Option<String>, ()> {
         self.read(repo_root, file)
             .map(|digest| digest.map(|d| d.hash))
+    }
+
+    /// Snapshot absence is distinct from invalid paths and unavailable content.
+    pub(super) fn snapshot_hash(&mut self, root: &Path, file: &str) -> Result<Option<String>, ()> {
+        vettalon_contract::safe_path::SafeRepoPath::parse(file).map_err(|_| ())?;
+        match std::fs::symlink_metadata(root.join(file)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let canonical_root = root.canonicalize().map_err(|_| ())?;
+                let mut parent = root.join(file);
+                loop {
+                    if !parent.pop() {
+                        return Err(());
+                    }
+                    match std::fs::symlink_metadata(&parent) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => return Err(()),
+                        Ok(_) => {
+                            let real = parent.canonicalize().map_err(|_| ())?;
+                            if !real.starts_with(&canonical_root) {
+                                return Err(());
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Count tombstones against the same file budget as live content.
+                if !self.files.contains_key(file) {
+                    if self.files.len() >= MAX_HASH_FILES || self.remaining_bytes == 0 {
+                        return Err(());
+                    }
+                    self.files.insert(file.to_owned(), Ok(None));
+                }
+                Ok(None)
+            }
+            Err(_) => Err(()),
+            Ok(_) => self.hash(root, file)?.map(Some).ok_or(()),
+        }
     }
 
     fn read(&mut self, repo_root: &Path, file: &str) -> Result<Option<FileDigest>, ()> {
@@ -794,6 +886,10 @@ mod tests {
             }
         }
         AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             schema_version: version,
             scope: None,
             repo: repo.to_string(),
@@ -825,6 +921,7 @@ mod tests {
 
     fn e(status: FindingStatus, h: &str) -> PriorEntry {
         PriorEntry {
+            id: "test".into(),
             file: "src/a.rs".into(),
             status,
             file_hash: Some(h.into()),
@@ -1070,6 +1167,79 @@ mod tests {
             "module_path": path, "status": status, "reason": reason
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn prior_run_merge_uses_latest_ids_and_unions_gaps() {
+        use super::super::schema::ModuleCoverageStatus::Deferred;
+        let open = finding("b/x.rs", "same", FindingStatus::Candidate, Some("h"));
+        let mut base = report("/repo", CURRENT_SCHEMA_VERSION, vec![open.clone()]);
+        base.coverage.push(gap("b", Deferred, "base_gap"));
+        let mut index = PriorIndex::from_report("base.json", &base);
+        let mut newer = base.clone();
+        newer.findings[0].status = FindingStatus::Suppressed;
+        newer.coverage = vec![gap("c", Deferred, "supplement_gap")];
+        index.merge(PriorIndex::from_report("newer.json", &newer));
+        assert_eq!(index.report_file, "base.json");
+        assert!(index.open_findings.is_empty());
+        let entries = &index.by_fingerprint[&open.root_fingerprint];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(decide(Some("h"), entries), CarryDecision::Suppressed);
+        assert_eq!(index.gap_modules.len(), 2);
+        newer.findings[0].status = FindingStatus::Candidate;
+        index.merge(PriorIndex::from_report("newest.json", &newer));
+        index.merge(PriorIndex::from_report("newest.json", &newer));
+        assert_eq!(index.open_findings.len(), 1);
+        assert_eq!(index.by_fingerprint[&open.root_fingerprint].len(), 1);
+        assert_eq!(
+            decide(Some("h"), &index.by_fingerprint[&open.root_fingerprint]),
+            CarryDecision::None
+        );
+    }
+
+    #[test]
+    fn prior_run_merge_keeps_confirmed_id_against_opener_statuses() {
+        for status in [FindingStatus::NeedsHuman, FindingStatus::Candidate] {
+            let confirmed = finding("b/x.rs", "same", FindingStatus::Confirmed, Some("h"));
+            let mut index = PriorIndex::from_report(
+                "base.json",
+                &report("/repo", CURRENT_SCHEMA_VERSION, vec![confirmed.clone()]),
+            );
+            let incoming = finding("b/x.rs", "same", status, Some("h"));
+            index.merge(PriorIndex::from_report(
+                "newer.json",
+                &report("/repo", CURRENT_SCHEMA_VERSION, vec![incoming]),
+            ));
+            assert_eq!(index.by_fingerprint[&confirmed.root_fingerprint].len(), 1);
+            assert_eq!(
+                index.by_fingerprint[&confirmed.root_fingerprint][0].status,
+                FindingStatus::Confirmed
+            );
+            assert!(index.open_findings.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prior_run_snapshot_absence_rejects_symlinks_and_invalid_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("dangling"))
+            .unwrap();
+        let mut budget = HashBudget::default();
+        for path in [
+            "link/missing.rs",
+            "dangling",
+            "dangling/child.rs",
+            "../unsafe.rs",
+        ] {
+            assert!(budget.snapshot_hash(dir.path(), path).is_err(), "{path}");
+        }
+        assert_eq!(
+            budget.snapshot_hash(dir.path(), "removed/module.rs"),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -1373,6 +1543,22 @@ mod tests {
                 .get("prior_status")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn provider_usage_limit_is_a_prior_gap() {
+        let mut r = report("/repo", 3, vec![]);
+        r.coverage = vec![gap(
+            "z",
+            ModuleCoverageStatus::Deferred,
+            "provider_usage_limit",
+        )];
+        let prior = PriorIndex::from_report("p.json", &r);
+        let mut ranked =
+            super::super::ai_audit::rank_modules(&["a/x.rs".into(), "z/x.rs".into()], &[], &[]);
+        prior.prioritize_modules(&mut ranked, 8);
+        assert_eq!(ranked[0].module_path, "z");
+        assert_eq!(prior.gap_reason("z"), Some("provider_usage_limit"));
     }
 
     #[test]

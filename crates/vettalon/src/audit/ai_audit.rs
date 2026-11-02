@@ -1025,7 +1025,7 @@ pub enum ModuleOutcome {
     ParseFailed {
         reason: String,
     },
-    /// Never sent (`candidate_cap` / `engine_unavailable`).
+    /// Work left unfinished (`candidate_cap` / `engine_unavailable` / provider usage limit).
     Deferred {
         reason: String,
     },
@@ -1362,6 +1362,23 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         let raw = match result {
             Ok(r) => r,
             Err(e) => {
+                if matches!(e, crate::llm::LlmError::UsageLimit(_)) {
+                    module_reports.push(ModuleAuditReport {
+                        attack_classes: mp.attack_classes.clone(),
+                        files: mp.evidence,
+                        source_receipt: receipt,
+                        truncated_paths: mp.truncated,
+                        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        ..ModuleAuditReport::bare(
+                            module,
+                            ModuleOutcome::Deferred {
+                                reason: super::coverage::DEFER_PROVIDER_USAGE_LIMIT.into(),
+                            },
+                        )
+                    });
+                    llm_reachable = true;
+                    continue;
+                }
                 let refused = matches!(e, crate::llm::LlmError::Refused(_));
                 let reason = if refused {
                     format!(
@@ -1438,6 +1455,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
         let mut parsed = parse_finder_reply(&raw);
         let mut retries_used = 0usize;
         let mut retry_note: Option<String> = None;
+        let mut usage_limited = false;
         while parsed.is_err() && retries_used < parse_retries {
             let violation = match parsed.as_ref() {
                 Err(v) => v.to_string(),
@@ -1459,6 +1477,7 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
                     parsed = parse_finder_reply(&r2);
                 }
                 Err(e) => {
+                    usage_limited = matches!(e, crate::llm::LlmError::UsageLimit(_));
                     retry_note = Some(format!(
                         "reflector correction call failed after {retries_used} retry(ies): {e}"
                     ));
@@ -1477,6 +1496,22 @@ pub async fn run_ai_audit_progress<C: LlmCaller>(
             last.valid_reply = true;
         }
 
+        if usage_limited {
+            module_reports.push(ModuleAuditReport {
+                attack_classes: mp.attack_classes.clone(),
+                files: mp.evidence,
+                source_receipt: receipt,
+                truncated_paths: mp.truncated,
+                duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                ..ModuleAuditReport::bare(
+                    module,
+                    ModuleOutcome::Deferred {
+                        reason: super::coverage::DEFER_PROVIDER_USAGE_LIMIT.into(),
+                    },
+                )
+            });
+            continue;
+        }
         match parsed {
             Err(v) => {
                 let mut reason = format!("reply violated the JSON contract (discarded): {v}");
@@ -1792,6 +1827,31 @@ pub(crate) mod tests {
             pages.into_iter().flat_map(|p| p.files).collect::<Vec<_>>(),
             files
         );
+    }
+
+    #[tokio::test]
+    async fn usage_limit_defers_every_affected_module() {
+        struct Limited;
+        #[async_trait::async_trait]
+        impl crate::llm::LlmCaller for Limited {
+            async fn complete(&self, _: &str) -> crate::llm::Result<String> {
+                Err(crate::llm::LlmError::UsageLimit("m".into()))
+            }
+        }
+        let dir = tmp_repo_with_files(&[("a.rs", "fn main() {}")]);
+        let modules = vec![
+            evidence_target(&["a.rs"]),
+            ModuleTarget {
+                module_path: "later".into(),
+                ..evidence_target(&["a.rs"])
+            },
+        ];
+        let outcome = run_ai_audit(dir.path(), &modules, &Limited).await;
+        let AiAuditOutcome::Ran { module_reports, .. } = outcome else {
+            panic!("quota is a unit gap")
+        };
+        assert_eq!(module_reports.len(), 2);
+        assert!(module_reports.iter().all(|m| matches!(&m.outcome, ModuleOutcome::Deferred { reason } if reason == "provider_usage_limit")));
     }
 
     #[tokio::test]

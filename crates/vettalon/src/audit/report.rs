@@ -277,6 +277,14 @@ pub fn render_scan_summary(
         }
     }
 
+    let funnel = super::funnel::derive(report);
+    out.push_str(&tr!(
+        "  證據漏斗：candidates={} → refuted={} → needs_human={} → poc_differential={} → fix_verified={} → human_confirmed={}；掃描器={}\n",
+        "  Evidence funnel: candidates={} → refuted={} → needs_human={} → poc_differential={} → fix_verified={} → human_confirmed={}; scanners={}\n",
+        funnel.candidates, funnel.refuted, funnel.needs_human, funnel.poc_differential,
+        funnel.fix_verified, funnel.human_confirmed, funnel.scanner_findings
+    ));
+
     if report.profile.mode == ProfileMode::Deep {
         out.push('\n');
         out.push_str(pick(
@@ -929,6 +937,10 @@ mod tests {
 
     fn base_report(findings: Vec<Finding>) -> AuditReport {
         AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             scope: None,
             repo: "/tmp/repo".to_string(),
             started_at: "2026-08-17T00:00:00Z".to_string(),
@@ -1023,6 +1035,10 @@ mod tests {
         // Dogfood requirement: a machine with zero scanners installed must
         // still produce exit 0 with an honest, non-empty engines_missing list.
         let report = AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             scope: None,
             repo: "/tmp/repo".to_string(),
             started_at: "2026-08-17T00:00:00Z".to_string(),
@@ -1088,6 +1104,25 @@ mod tests {
         assert!(text.contains("/tmp/repo"));
         assert!(text.contains("總計：1"));
         assert!(text.contains("未通過"));
+    }
+
+    #[test]
+    fn funnel_summary_is_one_bilingual_line() {
+        use crate::lang::{Lang, with};
+        let report = base_report(vec![]);
+        for (language, expected) in [
+            (
+                Lang::ZhTw,
+                "  證據漏斗：candidates=0 → refuted=0 → needs_human=0 → poc_differential=0 → fix_verified=0 → human_confirmed=0；掃描器=0",
+            ),
+            (
+                Lang::En,
+                "  Evidence funnel: candidates=0 → refuted=0 → needs_human=0 → poc_differential=0 → fix_verified=0 → human_confirmed=0; scanners=0",
+            ),
+        ] {
+            let text = with(language, || render_summary(&report, Severity::High));
+            assert_eq!(text.lines().filter(|line| *line == expected).count(), 1);
+        }
     }
 
     #[test]
