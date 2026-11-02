@@ -4,14 +4,14 @@
 For each package and each published version in scope, require:
   (a) a tag v<version> and a published GitHub release for it in the public repo;
   (b) a release.yml run for that tag, built from the tag commit, with at least
-      one successful attempt;
+      one successful npm-publish job;
   (c) an npm SLSA provenance statement naming this repository's release.yml at
       that tag and commit, built on a GitHub-hosted runner by a run from (b),
       for the exact tarball digest the registry serves.
 
-A provenance statement from a later attempt of a run whose earlier attempt
-succeeded passes with a note: re-running npm-publish restages the packages that
-are not yet live and then fails on the one that already is.
+A provenance statement from a later attempt of a run with a successful
+npm-publish job on an earlier attempt passes with a note: re-running npm-publish
+restages the packages that are not yet live and then fails on the one that already is.
 
 Scope: versions whose major.minor.patch is >= 0.3.0 (prereleases included).
 The known earlier versions (LEGACY_VERSIONS) were published by hand or with a
@@ -20,8 +20,10 @@ not checked. Any other version below 0.3.0 is a mismatch: a new one cannot
 legitimately appear.
 
 Read-only: GET requests only; the GitHub token is sent to api.github.com only.
-It reads the provenance statement but does not verify its Sigstore signature
-(npm verifies provenance on publish; `npm audit signatures` re-checks it).
+It downloads each tarball and verifies its digest, provenance signature, exact
+workflow/tag certificate identity and GitHub OIDC issuer. Transparency-log and
+signature checks are delegated to `gh attestation verify`, whose trust root
+comes from Sigstore's TUF repository; they are not implemented by this script.
 
 Exit codes: 0 every in-scope version matched, 1 mismatch, 2 could not check.
 """
@@ -30,10 +32,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import http.client
 import json
 import os
+from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -53,11 +61,16 @@ MIN_VERSION = (0, 3, 0)
 # every package. Frozen: nothing new below MIN_VERSION may ever be published.
 LEGACY_VERSIONS = frozenset({"0.0.0-stage", "0.1.0", "0.1.1", "0.2.0", "0.2.1"})
 WORKFLOW_PATH = ".github/workflows/release.yml"
+PUBLISH_JOB = "npm-publish"
 SLSA_V1 = "https://slsa.dev/provenance/v1"
 GITHUB_HOSTED = "https://github.com/actions/runner/github-hosted"
 NPM = "https://registry.npmjs.org"
 GITHUB_API = "https://api.github.com"
 ISSUE_TITLE = "Registry version without a matching release run"
+ERROR_TITLE = "Registry alert could not check"
+MAX_TARBALL_BYTES = 256 * 1024 * 1024
+VERIFY_TIMEOUT = 120
+OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 
 
@@ -65,10 +78,15 @@ class CheckError(Exception):
     """The check itself could not run (network, HTTP or malformed data)."""
 
 
+class RunState(NamedTuple):
+    successful: frozenset[int]
+    latest: int
+
+
 class TagState(NamedTuple):
     sha: str | None
     published: bool
-    runs: dict  # run id -> frozenset of successful attempt numbers
+    runs: dict[int, RunState]  # run id -> successful npm-publish attempts and latest attempt
 
 
 class Row(NamedTuple):
@@ -84,6 +102,41 @@ def safe(value: object, limit: int = 120) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+def safe_error(value: object) -> str:
+    """Keep error prose readable without Markdown, HTML or mentions."""
+    return re.sub(r"[^0-9A-Za-z /._:+=%-]", "?", str(value))[:300]
+
+
+def npm_tarball_url(url: object) -> bool:
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        return (parsed.scheme == "https" and parsed.hostname == "registry.npmjs.org"
+                and parsed.port in (None, 443) and parsed.username is None
+                and parsed.password is None)
+    except ValueError:
+        return False
+
+
+class NpmRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not npm_tarball_url(newurl):
+            raise CheckError("tarball redirect is not HTTPS on registry.npmjs.org")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class JsonRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, url: str):
+        self.origin = urllib.parse.urlsplit(url)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlsplit(newurl)
+        if (target.scheme, target.netloc) != (self.origin.scheme, self.origin.netloc):
+            raise CheckError("JSON redirect is not on the original scheme and host")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class HttpFetcher:
     """GET JSON; returns None on 404. Retries transient failures."""
 
@@ -96,10 +149,11 @@ class HttpFetcher:
         if self.token and url.startswith(GITHUB_API + "/"):
             headers["Authorization"] = f"Bearer {self.token}"
             headers["Accept"] = "application/vnd.github+json"
+        opener = urllib.request.build_opener(JsonRedirectHandler(url))
         for attempt in range(3):
             try:
                 request = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with opener.open(request, timeout=self.timeout) as response:
                     return json.load(response)
             except urllib.error.HTTPError as err:
                 if err.code == 404:
@@ -112,9 +166,122 @@ class HttpFetcher:
             time.sleep(2 * (attempt + 1))
         raise CheckError(f"GET {url}: retries exhausted")
 
+    def get_bytes(self, url: str, destination: Path):
+        """Stream an npm tarball to disk, without credentials, with bounded size."""
+        if not npm_tarball_url(url):
+            raise CheckError("tarball URL is not HTTPS on registry.npmjs.org")
+        opener = urllib.request.build_opener(NpmRedirectHandler())
+        for attempt in range(3):
+            complete = False
+            try:
+                request = urllib.request.Request(
+                    url, headers={"User-Agent": "vettalon-registry-alert"})
+                with opener.open(request, timeout=self.timeout) as response:
+                    if not npm_tarball_url(response.geturl()):
+                        raise CheckError("tarball response is not HTTPS on registry.npmjs.org")
+                    size = 0
+                    with destination.open("wb") as handle:
+                        while chunk := response.read(64 * 1024):
+                            size += len(chunk)
+                            if size > MAX_TARBALL_BYTES:
+                                raise CheckError("tarball exceeds the download size cap")
+                            handle.write(chunk)
+                complete = True
+                return
+            except urllib.error.HTTPError as err:
+                err.close()
+                if err.code < 500 or attempt == 2:
+                    raise CheckError(f"GET {url}: HTTP {err.code}") from err
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as err:
+                if attempt == 2:
+                    raise CheckError(f"GET {url}: {err}") from err
+            finally:
+                # Failed attempts must not leave partial downloads behind.
+                if not complete:
+                    destination.unlink(missing_ok=True)
+            time.sleep(2 * (attempt + 1))
+        raise CheckError(f"GET {url}: retries exhausted")
+
+
+class ProvenanceVerifier:
+    """Verify bundles with gh in an isolated, credential-free home directory."""
+
+    def __init__(self, repo: str = REPO, *, download=None, runner=None):
+        self.repo = repo
+        self.download = download if download is not None else HttpFetcher().get_bytes
+        self.runner = runner if runner is not None else subprocess.run
+        self._temp = tempfile.TemporaryDirectory(prefix="registry-alert-")
+        self.home = Path(self._temp.name)  # TemporaryDirectory creates mode 0700.
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        self._temp.cleanup()
+
+    def verify(self, version: str, dist: dict, bundle: dict, statement: dict) -> list[str]:
+        if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
+            return ["version is not a release version"]
+        url = dist.get("tarball")
+        if not npm_tarball_url(url):
+            return ["(c) tarball URL is not HTTPS on registry.npmjs.org"]
+        gh = shutil.which("gh")
+        if gh is None:
+            raise CheckError("gh is required to verify npm provenance")
+        tarball = self.home / "tarball.tgz"
+        bundle_path = self.home / "bundle.json"
+        try:
+            self.download(url, tarball)
+            digest = hashlib.sha512()
+            with tarball.open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    digest.update(chunk)
+            if digest.hexdigest() != sha512_hex(dist.get("integrity", "")):
+                return ["(c) downloaded tarball does not match the registry integrity"]
+            with os.fdopen(os.open(bundle_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                           "w", encoding="utf-8") as handle:
+                json.dump(bundle, handle)
+            argv = [gh, "attestation", "verify", str(tarball), "--bundle", str(bundle_path),
+                    "--repo", self.repo, "--digest-alg", "sha512", "--predicate-type", SLSA_V1,
+                    "--cert-identity", f"https://github.com/{self.repo}/{WORKFLOW_PATH}"
+                    f"@refs/tags/v{version}", "--cert-oidc-issuer", OIDC_ISSUER, "--format", "json"]
+            env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.home),
+                   "GH_CONFIG_DIR": str(self.home), "GH_PROMPT_DISABLED": "1",
+                   "GH_NO_UPDATE_NOTIFIER": "1"}
+            for _ in range(2):
+                try:
+                    result = self.runner(argv, capture_output=True, text=True, env=env,
+                                         timeout=VERIFY_TIMEOUT, check=False)
+                except subprocess.TimeoutExpired as err:
+                    raise CheckError("gh attestation verify timed out") from err
+                except (OSError, UnicodeError) as err:
+                    raise CheckError("gh attestation verify could not run") from err
+                if result.returncode == 0:
+                    break
+            else:
+                return ["(c) provenance signature or signer identity did not verify"]
+            try:
+                verified = json.loads(result.stdout)
+                if not isinstance(verified, list) or len(verified) != 1:
+                    raise ValueError("expected exactly one verification result")
+                verified_statement = verified[0]["verificationResult"]["statement"]
+                if not isinstance(verified_statement, dict):
+                    raise ValueError("expected a verified statement object")
+            except (ValueError, KeyError, TypeError) as err:
+                raise CheckError("gh attestation verify returned malformed JSON results") from err
+            if verified_statement != statement:
+                return ["(c) verified provenance statement does not match the decoded bundle"]
+            return []
+        finally:
+            tarball.unlink(missing_ok=True)
+            bundle_path.unlink(missing_ok=True)
+
 
 def in_scope(version: str) -> bool:
-    match = VERSION_RE.match(version)
+    match = VERSION_RE.fullmatch(version)
     if not match:
         return True  # unparseable: never silently skipped
     return tuple(int(part) for part in match.groups()) >= MIN_VERSION
@@ -125,7 +292,7 @@ def purl(name: str, version: str) -> str:
 
 
 def sha512_hex(integrity: str) -> str | None:
-    if not integrity.startswith("sha512-"):
+    if not isinstance(integrity, str) or not integrity.startswith("sha512-"):
         return None
     try:
         return base64.b64decode(integrity[7:], validate=True).hex()
@@ -133,9 +300,71 @@ def sha512_hex(integrity: str) -> str | None:
         return None
 
 
+def validate_runs(page, tag: str) -> list[dict]:
+    """Validate the complete runs response before filtering release bindings."""
+    if (not isinstance(page, dict)
+            or type(page.get("total_count")) is not int
+            or page["total_count"] < 0
+            or not isinstance(page.get("workflow_runs"), list)):
+        raise CheckError(f"{tag}: malformed runs response")
+    runs = page["workflow_runs"]
+    if any(not isinstance(run, dict)
+           or any(type(run.get(key)) is not int or run[key] < 1
+                  for key in ("id", "run_attempt"))
+           or any(not isinstance(run.get(key), str)
+                  for key in ("head_branch", "head_sha", "path"))
+           or not isinstance(run.get("repository"), dict)
+           or not isinstance(run["repository"].get("full_name"), str)
+           for run in runs):
+        raise CheckError(f"{tag}: malformed runs response")
+    if page["total_count"] > len(runs):
+        raise CheckError(f"{tag}: more than {len(runs)} release runs; pagination not supported")
+    if (page["total_count"] < len(runs)
+            or len({run["id"] for run in runs}) != len(runs)):
+        raise CheckError(f"{tag}: malformed runs response")
+    return runs
+
+
+def validate_statement(statement: object) -> None:
+    """Validate the provenance statement shape used by the checker."""
+    def object_field(parent, key, default):
+        value = parent.get(key, default)
+        if not isinstance(value, dict):
+            raise TypeError(f"{key} must be an object")
+        return value
+
+    def object_entries(parent, key):
+        value = parent.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(v, dict) for v in value):
+            raise TypeError(f"{key} must be a list of objects")
+        return value
+
+    def string_field(parent, key):
+        if key in parent and not isinstance(parent[key], str):
+            raise TypeError(f"{key} must be a string")
+
+    if not isinstance(statement, dict):
+        raise TypeError("statement must be an object")
+    predicate = object_field(statement, "predicate", None)
+    build = object_field(predicate, "buildDefinition", None)
+    details = object_field(predicate, "runDetails", None)
+    for subject in object_entries(statement, "subject"):
+        string_field(subject, "name")
+        string_field(object_field(subject, "digest", {}), "sha512")
+    external = object_field(build, "externalParameters", {})
+    workflow = object_field(external, "workflow", {})
+    for key in ("repository", "path", "ref"):
+        string_field(workflow, key)
+    for dependency in object_entries(build, "resolvedDependencies"):
+        string_field(object_field(dependency, "digest", {}), "gitCommit")
+    string_field(object_field(details, "builder", {}), "id")
+    string_field(object_field(details, "metadata", {}), "invocationId")
+
+
 class Checker:
-    def __init__(self, fetcher, repo: str = REPO):
+    def __init__(self, fetcher, verifier, repo: str = REPO):
         self.fetch = fetcher
+        self.verifier = verifier
         self.repo = repo
         self._tags: dict[str, TagState] = {}
 
@@ -155,55 +384,72 @@ class Checker:
             )
         return self._tags[tag]
 
-    def release_runs(self, tag: str, sha: str) -> dict:
-        """Map each release.yml run for the tag commit to its successful attempts."""
+    def release_runs(self, tag: str, sha: str) -> dict[int, RunState]:
+        """Map each release.yml run to successful attempts and its latest attempt."""
         q = urllib.parse.quote(tag, safe="")
-        page = self.api(f"actions/workflows/release.yml/runs?branch={q}&per_page=100") or {}
-        runs = page.get("workflow_runs", [])
-        if page.get("total_count", 0) > len(runs):
-            raise CheckError(f"{tag}: more than {len(runs)} release runs; pagination not supported")
+        runs = validate_runs(
+            self.api(f"actions/workflows/release.yml/runs?branch={q}&per_page=100"), tag)
         found = {}
         for run in runs:
             if (run.get("head_branch") != tag or run.get("head_sha") != sha
                     or run.get("path") != WORKFLOW_PATH
-                    or run.get("repository", {}).get("full_name") != self.repo):
+                    or run["repository"]["full_name"] != self.repo):
                 continue
-            latest = int(run.get("run_attempt") or 1)
-            ok = set()
-            for n in range(1, latest + 1):
-                detail = run if n == latest else self.api(f"actions/runs/{run['id']}/attempts/{n}")
-                if (detail or {}).get("conclusion") == "success":
-                    ok.add(n)
-            found[int(run["id"])] = frozenset(ok)
+            latest = run["run_attempt"]
+            ok = {n for n in range(1, latest + 1)
+                  if self.publish_succeeded(tag, run["id"], n)}
+            found[run["id"]] = RunState(frozenset(ok), latest)
         return found
+
+    def publish_succeeded(self, tag: str, run_id: int, attempt: int) -> bool:
+        page = self.api(f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")
+        prefix = f"{tag}: run {run_id} attempt {attempt}: "
+        if (not isinstance(page, dict)
+                or type(page.get("total_count")) is not int
+                or page["total_count"] < 0
+                or not isinstance(page.get("jobs"), list)):
+            raise CheckError(f"{prefix}malformed jobs response")
+        jobs = page["jobs"]
+        if page["total_count"] > len(jobs):
+            raise CheckError(f"{prefix}more than {len(jobs)} jobs; pagination not supported")
+        if (page["total_count"] != len(jobs)
+                or any(not isinstance(job, dict)
+                       or not isinstance(job.get("name"), str)
+                       or "conclusion" not in job
+                       or (job["conclusion"] is not None
+                           and not isinstance(job["conclusion"], str)) for job in jobs)):
+            raise CheckError(f"{prefix}malformed jobs response")
+        return any(job["name"] == PUBLISH_JOB and job["conclusion"] == "success"
+                   for job in jobs)
 
     def load_provenance(self, name: str, version: str):
         url = f"{NPM}/-/npm/v1/attestations/{urllib.parse.quote(name, safe='@')}@{version}"
-        body = self.fetch.get_json(url) or {}
-        slsa = [a for a in body.get("attestations", []) if a.get("predicateType") == SLSA_V1]
+        body = self.fetch.get_json(url)
+        if (not isinstance(body, dict)
+                or not isinstance(body.get("attestations"), list)
+                or any(not isinstance(entry, dict) for entry in body["attestations"])):
+            raise CheckError(f"{name}@{version}: malformed provenance")
+        slsa = [a for a in body["attestations"] if a.get("predicateType") == SLSA_V1]
         if len(slsa) != 1:
-            return None, len(slsa)
+            return None, None, len(slsa)
         try:
             statement = json.loads(base64.b64decode(slsa[0]["bundle"]["dsseEnvelope"]["payload"]))
-            predicate = statement["predicate"]
-            if not (isinstance(predicate["buildDefinition"], dict)
-                    and isinstance(predicate["runDetails"], dict)):
-                raise TypeError("buildDefinition/runDetails must be objects")
+            validate_statement(statement)
         except (KeyError, ValueError, TypeError) as err:
             raise CheckError(f"{name}@{version}: malformed provenance ({err})") from err
-        return statement, 1
+        return statement, slsa[0]["bundle"], 1
 
     def provenance(self, name: str, version: str, meta: dict, state: TagState):
         """Return (problems, notes) for check (c) and its link to (b)."""
         dist = meta.get("dist", {})
         if not dist.get("attestations"):
             return ["(c) no npm provenance attestation"], []
-        statement, count = self.load_provenance(name, version)
+        statement, bundle, count = self.load_provenance(name, version)
         if statement is None:
             return [f"(c) expected one SLSA v1 provenance, found {count}"], []
         build = statement["predicate"]["buildDefinition"]
         details = statement["predicate"]["runDetails"]
-        problems = []
+        problems = self.verifier.verify(version, dist, bundle, statement)
         subjects = {(s.get("name"), s.get("digest", {}).get("sha512"))
                     for s in statement.get("subject", [])}
         if (purl(name, version), sha512_hex(dist.get("integrity", ""))) not in subjects:
@@ -229,18 +475,20 @@ class Checker:
         if not match:
             return [f"(c) provenance invocation `{safe(invocation)}` is not a run of this repo"], []
         run_id, attempt = int(match[1]), int(match[2])
-        successful = state.runs.get(run_id)
-        if not successful:
+        run = state.runs.get(run_id)
+        if run is not None and not 1 <= attempt <= run.latest:
+            return [f"(b/c) provenance names attempt {attempt}, which run {run_id} never had"], []
+        if run is None or not run.successful:
             return [f"(b/c) provenance run {run_id} is not a release.yml run for the tag "
-                    "with a successful attempt"], []
-        if attempt in successful:
+                    "with a successful npm-publish job"], []
+        if attempt in run.successful:
             return [], []
-        tried = ", ".join(str(n) for n in sorted(successful))
+        tried = ", ".join(str(n) for n in sorted(run.successful))
         return [], [f"provenance from run {run_id} attempt {attempt}; "
-                    f"that run succeeded on attempt {tried}"]
+                    f"its npm-publish job succeeded on attempt {tried}"]
 
     def check_version(self, name: str, version: str, meta: dict) -> Row:
-        if not VERSION_RE.match(version):
+        if not VERSION_RE.fullmatch(version):
             return Row(name, version, ("version is not a release version",), ())
         tag = f"v{version}"
         state = self.tag_state(tag)
@@ -249,8 +497,8 @@ class Checker:
             problems.append(f"(a) no tag `{safe(tag)}` in {self.repo}")
         if not state.published:
             problems.append(f"(a) no published GitHub release for `{safe(tag)}`")
-        if state.sha and not any(state.runs.values()):
-            problems.append(f"(b) no successful release.yml run for `{safe(tag)}`")
+        if state.sha and not any(run.successful for run in state.runs.values()):
+            problems.append(f"(b) no successful npm-publish job in a release.yml run for `{safe(tag)}`")
         more, notes = self.provenance(name, version, meta, state)
         return Row(name, version, tuple(problems + more), tuple(notes))
 
@@ -295,9 +543,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     try:
-        rows, skipped = Checker(HttpFetcher(token), args.repo).run()
-    except CheckError as err:
+        with ProvenanceVerifier(args.repo) as verifier:
+            rows, skipped = Checker(HttpFetcher(token), verifier, args.repo).run()
+    except Exception as err:
         print(f"registry-alert: could not check: {err}", file=sys.stderr)
+        if args.report:
+            with open(args.report, "w", encoding="utf-8") as handle:
+                handle.write(f"# {ERROR_TITLE}\n\nThe check did not finish: {safe_error(err)}\n")
         return 2
     report = render(rows, skipped, args.repo)
     print(report, end="")

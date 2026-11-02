@@ -4,10 +4,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- registry 警報現在會下載每個 npm tarball，核對摘要後用 `gh attestation verify` 驗證 provenance 簽章、綁定發版 tag 的 workflow 身分與 issuer；無法完成檢查時也會開獨立 issue。
+  The registry alert now downloads each npm tarball, checks its digest, and uses `gh attestation verify` to verify the provenance signature, the workflow identity at the release tag and the issuer. A check that cannot finish now opens its own issue.
+
+### Changed
+
+- 將 zip 從 9.0.5 更新至 9.1.3。
+  Updated zip from 9.0.5 to 9.1.3.
+
 ### Fixed
 
-- 修正 Git 背景維護在 metadata 檢查期間移除暫存檔時，掃描可能失敗的問題。
-  Fixed scans failing when Git background maintenance removes a temporary file during the metadata check.
+- 修正 registry 警報在 release run 僅有無關工作失敗時，仍將版本誤報為不符的問題。
+  Fixed the registry alert reporting a version as mismatched when only an unrelated job of its release run failed.
 
 ## [0.7.0] - 2026-11-02
 
@@ -34,6 +44,11 @@
   Evidence funnel: the scan summary and SARIF (`vettalon.funnel`) show candidates, refuted, needs_human, poc_differential, fix_verified and human_confirmed, with scanner findings counted separately. It is derived from the report and does not change the schema.
 - 用量上限斷路器：見升級須知。比對各家 CLI 失敗時的額度訊息與 HTTP `insufficient_quota`，暫時性 429 不算，prompt 裡出現的相同字句也不算。實際額度耗盡的情境還沒有用真實帳號驗證過。
   Usage-limit breaker: see the upgrade notes. It matches each CLI's quota message on failure and HTTP `insufficient_quota`; transient 429s and phrases also present in the prompt do not count. It has not been exercised against a truly exhausted account.
+
+### Fixed
+
+- 修正 Git 背景維護在 metadata 檢查期間移除暫存檔時，掃描可能失敗的問題。
+  Fixed scans failing when Git background maintenance removes a temporary file during the metadata check.
 
 ## [0.6.1] - 2026-10-29
 

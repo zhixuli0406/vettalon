@@ -1,8 +1,8 @@
 # Daily check that every npm version from 0.3.0 on has a matching GitHub
-# release, a successful release.yml run for its tag and npm provenance naming
-# that run (scripts/trust/registry_alert.py). On a mismatch the check fails and
-# a separate job opens or comments on one alert issue. Runs only on the public
-# repo; read-only apart from that issue. Uses GITHUB_TOKEN only.
+# release, a release.yml run with a successful npm-publish job for its tag, and
+# verified npm provenance naming that run (scripts/trust/registry_alert.py).
+# Mismatches and check errors open or comment on separate alert issues. Runs
+# only on the public repo; read-only apart from that issue. Uses GITHUB_TOKEN only.
 name: Registry alert
 
 on:
@@ -17,7 +17,7 @@ jobs:
     name: npm versions match release runs
     if: github.repository == 'zhixuli0406/vettalon'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: read
@@ -55,7 +55,7 @@ jobs:
   issue:
     name: Open or update the alert issue
     needs: check
-    if: always() && needs.check.outputs.status == 'mismatch'
+    if: always() && github.repository == 'zhixuli0406/vettalon' && needs.check.result != 'cancelled' && needs.check.result != 'skipped' && (needs.check.result != 'success' || needs.check.outputs.status != 'ok')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -67,9 +67,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
           REPORT: ${{ needs.check.outputs.report }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          TITLE: Registry version without a matching release run
+          TITLE: ${{ needs.check.outputs.status == 'mismatch' && 'Registry version without a matching release run' || 'Registry alert could not check' }}
         run: |
           body="$RUNNER_TEMP/body.md"
+          if [ -z "$REPORT" ]; then
+            REPORT='The check did not finish. See the run linked above for details.'
+          fi
           { printf 'Failed check: %s\n\n' "$RUN_URL"; printf '%s\n' "$REPORT"; } > "$body"
           number=$(gh issue list --state open --limit 500 --json number,title \
             --jq 'map(select(.title == env.TITLE)) | .[0].number // empty')
