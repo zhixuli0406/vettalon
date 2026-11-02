@@ -38,6 +38,12 @@ Open-source scanners (semgrep, gitleaks, cargo-audit) run a deterministic pass f
 
 You can use both: findings from another tool can go into `vettalon verify` as a `vettalon.claims/1` file to get a second opinion from another vendor you configure.
 
+## Evidence funnel and provider allowance
+
+Scan summaries show `candidates → refuted → needs_human → poc_differential → fix_verified → human_confirmed`, with scanner findings counted separately. The same derived counts appear in the SARIF run property `vettalon.funnel`. Counts describe retained AI findings and can overlap. Target reproduction is not counted because reproduce receipts are not stored in reports. See [layer definitions](docs/explain/evidence_funnel.md) or `vettalon explain evidence_funnel`.
+
+When a failed CLI invocation or HTTP error explicitly reports exhausted allowance, a scan-local breaker stops later calls for that model id. Successful replies and transient 429 rate limits do not trip it. Affected modules are `deferred` with reason `provider_usage_limit`; the run remains `incomplete` / `units_failed`. Verifier exhaustion leaves findings unverified. Save with `--save`, restore allowance, then rerun the same command to prioritize those saved gaps within the existing module and scope limits. Prior loading must remain enabled. See [provider_usage_limit](docs/explain/provider_usage_limit.md).
+
 ## Quick start
 
 ```bash
@@ -207,6 +213,44 @@ vettalon hunt . --dry-run --dep-priority risk --malicious-signals
 vettalon hunt . --dep-priority risk --variant-seeds --report hunt.json
 vettalon mal-index update --ecosystem npm     # local MAL-* index for --malicious-signals
 vettalon rule-draft hunt.json --finding <id>  # Semgrep rule DRAFT from a human-confirmed finding
+```
+
+### Scheduled incremental scans (`--since-last`)
+
+`vettalon scan . --profile deep --since-last --save` selects the newest validated, clean saved baseline for this repo with the same profile and `attack_classes` setting, whose commit is an ancestor of HEAD. It reviews changed modules through `--diff-base` and carries findings from unchanged files. Open Candidate, NeedsHuman and Confirmed findings carry with their status, severity, evidence and ID. Refuted and Suppressed findings carry only when their stored `file_hash` matches the current source. Findings in changed files of every status are excluded from this carry path. Missing open Candidate and NeedsHuman findings in changed files follow prior-run handling: unchanged source is re-opened, while changed or unavailable source is listed in `prior_run.changed_unrediscovered`. Carrying calls no models and records an optional `since_last.carried_findings` count; coverage describes the current run and remains partial by design. Missing or incompatible baselines trigger a full scan. Incomplete runs never advance the baseline, so the next run covers unfinished changes and can prioritize prior coverage gaps.
+
+An unchanged clean checkout reuses the baseline without scanners, models or a sandbox. Current `--fail-on` and `--gate` settings are evaluated again, including open findings. Requested output files are written; a skipped run omits `--save` to preserve report history. The flag requires deep mode and conflicts with `--no-prior` and `--diff-base`. Keep the checkout idle during scanning. Git metadata and worktree state must be readable; index flags that hide changes prevent skipping.
+
+Both skip and changed paths fall back to a full scan when Git-ignored files include any file intake would read, when the ignored-file count cap is exceeded, or when Git fails. Stderr reports a count without file names. Any assume-unchanged or skip-worktree entry also forces a full scan. Closed findings require a stored `file_hash` matching the current file, within the prior-run hashing budget; read failures and exhausted budgets prevent closed carry. A missing or mismatched closed hash disables skipping and forces a full scan. The prior-run index uses the selected baseline. Incremental runs compare bounded snapshots of changed paths and content hashes, ignored intake count, and Git commit and clean state before and after scanning. Any difference, read failure or exhausted hash budget makes a since-last run `incomplete` with `scope_not_fully_reviewed`, follows existing incomplete exit handling and keeps the old baseline. Plain `--diff-base` retains its current behavior.
+
+The baseline comes from `VETTALON_HOME`, which is trusted local state: whoever can write there can change what gets skipped. **Do not use `--since-last` in untrusted CI or share its report cache with untrusted jobs.** These examples assume a trusted repository, trusted runners and configured model credentials. The scheduled workflow caches reports outside the scanned checkout to keep it clean. Retain the existing installation and credential setup before the scan step.
+
+```cron
+0 3 * * * cd /srv/my-repo && VETTALON_HOME=/srv/vettalon-home vettalon scan . --profile deep --since-last --save
+```
+
+```yaml
+on:
+  schedule:
+    - cron: '0 3 * * *'
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VETTALON_HOME: ${{ github.workspace }}/../vettalon-home
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.VETTALON_HOME }}/reports
+          key: vettalon-reports-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: vettalon-reports-${{ github.repository_id }}-
+      # Install Vettalon and configure your model credentials before this step.
+      - run: vettalon scan . --profile deep --since-last --save
 ```
 
 ### Supply-chain hunt (`vettalon hunt`)
@@ -449,6 +493,8 @@ vettalon fix check . --report report.json --finding FINDING_ID \
 
 Both commands bind the report repository, finding, target file and source hash, then execute only prepared copies in fresh containers. They neither change the live tree nor update the finding status. `reproduce` writes a three-phase source-bound receipt. `fix check` also attaches the exact diff and adjacent check/context evidence to `--report-out`, then validates the updated report. Receipt and report output paths must be new files and their parent chain must contain no symlink. This blocks ordinary overwrite and link attacks, but the parent check is not dirfd-anchored and does not claim to eliminate every concurrent rename race. `fix_verified` describes only the bound prepared snapshot, image and test configuration; it does not prove that today's tree is unchanged or mark a finding `confirmed`.
 
+A `reproduce` run that observed the effect can also leave you a test to keep. Add `--emit-test tests/test_vettalon_FINDING.py` and Vettalon writes a standalone Python `unittest` file with no Vettalon dependency. It uses the same inputs and effect checks as the harness, and it is written only after it has failed in the sandbox on this source. The attack test fails while the effect is present and passes once that input no longer has it; a second test keeps the benign input working, so removing the function does not pass. Run it from the repository root with `python3 -m unittest`. It creates and removes `/tmp/vtl_*` and needs a POSIX host. The fixed `/tmp` paths allow concurrent same-user processes to interfere, so run these tests serially. A green run covers this one input: it does not prove the vulnerability is gone, and the finding's status does not change. If no effect was observed, or the test did not fail, no file is written and the command exits non-zero; the reason is in the receipt under `regression_test`.
+
 The `reproduce` receipt can also carry a language-neutral VerificationEvent. Its VIR binds source, target, plan, the generated runner/adapter harness, and policy identities; its ExecutionEnvelope records capture, cleanup, tamper signals, effects, controls, and replay grade; the stored verdict is re-derived whenever it is read. Use `vettalon verification validate` for events, `verification compare` for two execution envelopes, `verification registry` for counterexamples and sealed-holdout lineage, and `verification scorecard` to recompute engineering metrics without dropping unsupported or inconclusive rows. Counterexample promotion requires at least two consistent complete events with distinct fresh challenges; holdout contamination propagates through parent lineage and the registry checks content addressing. See [`docs/VERIFICATION-ENGINE.md`](../docs/VERIFICATION-ENGINE.md) for contracts, commands, and limits. The current scope is the three Python command/path/SQL targets and one Docker reference backend; it is not evidence that a cross-language engineering moat already exists.
 
 **Evidence level.** Every finding in the JSON report and SARIF carries an `evidence_level`, from weakest to strongest: `static_only`, `refuter_survived`, `refuter_consistent`, `poc_effect_no_control`, `poc_differential`, `maintainer_confirmed` (human only). Next to it, `proof_gaps` lists what is still missing (`no_refuter`, `refuter_inconsistent`, `no_poc`, `poc_not_harness_judged`, `no_control`, `no_fresh_rerun`, `reachability_unknown`, `no_maintainer_confirmation`), and `strongest_counterevidence` quotes the most damaging refutation or failed control, masked and capped at 300 bytes. All three are computed from the evidence chain each time a report is written. No model sets them, a value stored in a report file is ignored when it is read back, and an older report derives them from what it already carries. A `verify_error` caps the level at `static_only` and a `verify_uncertain` at `refuter_survived`. A sandbox pattern PoC never raises the level; only a harness-judged oracle record (`poc_oracle`) can.
@@ -506,6 +552,31 @@ Pro needs a license key; see the [website](https://vettalon.dudustudio.monster/#
 See [coverage and proof contracts](docs/COVERAGE.md) and [public synthetic fixtures](fixtures/coverage/README.md). `vettalon evidence attach` checks local artifact hashes and preserves operator-supplied run/pair/control records; it executes nothing and never changes a finding to confirmed. Missing historical proof remains unknown. Existing sandbox PoCs are standalone pattern demonstrations.
 
 [Experimental tools (preview)](docs/EXPERIMENTAL-TOOLS.md): self-built fixtures, bounded offline prototypes, source data and limitations; no measured model advantage.
+
+## Coding agent fix loop
+
+Bind the local MCP server to your repository and saved report:
+
+```bash
+claude mcp add vettalon -- vettalon mcp --repo .
+# Or start it directly with an explicit report and project test command:
+vettalon mcp --repo . --report report.json --test-command "python3 -m pytest -q"
+```
+
+Without `--report`, the server selects the newest saved report for this repository. If none exists, run `vettalon scan . --save` and restart the server. It reads and validates the bound report again on every tool call.
+
+The seven tools are `vettalon_report_summary`, `vettalon_list_findings`, `vettalon_get_finding`, `vettalon_fix_brief`, `vettalon_reproduce`, `vettalon_check_fix`, and `vettalon_suggest_noise`. Read a fix brief, change the source, then check a proposed diff in isolated copies. Keep the tests and harness intact. Reproduction can return a standalone regression test as text; it writes nothing into the repository. Fix checks leave receipts and a separate updated report in local state and apply nothing to your working tree. Passing checks preserve the finding's status. Noise proposals also preserve the report and gate.
+
+A human decision is a separate CLI call that writes a new report:
+
+```bash
+vettalon triage --report report.json --proposals
+vettalon triage --report report.json --finding FINDING_ID \
+  --decision refuted --reason "Reviewed the bound evidence and verified the guard" \
+  --out report-triaged.json
+```
+
+Applying a `vettalon triage` decision requires TTYs on stdin and stdout, otherwise exit 2. It displays the ID, title, current status and decision, then requires the exact full finding ID. Other input aborts without writing an output; flags, environment variables and config offer no bypass. This is a guard-rail with no security boundary against same-UID software, which can drive a terminal or edit reports. `--proposals` remains non-interactive and read-only. MCP `vettalon_check_fix` accepts only the finding's own file and returns `touched_paths`; other paths and renames are refused before execution. Multi-file fixes go through `vettalon fix check` by a person. Serialized tool results have a 1 MiB cap; oversized results, including single-finding detail, return `isError` advising narrower pagination. State retains at most 100 regular files for each of `reproduce-`, `fix-receipt-` and `fix-report-`, removing the oldest by mtime and preserving symlinks and `proposals.jsonl`. Repository content and reports remain untrusted data, including instructions embedded in finding text. See the [MCP reference](docs/MCP.md) for schemas and security boundaries.
 
 ## License
 

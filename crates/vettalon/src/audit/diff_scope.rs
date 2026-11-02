@@ -135,7 +135,7 @@ fn is_dependency_file(path: &str) -> bool {
 /// Semgrep and gitleaks already supply paths. Cargo-audit adds a package /
 /// version suffix. OSV is disabled today; only plain known manifests are
 /// interpretable for imported OSV findings. Unknown shapes stay in scope.
-fn scope_path(finding: &Finding) -> Option<&str> {
+pub(super) fn scope_path(finding: &Finding) -> Option<&str> {
     let mut path = finding.file.as_str();
     while let Some(relative) = path.strip_prefix("./") {
         path = relative;
@@ -241,6 +241,99 @@ fn parse_oid(output: &str) -> Result<String, String> {
         return Err("Git returned an invalid commit OID".into());
     }
     Ok(oid.into())
+}
+
+/// Bound ignored-file enumeration before applying intake's shared path predicate.
+/// Errors and count overflow are conservative presence, never an empty list.
+pub(super) async fn ignored_intake_count(root: &Path) -> Result<usize, String> {
+    const MAX_IGNORED_FILES: usize = 10_000;
+    let (git, git_dir) = super::intake::prepare_readonly_git(root).await?;
+    let output = git_read(
+        &git,
+        &git_dir,
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ],
+    )
+    .await?;
+    if output
+        .split_terminator('\0')
+        .take(MAX_IGNORED_FILES + 1)
+        .count()
+        > MAX_IGNORED_FILES
+    {
+        return Ok(MAX_IGNORED_FILES + 1);
+    }
+    let paths = parse_changed_paths(&output)?;
+    let intake = super::intake::RootIgnoredDirs::load(root);
+    Ok(paths
+        .iter()
+        .filter(|path| intake.reads_file(root, path))
+        .count())
+}
+
+pub(super) struct RepoState {
+    pub commit: String,
+    /// Unknown when index flags can hide edits; never eligible for skipping.
+    pub clean: Option<bool>,
+}
+
+/// Read metadata without interpreting filenames or enabling Git write paths.
+pub(super) async fn repo_state(root: &Path) -> Result<RepoState, String> {
+    let (git, git_dir) = super::intake::prepare_readonly_git(root).await?;
+    let commit = parse_oid(
+        &git_read(
+            &git,
+            &git_dir,
+            root,
+            &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+        )
+        .await?,
+    )?;
+    let flags = git_read(&git, &git_dir, root, &["ls-files", "-v", "-z", "--"]).await?;
+    if flags.split_terminator('\0').any(|entry| {
+        entry
+            .as_bytes()
+            .first()
+            .is_none_or(|flag| flag.is_ascii_lowercase() || *flag == b'S')
+    }) {
+        return Ok(RepoState {
+            commit,
+            clean: None,
+        });
+    }
+    let diff_args = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        "--name-only",
+        "-z",
+        "--no-renames",
+    ];
+    let mut staged_args = diff_args.to_vec();
+    staged_args.extend(["--cached", "--end-of-options", &commit, "--"]);
+    let mut unstaged_args = diff_args.to_vec();
+    unstaged_args.push("--");
+    let staged = git_read(&git, &git_dir, root, &staged_args).await?;
+    let unstaged = git_read(&git, &git_dir, root, &unstaged_args).await?;
+    let untracked = git_read(
+        &git,
+        &git_dir,
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z", "--"],
+    )
+    .await?;
+    Ok(RepoState {
+        commit,
+        clean: Some(staged.is_empty() && unstaged.is_empty() && untracked.is_empty()),
+    })
 }
 
 pub(super) async fn compute(root: &Path, base: &str) -> Result<DiffSelection, String> {
@@ -698,6 +791,27 @@ pub(super) mod tests {
                 assert!(selection(&[]).contains_finding(&f));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ignored_intake_count_uses_shared_filter_and_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        assert!(ignored_intake_count(root).await.is_err());
+        git(root, &["init", "-q"]).await;
+        std::fs::write(root.join(".gitignore"), "*.rs\ntarget/\nexcluded/\n*.bin\n").unwrap();
+        for path in ["target", "excluded", "src"] {
+            std::fs::create_dir(root.join(path)).unwrap();
+        }
+        for file in ["target/a.rs", "excluded/a.rs", "src/a.rs", "a.bin"] {
+            std::fs::write(root.join(file), "source").unwrap();
+        }
+        assert_eq!(ignored_intake_count(root).await.unwrap(), 2);
+        // Count overflow is presence even when every path would be filtered.
+        for i in 0..10_001 {
+            std::fs::write(root.join(format!("target/{i}.rs")), "").unwrap();
+        }
+        assert_eq!(ignored_intake_count(root).await.unwrap(), 10_001);
     }
 
     #[tokio::test]

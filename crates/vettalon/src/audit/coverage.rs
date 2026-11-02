@@ -13,6 +13,7 @@
 //! | in the `--prescreen` pool but below its cut | `deferred`, reason `prescreen_cut` |
 //! | run-wide candidate cap already reached | `deferred`, reason `candidate_cap` |
 //! | not attempted after the engine was found unreachable | `deferred`, reason `engine_unavailable` |
+//! | provider allowance exhausted | `deferred`, reason `provider_usage_limit` |
 //! | no readable text | `unreadable` |
 //! | LLM call failed | `llm_failed` |
 //! | reply violated the JSON contract | `parse_failed` |
@@ -21,6 +22,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::ai_audit::{ModuleAuditReport, ModuleOutcome, ModuleTarget};
 use super::schema::{FileReadStatus, ModuleAttempt, ModuleCoverage, ModuleCoverageStatus};
+
+pub const DEFER_PROVIDER_USAGE_LIMIT: &str = "provider_usage_limit";
 
 pub const DEFER_MAX_MODULES: &str = "max_modules";
 pub const DEFER_CANDIDATE_CAP: &str = "candidate_cap";
@@ -284,6 +287,14 @@ pub fn build_module_coverage(
                 } else {
                     Some(reasons.join("; "))
                 };
+            }
+            if coverage
+                .attempts
+                .iter()
+                .any(|a| a.reason.as_deref() == Some(DEFER_PROVIDER_USAGE_LIMIT))
+            {
+                coverage.status = ModuleCoverageStatus::Deferred;
+                coverage.reason = Some(DEFER_PROVIDER_USAGE_LIMIT.into());
             }
             coverage
         })

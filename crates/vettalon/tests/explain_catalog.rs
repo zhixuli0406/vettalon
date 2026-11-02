@@ -89,6 +89,7 @@ fn every_public_evidence_prefix_and_fixed_reason_has_an_embedded_page() {
         "shallow_no_checks",
         "shallow_missing_class_checks",
         "diff_scope",
+        "since_last",
         "max_modules",
         "prescreen_cut",
         "candidate_cap",

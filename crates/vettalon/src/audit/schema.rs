@@ -1738,7 +1738,25 @@ impl DiffScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinceLast {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub carried_findings: usize,
+    pub base_report: String,
+    pub base_commit: String,
+    pub skipped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_tree_clean: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_last: Option<SinceLast>,
+    /// Persist the run setting even when no module was submitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_classes: Option<super::attack_classes::AttackClassMode>,
     /// `2` for this pipeline; a report without the field reads as `1`.
     #[serde(default = "schema_version_v1")]
     pub schema_version: u32,
@@ -2395,6 +2413,10 @@ mod tests {
     #[test]
     fn audit_report_round_trips_through_json() {
         let report = AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             scope: None,
             repo: "/tmp/repo".to_string(),
             started_at: "2026-08-17T00:00:00Z".to_string(),

@@ -123,6 +123,7 @@ fn opts(repo: &Path, rank: crate::audit::RankStrategy) -> crate::audit::ScanOpti
     crate::audit::ScanOptions {
         repo_path: repo.into(),
         diff_base: None,
+        since_last: false,
         profile: "deep".into(),
         report: None,
         sarif: None,

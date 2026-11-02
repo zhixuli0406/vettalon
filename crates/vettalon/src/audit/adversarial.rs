@@ -1585,6 +1585,7 @@ pub async fn review_with<C: LlmCaller>(
     let mut runs: Vec<RunVerdict> = Vec::with_capacity(n);
     // I0: the basis each refutation gave, per run (None = no refutation).
     let mut bases: Vec<Option<BasisRecord>> = Vec::with_capacity(n);
+    let mut usage_limit = None;
     let (mut answered, mut call_failed, mut refused) = (false, false, false);
     let (mut reasked, mut recovered) = (0usize, 0usize);
     // One line per re-ask: why it happened and how the second reply ended.
@@ -1629,6 +1630,9 @@ pub async fn review_with<C: LlmCaller>(
             // Fail-closed toward "don't know": never auto-Confirm, never
             // silently Refuted either.
             Err(e) => {
+                if let crate::llm::LlmError::UsageLimit(model) = &e {
+                    usage_limit = Some(model.clone());
+                }
                 call_failed = true;
                 refused = matches!(e, crate::llm::LlmError::Refused(_));
                 (
@@ -1664,6 +1668,9 @@ pub async fn review_with<C: LlmCaller>(
             };
             (run, basis, score) = match caller.complete(&correction).await {
                 Err(e) => {
+                    if let crate::llm::LlmError::UsageLimit(model) = &e {
+                        usage_limit = Some(model.clone());
+                    }
                     call_failed = true;
                     refused = matches!(e, crate::llm::LlmError::Refused(_));
                     (
@@ -1726,6 +1733,9 @@ pub async fn review_with<C: LlmCaller>(
                 shown.extend(&found.shown);
                 let second = match caller.complete(&build(&ex)).await {
                     Err(e) => {
+                        if let crate::llm::LlmError::UsageLimit(model) = &e {
+                            usage_limit = Some(model.clone());
+                        }
                         call_failed = true;
                         refused = matches!(e, crate::llm::LlmError::Refused(_));
                         Err(e.to_string())
@@ -1820,14 +1830,19 @@ pub async fn review_with<C: LlmCaller>(
         }
         let p = refuter_policy::build_prosecutor_prompt(&claim, &ex, &target);
         match caller.complete(&p).await {
-            Err(e) => push_evidence(
-                finding,
-                format!(
-                    "{} call failed (closure stands): {}",
-                    refuter_policy::PROSECUTOR_PREFIX,
-                    crate::util::truncate_bytes(&e.to_string(), 300)
-                ),
-            ),
+            Err(e) => {
+                if let crate::llm::LlmError::UsageLimit(model) = &e {
+                    usage_limit = Some(model.clone());
+                }
+                push_evidence(
+                    finding,
+                    format!(
+                        "{} call failed (closure stands): {}",
+                        refuter_policy::PROSECUTOR_PREFIX,
+                        crate::util::truncate_bytes(&e.to_string(), 300)
+                    ),
+                );
+            }
             Ok(raw) => {
                 let outcome = refuter_policy::judge_prosecutor(repo_root, &raw, &shown);
                 refuter_policy::apply_prosecutor(finding, &outcome);
@@ -1851,6 +1866,19 @@ pub async fn review_with<C: LlmCaller>(
                 "{VERIFIER_REFLECTOR_PREFIX} {reasked} reply(ies) broke the contract and were re-asked, {recovered} recovered"
             ),
         );
+    }
+    if let Some(model) = usage_limit {
+        finding.status = FindingStatus::Candidate;
+        finding.blockers.clear();
+        finding.validation_plan = None;
+        finalize_severity(finding, None);
+        note_unverified(finding, &format!("provider_usage_limit: {model}"));
+        return ReviewOutcome::Reviewed {
+            votes: Vec::new(),
+            answered,
+            call_failed: true,
+            refused: false,
+        };
     }
     ReviewOutcome::Reviewed {
         votes,
@@ -2890,6 +2918,60 @@ pub(crate) mod tests {
             "a citation check failure is a check, not a format break"
         );
         assert!(guard_error(&f), "{:?}", f.evidence);
+    }
+
+    #[tokio::test]
+    async fn usage_limit_in_prosecutor_reopens_the_refutation() {
+        struct ProsecutorLimit(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl LlmCaller for ProsecutorLimit {
+            async fn complete(&self, _: &str) -> crate::llm::Result<String> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(REFUTED.replace("unreachable", "not_attacker_controlled"))
+                } else {
+                    Err(crate::llm::LlmError::UsageLimit("m".into()))
+                }
+            }
+        }
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        let caller = ProsecutorLimit(std::sync::atomic::AtomicUsize::new(0));
+        let mut policy = plan(1);
+        policy.policy.prosecutor = true;
+        let out = review_with(dir.path(), &mut f, &caller, policy).await;
+        assert_eq!(caller.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(f.status, FindingStatus::Candidate);
+        assert!(votes_of(&out).is_empty());
+    }
+
+    #[tokio::test]
+    async fn usage_limit_after_a_refuter_vote_leaves_no_verdict() {
+        struct LimitAfterVote(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl LlmCaller for LimitAfterVote {
+            async fn complete(&self, _: &str) -> crate::llm::Result<String> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(REFUTED.into())
+                } else {
+                    Err(crate::llm::LlmError::UsageLimit("m".into()))
+                }
+            }
+        }
+        let dir = repo_with_db();
+        let mut f = sample_finding();
+        let caller = LimitAfterVote(std::sync::atomic::AtomicUsize::new(0));
+        let out = review_with(dir.path(), &mut f, &caller, plan(3)).await;
+        assert_eq!(f.status, FindingStatus::Candidate);
+        assert!(votes_of(&out).is_empty());
+        assert_eq!(
+            f.evidence_level(),
+            crate::audit::evidence_level::EvidenceLevel::StaticOnly
+        );
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.detail == "verify_error: provider_usage_limit: m")
+        );
     }
 
     #[tokio::test]

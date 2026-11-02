@@ -420,12 +420,20 @@ impl LlmCaller for CliCaller {
                 )));
             }
         };
-        if let Err(e) = write_res {
-            return Err(LlmError::Executor(format!("cannot write prompt: {e}")));
-        }
         let status = status.map_err(|e| LlmError::Executor(format!("wait failed: {e}")))?;
         let stdout_text = String::from_utf8_lossy(&out).to_string();
         if !status.success() {
+            if super::usage_limit::cli_exhausted(
+                &self.spec.program,
+                &String::from_utf8_lossy(&err),
+                prompt,
+            ) || super::usage_limit::cli_exhausted(
+                &self.spec.program,
+                &String::from_utf8_lossy(&out),
+                prompt,
+            ) {
+                return Err(LlmError::UsageLimit(self.spec.program.clone()));
+            }
             let tail = String::from_utf8_lossy(&err);
             let tail = crate::util::mask_sensitive_text(tail.trim());
             return Err(LlmError::Executor(format!(
@@ -434,6 +442,9 @@ impl LlmCaller for CliCaller {
                 status,
                 crate::util::truncate_bytes(&tail, 400)
             )));
+        }
+        if let Err(e) = write_res {
+            return Err(LlmError::Executor(format!("cannot write prompt: {e}")));
         }
         let reply = extract_reply(&self.spec.output, &stdout_text, &out_file)?;
         self.spec.check_output_cap(&reply)?;
@@ -700,6 +711,106 @@ mod tests {
         );
         assert!(parse_agy_stream(&empty).is_err());
         assert!(parse_agy_stream("not json at all").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_limit_early_exit_does_not_hide_behind_broken_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("codex");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf usage_limit_reached >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let caller = CliCaller {
+            spec: CliSpec {
+                program: script.to_string_lossy().into(),
+                args: vec![],
+                prompt_via: PromptVia::Stdin,
+                output: OutputMode::Stdout,
+                model: None,
+                timeout: Duration::from_secs(5),
+                env_passthrough: vec![],
+                max_output_tokens: None,
+                output_cap_env: None,
+            },
+        };
+        assert!(matches!(
+            caller.complete(&"x".repeat(1024 * 1024)).await,
+            Err(LlmError::UsageLimit(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_limit_echoed_prompt_is_ordinary_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("codex");
+        std::fs::write(&script, "#!/bin/sh\n/bin/cat >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let caller = CliCaller {
+            spec: CliSpec {
+                program: script.to_string_lossy().into(),
+                args: vec![],
+                prompt_via: PromptVia::Stdin,
+                output: OutputMode::Stdout,
+                model: None,
+                timeout: Duration::from_secs(5),
+                env_passthrough: vec![],
+                max_output_tokens: None,
+                output_cap_env: None,
+            },
+        };
+        assert!(matches!(
+            caller
+                .complete("Repository text: USAGE_LIMIT_REACHED")
+                .await,
+            Err(LlmError::Executor(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_limit_only_inspects_failed_cli_stdout_or_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        for (provider, marker) in [
+            ("claude", "You've hit your limit"),
+            ("codex", "usage_limit_reached"),
+            ("grok", "You hit your weekly limit."),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join(provider);
+            for (exit, stream) in [(0, 1), (0, 2), (1, 1), (1, 2)] {
+                std::fs::write(&script, format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' \"{marker}\" >&{stream}\nexit {exit}\n")).unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let caller = CliCaller {
+                    spec: CliSpec {
+                        program: script.to_string_lossy().into(),
+                        args: vec![],
+                        prompt_via: PromptVia::Stdin,
+                        output: OutputMode::Stdout,
+                        model: None,
+                        timeout: Duration::from_secs(5),
+                        env_passthrough: vec![],
+                        max_output_tokens: None,
+                        output_cap_env: None,
+                    },
+                };
+                let result = caller.complete("test").await;
+                if exit == 0 {
+                    assert!(result.is_ok(), "{provider}: {result:?}");
+                } else {
+                    assert!(
+                        matches!(result, Err(LlmError::UsageLimit(_))),
+                        "{provider}: {result:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

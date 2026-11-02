@@ -315,6 +315,10 @@ mod tests {
 
     fn report(findings: Vec<Finding>) -> AuditReport {
         AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             schema_version: 2,
             scope: None,
             repo: "/r".into(),

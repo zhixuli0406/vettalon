@@ -564,6 +564,17 @@ impl LlmCaller for ContainerCliCaller {
             Err(error) => return Err(LlmError::Executor(format!("wait failed: {error}"))),
         };
         if !status.success() {
+            if super::usage_limit::cli_exhausted(
+                &self.spec.program,
+                &String::from_utf8_lossy(&err),
+                prompt,
+            ) || super::usage_limit::cli_exhausted(
+                &self.spec.program,
+                &String::from_utf8_lossy(&out),
+                prompt,
+            ) {
+                return Err(LlmError::UsageLimit(self.spec.program.clone()));
+            }
             let tail = crate::util::mask_sensitive_text(String::from_utf8_lossy(&err).trim());
             return Err(LlmError::Executor(format!(
                 "{} in container exited with {}: {}",

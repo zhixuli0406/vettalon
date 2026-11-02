@@ -363,6 +363,7 @@ impl EngineAuditor {
         let opts = crate::audit::ScanOptions {
             repo_path: dir.to_path_buf(),
             diff_base: None,
+            since_last: false,
             profile: "deep".into(),
             report: None,
             sarif: None,

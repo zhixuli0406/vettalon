@@ -1,3 +1,4 @@
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -7,6 +8,10 @@ use vettalon::audit::schema::{ModelInfo, ProfileMode};
 use vettalon::audit::{self, ScanOptions};
 use vettalon::config::{Config, Role};
 use vettalon::llm::ModelHandle;
+use vettalon::remediation::{
+    preflight_new_output, read_regular_capped, remediation_context, write_new_remediation_output,
+    write_new_remediation_pair, write_new_text_output,
+};
 
 #[derive(Parser)]
 #[command(
@@ -35,6 +40,9 @@ struct ScanArgs {
     /// Deep PR scope relative to a Git ref. Quick accepts but ignores this flag.
     #[arg(long, value_name = "REF", value_parser = vettalon::audit::diff_scope::validate_ref)]
     diff_base: Option<String>,
+    /// Deep scan since the newest compatible clean saved report.
+    #[arg(long)]
+    since_last: bool,
     /// quick = OSS scanners only; deep = + AI audit and review.
     #[arg(long, default_value = "quick")]
     profile: String,
@@ -363,6 +371,11 @@ struct ReproduceArgs {
     /// Write the versioned target-PoC receipt here (0600).
     #[arg(long)]
     out: PathBuf,
+    /// Also write a standalone Python regression test here (0600), once the
+    /// sandbox has seen it fail on this source. It passes when this input no
+    /// longer has the effect; the finding's status does not change.
+    #[arg(long, value_name = "PATH")]
+    emit_test: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -479,6 +492,44 @@ enum VerificationAction {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
+    /// Serve local MCP tools over stdio.
+    Mcp {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        report: Option<PathBuf>,
+        #[arg(long)]
+        test_command: Option<String>,
+        #[arg(long, default_value = vettalon::sandbox::DEFAULT_POC_IMAGE)]
+        poc_image: String,
+    },
+    /// Record a human decision in a new report, or inspect noise proposals.
+    Triage {
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(
+            long,
+            required_unless_present = "proposals",
+            conflicts_with = "proposals"
+        )]
+        finding: Option<String>,
+        #[arg(long, required_unless_present = "proposals", conflicts_with = "proposals", value_parser = ["confirmed", "refuted", "suppressed"])]
+        decision: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "proposals",
+            conflicts_with = "proposals"
+        )]
+        reason: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "proposals",
+            conflicts_with = "proposals"
+        )]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        proposals: bool,
+    },
     /// Explain a Vettalon code offline (reference pages are in English).
     Explain {
         #[arg(
@@ -1092,6 +1143,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
     let ScanArgs {
         path,
         diff_base,
+        since_last,
         profile,
         config,
         finders,
@@ -1130,6 +1182,16 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
         refuter_budget,
         poc_budget,
     } = args;
+    if since_last
+        && (no_prior
+            || diff_base.is_some()
+            || profile.parse::<ProfileMode>() != Ok(ProfileMode::Deep))
+    {
+        eprintln!(
+            "[vettalon] --since-last requires --profile deep and conflicts with --no-prior and --diff-base"
+        );
+        return 2;
+    }
     // Budget flags fail fast, before any scanner or model runs: a value
     // that cannot fund one call is a configuration error, not a budget.
     let budget = match vettalon::budget::validate_scan(vettalon::budget::ScanBudgetFlags {
@@ -1379,6 +1441,7 @@ async fn cmd_scan(args: ScanArgs) -> i32 {
     let opts = ScanOptions {
         repo_path: path,
         diff_base,
+        since_last,
         profile,
         report,
         sarif,
@@ -2396,231 +2459,6 @@ fn remediation_fail(error: impl std::fmt::Display) -> i32 {
     2
 }
 
-fn read_regular_capped(path: &Path, cap: u64, label: &str) -> Result<String, String> {
-    use std::io::Read;
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("cannot inspect {label} {}: {e}", path.display()))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > cap {
-        return Err(format!(
-            "{label} must be a regular non-symlink file no larger than {cap} bytes"
-        ));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|e| format!("cannot open {label} {}: {e}", path.display()))?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    (&mut file)
-        .take(cap + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read {label} {}: {e}", path.display()))?;
-    if bytes.len() as u64 > cap || file.metadata().map(|m| m.len()).ok() != Some(metadata.len()) {
-        return Err(format!("{label} changed while it was read"));
-    }
-    String::from_utf8(bytes).map_err(|_| format!("{label} must be UTF-8"))
-}
-
-fn remediation_context(
-    repo: &Path,
-    report_path: &Path,
-    finding_id: &str,
-    target_path: &Path,
-) -> Result<
-    (
-        PathBuf,
-        vettalon::audit::schema::AuditReport,
-        vettalon::audit::schema::Finding,
-        vettalon::audit::target_poc::TargetCall,
-    ),
-    String,
-> {
-    let repo = std::fs::canonicalize(repo)
-        .map_err(|e| format!("cannot resolve repository {}: {e}", repo.display()))?;
-    if !repo.is_dir() {
-        return Err("repository path is not a directory".into());
-    }
-    let report = audit::load_report_for_delivery(report_path)?;
-    let reported_repo = std::fs::canonicalize(&report.repo).map_err(|e| {
-        format!(
-            "cannot resolve the report repository {:?}: {e}; reproduce/fix-check refuses a moved or unavailable tree",
-            report.repo
-        )
-    })?;
-    if repo != reported_repo {
-        return Err(format!(
-            "repository identity mismatch: report names {}, command names {}",
-            reported_repo.display(),
-            repo.display()
-        ));
-    }
-    let exact: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|finding| finding.id == finding_id)
-        .collect();
-    let matches = if exact.is_empty() {
-        report
-            .findings
-            .iter()
-            .filter(|finding| finding.id.starts_with(finding_id))
-            .collect::<Vec<_>>()
-    } else {
-        exact
-    };
-    let finding = match matches.as_slice() {
-        [finding] => (*finding).clone(),
-        [] => return Err(format!("finding {finding_id:?} is not in the report")),
-        _ => return Err(format!("finding prefix {finding_id:?} is ambiguous")),
-    };
-    let target_raw = read_regular_capped(target_path, 8 * 1024, "target call")?;
-    let target = vettalon::audit::target_poc::parse_target_call(&target_raw)
-        .map_err(|reason| format!("target call refused: {reason}"))?;
-    if target.file != finding.file {
-        return Err(format!(
-            "target file {:?} does not match finding file {:?}",
-            target.file, finding.file
-        ));
-    }
-    Ok((repo, report, finding, target))
-}
-
-fn encode_remediation_output<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
-    serde_json::to_vec_pretty(value)
-        .map_err(|e| format!("cannot serialize remediation output: {e}"))
-}
-
-/// Resolve a brand-new output without following a symlink in its parent
-/// chain. Remediation outputs contain source evidence and must never replace
-/// an operator-owned file, symlink target or hardlink.
-fn preflight_new_output(path: &Path) -> Result<PathBuf, String> {
-    use std::path::Component;
-
-    if path.file_name().is_none()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(format!(
-            "unsafe output path {}; '..' is refused",
-            path.display()
-        ));
-    }
-    let raw_absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| format!("cannot resolve current directory: {e}"))?
-            .join(path)
-    };
-    let mut absolute = PathBuf::new();
-    for component in raw_absolute.components() {
-        if !matches!(component, Component::CurDir) {
-            absolute.push(component.as_os_str());
-        }
-    }
-    let parent = absolute
-        .parent()
-        .ok_or_else(|| format!("output has no parent: {}", path.display()))?;
-    let mut cursor = PathBuf::new();
-    for component in parent.components() {
-        cursor.push(component.as_os_str());
-        if matches!(component, Component::CurDir) {
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(&cursor)
-            .map_err(|e| format!("cannot inspect output parent {}: {e}", cursor.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(format!(
-                "output parent must be a real directory, not a symlink: {}",
-                cursor.display()
-            ));
-        }
-    }
-    match std::fs::symlink_metadata(&absolute) {
-        Ok(_) => Err(format!(
-            "output already exists and will not be replaced: {}",
-            absolute.display()
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
-        Err(error) => Err(format!(
-            "cannot inspect output {}: {error}",
-            absolute.display()
-        )),
-    }
-}
-
-fn create_new_private_output(path: &Path) -> Result<std::fs::File, String> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    options
-        .open(path)
-        .map_err(|e| format!("cannot create new output {}: {e}", path.display()))
-}
-
-fn write_new_remediation_output<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    use std::io::Write;
-
-    let encoded = encode_remediation_output(value)?;
-    let path = preflight_new_output(path)?;
-    let mut file = create_new_private_output(&path)?;
-    if let Err(error) = file.write_all(&encoded).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(&path);
-        return Err(format!("cannot write output {}: {error}", path.display()));
-    }
-    Ok(())
-}
-
-fn write_new_remediation_pair<A: serde::Serialize, B: serde::Serialize>(
-    first_path: &Path,
-    first: &A,
-    second_path: &Path,
-    second: &B,
-) -> Result<(), String> {
-    use std::io::Write;
-
-    let first_bytes = encode_remediation_output(first)?;
-    let second_bytes = encode_remediation_output(second)?;
-    let first_path = preflight_new_output(first_path)?;
-    let second_path = preflight_new_output(second_path)?;
-    if first_path == second_path {
-        return Err("--out and --report-out must be different paths".into());
-    }
-    let mut first_file = create_new_private_output(&first_path)?;
-    let mut second_file = match create_new_private_output(&second_path) {
-        Ok(file) => file,
-        Err(error) => {
-            drop(first_file);
-            let _ = std::fs::remove_file(&first_path);
-            return Err(error);
-        }
-    };
-    let write_result = first_file
-        .write_all(&first_bytes)
-        .and_then(|()| first_file.sync_all())
-        .and_then(|()| second_file.write_all(&second_bytes))
-        .and_then(|()| second_file.sync_all());
-    if let Err(error) = write_result {
-        drop(first_file);
-        drop(second_file);
-        let _ = std::fs::remove_file(&first_path);
-        let _ = std::fs::remove_file(&second_path);
-        return Err(format!("cannot write remediation outputs: {error}"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod remediation_output_tests {
     use super::*;
@@ -2721,6 +2559,10 @@ mod remediation_output_tests {
         let finding_id = finding.id.clone();
         let findings = vec![finding];
         let report = AuditReport {
+            repo_commit: None,
+            repo_tree_clean: None,
+            since_last: None,
+            attack_classes: None,
             schema_version: 2,
             scope: None,
             repo: std::fs::canonicalize(&repo)
@@ -3192,8 +3034,32 @@ async fn cmd_reproduce(args: ReproduceArgs) -> i32 {
             Ok(value) => value,
             Err(error) => return remediation_fail(error),
         };
-    let receipt =
-        audit::target_poc::run_target_poc(&repo, &finding, &target, &args.poc_image).await;
+    if let Some(path) = args.emit_test.as_deref() {
+        let checked = preflight_new_output(path).and_then(|test| {
+            if test == preflight_new_output(&args.out)? {
+                Err("--emit-test and --out must be different paths".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = checked {
+            return remediation_fail(error);
+        }
+    }
+    let audit::target_poc::TargetPocWithTest {
+        receipt,
+        test_source,
+    } = match args.emit_test {
+        Some(_) => {
+            audit::target_poc::run_target_poc_with_test(&repo, &finding, &target, &args.poc_image)
+                .await
+        }
+        None => audit::target_poc::TargetPocWithTest {
+            receipt: audit::target_poc::run_target_poc(&repo, &finding, &target, &args.poc_image)
+                .await,
+            test_source: None,
+        },
+    };
     if let Err(error) = write_new_remediation_output(&args.out, &receipt) {
         return remediation_fail(error);
     }
@@ -3202,6 +3068,23 @@ async fn cmd_reproduce(args: ReproduceArgs) -> i32 {
         receipt.outcome,
         args.out.display()
     );
+    if let Some(path) = args.emit_test.as_deref() {
+        let Some(source) = test_source else {
+            let reason = receipt
+                .regression_test
+                .as_ref()
+                .and_then(|record| record.reason.as_deref())
+                .unwrap_or("regression_test_unavailable");
+            return remediation_fail(format!("no regression test written: {reason}"));
+        };
+        if let Err(error) = write_new_text_output(path, &source) {
+            return remediation_fail(error);
+        }
+        eprintln!(
+            "[vettalon] regression test: failed on this source as expected; test={}",
+            path.display()
+        );
+    }
     match receipt.outcome {
         audit::target_poc::TargetPocOutcome::EffectObserved => 0,
         audit::target_poc::TargetPocOutcome::EffectAbsent => 1,
@@ -3451,6 +3334,105 @@ async fn main() -> ExitCode {
     }
     vettalon::lang::set(vettalon::lang::detect(cli.lang.as_deref()));
     let code = match cli.command {
+        Command::Mcp {
+            repo,
+            report,
+            test_command,
+            poc_image,
+        } => {
+            let command = match test_command {
+                Some(command) => Ok(Some(command)),
+                None if home_dir().join("config.toml").is_file() => load_config(None, Some(&repo))
+                    .map(|(cfg, _)| cfg.fix_check.and_then(|c| c.test_command)),
+                None => Ok(None),
+            };
+            match command {
+                Err(e) => remediation_fail(e),
+                Ok(command) => match tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let backend = vettalon::mcp::LocalBackend::new(
+                        &repo,
+                        report,
+                        &home_dir(),
+                        command,
+                        poc_image,
+                    )?;
+                    vettalon::mcp::serve(
+                        &mut vettalon::mcp::State::new(backend),
+                        std::io::stdin().lock(),
+                        std::io::stdout().lock(),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                {
+                    Ok(Ok(())) => 0,
+                    Ok(Err(e)) => remediation_fail(e),
+                    Err(e) => remediation_fail(e),
+                },
+            }
+        }
+        Command::Triage {
+            report,
+            finding,
+            decision,
+            reason,
+            out,
+            proposals,
+        } => {
+            let result = (|| -> Result<(), String> {
+                if proposals {
+                    println!("{}", vettalon::mcp::print_proposals(&report, &home_dir())?);
+                    return Ok(());
+                }
+                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                    return Err("The decision must be made by a person at a terminal (stdin and stdout must both be TTYs).".into());
+                }
+                let mut value = audit::load_report_for_delivery(&report)?;
+                let selected = vettalon::mcp::select_finding(&value, finding.as_deref().unwrap())?;
+                let id = selected.id.clone();
+                let decision = decision.unwrap();
+                let display = |text: &str| {
+                    text.chars()
+                        .flat_map(|c| {
+                            if c.is_control() {
+                                c.escape_default().collect::<Vec<_>>()
+                            } else {
+                                vec![c]
+                            }
+                        })
+                        .collect::<String>()
+                };
+                println!(
+                    "Finding: {}\nTitle: {}\nCurrent status: {}\nDecision: {}",
+                    display(&id),
+                    display(&selected.title),
+                    serde_json::to_value(selected.status).unwrap(),
+                    decision
+                );
+                print!("Type the full finding id exactly to apply this decision: ");
+                std::io::stdout().flush().map_err(|e| e.to_string())?;
+                let mut confirmation = String::new();
+                std::io::stdin()
+                    .read_line(&mut confirmation)
+                    .map_err(|e| e.to_string())?;
+                let confirmation = confirmation.strip_suffix('\n').unwrap_or(&confirmation);
+                let confirmation = confirmation.strip_suffix('\r').unwrap_or(confirmation);
+                if confirmation != id {
+                    return Err("Decision aborted: finding id did not match exactly.".into());
+                }
+                let decision = serde_json::from_value(serde_json::Value::String(decision))
+                    .map_err(|e| e.to_string())?;
+                audit::triage::apply(&mut value, &id, decision, reason.as_deref().unwrap())?;
+                if !audit::validation_errors(&value).is_empty() {
+                    return Err("triaged report failed validation".into());
+                }
+                write_new_remediation_output(out.as_deref().unwrap(), &value)
+            })();
+            match result {
+                Ok(()) => 0,
+                Err(e) => remediation_fail(e),
+            }
+        }
         Command::Explain { code, list } => vettalon::explain::run(code.as_deref(), list),
         Command::Scan(args) => cmd_scan(args).await,
         Command::Validate { report } => audit::cmd_validate(&report).await,

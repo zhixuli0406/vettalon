@@ -20,6 +20,8 @@ The scan execution deadline stays 180 seconds by default, at most 600, plus at m
 
 JSON/SARIF are public CLI outputs. Paid Pro features and licensing are unchanged. This preview is distributed through the repository marketplace (`/plugin marketplace add zhixuli0406/vettalon`) and is not an official Anthropic directory listing.
 
+For the CLI MCP fix loop, see the [MCP reference](../../../../docs/MCP.md).
+
 ## License
 
 Apache-2.0.

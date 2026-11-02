@@ -4,6 +4,37 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 修正 Git 背景維護在 metadata 檢查期間移除暫存檔時，掃描可能失敗的問題。
+  Fixed scans failing when Git background maintenance removes a temporary file during the metadata check.
+
+## [0.7.0] - 2026-11-02
+
+本版主題：證明帶得走。重現成功的 finding 可以留下一支 failing test，coding agent 能接上修補迴圈，排程掃描只看上次之後的變更。Desktop 本版沒有更新，仍是 0.7.0。
+
+### 升級須知 / Upgrade notes
+
+- **Rust API 有不相容的 struct literal 變更。** `audit::schema::AuditReport` 新增 `repo_commit`、`repo_tree_clean`、`since_last`、`attack_classes`；`ScanOptions` 新增 `since_last`；`TargetPocReceipt` 新增 `regression_test`；`LlmError` 新增 `UsageLimit`，窮舉比對的程式要補一支。JSON 報告相容：新欄位都是選填，schema 維持 3，0.6.x 可以讀 0.7.0 的報告。
+  Rust struct literals must add the new fields on `AuditReport`, `ScanOptions` and `TargetPocReceipt`; exhaustive matches on `LlmError` need the `UsageLimit` arm. JSON reports stay compatible: the new fields are optional, the schema stays 3, and 0.6.x reads 0.7.0 reports.
+- **用量上限不再逐模組失敗。** 模型回報額度用完後，本次掃描不再呼叫它，受影響模組記為 `deferred`（`provider_usage_limit`），執行狀態是 `incomplete`。加上 `--save` 重跑同一指令會優先處理這些模組。
+  After a model reports exhausted quota it is not called again in that run; affected modules become `deferred` (`provider_usage_limit`) and the run is `incomplete`. Rerunning with `--save` prioritises them.
+
+### Added
+
+- `vettalon reproduce --emit-test PATH`：觀察到效果後寫出獨立的 Python `unittest` 回歸測試，不依賴 Vettalon，用的是 harness 相同的輸入與效果判定。測試要先在沙箱對同一份原始碼失敗、良性對照通過才會寫出，結果記在 receipt 的 `regression_test`。修好後測試變綠，但只代表這個輸入不再有效果，finding 狀態不變。測試使用固定的 `/tmp/vtl_*` 路徑，既有檔案一律不動，要依序執行。
+  `vettalon reproduce --emit-test PATH` writes a standalone Python `unittest` regression test with no Vettalon dependency, using the harness's inputs and effect checks. It is written only after it fails on the same source in the sandbox with the benign control passing; the result is in the receipt's `regression_test`. A green run means this input no longer has the effect, and the finding's status does not change. The test uses fixed `/tmp/vtl_*` paths, never touches existing files there, and must run serially.
+- `vettalon mcp`：本機 stdio MCP server，讓 coding agent 讀取報告、取得修補說明、重現、檢查修補，以及提出雜訊提案。綁定啟動時的 repo 與報告，工具參數不接受檔案路徑，不呼叫模型，沒有工具能改變 finding 狀態。`check_fix` 只接受改動 finding 所在檔案的 diff，在隔離副本上檢查，不套用修補。參考文件見 [docs/MCP.md](docs/MCP.md)。
+  `vettalon mcp` is a local stdio MCP server that lets a coding agent read a report, get a fix brief, reproduce, check a fix and propose noise. It is bound to a repository and report at startup, takes no file paths as arguments, calls no model, and no tool can change a finding's status. `check_fix` accepts a diff touching only the finding's file, checks it on an isolated copy and applies nothing. See [docs/MCP.md](docs/MCP.md).
+- `vettalon triage`：把人工判定寫進新報告，要在互動終端手打完整 finding id。這是護欄，不是安全邊界：同一使用者的程式仍能操作終端或直接改報告檔。`--proposals` 列出 agent 的雜訊提案。
+  `vettalon triage` writes a human decision to a new report and needs the full finding id typed at an interactive terminal. It is a guard-rail, not a security boundary: same-user software can still drive a terminal or edit a report. `--proposals` lists agents' noise proposals.
+- `vettalon scan --since-last`（deep）：自動選上一份合格的保存報告當基準，只審之後的變更；沒有變更就跳過，不呼叫模型，`--fail-on` 與 `--gate` 用基準報告重算。未變更檔案的 open finding 會帶進新報告，gate 持續看得到；未完成的掃描不推進基準，它的 finding、人工決定與延後模組會補進下一次。遇到會被讀取的 git-ignored 檔案、隱藏變更的 index 旗標，或沒有合格基準時，改做完整掃描。基準來自 `VETTALON_HOME`，不受信任的 CI 不要使用。
+  `vettalon scan --since-last` (deep) picks the last eligible saved report as a baseline and reviews only later changes. With no change it skips, calls no model and recomputes `--fail-on` and `--gate` from the baseline. Open findings in unchanged files carry into the new report so the gate keeps seeing them. An incomplete run does not advance the baseline, and its findings, human decisions and deferred modules feed the next run. It falls back to a full scan on readable git-ignored files, index flags that hide changes, or no eligible baseline. The baseline comes from `VETTALON_HOME`, so do not use this in untrusted CI.
+- 證據漏斗：掃描摘要與 SARIF（`vettalon.funnel`）列出 candidates、refuted、needs_human、poc_differential、fix_verified、human_confirmed，掃描器發現另計。由報告推導，不改 schema。
+  Evidence funnel: the scan summary and SARIF (`vettalon.funnel`) show candidates, refuted, needs_human, poc_differential, fix_verified and human_confirmed, with scanner findings counted separately. It is derived from the report and does not change the schema.
+- 用量上限斷路器：見升級須知。比對各家 CLI 失敗時的額度訊息與 HTTP `insufficient_quota`，暫時性 429 不算，prompt 裡出現的相同字句也不算。實際額度耗盡的情境還沒有用真實帳號驗證過。
+  Usage-limit breaker: see the upgrade notes. It matches each CLI's quota message on failure and HTTP `insufficient_quota`; transient 429s and phrases also present in the prompt do not count. It has not been exercised against a truly exhausted account.
+
 ## [0.6.1] - 2026-10-29
 
 ### Fixed
@@ -44,6 +75,9 @@
 - 深審的模組排序：沒有 git 歷史時原本只看檔案數，現在資料檔（`.json`、`.yaml`、`.eml` 等）不加分（`.github/` 等 CI 設定除外），`tests`／`benches`／`examples`／`fixtures` 這類輔助目錄一律排在原始碼模組之後（仍列入 coverage，沒有其他程式碼時照樣審）。
 
 ### Fixed
+
+- 修正 Git 背景維護在 metadata 檢查期間移除暫存檔時，掃描可能失敗的問題。
+  Fixed scans failing when Git background maintenance removes a temporary file during the metadata check.
 
 - `hunt` 把外殼 crate 報成審完：直接相依若只是 re-export 另一個 crate（xml-rs 1.0 → xml、liquid → liquid-core），實作所在的 crate 原本被當成 transitive 跳過，結果顯示 complete、實際沒審到解析器。現在自身程式碼少於 500 行、且整包 re-export 某個相依（`pub use dep::*;`／`pub extern crate dep;`）的 crate 會被標 `facade_of`，lockfile 實際連結的那個版本（每個外殼最多 3 個、只追一層，不含 derive／macro 輔助 crate）在計畫內的相依之後補審，記 `promoted_from`。補審另受 `--max-deps` 限制，`--hunt-budget` 下平分剩餘時間；有已知 advisory 時照一般政策略過；實作 crate 不在 lockfile 時 hunt 標為未完成（`facade_implementation_unresolved`）。
 - `hunt` 審套件原始碼包時，mail-parser 的 `resources/` 測試資料（數百個 `.json`／`.eml`）佔滿模組名額，`src/` 一個檔都沒審；同上排序修正。

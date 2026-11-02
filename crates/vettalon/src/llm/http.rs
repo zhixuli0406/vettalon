@@ -81,14 +81,22 @@ impl LlmCaller for OpenAiCompatCaller {
             )));
         }
         let text = String::from_utf8_lossy(&bytes).to_string();
-        if !status.is_success() {
-            return Err(LlmError::Executor(format!(
-                "HTTP {status}: {}",
-                crate::util::truncate_bytes(&crate::util::mask_sensitive_text(&text), 400)
-            )));
-        }
-        parse_reply(&text)
+        decode_response(status, &text)
     }
+}
+
+/// Classify only provider errors; successful model content bypasses detection.
+fn decode_response(status: reqwest::StatusCode, text: &str) -> Result<String> {
+    if !status.is_success() {
+        if super::usage_limit::http_exhausted(text) {
+            return Err(LlmError::UsageLimit("insufficient_quota".into()));
+        }
+        return Err(LlmError::Executor(format!(
+            "HTTP {status}: {}",
+            crate::util::truncate_bytes(&crate::util::mask_sensitive_text(text), 400)
+        )));
+    }
+    parse_reply(text)
 }
 
 /// Pull `choices[0].message.content`. A provider-side refusal field
@@ -163,6 +171,31 @@ mod tests {
             Err(LlmError::Refused(_))
         ));
         assert!(matches!(parse_reply("nope"), Err(LlmError::Executor(_))));
+    }
+
+    #[test]
+    fn usage_limit_http_requires_error_status_and_quota_code() {
+        for (status, body, limited) in [
+            (429, r#"{"error":{"code":"insufficient_quota"}}"#, true),
+            (429, r#"{"error":{"type":"insufficient_quota"}}"#, true),
+            (429, r#"{"error":{"code":"rate_limit_exceeded"}}"#, false),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"insufficient_quota"}}]}"#,
+                false,
+            ),
+            (200, r#"{"error":{"code":"insufficient_quota"}}"#, false),
+        ] {
+            let result = decode_response(reqwest::StatusCode::from_u16(status).unwrap(), body);
+            assert_eq!(
+                matches!(result, Err(LlmError::UsageLimit(_))),
+                limited,
+                "{result:?}"
+            );
+            if status == 200 && body.contains("choices") {
+                assert_eq!(result.unwrap(), "insufficient_quota");
+            }
+        }
     }
 
     #[tokio::test]

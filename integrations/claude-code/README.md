@@ -64,6 +64,8 @@ A relative-path marketplace uses `readFromFolder` / `folderVersion` observations
 
 Local validation records are not distributed with the public plugin. See the [plugin guide](plugins/vettalon/README.md) and [experimental tools](../../docs/EXPERIMENTAL-TOOLS.md). JSON/SARIF are free CLI outputs; paid deliverables and licensing remain governed by the product documentation.
 
+For the CLI MCP fix loop, see the [MCP reference](../../docs/MCP.md).
+
 ## License
 
 Apache-2.0, matching the public CLI. No third-party scanner or model license is changed.

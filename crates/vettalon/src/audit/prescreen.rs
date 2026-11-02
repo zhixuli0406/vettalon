@@ -335,6 +335,9 @@ async fn score_one(
     {
         Err(_) => (CallResult::Failed("timed out".into()), sent, 0),
         Ok(Err(LlmError::Refused(_))) => (CallResult::Refused, sent, 0),
+        Ok(Err(LlmError::UsageLimit(_))) => {
+            (CallResult::Failed("provider_usage_limit".into()), sent, 0)
+        }
         Ok(Err(LlmError::Executor(e))) => (
             CallResult::Failed(crate::util::truncate_bytes(&e, 200).to_string()),
             sent,
