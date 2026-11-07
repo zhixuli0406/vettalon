@@ -106,7 +106,9 @@ steps:
   - uses: zhixuli0406/vettalon-action@v1
 ```
 
-To run scans from Claude Code, install the plugin (preview; it still needs the CLI above): `/plugin install vettalon --marketplace zhixuli0406/vettalon`. See [integrations/claude-code](integrations/claude-code/README.md).
+To run scans from Claude Code, install the skills-only plugin (0.2.0; it requires the separately installed CLI above): `/plugin install vettalon --marketplace zhixuli0406/vettalon`. See [integrations/claude-code](integrations/claude-code/README.md).
+
+The skills do not add custom commands, host tools or hooks. A deep-scan roster can still configure host programs, tools, arguments, environment passthrough and endpoints; the CLI does not block these for the plugin. Only the user's roster review and explicit confirmation protect against these settings; the skill cannot verify them. Deep scans require an explicit yes for every item in the scan skill's roster checklist, stopping on any no or unsure answer. The skill defaults to 5 modules / 120 AI seconds and requires 1–40 modules / 60–300 AI seconds. The CLI itself caps AI audit modules at 40. The 300-second AI budget cap is enforced only by the skill; the CLI applies whatever `--time-budget` is passed.
 
 ## Usage
 

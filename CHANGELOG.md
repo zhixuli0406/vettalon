@@ -13,8 +13,16 @@
 
 ### Changed
 
+- **Breaking change for Claude Code plugin users:** plugin 0.2.0 is skills-only and calls the separately installed Vettalon CLI directly through the host's normal Bash approval policy and sandbox. The CLI itself caps AI audit modules at 40; the skill also requires 1–40. The 300-second AI budget cap and egress consent are skill instructions; the CLI applies whatever `--time-budget` is passed. The skills do not add custom commands, host tools or hooks. A deep-scan roster can still configure host programs, tools, arguments, environment passthrough and endpoints; the CLI does not block these for the plugin. Only the user's roster review and explicit confirmation protect against these settings; the skill cannot verify them. Deep scans require an explicit yes for every roster checklist item and stop on any no or unsure answer.
+  **Claude Code plugin 使用者的不相容變更：** 0.2.0 改為 skills-only，透過 host 的一般 Bash 核准政策與沙箱直接呼叫另行安裝的 CLI；CLI 本身將 AI 審查模組數限制在 40 個，技能也要求 1–40 個；300 秒 AI 預算上限與 egress 同意由技能指示約束，CLI 會套用傳入的 `--time-budget` 值。技能不會加入自訂命令、主機工具或 hooks，但 deep scan 的 roster 仍可設定主機程式、工具、引數、環境變數傳遞與端點，CLI 不會為 plugin 阻擋；唯一的防護是使用者自行檢查 roster 並明確確認，技能無法驗證。執行前必須取得 roster 檢查清單每一項明確肯定的答覆，任何一項否定或不確定都必須停止。
+
 - 將 zip 從 9.0.5 更新至 9.1.3。
   Updated zip from 9.0.5 to 9.1.3.
+
+### Removed
+
+- **Breaking change:** removed the plugin's bundled Python wrapper, process supervisor and deadline capture. The plugin no longer needs Python; existing repo-root runtime utilities remain available for other consumers. The historical wrapper-based launch demo is retired; its guide now documents direct CLI use.
+  **不相容變更：** 移除 plugin 內附的 Python wrapper、程序監督器與期限擷取；plugin 不再需要 Python。repo-root runtime 保留供其他程式使用。
 
 ### Fixed
 

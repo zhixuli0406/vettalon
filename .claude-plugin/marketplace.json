@@ -3,14 +3,15 @@
   "owner": {
     "name": "Dudu Technology Ltd."
   },
-  "description": "Vettalon for Claude Code: explicit setup checks, bounded CLI scans and JSON/SARIF report reading.",
+  "description": "Skills-only Vettalon integration for Claude Code; requires the separately installed CLI.",
   "plugins": [
     {
       "name": "vettalon",
       "source": "./integrations/claude-code/plugins/vettalon",
-      "description": "Bounded, explicit Vettalon CLI scans and local SARIF reports (preview).",
+      "description": "Manual skills for installed Vettalon CLI checks, scans and JSON/SARIF report reading.",
       "homepage": "https://github.com/zhixuli0406/vettalon/tree/main/integrations/claude-code",
-      "license": "Apache-2.0"
+      "license": "Apache-2.0",
+      "version": "0.2.0"
     }
   ]
 }
