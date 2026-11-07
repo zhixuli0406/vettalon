@@ -7,8 +7,9 @@
     {
       "name": "vettalon",
       "source": "./plugins/vettalon",
-      "description": "Bounded, explicit Vettalon CLI scans and local SARIF reports (preview)."
+      "description": "Manual skills for installed Vettalon CLI checks, scans and JSON/SARIF report reading.",
+      "version": "0.2.0"
     }
   ],
-  "description": "Local preview of explicit, bounded Vettalon CLI integration."
+  "description": "Skills-only Vettalon integration for Claude Code; requires the separately installed CLI."
 }

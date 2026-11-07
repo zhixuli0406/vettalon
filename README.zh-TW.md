@@ -94,7 +94,9 @@ steps:
   - uses: zhixuli0406/vettalon-action@v1
 ```
 
-在 Claude Code 裡掃描，可以裝 plugin（預覽版，仍需要上面安裝的 CLI）：`/plugin install vettalon --marketplace zhixuli0406/vettalon`，說明見 [integrations/claude-code](integrations/claude-code/README.md)。
+在 Claude Code 裡掃描，可以裝 skills-only plugin（0.2.0，需另行安裝上面的 CLI）：`/plugin install vettalon --marketplace zhixuli0406/vettalon`，說明見 [integrations/claude-code](integrations/claude-code/README.md)。
+
+技能不會加入自訂命令、主機工具或 hooks。但 deep scan 的 roster 仍可設定主機程式、工具、引數、環境變數傳遞與端點，CLI 不會為 plugin 阻擋這些設定；唯一的防護是使用者自行檢查 roster 並明確確認，技能無法驗證。執行前，Claude 必須展示 scan 技能的 roster 檢查清單，取得每一項明確肯定的答覆；任何一項否定或不確定都必須停止。技能預設使用 5 個模組／120 秒 AI 預算，要求 1–40 個模組／60–300 秒 AI 預算。CLI 本身會將 AI 審查模組數限制在 40 個；300 秒 AI 預算上限僅由技能約束，CLI 會套用傳入的 `--time-budget` 值。
 
 ## 使用
 

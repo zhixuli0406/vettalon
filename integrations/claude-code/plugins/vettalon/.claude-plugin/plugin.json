@@ -1,1 +1,14 @@
-{"name":"vettalon","version":"0.1.0-preview.1","description":"Explicit Vettalon CLI setup checks, bounded scans and JSON/SARIF report access.","author":{"name":"Dudu Technology Ltd."},"license":"Apache-2.0","homepage":"https://github.com/zhixuli0406/vettalon/tree/main/integrations/claude-code","repository":"https://github.com/zhixuli0406/vettalon","documentationUrl":"https://github.com/zhixuli0406/vettalon/blob/main/integrations/claude-code/plugins/vettalon/README.md","supportUrl":"https://github.com/zhixuli0406/vettalon/issues","privacyPolicyUrl":"https://vettalon.dudustudio.monster/en/privacy/"}
+{
+  "name": "vettalon",
+  "version": "0.2.0",
+  "description": "Manually invoked skills for installed Vettalon CLI setup checks, scans and local JSON/SARIF reports.",
+  "author": {
+    "name": "Dudu Technology Ltd."
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/zhixuli0406/vettalon/tree/main/integrations/claude-code",
+  "repository": "https://github.com/zhixuli0406/vettalon",
+  "documentationUrl": "https://github.com/zhixuli0406/vettalon/blob/main/integrations/claude-code/plugins/vettalon/README.md",
+  "supportUrl": "https://github.com/zhixuli0406/vettalon/issues",
+  "privacyPolicyUrl": "https://vettalon.dudustudio.monster/en/privacy/"
+}
