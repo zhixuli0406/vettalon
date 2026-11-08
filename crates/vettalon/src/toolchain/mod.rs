@@ -36,7 +36,7 @@ pub use cli::{AuditOptions, Format, cmd_audit, cmd_pin, cmd_pins, parse_fail_on}
 pub const EXIT_INCOMPLETE: i32 = 2;
 
 /// Version of the static rule set; recorded in every report.
-pub const RULES_VERSION: &str = "tc-rules-1";
+pub const RULES_VERSION: &str = "tc-rules-2";
 /// JSON schema id of the audit report.
 pub const SCHEMA: &str = "vettalon.toolchain/1";
 /// Hidden override of the user's home directory (tests only).

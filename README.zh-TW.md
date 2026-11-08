@@ -266,7 +266,7 @@ vettalon toolchain pin                        # 記下目前的雜湊（有 high
 vettalon toolchain audit --format sarif --out toolchain.sarif --fail-on medium
 ```
 
-指令、掃描位置、規則（TC001–TC012、MC001–MC006、PN001–PN003）與報告格式見 [docs/TOOLCHAIN-AUDIT.md](docs/TOOLCHAIN-AUDIT.md)（英文）。
+指令、掃描位置、規則（TC001–TC013、MC001–MC006、PN001–PN003）與報告格式見 [docs/TOOLCHAIN-AUDIT.md](docs/TOOLCHAIN-AUDIT.md)（英文）。
 
 ### 漏洞提交草稿
 

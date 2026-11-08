@@ -283,7 +283,7 @@ vettalon toolchain pin                        # record the current hashes (refus
 vettalon toolchain audit --format sarif --out toolchain.sarif --fail-on medium
 ```
 
-Commands, discovery locations, rules (TC001–TC012, MC001–MC006, PN001–PN003) and the report schema: [docs/TOOLCHAIN-AUDIT.md](docs/TOOLCHAIN-AUDIT.md).
+Commands, discovery locations, rules (TC001–TC013, MC001–MC006, PN001–PN003) and the report schema: [docs/TOOLCHAIN-AUDIT.md](docs/TOOLCHAIN-AUDIT.md).
 
 ### Disclosure drafts
 

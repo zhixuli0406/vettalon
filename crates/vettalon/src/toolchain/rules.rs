@@ -1,4 +1,4 @@
-//! Static text rules TC001–TC005 and TC007–TC009 (`tc-rules-1`).
+//! Static text rules TC001–TC005, TC007–TC009 and TC013 (`tc-rules-2`).
 //!
 //! Regex and structure based, deliberately conservative. A clean result
 //! means "no rule matched", not "safe". TC006, TC010, TC011 and TC012 come
@@ -45,7 +45,7 @@ static LINE_RULES: LazyLock<Vec<LineRule>> = LazyLock::new(|| {
             re: r(&format!(
                 r"(?i)\b(?:curl|wget|fetch)\b[^\n|]*\|\s*(?:{SHELLS})\b"
             )),
-            keep: always,
+            keep: executes_download,
         },
         LineRule {
             rule: "TC001",
@@ -130,8 +130,37 @@ static LINE_RULES: LazyLock<Vec<LineRule>> = LazyLock::new(|| {
             ),
             keep: always,
         },
+        // TC013 remote self-overwrite
+        LineRule {
+            rule: "TC013",
+            severity: Severity::Medium,
+            message: "downloads content over the skill's own instruction files (publisher can change instructions outside marketplace review; pin the skill to detect changes)",
+            re: r(
+                r#"(?i)\b(?:curl|wget)\b[^\n]*?(?:>>?|\|\s*tee(?:\s+-a)?|\s(?:-o|-O|--output|--output-document)[\s=])\s*["']?(?:[^\s"'|;&:]*SKILL\.md\b|\$\{?SKILL_DIR\b|(?:[^\s"'|;&:]*/)?references/[^\s"'|;&:]*\.md\b)"#,
+            ),
+            keep: always,
+        },
     ]
 });
+
+/// Interpreter flags that make the piped download *data* for inline code
+/// (`curl … | python3 -c "…"`, `| node -e '…'`), not the program itself.
+static INLINE_CODE_FLAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+(?:-c|-e|-E|-pe|-ne|-m\s+json\.tool)(?:\s|$|[\x22'])").expect("static flag")
+});
+
+/// TC001 pipe rule: `curl … | python3 -c '…'` and friends parse data.
+fn executes_download(line: &str, m: &regex::Match<'_>) -> bool {
+    let word = m
+        .as_str()
+        .rsplit(|c: char| c.is_whitespace() || c == '|' || c == '/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let scripting =
+        word.starts_with("python") || matches!(word.as_str(), "node" | "perl" | "ruby" | "php");
+    !(scripting && INLINE_CODE_FLAG_RE.is_match(&line[m.end()..]))
+}
 
 fn public_ipv4(_: &str, m: &regex::Match<'_>) -> bool {
     let digits = m
@@ -162,21 +191,167 @@ fn path_in(file: &Path, dirs: &[&str]) -> bool {
     })
 }
 
-fn persistence_severity(file: Option<&Path>, severity: Severity, rule: &str) -> Severity {
-    if rule == "TC004"
-        && file.is_some_and(|p| {
-            path_in(p, &["examples", "docs", "references"])
-                || p.file_name().is_some_and(|n| {
-                    n.to_string_lossy()
-                        .to_ascii_lowercase()
-                        .starts_with("readme")
-                })
+const TEST_DIRS: &[&str] = &[
+    "evals",
+    "eval",
+    "tests",
+    "test",
+    "__tests__",
+    "fixtures",
+    "examples",
+];
+
+fn file_name_lower(file: &Path) -> String {
+    file.file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Test, eval, fixture and example material: findings are informational.
+fn is_test_path(file: &Path) -> bool {
+    let name = file_name_lower(file);
+    path_in(file, TEST_DIRS)
+        || name.contains(".test.")
+        || name.contains("_test.")
+        || name.starts_with("test_")
+}
+
+/// Reference documentation: findings are at most medium.
+fn is_doc_path(file: &Path) -> bool {
+    let name = file_name_lower(file);
+    path_in(file, &["references", "docs"])
+        || name.starts_with("readme")
+        || name.starts_with("changelog")
+}
+
+fn is_comment_in_source(file: &Path, line: &str) -> bool {
+    let source = file.extension().is_some_and(|e| {
+        matches!(
+            e.to_string_lossy().to_ascii_lowercase().as_str(),
+            "js" | "mjs" | "ts" | "py" | "rs" | "go" | "sh"
+        )
+    });
+    let t = line.trim();
+    source
+        && (t.starts_with("//") || t.starts_with('#') || (t.starts_with("/*") && t.ends_with("*/")))
+}
+
+static NEGATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:\b(?:never|don['’]t|do not|avoid|must not|should not)\b|(?:^|[\s*_(>])no\s|不要|不得|禁止|切勿|避免|絕不|绝不|不可)",
+    )
+    .expect("static negation marker")
+});
+
+static EXAMPLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:\bexamples?\b|red flags?|malicious patterns?|dangerous|範例|示例|危險|恶意|惡意)",
+    )
+    .expect("static example marker")
+});
+
+fn is_list_item(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("- ")
+        || t.starts_with("* ")
+        || t.starts_with("+ ")
+        || t.split_once(['.', ')']).is_some_and(|(n, rest)| {
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with(' ')
         })
-    {
-        Severity::Medium
-    } else {
-        severity
+}
+
+/// The line, or for a list item the introducing (non-list) line above it,
+/// carries a negation / defensive marker.
+fn is_negated(lines: &[&str], i: usize) -> bool {
+    NEGATION_RE.is_match(lines[i])
+        || (i > 0
+            && is_list_item(lines[i])
+            && !is_list_item(lines[i - 1])
+            && NEGATION_RE.is_match(lines[i - 1]))
+}
+
+/// Per line: inside a fenced block opened within 3 lines after an
+/// "example" / "red flag" / "dangerous" heading or line.
+fn example_fences(lines: &[&str]) -> Vec<bool> {
+    let mut out = vec![false; lines.len()];
+    let mut open: Option<bool> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            open = match open {
+                Some(_) => None,
+                None => Some(
+                    lines[i.saturating_sub(3)..i]
+                        .iter()
+                        .any(|l| EXAMPLE_RE.is_match(l)),
+                ),
+            };
+        } else if open == Some(true) {
+            out[i] = true;
+        }
     }
+    out
+}
+
+/// Octets of the host of an `http(s)://a.b.c.d` match.
+fn url_octets(m: &str) -> Vec<u16> {
+    m.rsplit("//")
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .map(|o| o.parse::<u16>().unwrap_or(999))
+        .collect()
+}
+
+static PLACEHOLDER_HOST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:abc\d*|x{3,}|1234\w*|example\w*|your[-_]?\w*|my[-_]?\w*|foo|bar|demo|sample|test\w*|subdomain|random\w*|[a-f0-9]{0,2}x{3,}\w*)$",
+    )
+    .expect("static placeholder host")
+});
+
+/// TC003 matches that are documentation / placeholder values: documentation
+/// and shared-address-space IPv4 anywhere, the cloud metadata address and
+/// example ngrok hosts in reference documentation.
+fn tc003_low(line: &str, m: &regex::Match<'_>, docs: bool) -> bool {
+    let text = m.as_str();
+    if text.contains("://") {
+        let o = url_octets(text);
+        return match o[..] {
+            [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _] => true,
+            [100, b, _, _] => (64..=127).contains(&b),
+            [169, 254, 169, 254] => docs,
+            _ => false,
+        };
+    }
+    if !docs || !text.to_ascii_lowercase().starts_with("ngrok") {
+        return false;
+    }
+    let before = line[..m.start()].strip_suffix('.').unwrap_or("");
+    let label: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    !label.is_empty() && PLACEHOLDER_HOST_RE.is_match(&label)
+}
+
+/// `None` when the rule does not fire on `line`; otherwise whether every
+/// kept match is a documentation / placeholder value.
+fn rule_hit(rule: &LineRule, line: &str, docs: bool) -> Option<bool> {
+    let mut hit = false;
+    let mut all_low = true;
+    for m in rule.re.find_iter(line) {
+        if !(rule.keep)(line, &m) {
+            continue;
+        }
+        hit = true;
+        all_low &= rule.rule == "TC003" && tc003_low(line, &m, docs);
+    }
+    hit.then_some(all_low)
 }
 
 /// Collects findings with per-file dedupe and caps.
@@ -206,27 +381,66 @@ impl<'a> Sink<'a> {
 }
 
 /// TC001–TC005 over each line of `text` (line numbers start at `first_line`).
-fn line_rules(file: Option<&Path>, first_line: usize, text: &str, sink: &mut Sink<'_>) {
-    for (i, line) in text.lines().enumerate() {
+fn line_rules(
+    file: Option<&Path>,
+    ctx: Option<&Path>,
+    first_line: usize,
+    text: &str,
+    sink: &mut Sink<'_>,
+) {
+    let lines: Vec<&str> = text.lines().collect();
+    let example = example_fences(&lines);
+    let docs = ctx.is_some_and(is_doc_path);
+    for (i, line) in lines.iter().enumerate() {
         for rule in LINE_RULES.iter() {
-            if rule.re.find_iter(line).any(|m| (rule.keep)(line, &m)) {
-                sink.push(RawFinding::new(
-                    rule.rule,
-                    persistence_severity(file, rule.severity, rule.rule),
-                    file,
-                    Some(first_line + i),
-                    rule.message,
-                    line,
-                ));
+            let Some(low) = rule_hit(rule, line, docs) else {
+                continue;
+            };
+            let mut severity = rule.severity;
+            if low {
+                severity = severity.min(Severity::Low);
             }
+            if let Some(f) = ctx {
+                if is_test_path(f) || is_negated(&lines, i) {
+                    severity = Severity::Info;
+                } else {
+                    if docs || is_comment_in_source(f, line) {
+                        severity = severity.min(Severity::Medium);
+                    }
+                    if example[i] && matches!(rule.rule, "TC002" | "TC005") {
+                        severity = severity.min(Severity::Medium);
+                    }
+                }
+            }
+            sink.push(RawFinding::new(
+                rule.rule,
+                severity,
+                file,
+                Some(first_line + i),
+                rule.message,
+                line,
+            ));
         }
     }
 }
 
 /// Every text rule for one skill/plugin file.
 pub fn scan_text(file: &Path, text: &str, instruction: bool, out: &mut Vec<RawFinding>) {
+    scan_text_in(file, file, text, instruction, out);
+}
+
+/// Like [`scan_text`], but path-based severity context (tests, docs, source
+/// comments) is judged on `rel`, the path inside the item, so directories
+/// above the item cannot change a severity.
+pub fn scan_text_in(
+    file: &Path,
+    rel: &Path,
+    text: &str,
+    instruction: bool,
+    out: &mut Vec<RawFinding>,
+) {
     let mut sink = Sink::new(out);
-    line_rules(Some(file), 1, text, &mut sink);
+    line_rules(Some(file), Some(rel), 1, text, &mut sink);
     hidden_chars(file, text, &mut sink);
     if instruction {
         base64_runs(file, text, &mut sink);
@@ -254,10 +468,14 @@ pub fn scan_command(
     let mut sink = Sink::new(out);
     let flat = command.replace(['\n', '\r'], " ");
     for rule in LINE_RULES.iter() {
-        if rule.re.find_iter(&flat).any(|m| (rule.keep)(&flat, &m)) {
+        if let Some(low) = rule_hit(rule, &flat, false) {
             sink.push(RawFinding::new(
                 rule.rule,
-                persistence_severity(file, rule.severity, rule.rule),
+                if low {
+                    rule.severity.min(Severity::Low)
+                } else {
+                    rule.severity
+                },
                 file,
                 line,
                 rule.message,
