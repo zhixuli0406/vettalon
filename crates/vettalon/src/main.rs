@@ -636,6 +636,148 @@ enum Command {
         #[command(subcommand)]
         action: MalIndexAction,
     },
+    /// Audit what coding agents have installed (Claude Code skills, plugins,
+    /// hooks and MCP servers; Codex MCP servers and skills). Local and
+    /// offline by default; never runs the audited items.
+    Toolchain {
+        #[command(subcommand)]
+        action: ToolchainAction,
+    },
+}
+
+#[derive(clap::Args)]
+struct ToolchainSelectArgs {
+    /// Project root for project-level locations (default: current directory).
+    #[arg(long)]
+    project: Option<PathBuf>,
+    /// user | project | all
+    #[arg(long, default_value = "all", value_parser = ["user", "project", "all"])]
+    scope: String,
+    /// claude | codex | all
+    #[arg(long, default_value = "all", value_parser = ["claude", "codex", "all"])]
+    agent: String,
+}
+
+#[derive(Subcommand)]
+enum ToolchainAction {
+    /// Discover items, run the static rules, compare with pins. Never writes pins.
+    Audit {
+        #[command(flatten)]
+        select: ToolchainSelectArgs,
+        /// text | json | sarif
+        #[arg(long, default_value = "text", value_parser = ["text", "json", "sarif"])]
+        format: String,
+        /// Write the output to this new file (mode 0600; existing paths and
+        /// symlinks are refused).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Exit 1 when a finding is at or above this severity (`none` to disable).
+        #[arg(long, default_value = "high")]
+        fail_on: String,
+        /// Do not exit 2 for an incomplete audit; exit by --fail-on alone.
+        #[arg(long)]
+        allow_incomplete: bool,
+        /// Also query OSV and the npm registry (allowlisted hosts only) for MC002.
+        #[arg(long)]
+        online: bool,
+        /// Files larger than this are reported (TC006); scanning stops at 8 MiB.
+        #[arg(long, default_value_t = vettalon::toolchain::DEFAULT_MAX_FILE_BYTES)]
+        max_file_bytes: u64,
+    },
+    /// Record the current content hash of the selected items.
+    Pin {
+        #[command(flatten)]
+        select: ToolchainSelectArgs,
+        /// Item id to pin (repeatable; default: every discovered item).
+        #[arg(long = "item", value_name = "ID")]
+        items: Vec<String>,
+        /// Pin even items with a high/critical finding or incomplete content.
+        #[arg(long)]
+        accept_risk: bool,
+    },
+    /// List pinned items, their hash, pin time and whether they are still present.
+    Pins {
+        /// text | json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+}
+
+fn toolchain_selection(
+    select: Option<&ToolchainSelectArgs>,
+) -> Result<vettalon::toolchain::Selection, String> {
+    use vettalon::toolchain::{parse_agents, parse_scopes, toolchain_home};
+    let project = match select.and_then(|s| s.project.clone()) {
+        Some(p) => p,
+        None => {
+            std::env::current_dir().map_err(|e| format!("cannot read current directory: {e}"))?
+        }
+    };
+    if !project.is_dir() {
+        return Err(format!(
+            "--project is not a directory: {}",
+            project.display()
+        ));
+    }
+    Ok(vettalon::toolchain::Selection {
+        home: toolchain_home(),
+        project,
+        agents: parse_agents(select.map_or("all", |s| s.agent.as_str()))?,
+        scopes: parse_scopes(select.map_or("all", |s| s.scope.as_str()))?,
+    })
+}
+
+async fn cmd_toolchain(action: ToolchainAction) -> i32 {
+    use vettalon::toolchain::{self, Format};
+    let fail = |e: String| {
+        eprintln!("[vettalon] {e}");
+        2
+    };
+    match action {
+        ToolchainAction::Audit {
+            select,
+            format,
+            out,
+            fail_on,
+            allow_incomplete,
+            online,
+            max_file_bytes,
+        } => {
+            let selection = match toolchain_selection(Some(&select)) {
+                Ok(s) => s,
+                Err(e) => return fail(e),
+            };
+            let (format, fail_on) =
+                match (Format::parse(&format), toolchain::parse_fail_on(&fail_on)) {
+                    (Ok(f), Ok(t)) => (f, t),
+                    (Err(e), _) | (_, Err(e)) => return fail(e),
+                };
+            toolchain::cmd_audit(toolchain::AuditOptions {
+                selection,
+                format,
+                out,
+                fail_on,
+                allow_incomplete,
+                online,
+                max_file_bytes,
+            })
+            .await
+        }
+        ToolchainAction::Pin {
+            select,
+            items,
+            accept_risk,
+        } => match toolchain_selection(Some(&select)) {
+            Ok(selection) => toolchain::cmd_pin(selection, items, accept_risk).await,
+            Err(e) => fail(e),
+        },
+        ToolchainAction::Pins { format } => {
+            match (toolchain_selection(None), Format::parse(&format)) {
+                (Ok(selection), Ok(format)) => toolchain::cmd_pins(selection, format),
+                (Err(e), _) | (_, Err(e)) => fail(e),
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -3505,6 +3647,7 @@ async fn main() -> ExitCode {
             out,
         } => cmd_rule_draft(&report, &finding, out),
         Command::MalIndex { action } => cmd_mal_index(action).await,
+        Command::Toolchain { action } => cmd_toolchain(action).await,
         Command::Models { config, probe } => cmd_models(config, probe).await,
         Command::Joern { action } => cmd_joern(action).await,
         Command::Agents { action } => {

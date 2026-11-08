@@ -18,6 +18,7 @@ pub mod kb;
 pub mod lang;
 pub mod llm;
 pub mod sandbox;
+pub mod toolchain;
 pub mod util;
 
 pub mod mcp;

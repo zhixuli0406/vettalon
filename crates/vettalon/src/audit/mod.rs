@@ -62,7 +62,7 @@ pub(crate) mod fix_diff;
 pub use fix_diff::SUGGESTED_FIX_MAX_BYTES;
 pub mod funnel;
 pub mod gate;
-mod injection;
+pub(crate) mod injection;
 mod intake;
 mod jev;
 mod llm_util;

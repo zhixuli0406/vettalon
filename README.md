@@ -273,6 +273,18 @@ Three opt-in additions, all off by default:
 
 The paid Vettalon Pro can also turn a hunt report into an enterprise supply-chain report (Word/PDF/HTML).
 
+### Agent toolchain audit (`vettalon toolchain`)
+
+`vettalon toolchain` audits what your coding agents have installed: Claude Code skills, plugins (their skills, hooks and bundled MCP configs) and MCP servers, plus Codex MCP servers and skills. Fixed regex and structure rules look for fetch-and-execute, encoded payloads, exfiltration endpoints, persistence, credential access, hidden characters, prompt injection, "run this first" traps, bundled executables, unpinned `npx`/`uvx` packages, plain-http remotes and inline secrets; npm launchers also get the local `MAL-*` index and typosquat checks from `hunt`. `pin` records content hashes you approve, and later audits name the files that changed. It runs locally, never executes what it audits, sends nothing to a model, and makes no network request unless `--online` is given. Secret values are never printed or stored, only `<redacted:hmac-prefix>` under a local key; URL userinfo, query and fragment values are always redacted, and secret-bearing files such as `.env` get no excerpts. An incomplete audit (unreadable file, size limit, broken manifest, no MAL index) says so, is never reported as clean, and exits 2 unless `--allow-incomplete` is given; a clean result means no rule matched, not that the items are safe.
+
+```bash
+vettalon toolchain audit                      # text report; exit 1 on a high or critical finding, 2 when incomplete
+vettalon toolchain pin                        # record the current hashes (refuses items with high findings)
+vettalon toolchain audit --format sarif --out toolchain.sarif --fail-on medium
+```
+
+Commands, discovery locations, rules (TC001–TC012, MC001–MC006, PN001–PN003) and the report schema: [docs/TOOLCHAIN-AUDIT.md](docs/TOOLCHAIN-AUDIT.md).
+
 ### Disclosure drafts
 
 `vettalon disclose` uses local repository metadata (git remote, SECURITY.md and package metadata) to suggest a reporting channel and generate an unapproved local draft. Formats: `--format ghsa | minimal | kernel | email` (default: the channel's own form; TWCERT/CC and HITCON ZeroDay keep their forms). Rules every draft follows:
