@@ -92,7 +92,13 @@ fn item_findings(item: &Discovered) -> Vec<RawFinding> {
         if item.is_structured(t) {
             rules::scan_hidden(&t.path, &t.text, &mut found);
         } else {
-            rules::scan_text(&t.path, &t.text, t.is_instruction(), &mut found);
+            rules::scan_text_in(
+                &t.path,
+                std::path::Path::new(&t.rel),
+                &t.text,
+                t.is_instruction(),
+                &mut found,
+            );
         }
         if t.secret {
             withhold(&mut found);

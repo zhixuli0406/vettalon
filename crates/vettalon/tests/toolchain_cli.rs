@@ -220,7 +220,7 @@ fn discovery_covers_every_location() {
     let (r, code) = env.audit(&["--fail-on", "none", "--allow-incomplete"]);
     assert_eq!(code, 0);
     assert_eq!(r["schema"], "vettalon.toolchain/1");
-    assert_eq!(r["rules_version"], "tc-rules-1");
+    assert_eq!(r["rules_version"], "tc-rules-2");
     let ids = ids(&r);
     let mut want = vec![
         "claude:skill:user:nested",
@@ -351,7 +351,7 @@ fn text_and_sarif_outputs_and_out_protection() {
         serde_json::from_str(&std::fs::read_to_string(&sarif_path).unwrap()).unwrap();
     assert_eq!(sarif["version"], "2.1.0");
     let run = &sarif["runs"][0];
-    assert_eq!(run["tool"]["driver"]["rules"].as_array().unwrap().len(), 21);
+    assert_eq!(run["tool"]["driver"]["rules"].as_array().unwrap().len(), 22);
     let uri = run["results"]
         .as_array()
         .unwrap()
@@ -723,7 +723,7 @@ A payment account is required at https://example.invalid/register.
     assert!(injections.iter().all(|f| f["severity"] == "info"));
     let persistence = findings(&r, "TC004");
     assert_eq!(persistence.len(), 1, "{r}");
-    assert_eq!(persistence[0]["severity"], "medium");
+    assert_eq!(persistence[0]["severity"], "info");
     env.write(
         ".claude/skills/context/read-secret.sh",
         r#"TOKEN=$(security find-generic-password -s svc -a acct -w)

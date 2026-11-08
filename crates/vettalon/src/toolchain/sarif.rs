@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use super::report::{ReportFinding, ToolchainReport};
 use crate::audit::schema::Severity;
 
-/// `(id, name, short description)` for every rule in `tc-rules-1`.
+/// `(id, name, short description)` for every rule in `tc-rules-2`.
 pub const RULES: &[(&str, &str, &str)] = &[
     (
         "TC001",
@@ -67,6 +67,11 @@ pub const RULES: &[(&str, &str, &str)] = &[
         "TC012",
         "secret-bearing-file",
         "Secret-bearing file bundled (.env, keys, credential stores); excerpts withheld",
+    ),
+    (
+        "TC013",
+        "remote-self-overwrite",
+        "Downloads content over the skill's own instruction files",
     ),
     (
         "MC001",
