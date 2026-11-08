@@ -256,6 +256,18 @@ jobs:
 
 付費的 Vettalon Pro 另可把獵捕報告產成企業供應鏈報告（Word／PDF／HTML）。
 
+### 程式代理工具鏈稽核（`vettalon toolchain`）
+
+`vettalon toolchain` 稽核程式代理裝了什麼：Claude Code 的 skill、plugin（含其中的 skill、hook 與附帶的 MCP 設定）與 MCP server，以及 Codex 的 MCP server 與 skill。固定的正規式與結構規則會找：下載後直接執行、編碼過的 payload、外洩端點、常駐機制、讀取憑證、隱藏字元、prompt injection、「使用前先執行」陷阱、夾帶的執行檔、沒鎖版本的 `npx`／`uvx` 套件、明文 http 遠端與寫死的密鑰；透過 npm 啟動的套件另外跑 `hunt` 的本機 `MAL-*` 索引與仿冒名稱檢查。`pin` 會記下你認可的內容雜湊，之後的稽核會列出哪些檔案變了。全程在本機執行，不會執行被稽核的內容，不送任何東西給模型，沒加 `--online` 就不連網。密鑰值一律不印出也不儲存，只顯示本機金鑰下的 `<redacted:HMAC 前綴>`；URL 的帳密、query 與 fragment 值一律遮蔽，`.env` 等含密鑰的檔案不顯示摘錄。稽核不完整時（讀不到的檔案、超過大小上限、manifest 壞掉、沒有 MAL 索引）會明白標示，不會當成乾淨，沒加 `--allow-incomplete` 時結束碼 2；沒有發現代表「沒有規則命中」，不代表安全。
+
+```bash
+vettalon toolchain audit                      # 文字報告；有 high 或 critical 發現時結束碼 1，不完整時 2
+vettalon toolchain pin                        # 記下目前的雜湊（有 high 發現的項目會拒絕）
+vettalon toolchain audit --format sarif --out toolchain.sarif --fail-on medium
+```
+
+指令、掃描位置、規則（TC001–TC012、MC001–MC006、PN001–PN003）與報告格式見 [docs/TOOLCHAIN-AUDIT.md](docs/TOOLCHAIN-AUDIT.md)（英文）。
+
 ### 漏洞提交草稿
 
 `vettalon disclose` 依本機 repo 資訊（git remote、SECURITY.md、套件設定）建議管道並產生未核准的本機草稿。格式用 `--format ghsa | minimal | kernel | email`（預設依管道；TWCERT/CC 與 HITCON ZeroDay 維持原表單）。每份草稿都遵守這些規則：
