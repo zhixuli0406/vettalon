@@ -73,6 +73,14 @@ fn between<'a>(s: &'a str, start: &str, end: &str) -> &'a str {
     &rest[..rest.find(end).unwrap()]
 }
 
+/// The marker the runner reads from stdin; the runner text never holds it.
+fn stdin_marker<'a>(runner: &str, input: &'a str) -> &'a str {
+    let marker = input.strip_suffix('\n').expect("one line on stdin");
+    assert!(marker.starts_with("vtlm") && !marker.contains('\n'));
+    assert!(!runner.contains(marker), "marker leaked into the runner");
+    marker
+}
+
 #[async_trait::async_trait]
 impl FixSandbox for FakeSandbox {
     fn image_identity(&self) -> Option<&str> {
@@ -84,21 +92,58 @@ impl FixSandbox for FakeSandbox {
         tree: &Path,
         runner: &str,
         adapter: &str,
+        input: &str,
     ) -> Result<String, String> {
         self.harness_runs.fetch_add(1, SeqCst);
         assert_eq!(adapter, ADAPTER, "the same adapter runs on both copies");
-        assert!(runner.contains("sys.path.append('/workspace/tree')"));
-        assert!(runner.contains("def raised():"));
-        let marker = between(runner, "MARKER = '", "'");
+        assert!(runner.contains("sys.path.insert(0, '/workspace/tree')"));
+        assert!(runner.contains("def failed():"));
+        let marker = stdin_marker(runner, input);
         let payload = between(runner, "PAYLOAD = \"", "\"\n");
         let code = std::fs::read_to_string(tree.join("app.py")).unwrap();
-        // A broken copy raises inside the harness: no effect, but an error.
+        // A broken copy raises in the sink child: no effect, `raised=true`.
         if code.contains("raise RuntimeError") {
             return Ok(format!(
-                "Traceback\n__VTL_ORACLE__ {marker} error=true\n__VTL_ORACLE__ {marker} effect=false\n"
+                "sink raised 'RuntimeError'\n__VTL_ORACLE__ {marker} effect=false raised=true\n"
             ));
         }
+        // Markers a fix diff can carry, so only the fixed copy hits them.
+        // `_ON_BASE` acts on the `;` attack input, `_ON_BENIGN` on the
+        // benign input.
+        let base = payload.contains(';');
+        let benign = !payload.contains("cat /tmp/vtl_secret");
+        // A fix that rejects attack inputs by raising (e.g. a validation
+        // error) and leaves the benign input working.
+        if !benign && code.contains("RAISE_ON_ATTACK") {
+            return Ok(format!(
+                "sink raised 'ValueError'\n__VTL_ORACLE__ {marker} effect=false raised=true\n"
+            ));
+        }
+        // A forged `effect=false` line, then the runner exits non-zero:
+        // the Docker path never counts output from a non-zero exit.
+        if (base && code.contains("EXIT_ON_BASE")) || (benign && code.contains("EXIT_ON_BENIGN")) {
+            return successful_harness_output(3, format!("__VTL_ORACLE__ {marker} effect=false\n"));
+        }
+        if base && code.contains("SILENT_ON_BASE") {
+            return Ok("no marked line\n".to_string());
+        }
+        if base && code.contains("DUP_ON_BASE") {
+            return Ok(format!(
+                "__VTL_ORACLE__ {marker} effect=false\n__VTL_ORACLE__ {marker} effect=true\n"
+            ));
+        }
+        if base && code.contains("BUDGET_ON_BASE") {
+            return Err(format!("{BUDGET_REFUSAL_PREFIX}8{BUDGET_REFUSAL_SUFFIX}"));
+        }
         let effect = (self.judge)(&code, payload);
+        // A copy whose run fails without an exception (timeout, bad exit,
+        // no result, altered evidence): `error=true`, next to whatever
+        // effect the judge sees.
+        if code.contains("VTL_TEST_HARNESS_ERROR") {
+            return Ok(format!(
+                "Traceback\n__VTL_ORACLE__ {marker} effect={effect} error=true\n"
+            ));
+        }
         Ok(format!("noise\n__VTL_ORACLE__ {marker} effect={effect}\n"))
     }
 
@@ -113,7 +158,7 @@ impl FixSandbox for FakeSandbox {
 struct NeverRun;
 #[async_trait::async_trait]
 impl FixSandbox for NeverRun {
-    async fn run_harness(&self, _t: &Path, _r: &str, _a: &str) -> Result<String, String> {
+    async fn run_harness(&self, _t: &Path, _r: &str, _a: &str, _i: &str) -> Result<String, String> {
         panic!("a refused fix must not run the harness")
     }
     async fn run_tests(&self, _t: &Path, _c: &str) -> Result<i64, String> {
@@ -297,18 +342,42 @@ async fn a_benign_control_that_fails_on_the_original_is_inconclusive() {
 }
 
 #[test]
-fn fix_runner_reports_errors_and_benign_results_and_keeps_stdlib_first() {
+fn fix_runner_reports_errors_and_benign_results_and_puts_the_tree_first_in_the_child() {
     let s = OracleSecrets {
         canary: "vtlcC".into(),
         marker: "vtlmM".into(),
     };
     let r = build_fix_runner(OracleClass::PathTraversal, &s, "safe.txt");
-    assert!(r.contains("sys.path.insert(0, '/workspace')\nsys.path.append('/workspace/tree')\n"));
-    assert!(!r.contains("sys.path.insert(1"));
-    assert!(r.contains("def raised():\n    traceback.print_exc()\n    print('__VTL_ORACLE__ ' + MARKER + ' error=true')"));
-    // Every caught exception reports through raised(), including import.
-    assert_eq!(r.matches("traceback.print_exc()").count(), 1);
-    assert!(r.contains("except Exception:\n    raised()\n    verdict(False)"));
+    // The marker is never in the runner text (it arrives on stdin).
+    assert!(!r.contains("vtlmM"));
+    assert!(r.contains("marker = sys.stdin.buffer.read()"));
+    // The tree is importable only in the sink child's bootstrap (a Python
+    // literal in the runner): inserted first, after the stdlib imports and
+    // before the sink is loaded; the parent never touches sys.path.
+    let tree_first = "sys.path.insert(0, '/workspace/tree')\\n";
+    assert_eq!(r.matches("sys.path").count(), 1);
+    assert!(r.contains(tree_first));
+    assert!(!r.contains("sys.path.append"));
+    let imports = r.find("import sys, os, json, importlib.util").unwrap();
+    let insert = r.find(tree_first).unwrap();
+    let load = r.find("spec_from_file_location('sink'").unwrap();
+    assert!(imports < insert && insert < load);
+    assert!(r.contains("CHILD = ['-c', BOOTSTRAP]\n"));
+    assert!(!r.contains("import sink\n"));
+    // Every child failure (non-zero exit, invalid result, timeout) goes
+    // through failed() and reports error=true.
+    assert!(r.contains("def failed():\n    traceback.print_exc()\n    STATE['error'] = True\n"));
+    assert!(r.contains("    except Exception:\n        failed()\n        return ''\n"));
+    assert!(r.contains("raise RuntimeError('sink child exited with code '"));
+    assert!(r.contains("raise RuntimeError('invalid target result')"));
+    assert!(r.contains("timeout=30,"));
+    assert!(r.contains("if STATE['error']:\n    fields.append('error=true')\n"));
+    // An exception from sink.run is reported as raised=true.
+    assert!(r.contains("record = {'raised': type(exc).__name__[:64]}"));
+    assert!(r.contains("STATE['raised'] = True\n"));
+    assert!(r.contains("if STATE['raised']:\n    fields.append('raised=true')\n"));
+    assert!(!r.contains("def raised()"));
+    assert!(r.contains("result = invoke(PAYLOAD)\n"));
     assert!(r.contains("functional=' + ('true' if \"vtl_safe_content\" in str(result)"));
     let cmd = build_fix_runner(OracleClass::CommandInjection, &s, SEMI);
     assert!(!cmd.contains("functional="));
@@ -317,7 +386,12 @@ fn fix_runner_reports_errors_and_benign_results_and_keeps_stdlib_first() {
             "__VTL_ORACLE__ vtlmM error=true\n__VTL_ORACLE__ vtlmM effect=false\n",
             "vtlmM"
         ),
-        Ok((false, None, true))
+        Ok(super::super::target_poc::HarnessVerdict {
+            effect: false,
+            functional: None,
+            error: true,
+            raised: false,
+        })
     );
     assert!(
         super::super::target_poc::parse_verdict("__VTL_ORACLE__ other error=true\n", "vtlmM")
@@ -356,7 +430,13 @@ async fn sandbox_errors_and_missing_verdicts_are_unverified_with_a_note() {
     struct Broken(bool);
     #[async_trait::async_trait]
     impl FixSandbox for Broken {
-        async fn run_harness(&self, _t: &Path, _r: &str, _a: &str) -> Result<String, String> {
+        async fn run_harness(
+            &self,
+            _t: &Path,
+            _r: &str,
+            _a: &str,
+            _i: &str,
+        ) -> Result<String, String> {
             if self.0 {
                 Err("container start failed".to_string())
             } else {
@@ -852,11 +932,12 @@ async fn typed_verification_binding_keeps_one_call_plan_with_two_bound_adapters(
             tree: &Path,
             runner: &str,
             adapter: &str,
+            stdin: &str,
         ) -> Result<String, String> {
             let code = std::fs::read_to_string(tree.join("app.py")).unwrap();
             assert!(adapter.contains(&sha256_hex(code.as_bytes())));
             assert!(!runner.contains("sys.path.append('/workspace/tree')"));
-            let marker = between(runner, "MARKER = '", "'");
+            let marker = stdin_marker(runner, stdin);
             let payload = between(runner, "PAYLOAD = \"", "\"\n");
             let effect = (payload.contains(';') || payload.contains("$("))
                 && code.contains("'echo ' + cmd)");
@@ -920,8 +1001,9 @@ async fn typed_fix_rejects_duplicate_marked_effects_instead_of_taking_the_first(
             _tree: &Path,
             runner: &str,
             _adapter: &str,
+            stdin: &str,
         ) -> Result<String, String> {
-            let marker = between(runner, "MARKER = '", "'");
+            let marker = stdin_marker(runner, stdin);
             Ok(format!(
                 "__VTL_ORACLE__ {marker} effect=false\n__VTL_ORACLE__ {marker} effect=true\n"
             ))
@@ -1245,6 +1327,12 @@ async fn live_typed_fix_rejects_proc_parent_stdout_verdict_forgery() {
     )
     .await;
     assert_ne!(run.outcome(), FixOutcome::FixVerified, "{:?}", run.note);
+    // The marker is no longer written into /workspace/runner.py (it reaches
+    // the runner on stdin), so the planted source's
+    // `open('/workspace/runner.py')...split("MARKER = '")` raises on the
+    // ORIGINAL copy too. The original therefore shows no effect and the check
+    // stops as inconclusive (`original_shows_no_effect`) before any forged
+    // verdict could matter.
     assert_eq!(
         run.check.regression,
         CheckResult::Inconclusive,
@@ -1253,9 +1341,387 @@ async fn live_typed_fix_rejects_proc_parent_stdout_verdict_forgery() {
     );
     assert_eq!(
         run.check.reason.as_deref(),
-        Some("no_verdict"),
+        Some("original_shows_no_effect"),
         "{:?}",
         run.note
+    );
+}
+
+// ── raw adapter path: verdict forgery by code added in the fix diff ──
+//
+// These mirror `live_typed_fix_rejects_proc_parent_stdout_verdict_forgery`
+// for the raw adapter path (`check_fix_bound` with a `FixCheckRequest`
+// adapter). `sink.py` used to be imported in the same Python process as the
+// runner, so code the fix diff adds to `app.py` (fixed copy only) could learn
+// the per-run MARKER and print a forged `effect=false` verdict. It now runs
+// in a child process with its output discarded. None of these
+// diffs touches the vulnerable `os.system('echo ' + cmd)` call, so none of
+// them may come out as `FixVerified` or `FixCheckPartial`. If one of these
+// fails, the raw path accepts a forged verdict.
+
+/// A minimal raw adapter: it only imports the project module and calls it.
+const RAW_FORGERY_ADAPTER: &str = "import app\ndef run(payload):\n    return app.run(payload)\n";
+
+/// A unified diff for `APP` that inserts `added` at the top of `run` and
+/// keeps the vulnerable `os.system('echo ' + cmd)` line unchanged.
+fn insert_at_top_of_run(added: &[&str]) -> String {
+    let mut diff = format!(
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -3,2 +3,{} @@\n def run(cmd):\n",
+        2 + added.len()
+    );
+    for line in added {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff.push_str("     os.system('echo ' + cmd)\n");
+    diff
+}
+
+/// Run the bound raw-adapter fix check in real Docker on `APP` with `diff`.
+async fn live_raw_forgery_run(diff: &str) -> FixCheckRun {
+    use super::super::verification_context::VerificationTarget;
+
+    let sb = crate::sandbox::DockerSandbox::detect(crate::sandbox::DEFAULT_POC_IMAGE)
+        .await
+        .expect("docker + image");
+    let n = fixture_inputs(OracleClass::CommandInjection).len();
+    let budget = PocBudget::new(n * 4 + 8);
+    let sandbox = DockerFixSandbox {
+        sb,
+        budget: &budget,
+    };
+    let r = repo();
+    let mut finding = finding("CWE-78");
+    finding.file_hash = Some(sha256_hex(APP.as_bytes()));
+    let req = FixCheckRequest {
+        class: OracleClass::CommandInjection,
+        adapter: RAW_FORGERY_ADAPTER,
+        diff,
+        test_command: Some("true"),
+    };
+    let run = check_fix_bound(
+        r.path(),
+        &req,
+        &sandbox,
+        VerificationTarget {
+            file: "app.py",
+            file_hash: finding.file_hash.as_deref(),
+        },
+    )
+    .await;
+    eprintln!(
+        "{} outcome={:?} note={:?}",
+        run.check.to_detail(),
+        run.outcome(),
+        run.note
+    );
+    // The check ran on temporary copies; the scanned tree is untouched.
+    assert_eq!(
+        std::fs::read_to_string(r.path().join("app.py")).unwrap(),
+        APP
+    );
+    run
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_raw_fix_rejects_main_module_marker_forgery() {
+    let diff = insert_at_top_of_run(&[
+        "    marker = __import__('__main__').MARKER",
+        "    print('__VTL_ORACLE__ ' + marker + ' effect=false', flush=True)",
+        "    os._exit(0)",
+    ]);
+    let run = live_raw_forgery_run(&diff).await;
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "forged verdict accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_raw_fix_rejects_frame_walk_marker_forgery() {
+    let diff = insert_at_top_of_run(&[
+        "    import sys",
+        "    frame = sys._getframe()",
+        "    marker = None",
+        "    while frame is not None:",
+        "        if 'MARKER' in frame.f_globals:",
+        "            marker = frame.f_globals['MARKER']",
+        "            break",
+        "        frame = frame.f_back",
+        "    print('__VTL_ORACLE__ ' + str(marker) + ' effect=false', flush=True)",
+        "    os._exit(0)",
+    ]);
+    let run = live_raw_forgery_run(&diff).await;
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "forged verdict accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_raw_fix_rejects_duplicate_verdict_line() {
+    // No exit: the vulnerable call still runs, so stdout carries the forged
+    // `effect=false` line followed by the harness's real verdict line.
+    let diff = insert_at_top_of_run(&[
+        "    marker = __import__('__main__').MARKER",
+        "    print('__VTL_ORACLE__ ' + marker + ' effect=false', flush=True)",
+    ]);
+    let run = live_raw_forgery_run(&diff).await;
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "forged verdict accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_raw_fix_rejects_runner_file_marker_forgery() {
+    let diff = insert_at_top_of_run(&[
+        "    try:",
+        "        runner = open('/workspace/runner.py').read()",
+        r#"        marker = runner.split("MARKER = '", 1)[1].split("'", 1)[0]"#,
+        "    except Exception:",
+        "        marker = __import__('__main__').MARKER",
+        "    print('__VTL_ORACLE__ ' + marker + ' effect=false', flush=True)",
+        "    os._exit(0)",
+    ]);
+    let run = live_raw_forgery_run(&diff).await;
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "forged verdict accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_raw_fix_finds_no_marker_to_forge() {
+    // Search every place a marker could leak (runner file, pid 1 and parent
+    // process cmdline/environ, own environ) for a `vtlm`-prefixed token, then
+    // print a forged verdict with whatever was found (or a dummy) and exit.
+    let diff = insert_at_top_of_run(&[
+        "    import re",
+        "    found = []",
+        "    paths = ['/workspace/runner.py', '/proc/1/cmdline', '/proc/1/environ',",
+        "             '/proc/' + str(os.getppid()) + '/cmdline',",
+        "             '/proc/' + str(os.getppid()) + '/environ']",
+        "    blobs = []",
+        "    for p in paths:",
+        "        try:",
+        "            blobs.append(open(p, 'rb').read().decode('utf-8', 'replace'))",
+        "        except Exception:",
+        "            pass",
+        "    blobs.append('\\0'.join(k + '=' + v for k, v in os.environ.items()))",
+        "    for blob in blobs:",
+        "        found += re.findall(r'vtlm[0-9A-Za-z_-]*', blob)",
+        "    marker = found[0] if found else 'vtlm_dummy'",
+        "    print('__VTL_ORACLE__ ' + marker + ' effect=false', flush=True)",
+        "    os._exit(0)",
+    ]);
+    let run = live_raw_forgery_run(&diff).await;
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "forged verdict accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_raw_fix_evidence_tampering_is_not_verified() {
+    // Keeps the vulnerable call, then deletes the evidence file. The runner
+    // keeps /tmp/vtl_out open and its integrity check requires the path to
+    // still be the same regular file (`same_out`), so deletion is caught and
+    // is distinguishable from a real fix (which leaves the file untouched).
+    // Hunk: context line 4 (the vulnerable call) followed by added lines.
+    let diff = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -4,1 +4,5 @@\n     os.system('echo ' + cmd)\n+    try:\n+        os.remove('/tmp/vtl_out')\n+    except Exception:\n+        pass\n";
+    let run = live_raw_forgery_run(diff).await;
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "evidence tampering accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_raw_fix_rename_restore_is_not_verified() {
+    // Path traversal: the diff moves the secret away, calls the still
+    // vulnerable read (the original body, now `_read`), maps the resulting
+    // OSError to an empty result, and moves the secret back. The secret's
+    // content is intact afterwards and the benign read still works, so only
+    // the identity check (device, inode, mode, ctime recorded before the
+    // child) shows the tampering: the fixed copy's run is an error, never
+    // counted as blocked.
+    let sb = crate::sandbox::DockerSandbox::detect(crate::sandbox::DEFAULT_POC_IMAGE)
+        .await
+        .expect("docker + image");
+    let budget = PocBudget::new(64);
+    let sandbox = DockerFixSandbox {
+        sb,
+        budget: &budget,
+    };
+    let source = "import os\n\ndef run(name):\n    path = os.path.join(os.environ[\"VTL_BASE\"], name)\n    with open(path) as fh:\n        return fh.read()\n";
+    let diff = concat!(
+        "--- a/app.py\n+++ b/app.py\n@@ -3,4 +3,13 @@\n",
+        " def run(name):\n",
+        "+    os.rename('/tmp/vtl_secret', '/tmp/vtl_hidden')\n",
+        "+    try:\n",
+        "+        return _read(name)\n",
+        "+    except OSError:\n",
+        "+        return ''\n",
+        "+    finally:\n",
+        "+        os.rename('/tmp/vtl_hidden', '/tmp/vtl_secret')\n",
+        "+\n",
+        "+def _read(name):\n",
+        "     path = os.path.join(os.environ[\"VTL_BASE\"], name)\n",
+        "     with open(path) as fh:\n",
+        "         return fh.read()\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), source).unwrap();
+    let req = FixCheckRequest {
+        class: OracleClass::PathTraversal,
+        adapter: ADAPTER,
+        diff,
+        test_command: None,
+    };
+    let run = check_fix(dir.path(), &req, &sandbox).await;
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "rename-and-restore accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+    assert_eq!(
+        run.check.reason.as_deref(),
+        Some(FIXED_COPY_NO_VERDICT),
+        "{:?} {:?}",
+        run.check,
+        run.note
+    );
+}
+
+/// Lines a fix diff adds at the top of `run`: learn the marker (from the
+/// mounted runner, else from `__main__`), put a forged `effect=false` line
+/// on the container's stdout (through `/proc/<ppid>/fd/1` when allowed,
+/// else plain `print`), then kill the harness runner so its real line never
+/// appears.
+const FORGE_THEN_KILL_PARENT: &[&str] = &[
+    "    try:",
+    r#"        marker = open('/workspace/runner.py').read().split("MARKER = '", 1)[1].split("'", 1)[0]"#,
+    "    except Exception:",
+    "        marker = getattr(__import__('__main__'), 'MARKER', 'unknown')",
+    "    line = '__VTL_ORACLE__ ' + marker + ' effect=false\\n'",
+    "    try:",
+    "        fd = os.open('/proc/' + str(os.getppid()) + '/fd/1', os.O_WRONLY)",
+    "        os.write(fd, line.encode())",
+    "        os.close(fd)",
+    "    except Exception:",
+    "        print(line, end='', flush=True)",
+    "    os.kill(os.getppid(), 9)",
+];
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_raw_fix_rejects_forged_line_then_parent_kill() {
+    let diff = insert_at_top_of_run(FORGE_THEN_KILL_PARENT);
+    let run = live_raw_forgery_run(&diff).await;
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "forged verdict accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_typed_fix_rejects_forged_line_then_parent_kill() {
+    use super::super::target_poc::{TargetArgument, TargetCall};
+
+    let repo = repo();
+    let mut finding = finding("CWE-78");
+    finding.file_hash = Some(sha256_hex(APP.as_bytes()));
+    let call = TargetCall {
+        file: "app.py".into(),
+        function: "run".into(),
+        args: vec![TargetArgument::Payload],
+    };
+    let diff = insert_at_top_of_run(FORGE_THEN_KILL_PARENT);
+    let run = run_target_fix(
+        repo.path(),
+        &finding,
+        &call,
+        &diff,
+        Some("true"),
+        crate::sandbox::DEFAULT_POC_IMAGE,
+    )
+    .await;
+    eprintln!(
+        "{} outcome={:?} note={:?}",
+        run.check.to_detail(),
+        run.outcome(),
+        run.note
+    );
+    let outcome = run.outcome();
+    assert!(
+        !matches!(
+            outcome,
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        ),
+        "forged verdict accepted: outcome={outcome:?} note={:?} check={:?}",
+        run.note,
+        run.check
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("app.py")).unwrap(),
+        APP
     );
 }
 
@@ -1275,4 +1741,385 @@ fn an_exhausted_poc_budget_leaves_the_fix_unverified_with_a_reason() {
     let label = f.fix_check().unwrap();
     assert_eq!(label.outcome, FixOutcome::FixUnverified);
     assert_eq!(label.reason.as_deref(), Some("time_budget_exhausted"));
+}
+
+// ── fixed copy without a usable verdict (#288) ────────────────────────
+
+/// Judge for the fixed-copy tests. The original `APP` shows the effect for
+/// every attack input. On a fixed copy, markers in the code choose what
+/// still fires: `KEEP_BASE` the `;` input, `KEEP_SUBST` the `$(` input,
+/// `BREAK_BENIGN` the benign input.
+fn marked_judge(code: &str, payload: &str) -> bool {
+    if !payload.contains("cat /tmp/vtl_secret") {
+        return code.contains("BREAK_BENIGN");
+    }
+    code.contains("'echo ' + cmd)")
+        || (payload.contains(';') && code.contains("KEEP_BASE"))
+        || (payload.contains("$(") && code.contains("KEEP_SUBST"))
+}
+
+/// A real-looking fix whose trailing comment carries the judge markers.
+fn marked_fix(markers: &str) -> String {
+    sink_diff(&format!(
+        "    os.system('echo ' + __import__('shlex').quote(cmd))  # {markers}"
+    ))
+}
+
+/// The `[SEMI, SUBST]` check of `marked_fix(markers)` with a configured
+/// test command. Returns the check and the (harness, test) run counts.
+async fn marked_check(markers: &str) -> (FixCheck, (usize, usize)) {
+    let r = repo();
+    let sb = FakeSandbox::new(marked_judge, tests_pass);
+    let diff = marked_fix(markers);
+    let c = check(r.path(), &diff, Some("pytest"), &[SEMI, SUBST], &sb).await;
+    (c, sb.runs())
+}
+
+/// `marked_check` with test command `None`, keeping the sandbox note.
+async fn marked_run(markers: &str, fixtures: &[&str]) -> (FixCheckRun, (usize, usize)) {
+    let r = repo();
+    let sb = FakeSandbox::new(marked_judge, tests_pass);
+    let diff = marked_fix(markers);
+    let req = FixCheckRequest {
+        class: OracleClass::CommandInjection,
+        adapter: ADAPTER,
+        diff: &diff,
+        test_command: None,
+    };
+    let run = check_fix_with(r.path(), &req, fixtures, &sb).await;
+    (run, sb.runs())
+}
+
+/// What every fixed-copy-without-verdict result shares.
+fn assert_fixed_copy_no_verdict(c: &FixCheck, blocked: u32) {
+    assert_eq!(c.regression, CheckResult::Inconclusive, "{c:?}");
+    assert_eq!(c.tests, CheckResult::NotRun, "{c:?}");
+    assert_eq!(c.outcome(), FixOutcome::FixUnverified, "{c:?}");
+    assert_eq!(c.reason.as_deref(), Some(FIXED_COPY_NO_VERDICT), "{c:?}");
+    assert_eq!((c.inputs_blocked, c.inputs_total), (blocked, 2), "{c:?}");
+    assert_eq!(FixCheck::parse(&c.to_detail()).as_ref(), Some(c));
+}
+
+#[tokio::test]
+async fn a_correct_fix_passes_the_marked_judge() {
+    // Control for the marker tests below.
+    let (c, runs) = marked_check("reviewed").await;
+    assert_eq!(
+        (c.regression, c.tests),
+        (CheckResult::Pass, CheckResult::Pass)
+    );
+    assert_eq!(c.outcome(), FixOutcome::FixVerified);
+    assert_eq!((c.inputs_blocked, c.inputs_total), (2, 2));
+    assert_eq!(runs, (6, 2));
+}
+
+#[tokio::test]
+async fn a_fixed_copy_without_a_verdict_is_not_blocked_and_does_not_stop_the_check() {
+    // Patched code forges `effect=false` then exits non-zero, prints no
+    // marked line, or prints a duplicate marked verdict, on the `;` input
+    // only. That input is never counted as blocked; the `$(` input and the
+    // benign control still run.
+    for (marker, note) in [
+        ("EXIT_ON_BASE", "fix harness exited with code 3"),
+        ("SILENT_ON_BASE", "target_verdict_missing"),
+        ("DUP_ON_BASE", "duplicate_target_verdict"),
+    ] {
+        let (c, runs) = marked_check(marker).await;
+        assert_fixed_copy_no_verdict(&c, 1);
+        assert_eq!(runs, (6, 0), "{marker}: every input and benign ran");
+
+        // The sandbox note is kept for a human.
+        let (run, _) = marked_run(marker, &[SEMI, SUBST]).await;
+        assert_eq!(run.check.reason.as_deref(), Some(FIXED_COPY_NO_VERDICT));
+        assert!(
+            run.note.as_deref().is_some_and(|n| n.contains(note)),
+            "{marker}: {:?}",
+            run.note
+        );
+
+        // An effect on a later input still rejects the fix.
+        let (c, runs) = marked_check(&format!("{marker} KEEP_SUBST")).await;
+        assert_eq!(c.regression, CheckResult::Fail, "{marker}");
+        assert_eq!(c.outcome(), FixOutcome::FixRejected, "{marker}");
+        assert_eq!(c.reason.as_deref(), Some("fixed_copy_shows_effect"));
+        assert_eq!((c.inputs_blocked, c.inputs_total), (0, 2), "{marker}");
+        assert_eq!(runs, (4, 0), "{marker}");
+
+        // So does a broken benign input.
+        let (c, runs) = marked_check(&format!("{marker} BREAK_BENIGN")).await;
+        assert_eq!(c.regression, CheckResult::Fail, "{marker}");
+        assert_eq!(c.reason.as_deref(), Some("fix_breaks_benign_input"));
+        assert_eq!((c.inputs_blocked, c.inputs_total), (1, 2), "{marker}");
+        assert_eq!(runs, (6, 0), "{marker}");
+    }
+}
+
+#[tokio::test]
+async fn a_fixed_copy_without_a_verdict_on_a_later_input_or_benign_is_inconclusive() {
+    // The `;` input runs second: the `$(` input before it was blocked.
+    let (run, runs) = marked_run("EXIT_ON_BASE", &[SUBST, SEMI]).await;
+    assert_fixed_copy_no_verdict(&run.check, 1);
+    assert_eq!(runs, (6, 0));
+
+    // The benign run on the fixed copy forges a line and exits non-zero:
+    // the fix is not shown to keep normal behaviour, so not a pass.
+    let (c, runs) = marked_check("EXIT_ON_BENIGN").await;
+    assert_fixed_copy_no_verdict(&c, 2);
+    assert_eq!(runs, (6, 0));
+}
+
+#[tokio::test]
+async fn a_failure_on_the_original_copy_keeps_its_old_reason() {
+    // Only the fixed copy's failures are `fixed_copy_no_verdict`. The
+    // original runs the scanned code, so a failure there stops A as before
+    // (see also `sandbox_errors_and_missing_verdicts_are_unverified_with_a_note`).
+    struct OriginalBroken(bool);
+    #[async_trait::async_trait]
+    impl FixSandbox for OriginalBroken {
+        async fn run_harness(
+            &self,
+            _tree: &Path,
+            runner: &str,
+            _adapter: &str,
+            input: &str,
+        ) -> Result<String, String> {
+            let marker = stdin_marker(runner, input);
+            if self.0 {
+                successful_harness_output(3, format!("__VTL_ORACLE__ {marker} effect=true\n"))
+            } else {
+                Ok(format!(
+                    "__VTL_ORACLE__ {marker} effect=true\n__VTL_ORACLE__ {marker} effect=true\n"
+                ))
+            }
+        }
+        async fn run_tests(&self, _t: &Path, _c: &str) -> Result<i64, String> {
+            panic!("A never passes")
+        }
+    }
+    let r = repo();
+    for (exit, reason) in [(true, "sandbox_error"), (false, "no_verdict")] {
+        let c = check(
+            r.path(),
+            &correct_fix(),
+            Some("pytest"),
+            &[SEMI, SUBST],
+            &OriginalBroken(exit),
+        )
+        .await;
+        assert_eq!(c.regression, CheckResult::Inconclusive, "{reason}");
+        assert_eq!(c.reason.as_deref(), Some(reason));
+        assert_eq!((c.inputs_blocked, c.inputs_total), (0, 2), "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn a_budget_refusal_on_the_fixed_copy_stays_a_sandbox_error() {
+    // Nothing ran, so it says nothing about the fix: A stops right there.
+    let (run, runs) = marked_run("BUDGET_ON_BASE", &[SEMI, SUBST]).await;
+    let c = &run.check;
+    assert_eq!(c.regression, CheckResult::Inconclusive);
+    assert_eq!(c.reason.as_deref(), Some("sandbox_error"));
+    assert_eq!((c.inputs_blocked, c.inputs_total), (0, 2));
+    assert!(run.note.as_deref().is_some_and(is_budget_refusal));
+    assert_eq!(runs, (2, 0));
+}
+
+#[tokio::test]
+async fn a_fixed_copy_run_reporting_error_is_not_blocked() {
+    // The runner reports `error=true` and no effect on the fixed copy for
+    // every input (timeout, bad child exit, missing result or altered
+    // evidence): never counted as blocked, and every input and the benign
+    // control still run.
+    let (run, runs) = marked_run("VTL_TEST_HARNESS_ERROR", &[SEMI, SUBST]).await;
+    assert_fixed_copy_no_verdict(&run.check, 0);
+    assert_eq!(run.note.as_deref(), Some(FIXED_COPY_ERROR_NOTE));
+    assert_eq!(runs, (6, 0));
+
+    // With a configured test command, B never runs.
+    let (c, runs) = marked_check("VTL_TEST_HARNESS_ERROR").await;
+    assert_fixed_copy_no_verdict(&c, 0);
+    assert_eq!(runs, (6, 0));
+
+    // An effect still counts even when the run also reported an error.
+    let r = repo();
+    let sb = FakeSandbox::standard(tests_pass);
+    let keeps_sink = sink_diff("    os.system('echo ' + cmd)  # VTL_TEST_HARNESS_ERROR");
+    let c = check(r.path(), &keeps_sink, None, &[SEMI, SUBST], &sb).await;
+    assert_eq!(c.regression, CheckResult::Fail);
+    assert_eq!(c.outcome(), FixOutcome::FixRejected);
+    assert_eq!(c.reason.as_deref(), Some("fixed_copy_shows_effect"));
+    assert_eq!(sb.runs(), (2, 0));
+}
+
+#[tokio::test]
+async fn a_python_exception_from_the_checked_code_counts_as_blocked() {
+    // `raised=true` with no effect on the attack inputs is blocked; the
+    // benign input still works, so the fix passes.
+    let (c, runs) = marked_check("RAISE_ON_ATTACK").await;
+    assert_eq!(
+        (c.regression, c.tests),
+        (CheckResult::Pass, CheckResult::Pass)
+    );
+    assert_eq!(c.outcome(), FixOutcome::FixVerified);
+    assert_eq!((c.inputs_blocked, c.inputs_total), (2, 2));
+    assert_eq!(c.reason, None);
+    assert_eq!(runs, (6, 2));
+
+    // A fix that always raises is caught by the benign control instead.
+    let r = repo();
+    let sb = FakeSandbox::standard(tests_pass);
+    let raises = sink_diff("    raise RuntimeError('disabled')");
+    let c = check(r.path(), &raises, None, &[SEMI, SUBST], &sb).await;
+    assert_eq!(c.regression, CheckResult::Fail);
+    assert_eq!(c.reason.as_deref(), Some("fix_breaks_benign_input"));
+    assert_eq!((c.inputs_blocked, c.inputs_total), (2, 2));
+    assert_eq!(c.outcome(), FixOutcome::FixRejected);
+    assert_eq!(sb.runs(), (6, 0));
+}
+
+#[tokio::test]
+async fn the_producer_never_writes_a_positive_outcome_without_a_usable_fixed_verdict() {
+    for markers in [
+        "reviewed",
+        "RAISE_ON_ATTACK",
+        "KEEP_BASE",
+        "EXIT_ON_BASE",
+        "SILENT_ON_BASE",
+        "DUP_ON_BASE",
+        "EXIT_ON_BENIGN",
+        "VTL_TEST_HARNESS_ERROR",
+    ] {
+        let (c, _) = marked_check(markers).await;
+        let positive = matches!(
+            c.outcome(),
+            FixOutcome::FixVerified | FixOutcome::FixCheckPartial
+        );
+        assert_eq!(
+            positive,
+            matches!(markers, "reviewed" | "RAISE_ON_ATTACK"),
+            "{markers}: {c:?}"
+        );
+        if positive {
+            assert_eq!(c.reason, None, "{markers}");
+        }
+        assert_eq!(FixCheck::parse(&c.to_detail()), Some(c));
+    }
+}
+
+#[tokio::test]
+async fn every_harness_run_gets_a_fresh_marker_on_stdin_only() {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    struct Recording {
+        inner: FakeSandbox,
+        markers: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl FixSandbox for Recording {
+        fn image_identity(&self) -> Option<&str> {
+            self.inner.image_identity()
+        }
+        async fn run_harness(
+            &self,
+            tree: &Path,
+            runner: &str,
+            adapter: &str,
+            input: &str,
+        ) -> Result<String, String> {
+            let marker = stdin_marker(runner, input).to_string();
+            assert_eq!(
+                input,
+                format!("{marker}\n"),
+                "stdin is the marker line only"
+            );
+            assert!(runner.contains("marker = sys.stdin.buffer.read()"));
+            assert!(
+                !runner.contains("MARKER = '"),
+                "no marker literal in the runner"
+            );
+            assert!(!adapter.contains(&marker));
+            self.markers.lock().unwrap().push(marker);
+            self.inner.run_harness(tree, runner, adapter, input).await
+        }
+        async fn run_tests(&self, tree: &Path, command: &str) -> Result<i64, String> {
+            self.inner.run_tests(tree, command).await
+        }
+    }
+    let r = repo();
+    let sb = Recording {
+        inner: FakeSandbox::standard(tests_pass),
+        markers: Mutex::new(Vec::new()),
+    };
+    let c = check(r.path(), &correct_fix(), None, &[SEMI, SUBST], &sb).await;
+    assert_eq!(c.outcome(), FixOutcome::FixCheckPartial);
+    let markers = sb.markers.lock().unwrap().clone();
+    assert_eq!(markers.len(), 6, "both copies, both inputs and benign");
+    assert!(markers.iter().all(|m| m.len() == 36), "{markers:?}");
+    let distinct: HashSet<_> = markers.iter().collect();
+    assert_eq!(distinct.len(), markers.len(), "one fresh marker per run");
+}
+
+#[tokio::test]
+async fn only_a_current_harness_binding_promotes_a_positive_check() {
+    use super::super::verification_context::{HARNESS_VERSION, VerificationTarget};
+    // v3: the marker reaches the runner on stdin only. A receipt from an
+    // older harness (marker in the mounted runner.py) still reads but is
+    // never complete, so it cannot promote a positive result.
+    assert_eq!(HARNESS_VERSION, "vettalon-three-class-oracle-v3");
+    let dir = repo();
+    let diff = correct_fix();
+    let file_hash = sha256_hex(APP.as_bytes());
+    let req = FixCheckRequest {
+        class: OracleClass::CommandInjection,
+        adapter: ADAPTER,
+        diff: &diff,
+        test_command: None,
+    };
+    let sb = FakeSandbox::standard(tests_pass);
+    let run = check_fix_bound(
+        dir.path(),
+        &req,
+        &sb,
+        VerificationTarget {
+            file: "app.py",
+            file_hash: Some(&file_hash),
+        },
+    )
+    .await;
+    assert_eq!(run.outcome(), FixOutcome::FixCheckPartial);
+    assert_eq!(
+        run.binding.as_ref().unwrap().harness_version,
+        HARNESS_VERSION
+    );
+    let labelled = |run: &FixCheckRun| {
+        let mut f = finding("CWE-78");
+        f.file_hash = Some(file_hash.clone());
+        f.suggested_fix = Some(diff.clone());
+        record_fix_run(&mut f, run);
+        f.fix_check().unwrap()
+    };
+    assert_eq!(labelled(&run).outcome, FixOutcome::FixCheckPartial);
+
+    for old in [
+        "vettalon-three-class-oracle-v1",
+        "vettalon-three-class-oracle-v2",
+    ] {
+        let mut binding = run.binding.clone().unwrap();
+        binding.harness_version = old.into();
+        let stale = FixCheckRun {
+            check: run.check.clone(),
+            note: None,
+            binding: Some(binding),
+        };
+        assert_eq!(stale.outcome(), FixOutcome::FixUnverified, "{old}");
+        let label = labelled(&stale);
+        assert_eq!(label.outcome, FixOutcome::FixUnverified, "{old}");
+        assert_eq!(
+            label.reason.as_deref(),
+            Some("binding_incomplete_or_mismatched"),
+            "{old}"
+        );
+        assert_eq!(label.binding.unwrap().harness_version, old);
+    }
 }

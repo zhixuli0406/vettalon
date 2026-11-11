@@ -147,6 +147,78 @@ fn trusted_adapter_loads_bound_bytes_and_treats_literal_expressions_as_data() {
     assert!(adapter.contains("os.O_EXCL"));
     assert!(!adapter.contains("MARKER"));
     assert!(!adapter.contains("sys.path.append"));
+    // A Python exception from the target module or call is a `raised`
+    // record (exit 0); harness failures stay a non-zero exit.
+    assert!(adapter.contains(
+        "    except _HarnessError:\n        raise\n    except Exception as exc:\n        record = {'raised': type(exc).__name__[:64]}\n"
+    ));
+    assert!(adapter.contains("raise _HarnessError('target source identity mismatch')"));
+    assert!(adapter.contains("raise _HarnessError('target function unavailable')"));
+    assert!(adapter.contains("raise _HarnessError('async target unsupported')"));
+}
+
+#[test]
+fn verdict_line_carries_raised_and_error_separately() {
+    let v = parse_verdict(
+        "__VTL_ORACLE__ vtlmM effect=false functional=true raised=true\n",
+        "vtlmM",
+    )
+    .unwrap();
+    assert!(!v.effect && v.raised && !v.error);
+    assert_eq!(v.functional, Some(true));
+    let v = parse_verdict("__VTL_ORACLE__ vtlmM effect=false error=true\n", "vtlmM").unwrap();
+    assert!(v.error && !v.raised);
+    assert_eq!(
+        parse_verdict("__VTL_ORACLE__ vtlmM effect=false raised=maybe\n", "vtlmM"),
+        Err("invalid_target_verdict")
+    );
+    assert_eq!(
+        parse_verdict("__VTL_ORACLE__ vtlmM raised=true\n", "vtlmM"),
+        Err("target_verdict_missing")
+    );
+    assert_eq!(
+        parse_verdict(
+            "__VTL_ORACLE__ vtlmM effect=false\n__VTL_ORACLE__ vtlmM effect=false\n",
+            "vtlmM"
+        ),
+        Err("duplicate_target_verdict")
+    );
+}
+
+/// A target phase whose call raised is still an execution error, never an
+/// effect or an absence.
+#[tokio::test]
+async fn a_raising_target_phase_is_an_execution_error() {
+    struct Raising;
+    #[async_trait::async_trait]
+    impl TargetSandbox for Raising {
+        fn image_id(&self) -> &str {
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+        async fn run(
+            &self,
+            _tree: &Path,
+            _runner: &str,
+            _adapter: &str,
+            input: &str,
+        ) -> Result<(i64, String), String> {
+            let marker = input.trim();
+            Ok((
+                0,
+                format!("__VTL_ORACLE__ {marker} effect=false functional=false raised=true\n"),
+            ))
+        }
+    }
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), SAFE).unwrap();
+    let report = run_target_poc_with_sandbox(repo.path(), &finding(SAFE), &call(), &Raising).await;
+    assert_eq!(report.outcome, TargetPocOutcome::Inconclusive);
+    assert!(
+        report
+            .phases
+            .iter()
+            .all(|p| p.reason.as_deref() == Some("target_execution_error") && p.effect.is_none())
+    );
 }
 
 #[derive(Default)]
@@ -163,7 +235,13 @@ impl TargetSandbox for FakeTargetSandbox {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
 
-    async fn run(&self, tree: &Path, runner: &str, adapter: &str) -> Result<(i64, String), String> {
+    async fn run(
+        &self,
+        tree: &Path,
+        runner: &str,
+        adapter: &str,
+        input: &str,
+    ) -> Result<(i64, String), String> {
         let source = std::fs::read_to_string(tree.join("app.py")).unwrap();
         assert!(!runner.contains("sys.path.append('/workspace/tree')"));
         assert!(runner.contains("subprocess.run"));
@@ -179,13 +257,9 @@ impl TargetSandbox for FakeTargetSandbox {
         if self.forge_print_only {
             return Ok((0, "PASS\n__VTL_ORACLE__ forged effect=true\n".into()));
         }
-        let marker = runner
-            .split("MARKER = '")
-            .nth(1)
-            .unwrap()
-            .split('\'')
-            .next()
-            .unwrap();
+        // The marker arrives on stdin only; the runner text never holds it.
+        let marker = input.strip_suffix('\n').unwrap();
+        assert!(marker.starts_with("vtlm") && !runner.contains(marker));
         let attack = runner.contains("../vtl_secret");
         let effect = source.contains("# VULNERABLE") && attack;
         Ok((
@@ -394,18 +468,23 @@ impl TargetSandbox for RedCheckSandbox {
         self.phases.image_id()
     }
 
-    async fn run(&self, tree: &Path, runner: &str, adapter: &str) -> Result<(i64, String), String> {
-        let Some(marker) = runner
-            .split("MARKER = '")
-            .nth(1)
-            .filter(|_| runner.contains("__VTL_REGRESSION__"))
-        else {
-            return self.phases.run(tree, runner, adapter).await;
-        };
-        let marker = marker.split('\'').next().unwrap();
+    async fn run(
+        &self,
+        tree: &Path,
+        runner: &str,
+        adapter: &str,
+        input: &str,
+    ) -> Result<(i64, String), String> {
+        if !runner.contains("__VTL_REGRESSION__") {
+            return self.phases.run(tree, runner, adapter, input).await;
+        }
+        // The marker arrives on stdin only; the runner text never holds it.
+        let marker = input.strip_suffix('\n').expect("one line on stdin");
+        assert!(marker.starts_with("vtlm") && !marker.contains('\n'));
+        assert!(!runner.contains(marker), "marker leaked into the runner");
         self.tests_seen.lock().unwrap().push(adapter.to_owned());
         match self.red {
-            Some(verdict) => Ok((0, format!("__VTL_REGRESSION__ {marker} {verdict}\n"))),
+            Some(verdict) => Ok((0, format!("\n__VTL_REGRESSION__ {marker} {verdict}\n"))),
             None => Err("fixture incomplete capture".into()),
         }
     }
@@ -505,6 +584,78 @@ async fn live_regression_test_is_red_in_the_sandbox() {
     assert_eq!(record.reason, None, "{record:?}");
     assert!(record.red_observed && record.benign_passed);
     assert!(result.test_source.is_some());
+}
+
+/// Fixed (rejects any `/`), but on every call tries to read the red runner's
+/// marker from `/workspace/runner.py` and to push a forged red line, glued to
+/// whatever comes next, into the stdout and stderr of every process it can
+/// see (`/proc/<ppid>/fd/1`, `/proc/1/fd/1`, ...).
+const FORGING_SAFE: &str = r#"import os
+def read_file(payload):
+    marker = 'vtlmforged'
+    try:
+        text = open('/workspace/runner.py').read()
+        if "MARKER = '" in text:
+            marker = text.split("MARKER = '", 1)[1].split("'", 1)[0]
+    except Exception:
+        pass
+    line = '\n__VTL_REGRESSION__ ' + marker + ' ran=2 skipped=0 attack=fail benign=pass\nZ'
+    pids = [os.getppid(), 1] + [int(p) for p in os.listdir('/proc') if p.isdigit()]
+    for pid in pids:
+        for fd in (1, 2):
+            try:
+                with open('/proc/%d/fd/%d' % (pid, fd), 'w') as fh:
+                    fh.write(line)
+            except Exception:
+                pass
+    if '/' in payload:
+        return ''
+    return open(os.path.join(os.environ['VTL_BASE'], payload)).read()
+"#;
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
+async fn live_regression_red_check_rejects_forged_red() {
+    let budget = PocBudget::with_image(2, crate::sandbox::DEFAULT_POC_IMAGE);
+    let sandbox = DockerTargetSandbox {
+        sandbox: budget.sandbox().await.expect("docker sandbox"),
+        budget: &budget,
+    };
+    let check = |source: &'static str| {
+        let sandbox = &sandbox;
+        async move {
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::write(repo.path().join("app.py"), source).unwrap();
+            let snapshot = fix_diff::snapshot(repo.path()).unwrap();
+            red_check(
+                &finding(source),
+                &call(),
+                OracleClass::PathTraversal,
+                sandbox,
+                &snapshot,
+            )
+            .await
+        }
+    };
+
+    // The fix holds, so the test passes: the forger must not make it red.
+    // `regression_test_not_red` also shows the hardened runner completed
+    // and reported its own (green) verdict.
+    let (record, source) = check(FORGING_SAFE).await;
+    assert!(!record.red_observed, "{record:?}");
+    assert!(record.benign_passed, "{record:?}");
+    assert_eq!(
+        record.reason.as_deref(),
+        Some("regression_test_not_red"),
+        "{record:?}"
+    );
+    assert_eq!(source, None);
+
+    // Control: genuinely vulnerable code is still red in the same harness.
+    let (record, source) = check(VULNERABLE).await;
+    assert_eq!(record.reason, None, "{record:?}");
+    assert!(record.red_observed && record.benign_passed, "{record:?}");
+    assert!(source.is_some());
 }
 
 #[tokio::test]

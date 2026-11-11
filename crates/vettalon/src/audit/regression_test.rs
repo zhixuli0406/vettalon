@@ -18,8 +18,9 @@ use super::poc_oracle::{OracleClass, benign_input, fixture_inputs};
 use super::schema::Finding;
 use super::target_poc::TargetCall;
 
-/// Printed once by [`red_runner`]; the marker is minted per run and never
-/// reaches the target, whose stdout and stderr are discarded anyway.
+/// Printed once by [`red_runner`], after a newline; the marker is minted per
+/// run, reaches the runner on stdin only and never reaches the test or the
+/// target, whose stdout and stderr are discarded anyway.
 const RED_PREFIX: &str = "__VTL_REGRESSION__ ";
 const ATTACK_TEST: &str = "test_attack_has_no_effect";
 const BENIGN_TEST: &str = "test_benign_input_still_works";
@@ -316,41 +317,194 @@ pub fn generate(
         .replace("@CLASS_BODY@", class_body(class)))
 }
 
+/// Program of the child process that runs the project test. It makes itself
+/// non-dumpable before loading `/workspace/sink.py`, so code the test starts
+/// (the target runs in a grandchild) cannot open its `/proc/<pid>/fd` or
+/// ptrace it. It reports the `TestResult` as one small JSON record on the
+/// inherited, already unlinked result file descriptor `argv[1]`, which it
+/// first marks non-inheritable so no process the test starts receives it.
+/// Its stdin, stdout and stderr are /dev/null. Exit 0 only after a complete
+/// write; any other exit (including `sys.exit` from the test module) leaves
+/// no usable record.
+const RED_CHILD: &str = r#"import ctypes, json, os, sys
+def main():
+    fd = int(sys.argv[1])
+    os.set_inheritable(fd, False)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(4, 0, 0, 0, 0) != 0 or libc.prctl(3, 0, 0, 0, 0) != 0:
+        os._exit(3)
+    import importlib.util, unittest
+    spec = importlib.util.spec_from_file_location('vettalon_regression', '/workspace/sink.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result = unittest.TestResult()
+    unittest.defaultTestLoader.loadTestsFromModule(module).run(result)
+    def state(name):
+        wanted = lambda rows: any(test.id().rsplit('.', 1)[-1] == name for test, _ in rows)
+        if wanted(result.errors):
+            return 'error'
+        return 'fail' if wanted(result.failures) else 'pass'
+    record = {'ran': result.testsRun, 'skipped': len(result.skipped),
+              'attack': state('@ATTACK@'), 'benign': state('@BENIGN@')}
+    data = json.dumps(record, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+    while data:
+        data = data[os.write(fd, data):]
+    os._exit(0)
+main()
+"#;
+
+/// The red runner after `poc_oracle::RUNNER_SETUP`:
+/// that start-up has already installed the hard-stop signal handlers and the
+/// alarm, read the marker from stdin to EOF, checked the runner is PID 1 and
+/// made it non-dumpable (verified), exiting 3 with nothing marked otherwise.
+///
+/// No project code runs in this process. The runner creates the result file
+/// (`O_EXCL|O_NOFOLLOW|O_NONBLOCK`) and unlinks it while it is the only
+/// process in the container, so only the runner and the test child hold it.
+/// After the child exits, `reap()` kills and waits for everything the test
+/// left behind; the record is then read through the runner's own descriptor
+/// (fstat, regular file, size cap, strict fields), `reap()` runs again and
+/// ONE marked line is written, starting with a newline so bytes pushed into
+/// the pipe without a trailing newline cannot swallow its prefix. Any failure
+/// exits 3 without a marked line.
+const RED_BODY: &str = r#"RED_PREFIX = '@PREFIX@'
+RESULT_LIMIT = 4096
+CHILD = r'''@CHILD@'''
+def emit(fields):
+    sys.stdout.write('\n' + RED_PREFIX + MARKER + ' ' + fields + '\n')
+    sys.stdout.flush()
+def fail(why):
+    sys.stderr.write('vettalon regression harness: ' + why + '; no verdict\n')
+    sys.stderr.flush()
+    os._exit(3)
+def reap():
+    # PID 1: kill(-1) reaches every other process in the container and every
+    # orphan is re-parented here. Kill and wait until no child is left.
+    while True:
+        try:
+            os.kill(-1, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            os.waitpid(-1, 0)
+        except ChildProcessError:
+            return
+def read_record(fd):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > RESULT_LIMIT:
+        raise RuntimeError('invalid test result')
+    data = os.pread(fd, RESULT_LIMIT + 1, 0)
+    if len(data) > RESULT_LIMIT:
+        raise RuntimeError('invalid test result')
+    record = json.loads(data.decode('ascii'))
+    if not isinstance(record, dict) or set(record) != {'ran', 'skipped', 'attack', 'benign'}:
+        raise RuntimeError('invalid test result')
+    for key in ('ran', 'skipped'):
+        if type(record[key]) is not int or not 0 <= record[key] <= 1000:
+            raise RuntimeError('invalid test result')
+    for key in ('attack', 'benign'):
+        if type(record[key]) is not str or record[key] not in ('pass', 'fail', 'error'):
+            raise RuntimeError('invalid test result')
+    return record
+def main():
+    reap()
+    path = '/tmp/vtl_regression_result'
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    os.unlink(path)
+    env = dict(os.environ)
+    env['VETTALON_REPO_ROOT'] = '/workspace/tree'
+    code = None
+    try:
+        child = subprocess.run(
+            [sys.executable, '-I', '-B', '-c', CHILD, str(fd)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            pass_fds=(fd,),
+            timeout=100,
+            check=False,
+        )
+        code = child.returncode
+    finally:
+        reap()
+    if code != 0:
+        fail('test child exited with code ' + str(code))
+    record = read_record(fd)
+    os.close(fd)
+    reap()
+    emit('ran=' + str(record['ran']) + ' skipped=' + str(record['skipped'])
+         + ' attack=' + record['attack'] + ' benign=' + record['benign'])
+try:
+    main()
+except Exception:
+    fail('harness error')
+"#;
+
 /// Fixed runner for the sandbox red check; the test file is mounted as
-/// `/workspace/sink.py` and the prepared tree as `/workspace/tree`.
-pub(crate) fn red_runner(marker: &str) -> String {
-    format!(
-        r#"import importlib.util
-import os
-import unittest
-MARKER = '{marker}'
-os.environ['VETTALON_REPO_ROOT'] = '/workspace/tree'
-def state(name, result):
-    wanted = lambda rows: any(test.id().rsplit('.', 1)[-1] == name for test, _ in rows)
-    if wanted(result.errors):
-        return 'error'
-    return 'fail' if wanted(result.failures) else 'pass'
-spec = importlib.util.spec_from_file_location('vettalon_regression', '/workspace/sink.py')
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-result = unittest.TestResult()
-unittest.defaultTestLoader.loadTestsFromModule(module).run(result)
-print('{RED_PREFIX}' + MARKER + ' ran=' + str(result.testsRun) + ' skipped=' + str(len(result.skipped))
-      + ' attack=' + state('{ATTACK_TEST}', result) + ' benign=' + state('{BENIGN_TEST}', result))
-"#
-    )
+/// `/workspace/sink.py` and the prepared tree as `/workspace/tree`. It holds
+/// no marker: the marker reaches it on stdin (`poc_oracle::runner_input`),
+/// and it must run as PID 1 of its container (`TargetSandbox::run`, i.e.
+/// `DockerSandbox::run_workspace_with_tree`).
+///
+/// Why the test and the target cannot forge the red line:
+/// - the marker is not in the runner text, a file, an argument or the
+///   environment; the runner reads it from stdin and is non-dumpable before
+///   any project code exists, so its memory and `/proc/1/fd` are closed;
+/// - project code only runs in the test child (itself non-dumpable) and its
+///   descendants, all with stdio on /dev/null, so none has a descriptor for
+///   the runner's stdout;
+/// - the record comes back through an unlinked file only the runner and the
+///   test child hold, read after `reap()` has removed every other process;
+/// - the host counts a verdict only with exit 0 and exactly one occurrence
+///   of the marked prefix, at the start of a line.
+///
+/// Not covered: a test that imports the target into its own process lets
+/// that code write the record, as it could already change the test's outcome
+/// directly.
+pub(crate) fn red_runner() -> String {
+    let child = RED_CHILD
+        .replace("@ATTACK@", ATTACK_TEST)
+        .replace("@BENIGN@", BENIGN_TEST);
+    let mut runner = String::from(super::poc_oracle::RUNNER_SETUP);
+    runner.push_str(
+        &RED_BODY
+            .replace("@PREFIX@", RED_PREFIX)
+            .replace("@CHILD@", &child),
+    );
+    runner
 }
 
-/// Read the single marker-bound verdict. Anything else is not a red result.
-pub(crate) fn parse_red_verdict(output: &str, marker: &str) -> Result<(bool, bool), &'static str> {
-    let expected = format!("{RED_PREFIX}{marker} ");
-    let mut lines = output
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix(expected.as_str()));
-    let line = lines.next().ok_or("regression_verdict_missing")?;
-    if lines.next().is_some() {
-        return Err("duplicate_regression_verdict");
+/// The fields after `PREFIX MARKER ` on the single marked line. A non-zero
+/// exit, no occurrence, more than one occurrence of the marked
+/// prefix anywhere in the output, or one not at the start of a line is no
+/// verdict.
+fn marked_fields<'a>(exit: i64, output: &'a str, marker: &str) -> Result<&'a str, &'static str> {
+    if exit != 0 {
+        return Err("regression_test_execution_error");
     }
+    let tag = format!("{RED_PREFIX}{marker}");
+    match output.matches(tag.as_str()).count() {
+        0 => return Err("regression_verdict_missing"),
+        1 => {}
+        _ => return Err("duplicate_regression_verdict"),
+    }
+    let expected = format!("{tag} ");
+    output
+        .lines()
+        .find_map(|line| line.trim_end().strip_prefix(expected.as_str()))
+        .ok_or("invalid_regression_verdict")
+}
+
+/// Read the single marker-bound verdict of a run that exited 0. Anything
+/// else is not a red result.
+pub(crate) fn parse_red_verdict(
+    exit: i64,
+    output: &str,
+    marker: &str,
+) -> Result<(bool, bool), &'static str> {
+    let line = marked_fields(exit, output, marker)?;
     match line.split_whitespace().collect::<Vec<_>>().as_slice() {
         ["ran=2", "skipped=0", attack, benign] => {
             Ok((*attack == "attack=fail", *benign == "benign=pass"))
@@ -653,22 +807,23 @@ mod tests {
 
     #[test]
     fn the_verdict_must_be_single_marker_bound_and_complete() {
-        let line = |rest: &str| format!("{RED_PREFIX}vtlmarker {rest}\n");
+        let line = |rest: &str| format!("\n{RED_PREFIX}vtlmarker {rest}\n");
         let red = line("ran=2 skipped=0 attack=fail benign=pass");
-        assert_eq!(parse_red_verdict(&red, "vtlmarker"), Ok((true, true)));
+        assert_eq!(parse_red_verdict(0, &red, "vtlmarker"), Ok((true, true)));
         assert_eq!(
             parse_red_verdict(
+                0,
                 &line("ran=2 skipped=0 attack=error benign=pass"),
                 "vtlmarker"
             ),
             Ok((false, true))
         );
         assert_eq!(
-            parse_red_verdict(&red, "othermarker"),
+            parse_red_verdict(0, &red, "othermarker"),
             Err("regression_verdict_missing")
         );
         assert_eq!(
-            parse_red_verdict(&format!("{red}{red}"), "vtlmarker"),
+            parse_red_verdict(0, &format!("{red}{red}"), "vtlmarker"),
             Err("duplicate_regression_verdict")
         );
         for bad in [
@@ -677,10 +832,135 @@ mod tests {
             "ran=2 skipped=0 attack=fail",
         ] {
             assert_eq!(
-                parse_red_verdict(&line(bad), "vtlmarker"),
+                parse_red_verdict(0, &line(bad), "vtlmarker"),
                 Err("invalid_regression_verdict"),
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_non_zero_exit_or_a_second_marked_prefix_is_no_verdict() {
+        let real = format!("\n{RED_PREFIX}vtlmarker ran=2 skipped=0 attack=pass benign=pass\n");
+        let forged = format!("\n{RED_PREFIX}vtlmarker ran=2 skipped=0 attack=fail benign=pass\nZ");
+        for exit in [1, 3, 137, -1] {
+            assert_eq!(
+                parse_red_verdict(exit, &real, "vtlmarker"),
+                Err("regression_test_execution_error"),
+                "{exit}"
+            );
+        }
+        // The R2-1 forgery: a line pushed into stdout without a trailing
+        // newline, before the runner's own line. With or without the
+        // runner's leading newline there are two marked prefixes.
+        let swallowed = format!("{forged}{}", real.trim_start());
+        for output in [format!("{forged}{real}"), swallowed] {
+            assert_eq!(
+                parse_red_verdict(0, &output, "vtlmarker"),
+                Err("duplicate_regression_verdict"),
+                "{output:?}"
+            );
+        }
+        // The only marked prefix, but not at the start of a line.
+        let glued = format!("Z{}", real.trim_start());
+        assert_eq!(
+            parse_red_verdict(0, &glued, "vtlmarker"),
+            Err("invalid_regression_verdict")
+        );
+        // A marked prefix elsewhere on a line still counts as a second one.
+        let echoed = format!("noise {RED_PREFIX}vtlmarker\n{real}");
+        assert_eq!(
+            parse_red_verdict(0, &echoed, "vtlmarker"),
+            Err("duplicate_regression_verdict")
+        );
+    }
+
+    fn position(haystack: &str, needle: &str) -> usize {
+        haystack
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing"))
+    }
+
+    #[test]
+    fn the_red_runner_holds_no_marker_and_is_hardened_before_any_test_code() {
+        let runner = red_runner();
+        // Same start-up as the oracle runner: signals, alarm, marker from
+        // stdin to EOF, PID 1, PR_SET_DUMPABLE=0 and PR_GET_DUMPABLE == 0.
+        assert!(runner.starts_with(crate::audit::poc_oracle::RUNNER_SETUP));
+        assert!(runner.contains("marker = sys.stdin.buffer.read()"));
+        assert!(runner.contains("os.getpid() == 1"));
+        assert!(runner.contains("signal.alarm(HARD_LIMIT_SECS)"));
+        assert!(!runner.contains("MARKER = '"));
+        let secrets = crate::audit::poc_oracle::OracleSecrets::fresh();
+        assert!(!runner.contains(&secrets.marker));
+        // The runner is non-dumpable before the test child exists.
+        let setup_prctl = position(&runner, "libc.prctl(4, 0, 0, 0, 0) == 0");
+        let spawn = position(&runner, "subprocess.run(");
+        assert!(setup_prctl < spawn);
+        // No project code in the runner: the test module loads in the child,
+        // which is itself non-dumpable before it loads it.
+        let child = runner.split("CHILD = r'''").nth(1).unwrap();
+        let child = child.split("'''").next().unwrap();
+        assert!(position(child, "libc.prctl(4, 0, 0, 0, 0) != 0") < position(child, "exec_module"));
+        assert!(position(child, "os.set_inheritable(fd, False)") < position(child, "exec_module"));
+        let parent = runner.replace(child, "");
+        assert!(!parent.contains("exec_module"));
+        assert!(!parent.contains("unittest"));
+        assert!(!parent.contains("/workspace/sink.py"));
+        // The child has no handle on the runner's stdout.
+        for stdio in [
+            "stdin=subprocess.DEVNULL",
+            "stdout=subprocess.DEVNULL",
+            "stderr=subprocess.DEVNULL",
+            "pass_fds=(fd,)",
+        ] {
+            assert!(parent.contains(stdio), "{stdio}");
+        }
+        // Bounded result read through the runner's own descriptor.
+        assert!(parent.contains("os.O_EXCL | os.O_NONBLOCK | os.O_NOFOLLOW"));
+        assert!(position(&parent, "os.open(path") < position(&parent, "os.unlink(path)"));
+        assert!(parent.contains("os.fstat(fd)"));
+        assert!(parent.contains("info.st_size > RESULT_LIMIT"));
+        // One marked write, starting with a newline, after the last reap().
+        assert_eq!(runner.matches("sys.stdout.write").count(), 1);
+        assert!(!runner.contains("print("));
+        assert!(runner.contains(r"sys.stdout.write('\n' + RED_PREFIX + MARKER + ' '"));
+        let reaped = position(&parent, "    os.close(fd)\n    reap()\n    emit('ran=");
+        assert!(reaped > position(&parent, "        reap()\n    if code != 0:"));
+        assert_eq!(parent.matches("emit('ran=").count(), 1);
+        assert!(runner.contains(&format!("RED_PREFIX = '{RED_PREFIX}'")));
+        assert!(runner.contains(&format!("state('{ATTACK_TEST}')")));
+        assert!(runner.contains(&format!("state('{BENIGN_TEST}')")));
+    }
+
+    /// Off PID 1 (any host run) the runner refuses before running anything.
+    #[test]
+    fn the_red_runner_fails_closed_outside_its_container() {
+        if !python3_present() {
+            return;
+        }
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("runner.py");
+        std::fs::write(&script, red_runner()).unwrap();
+        let mut child = Command::new("python3")
+            .args(["-I", "-B"])
+            .arg(&script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let marker = crate::audit::poc_oracle::OracleSecrets::fresh().marker;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{marker}\n").as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains(RED_PREFIX), "{stdout}");
     }
 }

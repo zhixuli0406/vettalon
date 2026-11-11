@@ -33,6 +33,18 @@
 //!   original copy (a failing baseline makes B inconclusive) and then on the
 //!   fixed copy. B runs only after A passed.
 //!
+//! The fixed copy runs the patched code, so a fixed-copy run that exits
+//! non-zero, times out, gives no, an invalid or a duplicate verdict, or
+//! reports `error=true` with no effect is never counted as blocked: A is
+//! then at best inconclusive (`fixed_copy_no_verdict`) and the remaining
+//! inputs and the benign control still run, so an effect or a broken benign
+//! input on the fixed copy still fails A. A Python exception from the
+//! checked code (`raised=true`) with no effect still counts as blocked; the
+//! benign control catches a fix that always raises. The per-run marker
+//! reaches the runner on stdin only, and the adapter and project code run in
+//! a child process of the runner. A sandbox error or missing verdict on the
+//! original copy stops A as inconclusive.
+//!
 //! Outcome, decided only from A and B (a model's opinion never enters):
 //! `fix_verified` = A pass and B pass; `fix_check_partial` = A pass, B not
 //! run; `fix_rejected` = A fail or B fail; `fix_unverified` = anything else
@@ -49,7 +61,7 @@ use super::llm_util::escape_xml_tag;
 use super::poc::{POC_TIMEOUT, PocBudget, parse_poc_response, poc_eligible, push_skip};
 use super::poc_oracle::{
     OracleClass, OracleSecrets, anti_cheat_adapter, benign_input, build_fix_runner, classify,
-    fixture_inputs,
+    fixture_inputs, runner_command, runner_input,
 };
 use super::schema::{EvidenceItem, EvidenceKind, Finding, sha256_hex};
 use super::verification_context::{self, VerificationContext, VerificationTarget};
@@ -58,6 +70,14 @@ use super::verification_context::{self, VerificationContext, VerificationTarget}
 pub const FIX_CHECK_PREFIX: &str = "fix_check:";
 /// Reason shown when a suggested fix carries no check for this exact diff.
 pub const NOT_CHECKED: &str = "not_checked";
+/// The original copy gave a verdict for an input but the fixed copy (where
+/// the patched code runs) exited non-zero, timed out, or printed no, an
+/// invalid or a duplicate verdict, or its runner reported `error=true` with
+/// no effect (the sink child timed out, exited non-zero, returned a missing
+/// or invalid result, or the evidence changed while it ran). That input is
+/// not counted as blocked and A is inconclusive. A Python exception from the
+/// checked code (`raised=true`) is not this: it counts as blocked.
+pub const FIXED_COPY_NO_VERDICT: &str = "fixed_copy_no_verdict";
 /// Upper bound on fixture inputs a detail may claim.
 const MAX_FIXTURE_INPUTS: u32 = 64;
 /// Cap on a reason token (same grammar as a `poc_oracle` rejection).
@@ -398,9 +418,16 @@ pub trait FixSandbox: Send + Sync {
         None
     }
     /// Run the harness `runner.py` next to the adapter `sink.py`, with `tree`
-    /// mounted read-only at `/workspace/tree`. Returns the combined output.
-    async fn run_harness(&self, tree: &Path, runner: &str, adapter: &str)
-    -> Result<String, String>;
+    /// mounted read-only at `/workspace/tree` and `input` (the per-run
+    /// marker, never written to a file) on the runner's stdin. Returns the
+    /// combined output.
+    async fn run_harness(
+        &self,
+        tree: &Path,
+        runner: &str,
+        adapter: &str,
+        input: &str,
+    ) -> Result<String, String>;
     /// Run the operator's test command (`sh -c`) with `tree` mounted
     /// read-only as the working directory. Returns the exit code.
     async fn run_tests(&self, tree: &Path, command: &str) -> Result<i64, String>;
@@ -863,23 +890,25 @@ impl Step {
     }
 }
 
-/// One harness run on one copy with fresh one-time secrets.
-/// What one harness run showed, read only from lines bearing its marker.
+/// What one harness run showed, read only from the line bearing its marker.
 struct HarnessRun {
     effect: bool,
-    /// The harness caught an exception (adapter import, missing `run`, or
-    /// the call itself raised).
+    /// The run failed without a Python exception from the checked code:
+    /// timeout, non-zero child exit, missing/oversized/invalid result, or
+    /// evidence altered while the sink ran.
     errored: bool,
+    /// The adapter or the project code raised a Python exception.
+    raised: bool,
     /// The benign input's known good result came back (`None` when the class
     /// has no such check).
     functional: Option<bool>,
 }
 
 impl HarnessRun {
-    /// A benign run that behaved normally: no effect, no exception, and the
-    /// expected result where the class has one.
+    /// A benign run that behaved normally: no effect, no exception, no
+    /// failure, and the expected result where the class has one.
     fn benign_ok(&self) -> bool {
-        !self.effect && !self.errored && self.functional != Some(false)
+        !self.effect && !self.errored && !self.raised && self.functional != Some(false)
     }
 }
 
@@ -895,16 +924,59 @@ async fn harness_run<S: FixSandbox>(
     let secrets = OracleSecrets::fresh();
     let runner = adapters.runner(req.class, &secrets, payload);
     let out = sandbox
-        .run_harness(tree, &runner, adapter)
+        .run_harness(tree, &runner, adapter, &runner_input(&secrets))
         .await
         .map_err(|e| ("sandbox_error", e))?;
-    let (effect, functional, errored) = super::target_poc::parse_verdict(&out, &secrets.marker)
+    let verdict = super::target_poc::parse_verdict(&out, &secrets.marker)
         .map_err(|reason| ("no_verdict", format!("invalid harness verdict: {reason}")))?;
     Ok(HarnessRun {
-        effect,
-        errored,
-        functional,
+        effect: verdict.effect,
+        errored: verdict.error,
+        raised: verdict.raised,
+        functional: verdict.functional,
     })
+}
+
+/// Note recorded when the fixed copy's runner reported `error=true` without
+/// an effect.
+const FIXED_COPY_ERROR_NOTE: &str = "the fixed copy's run failed (timeout, non-zero exit, missing or invalid result, or altered evidence); not counted as blocked";
+
+/// What the fixed copy showed for one input.
+enum FixedRun {
+    /// A usable verdict. No effect counts as blocked, including a Python
+    /// exception from the checked code (`raised=true`): a fixed copy that
+    /// raises on the attack input blocks it, and the benign control then
+    /// catches a fix that always raises.
+    Ran(HarnessRun),
+    /// The run ended without a usable verdict, or the runner reported
+    /// `error=true` with no effect; the bounded note. Never counted as
+    /// blocked.
+    NoVerdict(String),
+}
+
+/// The fixed copy's run. The patched code runs there, so any run that ends
+/// without a usable verdict (non-zero exit, timeout, no, invalid or
+/// duplicate marker) is [`FixedRun::NoVerdict`], attributed to the fix. So
+/// is a run whose runner reported `error=true` (the sink child timed out,
+/// exited non-zero, returned a missing or invalid result, or the evidence
+/// changed while it ran) and no effect: that input is not counted as
+/// blocked. An effect still counts even if the run also failed. Only a
+/// budget refusal (nothing ran) stays an error.
+async fn run_fixed<S: FixSandbox>(
+    sandbox: &S,
+    tree: &Path,
+    req: &FixCheckRequest<'_>,
+    payload: &str,
+    adapters: &PreparedAdapters,
+) -> Result<FixedRun, (&'static str, String)> {
+    match harness_run(sandbox, tree, req, payload, adapters, &adapters.fixed).await {
+        Ok(run) if !run.effect && run.errored => {
+            Ok(FixedRun::NoVerdict(FIXED_COPY_ERROR_NOTE.to_string()))
+        }
+        Ok(run) => Ok(FixedRun::Ran(run)),
+        Err((reason, note)) if is_budget_refusal(&note) => Err((reason, note)),
+        Err((_, note)) => Ok(FixedRun::NoVerdict(note)),
+    }
 }
 
 async fn regression_check<S: FixSandbox>(
@@ -916,6 +988,8 @@ async fn regression_check<S: FixSandbox>(
 ) -> Step {
     let mut blocked = 0u32;
     let mut original_quiet = false;
+    // First fixed-copy run without a usable verdict, if any.
+    let mut no_verdict: Option<String> = None;
     let stop = |result: CheckResult, reason: &str, note: Option<String>, blocked: u32| {
         let mut s = Step::new(result).because(reason, note);
         s.blocked = blocked;
@@ -937,28 +1011,30 @@ async fn regression_check<S: FixSandbox>(
                 return stop(CheckResult::Inconclusive, reason, Some(note), blocked);
             }
         };
-        let fixed = match harness_run(
-            sandbox,
-            &copies.fixed,
-            req,
-            payload,
-            adapters,
-            &adapters.fixed,
-        )
-        .await
-        {
-            Ok(v) => v.effect,
+        let fixed = match run_fixed(sandbox, &copies.fixed, req, payload, adapters).await {
+            Ok(fixed) => fixed,
             Err((reason, note)) => {
                 return stop(CheckResult::Inconclusive, reason, Some(note), blocked);
             }
         };
-        match (original, fixed) {
+        if !original {
+            original_quiet = true;
+        }
+        match fixed {
             // Any effect on the fixed copy is a failed fix, whatever the original did.
-            (_, true) => {
+            FixedRun::Ran(run) if run.effect => {
                 return stop(CheckResult::Fail, "fixed_copy_shows_effect", None, blocked);
             }
-            (true, false) => blocked += 1,
-            (false, false) => original_quiet = true,
+            FixedRun::Ran(_) => {
+                if original {
+                    blocked += 1;
+                }
+            }
+            // Never counted as blocked; later inputs still run so an effect
+            // there still fails A.
+            FixedRun::NoVerdict(note) => {
+                no_verdict.get_or_insert(note);
+            }
         }
     }
     if original_quiet {
@@ -974,27 +1050,48 @@ async fn regression_check<S: FixSandbox>(
     // always raises or returns nothing). The benign input must still behave
     // normally on the fixed copy, judged against the original copy.
     let benign = benign_input(req.class);
-    for (tree, side, adapter) in [
-        (&copies.original, "original", &adapters.original),
-        (&copies.fixed, "fixed", &adapters.fixed),
-    ] {
-        match harness_run(sandbox, tree, req, benign, adapters, adapter).await {
-            Err((reason, note)) => {
-                return stop(CheckResult::Inconclusive, reason, Some(note), blocked);
-            }
-            Ok(run) if run.benign_ok() => {}
-            Ok(_) if side == "original" => {
-                return stop(
-                    CheckResult::Inconclusive,
-                    "benign_control_unavailable",
-                    None,
-                    blocked,
-                );
-            }
-            Ok(_) => {
-                return stop(CheckResult::Fail, "fix_breaks_benign_input", None, blocked);
-            }
+    match harness_run(
+        sandbox,
+        &copies.original,
+        req,
+        benign,
+        adapters,
+        &adapters.original,
+    )
+    .await
+    {
+        Err((reason, note)) => {
+            return stop(CheckResult::Inconclusive, reason, Some(note), blocked);
         }
+        Ok(run) if run.benign_ok() => {}
+        Ok(_) => {
+            return stop(
+                CheckResult::Inconclusive,
+                "benign_control_unavailable",
+                None,
+                blocked,
+            );
+        }
+    }
+    match run_fixed(sandbox, &copies.fixed, req, benign, adapters).await {
+        Err((reason, note)) => {
+            return stop(CheckResult::Inconclusive, reason, Some(note), blocked);
+        }
+        Ok(FixedRun::Ran(run)) if run.benign_ok() => {}
+        Ok(FixedRun::Ran(_)) => {
+            return stop(CheckResult::Fail, "fix_breaks_benign_input", None, blocked);
+        }
+        Ok(FixedRun::NoVerdict(note)) => {
+            no_verdict.get_or_insert(note);
+        }
+    }
+    if let Some(note) = no_verdict {
+        return stop(
+            CheckResult::Inconclusive,
+            FIXED_COPY_NO_VERDICT,
+            Some(note),
+            blocked,
+        );
     }
     let mut s = Step::new(CheckResult::Pass);
     s.blocked = blocked;
@@ -1036,6 +1133,17 @@ struct DockerFixSandbox<'a> {
     budget: &'a PocBudget,
 }
 
+/// A harness verdict counts only when the runner exited 0; `harness_run`
+/// then also requires exactly one `effect=` for the marker
+/// (`target_poc::parse_verdict`), and the runner prints all its fields on
+/// one line at the end. Project code runs in a child of the runner and can
+/// never reach the marker: the runner gets it on stdin only (it is not in
+/// `runner.py`) and is non-dumpable before the child starts, so its memory,
+/// fds and environment are closed to the child even where same-uid ptrace
+/// is allowed. The runner is also PID 1 of its container, so nothing the
+/// child starts outlives its reap. A signal that ends the runner early
+/// leaves no marked line and a non-zero exit: no verdict either way. See
+/// `poc_oracle::runner_source` for what this does not cover.
 fn successful_harness_output(code: i64, output: String) -> Result<String, String> {
     if code == 0 {
         Ok(output)
@@ -1044,13 +1152,24 @@ fn successful_harness_output(code: i64, output: String) -> Result<String, String
     }
 }
 
+/// Start and end of the error a run gets when the PoC budget refused it.
+const BUDGET_REFUSAL_PREFIX: &str = "run-wide PoC execution budget (";
+const BUDGET_REFUSAL_SUFFIX: &str = ") reached; not executed";
+
+/// The sandbox refused the run before anything started because the PoC
+/// budget is used up: says nothing about the fix, so it is never
+/// [`FixedRun::NoVerdict`].
+fn is_budget_refusal(error: &str) -> bool {
+    error.starts_with(BUDGET_REFUSAL_PREFIX) && error.ends_with(BUDGET_REFUSAL_SUFFIX)
+}
+
 impl DockerFixSandbox<'_> {
     fn claim(&self) -> Result<(), String> {
         if self.budget.try_claim() {
             Ok(())
         } else {
             Err(format!(
-                "run-wide PoC execution budget ({}) reached; not executed",
+                "{BUDGET_REFUSAL_PREFIX}{}{BUDGET_REFUSAL_SUFFIX}",
                 self.budget.max()
             ))
         }
@@ -1067,15 +1186,16 @@ impl FixSandbox for DockerFixSandbox<'_> {
         tree: &Path,
         runner: &str,
         adapter: &str,
+        input: &str,
     ) -> Result<String, String> {
         self.claim()?;
-        let cmd = vec!["python3".to_string(), "/workspace/runner.py".to_string()];
         let (code, out) = self
             .sb
             .run_workspace_with_tree(
                 &[("runner.py", runner), ("sink.py", adapter)],
                 tree,
-                &cmd,
+                &runner_command(),
+                Some(input),
                 POC_TIMEOUT,
             )
             .await?;

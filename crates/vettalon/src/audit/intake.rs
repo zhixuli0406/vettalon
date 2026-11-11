@@ -437,6 +437,9 @@ async fn head_commit_epoch(git_bin: &str, git_dir: &Path, repo_root: &Path) -> O
             git_dir_arg.as_str(),
             "log",
             "--no-show-signature",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
             "-1",
             "--format=%ct",
             "HEAD",
@@ -459,14 +462,86 @@ async fn head_commit_epoch(git_bin: &str, git_dir: &Path, repo_root: &Path) -> O
     out.stdout.trim().parse().ok()
 }
 
+/// Extensions that only select an on-disk format (objects, refs, per-worktree
+/// config, which is validated below like the main config, relative worktree
+/// paths) or mark a partial clone (`git clone --filter`, actions/checkout
+/// `filter:`). A partial clone may try to fetch a missing object lazily, but
+/// every scanner Git process blocks lazy fetches and all transports, and the
+/// keys that would choose a transport command stay refused. Every other
+/// extension, including any this list does not know yet, is refused.
+const ALLOWED_GIT_EXTENSIONS: &[&str] = &[
+    "extensions.objectformat",
+    "extensions.compatobjectformat",
+    "extensions.refstorage",
+    "extensions.worktreeconfig",
+    "extensions.partialclone",
+    "extensions.relativeworktrees",
+];
+
+/// Per-remote variables naming the command a transport runs. Matched on the
+/// last segment because remote names may contain dots. `promisor` and
+/// `partialclonefilter` are allowed for partial clones.
+const FORBIDDEN_REMOTE_VARS: &[&str] = &["uploadpack", "receivepack", "vcs"];
+
+/// `ext::<command>` and other `<helper>::<address>` URLs run a transport
+/// helper: a scheme-like prefix (`[A-Za-z0-9][A-Za-z0-9+.-]*`) directly
+/// followed by `::` at the start. Leading whitespace is skipped to stay
+/// conservative. An IPv6 literal such as `ssh://[::1]/repo` is not a helper.
+fn is_transport_helper_url(value: &str) -> bool {
+    let value = value.trim_start().as_bytes();
+    let Some((first, rest)) = value.split_first() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    let scheme_len = rest
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || b"+.-".contains(*b))
+        .count();
+    rest[scheme_len..].starts_with(b"::")
+}
+
+/// The `<base>` of a `url.<base>.insteadOf` / `url.<base>.pushInsteadOf`
+/// key, which is the rewrite target. Expects a lowercased, trimmed key.
+fn url_rewrite_base(key: &str) -> Option<&str> {
+    key.strip_prefix("url.")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .filter(|(_, var)| *var == "insteadof" || *var == "pushinsteadof")
+        .map(|(base, _)| base)
+}
+
+/// Value-dependent refusals, applied after [`forbidden_git_config_key`].
+fn forbidden_git_config_value(key: &str, value: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    let remote_url = key
+        .strip_prefix("remote.")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .is_some_and(|(_, var)| var == "url" || var == "pushurl");
+    let url_rewrite = url_rewrite_base(&key).is_some();
+    (remote_url || url_rewrite) && is_transport_helper_url(value)
+}
+
 fn forbidden_git_config_key(key: &str) -> bool {
     let key = key.trim().to_ascii_lowercase();
+    let remote_var = key
+        .strip_prefix("remote.")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .map(|(_, var)| var);
+    let rewrite_base = url_rewrite_base(&key);
     key == "include.path"
         || (key.starts_with("includeif.") && key.ends_with(".path"))
         || key == "core.worktree"
         || key == "core.fsmonitor"
         || key == "core.hookspath"
         || key == "core.sshcommand"
+        || key == "core.gitproxy"
+        || (key.starts_with("extensions.") && !ALLOWED_GIT_EXTENSIONS.contains(&key.as_str()))
+        || remote_var.is_some_and(|var| FORBIDDEN_REMOTE_VARS.contains(&var))
+        || rewrite_base.is_some_and(is_transport_helper_url)
+        || key.starts_with("protocol.")
+        || key.starts_with("credential.")
+        || key.starts_with("uploadpack.")
         || key == "log.showsignature"
         || key == "gpg.program"
         || key == "gpg.openpgp.program"
@@ -478,6 +553,104 @@ fn forbidden_git_config_key(key: &str) -> bool {
             && (key.ends_with(".clean") || key.ends_with(".smudge") || key.ends_with(".process")))
 }
 
+/// Each legacy remote file is read up to this size; a larger one is refused.
+const MAX_LEGACY_REMOTE_BYTES: u64 = 64 * 1024;
+const MAX_LEGACY_REMOTE_ENTRIES: usize = 4096;
+const MAX_LEGACY_REMOTE_DEPTH: usize = 16;
+
+/// Git still reads a remote from `$GIT_DIR/remotes/<name>` (`URL:` lines)
+/// and `$GIT_DIR/branches/<name>` (a bare URL); names may contain `/`.
+/// Refuse a transport-helper URL in any such file, and any symlink or
+/// special file there. Links are never followed and names never printed.
+fn validate_legacy_remotes(git_dir: &Path) -> Result<(), String> {
+    let mut visited = 0usize;
+    for top in ["remotes", "branches"] {
+        let mut stack = vec![(git_dir.join(top), 0usize)];
+        while let Some((path, depth)) = stack.pop() {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(format!("cannot inspect legacy remote files in {top}/")),
+            };
+            let kind = metadata.file_type();
+            if kind.is_symlink() {
+                return Err(format!("legacy remote symlink is not allowed in {top}/"));
+            }
+            if kind.is_dir() {
+                if depth >= MAX_LEGACY_REMOTE_DEPTH {
+                    return Err(format!(
+                        "legacy remote files in {top}/ exceed the depth limit"
+                    ));
+                }
+                let entries = std::fs::read_dir(&path)
+                    .map_err(|_| format!("cannot inspect legacy remote files in {top}/"))?;
+                for entry in entries {
+                    let entry = entry
+                        .map_err(|_| format!("cannot inspect legacy remote files in {top}/"))?;
+                    visited += 1;
+                    if visited > MAX_LEGACY_REMOTE_ENTRIES {
+                        return Err("legacy remote files exceed the validation entry limit".into());
+                    }
+                    stack.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            if depth == 0 {
+                // Not a directory, so Git cannot read any remote from it.
+                continue;
+            }
+            if !kind.is_file() {
+                return Err(format!("special file is not allowed in {top}/"));
+            }
+            let text = read_legacy_remote(&path)
+                .map_err(|reason| format!("legacy remote file in {top}/ {reason}"))?;
+            if legacy_remote_has_helper(&text) {
+                return Err(format!(
+                    "transport-helper URL is not allowed in a legacy remote file in {top}/"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bounded read that never follows a symlink and never blocks on a FIFO.
+fn read_legacy_remote(path: &Path) -> Result<String, &'static str> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| "cannot be read")?;
+    if !file.metadata().map_err(|_| "cannot be read")?.is_file() {
+        return Err("is not a regular file");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_LEGACY_REMOTE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cannot be read")?;
+    if bytes.len() as u64 > MAX_LEGACY_REMOTE_BYTES {
+        return Err("exceeds the validation limit");
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Check every line, with or without a `URL:` prefix (case-insensitive), so
+/// both the `remotes/` and the `branches/` formats are covered.
+fn legacy_remote_has_helper(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        let url = match line.get(..4) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("url:") => &line[4..],
+            _ => line,
+        };
+        is_transport_helper_url(url)
+    })
+}
+
 /// Parse repository config with Git itself, but explicitly disable includes
 /// while parsing. This catches BOM, quoting, whitespace, case and includeIf
 /// variants without first following attacker-selected external paths.
@@ -486,6 +659,7 @@ async fn validate_git_configs(
     git_dir: &Path,
     repo_root: &Path,
 ) -> Result<(), String> {
+    validate_legacy_remotes(git_dir)?;
     for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
         if !config.is_file() {
             continue;
@@ -498,7 +672,6 @@ async fn validate_git_configs(
                 "--file",
                 config_arg.as_str(),
                 "--null",
-                "--name-only",
                 "--list",
                 "--no-includes",
             ],
@@ -520,13 +693,20 @@ async fn validate_git_configs(
                 config.strip_prefix(git_dir).unwrap_or(&config).display()
             ));
         }
-        if let Some(key) = out
-            .stdout
-            .split('\0')
-            .map(str::trim)
-            .find(|key| !key.is_empty() && forbidden_git_config_key(key))
-        {
-            return Err(format!("unsafe Git config key is not allowed: {key}"));
+        // `--null` prints `key\nvalue\0`, or just `key\0` for a bare boolean.
+        // Only the key is reported; values may hold arbitrary text.
+        for entry in out.stdout.split('\0') {
+            let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if forbidden_git_config_key(key) {
+                return Err(format!("unsafe Git config key is not allowed: {key}"));
+            }
+            if forbidden_git_config_value(key, value) {
+                return Err(format!("unsafe Git config value is not allowed for {key}"));
+            }
         }
     }
     Ok(())
@@ -584,13 +764,18 @@ pub async fn compute_git_history(repo_root: &Path) -> GitHistoryStatus {
         Ok(git) => git,
         Err(reason) => return GitHistoryStatus::Unavailable { reason },
     };
+    git_history_with(&git_bin, &git_dir, repo_root).await
+}
 
+/// [`compute_git_history`] after metadata validation; tests call it directly
+/// to prove the reads stay safe even when validation is bypassed.
+async fn git_history_with(git_bin: &str, git_dir: &Path, repo_root: &Path) -> GitHistoryStatus {
     // Bound to locals first so every element of the `.args([...])` array
     // literal is a plain `&str` — mixing `&str` literals with a `&Cow<str>`
     // (from `to_string_lossy()`) or an inline `&format!(...)` temporary
     // directly in the array does not type-unify.
     let pretty_arg = format!("--pretty=format:{GIT_LOG_COMMIT_MARKER}%s");
-    let since_arg = hotspot_since_arg(head_commit_epoch(&git_bin, &git_dir, repo_root).await);
+    let since_arg = hotspot_since_arg(head_commit_epoch(git_bin, git_dir, repo_root).await);
     let git_dir_arg = format!("--git-dir={}", git_dir.display());
     let args = [
         "--no-pager",
@@ -599,6 +784,11 @@ pub async fn compute_git_history(repo_root: &Path) -> GitHistoryStatus {
         // Defense in depth: even if Git learns another signature-related
         // config key, history inspection must never invoke a GPG helper.
         "--no-show-signature",
+        "--no-ext-diff",
+        "--no-textconv",
+        // Rename detection would read blob contents, which a partial clone
+        // may lack; a renamed file is listed under both of its paths instead.
+        "--no-renames",
         since_arg.as_str(),
         GIT_HISTORY_MAX_COMMITS,
         "--no-merges",
@@ -606,7 +796,7 @@ pub async fn compute_git_history(repo_root: &Path) -> GitHistoryStatus {
         pretty_arg.as_str(),
     ];
     let output = crate::audit::scanners::run_bounded_subprocess(
-        &git_bin,
+        git_bin,
         &args,
         repo_root,
         &crate::audit::scanners::SubprocessLimits {
@@ -896,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn git_history_refuses_bom_prefixed_include_config() {
         let dir = tempfile::tempdir().unwrap();
-        if crate::util::which_cli_for_scan("git", dir.path()).is_none() {
+        if crate::audit::scanners::git_for_security_test(dir.path()).is_none() {
             return;
         }
         std::fs::create_dir(dir.path().join(".git")).unwrap();
@@ -917,7 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn git_history_refuses_signature_helper_config() {
         let dir = tempfile::tempdir().unwrap();
-        if crate::util::which_cli_for_scan("git", dir.path()).is_none() {
+        if crate::audit::scanners::git_for_security_test(dir.path()).is_none() {
             return;
         }
         std::fs::create_dir(dir.path().join(".git")).unwrap();
@@ -953,6 +1143,451 @@ mod tests {
         }
         assert!(!forbidden_git_config_key("remote.origin.url"));
         assert!(!forbidden_git_config_key("branch.main.merge"));
+    }
+
+    #[test]
+    fn transport_and_credential_git_config_keys_are_rejected() {
+        for key in [
+            "extensions.preciousObjects",
+            "extensions.noop",
+            "extensions.someFutureExtension",
+            "remote.origin.uploadpack",
+            "remote.origin.uploadPack",
+            "remote.origin.receivepack",
+            "remote.origin.receivePack",
+            "remote.origin.vcs",
+            "REMOTE.ORIGIN.VCS",
+            "protocol.allow",
+            "protocol.version",
+            "protocol.ext.allow",
+            "Protocol.File.Allow",
+            "credential.helper",
+            "credential.https://example.com.helper",
+            "Credential.UseHttpPath",
+            "core.sshCommand",
+            "core.gitProxy",
+            "CORE.GITPROXY",
+            "uploadpack.packObjectsHook",
+            "uploadPack.allowFilter",
+            " remote.x.uploadpack ",
+        ] {
+            assert!(forbidden_git_config_key(key), "missed {key}");
+        }
+        for key in [
+            "extensions.objectFormat",
+            "EXTENSIONS.OBJECTFORMAT",
+            "extensions.compatObjectFormat",
+            "extensions.refStorage",
+            "extensions.worktreeConfig",
+            "extensions.relativeWorktrees",
+            // Partial clones (`git clone --filter`, actions/checkout `filter:`).
+            "extensions.partialClone",
+            "EXTENSIONS.PARTIALCLONE",
+            "remote.x.promisor",
+            "Remote.Origin.Promisor",
+            "remote.a.b.promisor",
+            "remote.origin.partialCloneFilter",
+            "remote.origin.partialclonefilter",
+            "core.repositoryformatversion",
+            "remote.origin.url",
+            "remote.origin.pushurl",
+            "remote.origin.fetch",
+            "remote.promisor.url",
+            "remote.pushDefault",
+            "fetch.prune",
+            "branch.main.remote",
+            "url.https://mirror.example/.insteadOf",
+        ] {
+            assert!(!forbidden_git_config_key(key), "wrongly refused {key}");
+        }
+    }
+
+    #[test]
+    fn transport_helper_urls_and_rewrites_are_rejected() {
+        for (key, value) in [
+            ("remote.origin.url", "ext::sh -c touch% /tmp/x"),
+            ("remote.origin.url", " EXT::sh"),
+            ("Remote.Origin.PushURL", "ext::sh"),
+            ("remote.a.b.url", "fd::17"),
+            ("remote.origin.url", "custom::https://example.com/r"),
+        ] {
+            assert!(
+                forbidden_git_config_value(key, value),
+                "missed {key}={value}"
+            );
+        }
+        for key in [
+            "url.ext::sh -c touch.insteadOf",
+            "url.custom::x.pushInsteadOf",
+        ] {
+            assert!(forbidden_git_config_key(key), "missed {key}");
+        }
+        for (key, value) in [
+            ("remote.origin.url", "https://github.com/o/r.git"),
+            ("remote.origin.url", "git@github.com:o/r.git"),
+            ("remote.origin.url", "/srv/repo.git"),
+            ("remote.origin.pushurl", "ssh://git@example.com/r"),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("branch.main.description", "a::b"),
+        ] {
+            assert!(
+                !forbidden_git_config_value(key, value),
+                "wrongly refused {key}"
+            );
+        }
+    }
+
+    /// `url.<base>.insteadOf` rewrites a matching remote into `<base>`, so a
+    /// helper form is refused in the key's base and in the value. Nothing
+    /// here runs Git; the helper commands are only inspected.
+    #[test]
+    fn url_rewrites_with_transport_helpers_are_rejected() {
+        for key in [
+            "url.ext::sh -c touch% /tmp/x.insteadOf",
+            "URL.EXT::sh.InsteadOf",
+            "url.fd::17.pushInsteadOf",
+            "url.custom::https://example.com/.PUSHINSTEADOF",
+        ] {
+            assert!(forbidden_git_config_key(key), "missed {key}");
+        }
+        for (key, value) in [
+            ("url.https://mirror.example/.insteadOf", "ext::sh -c x"),
+            ("url.https://mirror.example/.pushInsteadOf", " Custom::x"),
+            ("URL.https://m/.PushInsteadOf", "fd::17"),
+        ] {
+            assert!(
+                forbidden_git_config_value(key, value),
+                "missed {key}={value}"
+            );
+        }
+        for (key, value) in [
+            (
+                "url.https://mirror.example/.insteadOf",
+                "https://github.com/",
+            ),
+            ("url.https://mirror.example/.pushInsteadOf", "ssh://[::1]/x"),
+            ("url.ssh://[::1]/x.insteadOf", "https://example.com/"),
+        ] {
+            assert!(!forbidden_git_config_key(key), "wrongly refused {key}");
+            assert!(
+                !forbidden_git_config_value(key, value),
+                "wrongly refused {key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_remote_urls_are_not_transport_helpers() {
+        for value in [
+            "ssh://[::1]/x",
+            "ssh://git@[::1]:2222/repo.git",
+            "https://[fe80::1%25en0]/r.git",
+            "git://[::ffff:127.0.0.1]/r",
+            "[::1]:repo.git",
+        ] {
+            assert!(!is_transport_helper_url(value), "wrongly refused {value}");
+            for key in ["remote.origin.url", "remote.origin.pushurl"] {
+                assert!(!forbidden_git_config_value(key, value), "{key}={value}");
+            }
+        }
+        for value in [
+            "ext::sh",
+            "fd::17",
+            "a::b",
+            "9p::x",
+            "git+ssh.v2-x::y",
+            "\tEXT::sh",
+        ] {
+            assert!(is_transport_helper_url(value), "missed {value}");
+        }
+        for value in ["", "::", "-x::y", "+x::y", "a:b::c", "a/b::c", "a b::c"] {
+            assert!(!is_transport_helper_url(value), "wrongly refused {value}");
+        }
+    }
+
+    /// Legacy `remotes/` and `branches/` files are inspected, never used.
+    #[test]
+    fn legacy_remote_files_with_transport_helpers_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("remotes")).unwrap();
+        std::fs::create_dir_all(git_dir.join("branches")).unwrap();
+        validate_legacy_remotes(&git_dir).unwrap();
+        let remote = git_dir.join("remotes/origin");
+        let branch = git_dir.join("branches/x");
+        std::fs::write(
+            &remote,
+            "URL: https://example.com/r.git\nPull: refs/heads/main:refs/heads/origin\n",
+        )
+        .unwrap();
+        std::fs::write(&branch, "ssh://[::1]/repo#main\n").unwrap();
+        validate_legacy_remotes(&git_dir).unwrap();
+
+        std::fs::write(&remote, "URL: ext::sh -c x\n").unwrap();
+        let error = validate_legacy_remotes(&git_dir).unwrap_err();
+        assert!(
+            error.contains("transport-helper") && error.contains("remotes/"),
+            "{error}"
+        );
+        assert!(!error.contains("origin"), "{error}");
+        std::fs::write(&remote, "URL: https://example.com/r.git\nurl:fd::17\n").unwrap();
+        assert!(validate_legacy_remotes(&git_dir).is_err());
+        std::fs::write(&remote, "URL: https://example.com/r.git\n").unwrap();
+
+        std::fs::write(&branch, "ext::sh -c x#main\n").unwrap();
+        let error = validate_legacy_remotes(&git_dir).unwrap_err();
+        assert!(
+            error.contains("transport-helper") && error.contains("branches/"),
+            "{error}"
+        );
+        std::fs::write(&branch, "https://example.com/r.git#main\n").unwrap();
+        validate_legacy_remotes(&git_dir).unwrap();
+
+        // Remote names may contain '/', so nested files count too.
+        std::fs::create_dir(git_dir.join("remotes/team")).unwrap();
+        std::fs::write(git_dir.join("remotes/team/origin"), "URL: custom::x\n").unwrap();
+        assert!(validate_legacy_remotes(&git_dir).is_err());
+        std::fs::remove_dir_all(git_dir.join("remotes/team")).unwrap();
+
+        // Oversized files fail closed instead of being partly inspected.
+        let big = git_dir.join("remotes/big");
+        std::fs::write(&big, vec![b'a'; MAX_LEGACY_REMOTE_BYTES as usize + 1]).unwrap();
+        assert!(
+            validate_legacy_remotes(&git_dir)
+                .unwrap_err()
+                .contains("validation limit")
+        );
+        std::fs::remove_file(&big).unwrap();
+        validate_legacy_remotes(&git_dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("target");
+            std::fs::write(&target, "URL: https://example.com/r.git\n").unwrap();
+            std::os::unix::fs::symlink(&target, git_dir.join("branches/link")).unwrap();
+            assert!(
+                validate_legacy_remotes(&git_dir)
+                    .unwrap_err()
+                    .contains("symlink")
+            );
+            std::fs::remove_file(git_dir.join("branches/link")).unwrap();
+            std::fs::remove_dir_all(git_dir.join("branches")).unwrap();
+            std::os::unix::fs::symlink(dir.path(), git_dir.join("branches")).unwrap();
+            assert!(
+                validate_legacy_remotes(&git_dir)
+                    .unwrap_err()
+                    .contains("symlink")
+            );
+        }
+    }
+
+    /// The production entry point refuses a legacy remote helper too.
+    #[tokio::test]
+    async fn prepare_readonly_git_refuses_legacy_remote_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if crate::audit::scanners::git_for_security_test(root).is_none() {
+            return;
+        }
+        crate::audit::diff_scope::tests::git(root, &["init", "-q"]).await;
+        prepare_readonly_git(root).await.unwrap();
+        for (path, content) in [
+            ("remotes/origin", "URL: ext::sh -c x\n"),
+            ("branches/x", "ext::sh -c x\n"),
+        ] {
+            let file = root.join(".git").join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, content).unwrap();
+            let error = prepare_readonly_git(root).await.unwrap_err();
+            assert!(error.contains("transport-helper"), "{error}");
+            std::fs::remove_file(&file).unwrap();
+        }
+        prepare_readonly_git(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sha256_object_format_extension_is_still_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(git) = crate::audit::scanners::git_for_security_test(dir.path()) else {
+            return;
+        };
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".git/config"),
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n",
+        )
+        .unwrap();
+        validate_git_configs(&git, &dir.path().join(".git"), dir.path())
+            .await
+            .unwrap();
+    }
+
+    /// A partial clone (`git clone --filter`) is accepted. One whose promisor
+    /// upload-pack is a shell command is refused, and with validation bypassed
+    /// neither a raw object read nor the production history/diff reads may
+    /// run that command for a missing blob or tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partial_clone_is_accepted_but_never_lazily_fetches() {
+        use crate::audit::diff_scope;
+        use crate::audit::scanners::{GIT_SAFE_ENV, git_test_command, git_test_command_bare};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let Some(git) = crate::audit::scanners::git_for_security_test(&root) else {
+            return;
+        };
+        let marker = dir.path().join("marker");
+        let fixture = |args: &[&str]| {
+            let out = git_test_command(&git)
+                .arg("-C")
+                .arg(&root)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        fixture(&["init", "-q"]);
+        std::fs::write(root.join("secret.txt"), "only in the promisor\n").unwrap();
+        fixture(&["add", "secret.txt"]);
+        fixture(&["commit", "-qm", "base"]);
+        std::fs::write(root.join("secret.txt"), "still only in the promisor\n").unwrap();
+        fixture(&["commit", "-qam", "fix: auth bypass"]);
+        let blob = fixture(&["rev-parse", "HEAD:secret.txt"]);
+        let blob = blob.trim();
+        let tree = fixture(&["rev-parse", "HEAD^{tree}"]);
+        let tree = tree.trim();
+        let remote_url = dir.path().display().to_string();
+        for (key, value) in [
+            ("core.repositoryformatversion", "1"),
+            ("extensions.partialClone", "x"),
+            ("remote.x.promisor", "true"),
+            ("remote.x.partialclonefilter", "blob:none"),
+            ("remote.x.url", remote_url.as_str()),
+        ] {
+            fixture(&["config", key, value]);
+        }
+
+        // (a) A plain partial clone is accepted and its history is readable.
+        prepare_readonly_git(&root).await.unwrap();
+        match compute_git_history(&root).await {
+            GitHistoryStatus::Available { hotspots } => {
+                assert_eq!(hotspots.len(), 1, "{hotspots:?}");
+                assert_eq!(hotspots[0].file, "secret.txt");
+            }
+            GitHistoryStatus::Unavailable { reason } => panic!("partial clone refused: {reason}"),
+        }
+
+        // (b) A promisor transport command is refused before any object read.
+        let upload_pack = format!("sh -c 'touch {}; exit 1' #", marker.display());
+        fixture(&["config", "remote.x.uploadpack", &upload_pack]);
+        let refused = prepare_readonly_git(&root).await.unwrap_err();
+        assert!(refused.contains("unsafe Git config key"), "{refused}");
+        assert!(!marker.exists(), "config validation triggered a fetch");
+        for oid in [blob, tree] {
+            let loose = root.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            std::fs::remove_file(loose).unwrap();
+        }
+
+        // (c) Bypass validation: the production reads must not lazily fetch
+        // the missing tree (`git log --name-only`, `git diff`).
+        let git_dir = root.join(".git");
+        let history = git_history_with(&git, &git_dir, &root).await;
+        assert!(
+            matches!(history, GitHistoryStatus::Unavailable { .. }),
+            "{history:?}"
+        );
+        let state = diff_scope::repo_state_with(&git, &git_dir, &root).await;
+        assert!(state.is_err());
+        let scope = diff_scope::compute_with(&git, &git_dir, &root, "HEAD~1").await;
+        assert!(scope.is_err(), "{scope:?}");
+        assert!(!marker.exists(), "production Git reads ran the upload-pack");
+
+        // (d) Bypass validation: a raw blob read must not lazily fetch either.
+        let git_dir_arg = format!("--git-dir={}", root.join(".git").display());
+        let read_blob = [
+            "--no-pager",
+            "--no-replace-objects",
+            git_dir_arg.as_str(),
+            "cat-file",
+            "-p",
+            blob,
+        ];
+        let out = crate::audit::scanners::run_bounded_subprocess(
+            &git,
+            &read_blob,
+            &root,
+            &crate::audit::scanners::SubprocessLimits {
+                timeout: std::time::Duration::from_secs(20),
+                max_output_bytes: 64 * 1024,
+            },
+        )
+        .await;
+        assert!(out.spawn_error.is_none() && !out.timed_out, "{out:?}");
+        assert_ne!(out.exit_code, Some(0), "missing blob was read: {out:?}");
+        assert!(
+            !marker.exists(),
+            "sanitized git ran the repository's upload-pack"
+        );
+
+        // Direct reads start from no inherited GIT_* at all, so each layer is
+        // tested alone (no command-scoped config override either).
+        let direct_read = |env: &[(&str, &str)]| {
+            git_test_command_bare(&git)
+                .args(read_blob)
+                .current_dir(&root)
+                .envs(env.iter().copied())
+                .output()
+                .unwrap()
+        };
+        // Git older than 2.44 ignores GIT_NO_LAZY_FETCH; the protocol
+        // allow-list alone must still refuse the promisor transport.
+        let without_lazy_flag: Vec<_> = GIT_SAFE_ENV
+            .iter()
+            .copied()
+            .filter(|(name, _)| *name != "GIT_NO_LAZY_FETCH")
+            .collect();
+        direct_read(&without_lazy_flag);
+        assert!(
+            !marker.exists(),
+            "GIT_ALLOW_PROTOCOL did not block the fetch"
+        );
+        // On Git 2.44+, GIT_NO_LAZY_FETCH alone must also prevent the fetch.
+        if crate::audit::scanners::git_version(&git).is_some_and(|v| v >= (2, 44)) {
+            let without_protocol_block: Vec<_> = GIT_SAFE_ENV
+                .iter()
+                .copied()
+                .filter(|(name, _)| *name != "GIT_ALLOW_PROTOCOL")
+                .collect();
+            direct_read(&without_protocol_block);
+            assert!(
+                !marker.exists(),
+                "GIT_NO_LAZY_FETCH did not block the fetch"
+            );
+        }
+
+        // Control: the previous environment really runs the command, so the
+        // assertions above are not vacuous for this Git and fixture.
+        direct_read(&[
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+        ]);
+        assert!(marker.exists(), "fixture did not reproduce the lazy fetch");
     }
 
     #[test]
@@ -994,22 +1629,20 @@ mod tests {
 
     #[tokio::test]
     async fn old_checkout_still_gets_hotspots() {
-        if crate::util::which_cli("git").is_none() {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        let Some(binary) = crate::util::which_cli_for_scan("git", root) else {
+            return;
+        };
         // Every commit is two years old: a now-anchored window sees nothing.
         let old = "2024-06-01T12:00:00+00:00";
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::audit::scanners::git_test_command(&binary)
                 .arg("-C")
                 .arg(root)
                 .args(args)
                 .env("GIT_AUTHOR_DATE", old)
                 .env("GIT_COMMITTER_DATE", old)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();
             assert!(
