@@ -3402,6 +3402,7 @@ mod tests {
             },
             changed: std::collections::BTreeSet::from(["changed.rs".into()]),
             tracked_dependencies: std::collections::BTreeSet::from(["Cargo.lock".into()]),
+            gitlinks: std::collections::BTreeSet::new(),
         };
         for engine in ["semgrep", "gitleaks", "cargo-audit"] {
             let (kind, outside_file, inside_file) = if engine == "cargo-audit" {
@@ -3458,6 +3459,7 @@ mod tests {
                 scope: selection.scope.clone(),
                 changed: std::collections::BTreeSet::from([inside_file.into()]),
                 tracked_dependencies: selection.tracked_dependencies.clone(),
+                gitlinks: selection.gitlinks.clone(),
             };
             report.findings = vec![Finding::candidate(
                 engine,

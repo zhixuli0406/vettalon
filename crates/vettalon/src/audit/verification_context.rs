@@ -10,7 +10,17 @@ use super::schema::sha256_hex;
 
 pub const CONTEXT_PREFIX: &str = "fix_context_v1:";
 pub const POLICY_VERSION: &str = "vettalon-fix-check-v2";
-pub const HARNESS_VERSION: &str = "vettalon-three-class-oracle-v1";
+/// Current harness. Every version in [`PREVIOUS_HARNESS_VERSIONS`] still
+/// parses and is not current, so such a receipt is not bound
+/// (`fix_unverified`). v3: the per-run marker reaches the runner on stdin
+/// only and the runner is non-dumpable (v1/v2 runners kept it in the mounted
+/// `runner.py`, readable by checked code).
+pub const HARNESS_VERSION: &str = "vettalon-three-class-oracle-v3";
+/// Older harnesses: still read, never `complete()`.
+const PREVIOUS_HARNESS_VERSIONS: &[&str] = &[
+    "vettalon-three-class-oracle-v1",
+    "vettalon-three-class-oracle-v2",
+];
 pub const SOURCE_SCOPE: &str = "prepared_tree_only";
 const MAX_FILES: usize = 20_000;
 const MAX_ENTRIES: usize = 40_000;
@@ -245,7 +255,9 @@ impl VerificationContext {
     }
 
     pub fn complete(&self) -> bool {
+        // An older harness still reads but never binds a positive result.
         self.valid()
+            && self.harness_version == HARNESS_VERSION
             && self.finding_file_sha256.as_deref() == Some(self.target_file_sha256.as_str())
             && self.image_identity.is_some()
     }
@@ -261,7 +273,8 @@ impl VerificationContext {
         self.version == 1
             && self.source_scope == SOURCE_SCOPE
             && self.policy_version == POLICY_VERSION
-            && self.harness_version == HARNESS_VERSION
+            && (self.harness_version == HARNESS_VERSION
+                || PREVIOUS_HARNESS_VERSIONS.contains(&self.harness_version.as_str()))
             && self.target_file.len() <= 4096
             && vettalon_contract::safe_path::SafeRepoPath::parse(&self.target_file).is_ok()
             && [
@@ -305,6 +318,75 @@ impl VerificationContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context(policy: &str, harness: &str) -> VerificationContext {
+        let hash = "ab".repeat(32);
+        let digest = SnapshotDigest {
+            sha256: hash.clone(),
+            files: 1,
+            entries: 1,
+            bytes: 1,
+        };
+        VerificationContext {
+            version: 1,
+            source_scope: SOURCE_SCOPE.into(),
+            check_sha256: hash.clone(),
+            diff_sha256: hash.clone(),
+            target_file: "app.py".into(),
+            target_file_sha256: hash.clone(),
+            finding_file_sha256: Some(hash.clone()),
+            original: digest.clone(),
+            fixed: digest,
+            exclusions: SnapshotExclusions::default(),
+            adapter_sha256: hash.clone(),
+            fixed_adapter_sha256: hash.clone(),
+            target_plan_sha256: None,
+            test_command_sha256: None,
+            image_identity: Some(format!("sha256:{hash}")),
+            harness_sha256: hash,
+            harness_version: harness.into(),
+            policy_version: policy.into(),
+        }
+    }
+
+    #[test]
+    fn old_verification_context_keeps_the_previous_harness_and_is_not_complete() {
+        assert_eq!(POLICY_VERSION, "vettalon-fix-check-v2");
+        assert_eq!(HARNESS_VERSION, "vettalon-three-class-oracle-v3");
+        assert_eq!(
+            PREVIOUS_HARNESS_VERSIONS,
+            [
+                "vettalon-three-class-oracle-v1",
+                "vettalon-three-class-oracle-v2"
+            ]
+        );
+        // An older harness reads but is never complete.
+        for previous in PREVIOUS_HARNESS_VERSIONS {
+            let old = context(POLICY_VERSION, previous);
+            let parsed = VerificationContext::parse(&old.to_detail()).unwrap();
+            assert_eq!(parsed.harness_version, *previous);
+            assert_ne!(parsed.harness_version, HARNESS_VERSION);
+            assert!(!parsed.complete(), "{previous}");
+        }
+        let unknown = context(POLICY_VERSION, "vettalon-three-class-oracle-v0");
+        assert!(VerificationContext::parse(&unknown.to_detail()).is_none());
+        let unknown = context("vettalon-fix-check-v9", HARNESS_VERSION);
+        assert!(VerificationContext::parse(&unknown.to_detail()).is_none());
+        let old = context(POLICY_VERSION, PREVIOUS_HARNESS_VERSIONS[0]);
+        let current = context(POLICY_VERSION, HARNESS_VERSION);
+        assert!(
+            VerificationContext::parse(&current.to_detail())
+                .unwrap()
+                .complete()
+        );
+        let mut value = serde_json::to_value(&old).unwrap();
+        value.as_object_mut().unwrap().remove("harness_version");
+        let raw = format!(
+            "{CONTEXT_PREFIX} {}",
+            serde_json::to_string(&value).unwrap()
+        );
+        assert!(VerificationContext::parse(&raw).is_none());
+    }
 
     #[test]
     fn verification_binding_snapshot_is_stable_and_covers_prepared_bytes() {
