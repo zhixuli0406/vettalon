@@ -117,14 +117,18 @@ pub(super) async fn select(
         eprintln!("[vettalon] --since-last: {count} ignored intake files{note}; running full scan");
         return None;
     }
-    if !diff_scope::repo_state(root)
-        .await
-        .is_ok_and(|state| state.clean.is_some())
-    {
-        eprintln!(
-            "[vettalon] --since-last: index flags or unavailable Git state; running full scan"
-        );
-        return None;
+    match diff_scope::repo_state(root).await {
+        Ok(state) if state.clean.is_some() => {}
+        Ok(state) if state.submodules => {
+            eprintln!("[vettalon] --since-last: repository has submodules; running full scan");
+            return None;
+        }
+        _ => {
+            eprintln!(
+                "[vettalon] --since-last: index flags or unavailable Git state; running full scan"
+            );
+            return None;
+        }
     }
     let entries = std::fs::read_dir(home.join("reports")).ok()?;
     let mut names = Vec::new();
@@ -332,7 +336,7 @@ pub(super) fn carry_findings(
     let mut budget = super::prior_run::HashBudget::default();
     for finding in base {
         let path = diff_scope::scope_path(finding).unwrap_or(&finding.file);
-        if diff.changed.contains(path) {
+        if diff.path_changed(path) {
             continue;
         }
         if is_closed(finding) && !closed_hash_matches(root, finding, &mut budget) {
@@ -387,6 +391,7 @@ mod tests {
             },
             changed: BTreeSet::from(["b.rs".into()]),
             tracked_dependencies: BTreeSet::new(),
+            gitlinks: BTreeSet::new(),
         }
     }
 
@@ -637,7 +642,7 @@ mod tests {
             ],
         ] {
             assert!(
-                std::process::Command::new(&git)
+                crate::audit::scanners::git_test_command(&git)
                     .args(args)
                     .current_dir(root)
                     .status()

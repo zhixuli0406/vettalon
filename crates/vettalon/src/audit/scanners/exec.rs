@@ -28,25 +28,121 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// stderr is only kept for diagnostics on failure — a small tail is plenty.
 const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
-/// Ambient Git variables must never redirect a scanner from its validated
-/// repository root. The local repository config is still available, but
-/// system/global configuration and caller-supplied path overrides are not.
-pub(super) const GIT_ENV_REMOVE: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_INDEX_FILE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_EXEC_PATH",
-    "GIT_TEMPLATE_DIR",
-    "GIT_SHALLOW_FILE",
+const GIT_NULL_CONFIG: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// Command-scoped config (`GIT_CONFIG_COUNT`, Git 2.31+) outranks the
+/// repository's own config and is inherited by every child Git process,
+/// including the ones Git starts inside nested repositories, so it hardens
+/// metadata that intake never validated. Older Git ignores it; the
+/// repository config is still validated and transports stay blocked.
+pub(crate) const GIT_CONFIG_OVERRIDES: &[(&str, &str)] = &[
+    ("core.fsmonitor", "false"),
+    ("core.hooksPath", GIT_NULL_CONFIG),
+    ("diff.ignoreSubmodules", "dirty"),
+    ("submodule.recurse", "false"),
+    ("log.showSignature", "false"),
 ];
+
+/// Set on every bounded subprocess (scanners included: some invoke Git
+/// themselves). The scanned repository's config is attacker-controlled, so a
+/// read must never reach a transport. `GIT_NO_LAZY_FETCH` stops partial-clone
+/// promisor fetches (Git 2.44+). `GIT_ALLOW_PROTOCOL` naming a protocol that
+/// does not exist refuses every transport (local path, ssh, `ext::`, remote
+/// helpers) and overrides any `protocol.*.allow` in repository config, which
+/// also covers older Git that ignores `GIT_NO_LAZY_FETCH`.
+pub(crate) const GIT_SAFE_ENV: &[(&str, &str)] = &[
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_GLOBAL", GIT_NULL_CONFIG),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_NO_LAZY_FETCH", "1"),
+    ("GIT_ALLOW_PROTOCOL", "vettalon-none"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+];
+
+/// `true` for every inherited variable Git may interpret. Windows variable
+/// names are case-insensitive, so the prefix is compared that way everywhere.
+pub(crate) fn is_git_env_name(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
+}
+
+/// Every variable [`apply_git_env`] sets: [`GIT_SAFE_ENV`] followed by the
+/// numbered [`GIT_CONFIG_OVERRIDES`].
+pub(crate) fn git_safe_env_pairs() -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = GIT_SAFE_ENV
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect();
+    pairs.push((
+        "GIT_CONFIG_COUNT".into(),
+        GIT_CONFIG_OVERRIDES.len().to_string(),
+    ));
+    for (index, (key, value)) in GIT_CONFIG_OVERRIDES.iter().enumerate() {
+        pairs.push((format!("GIT_CONFIG_KEY_{index}"), (*key).to_owned()));
+        pairs.push((format!("GIT_CONFIG_VALUE_{index}"), (*value).to_owned()));
+    }
+    pairs
+}
+
+/// Strip every inherited `GIT_*` variable (path redirections, config
+/// injection, traces, helpers), then apply [`git_safe_env_pairs`]. Clearing
+/// happens first so the override is never wiped. Shared by the Unix and
+/// Windows spawn paths so the two cannot drift.
+fn apply_git_env(cmd: &mut tokio::process::Command) {
+    for (name, _) in std::env::vars_os() {
+        if is_git_env_name(&name) {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.envs(git_safe_env_pairs());
+}
+
+/// A direct Git command for test fixtures with every inherited `GIT_*`
+/// variable removed: a test run from a Git hook (with `GIT_DIR` set) must never
+/// write into the developer's repository. Callers add the environment under test.
+#[cfg(test)]
+pub(crate) fn git_test_command_bare(git: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(git);
+    for (name, _) in std::env::vars_os() {
+        if is_git_env_name(&name) {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
+/// [`git_test_command_bare`] plus the scanner's sanitized Git environment.
+#[cfg(test)]
+pub(crate) fn git_test_command(git: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = git_test_command_bare(git);
+    command.envs(git_safe_env_pairs());
+    command
+}
+
+/// Git for a security test. Missing Git skips locally but fails when `CI` is
+/// set, so a runner without Git cannot silently pass the security checks.
+#[cfg(test)]
+pub(crate) fn git_for_security_test(root: &Path) -> Option<String> {
+    let git = crate::util::which_cli_for_scan("git", root);
+    assert!(
+        git.is_some() || std::env::var_os("CI").is_none(),
+        "git is required for security tests when CI is set"
+    );
+    git
+}
+
+/// `(major, minor)` from `git version`, or `None` when it cannot be parsed.
+#[cfg(all(test, unix))]
+pub(crate) fn git_version(git: &str) -> Option<(u32, u32)> {
+    let out = git_test_command(git).arg("version").output().ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut parts = text
+        .strip_prefix("git version ")?
+        .split(|c: char| !c.is_ascii_digit());
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RunLimits {
@@ -370,20 +466,7 @@ async fn run_capped_direct(
         // an external reap/ECHILD must not trigger Tokio's numeric-PID kill.
         .kill_on_drop(cfg!(not(unix)));
     cmd.env("PATH", crate::util::trusted_path_for_scan(cwd));
-    for name in GIT_ENV_REMOVE {
-        cmd.env_remove(name);
-    }
-    for index in 0..64 {
-        cmd.env_remove(format!("GIT_CONFIG_KEY_{index}"));
-        cmd.env_remove(format!("GIT_CONFIG_VALUE_{index}"));
-    }
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    apply_git_env(&mut cmd);
 
     #[cfg(unix)]
     cmd.process_group(0);
@@ -764,6 +847,76 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut fixture = early_return(dir.path()).await;
         assert_not_live(&mut fixture).await;
+    }
+
+    #[test]
+    fn git_env_names_match_the_prefix_case_insensitively() {
+        for name in ["GIT_DIR", "GIT_CONFIG_KEY_7", "git_dir", "Git_Trace"] {
+            assert!(is_git_env_name(std::ffi::OsStr::new(name)), "{name}");
+        }
+        for name in ["GIT", "GITHUB_TOKEN", "MY_GIT_DIR", ""] {
+            assert!(!is_git_env_name(std::ffi::OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn git_env_clears_every_inherited_git_var_then_sets_the_override() {
+        use std::collections::BTreeMap;
+        use std::ffi::{OsStr, OsString};
+        let mut cmd = tokio::process::Command::new("git");
+        apply_git_env(&mut cmd);
+        let envs: BTreeMap<OsString, Option<OsString>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+            .collect();
+        let expected = git_safe_env_pairs();
+        for (name, _) in std::env::vars_os() {
+            let reset = expected
+                .iter()
+                .any(|(set, _)| name.as_os_str() == OsStr::new(set));
+            if is_git_env_name(&name) && !reset {
+                assert_eq!(envs.get(&name), Some(&None), "{name:?} was inherited");
+            }
+        }
+        for (name, value) in &expected {
+            assert_eq!(
+                envs.get(OsStr::new(name)),
+                Some(&Some(OsString::from(value))),
+                "{name}"
+            );
+        }
+        let count = GIT_CONFIG_OVERRIDES.len().to_string();
+        for (name, value) in [
+            ("GIT_CONFIG_COUNT", count.as_str()),
+            ("GIT_CONFIG_KEY_0", "core.fsmonitor"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_ALLOW_PROTOCOL", "vettalon-none"),
+        ] {
+            let pair = (name.to_owned(), value.to_owned());
+            assert!(expected.contains(&pair), "{pair:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spawned_process_sees_the_git_config_override() {
+        let outcome = run_capped("sh", &["-c", "env"], Path::new("."), &RunLimits::default()).await;
+        assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
+        let lines: Vec<&str> = outcome.stdout.lines().collect();
+        for (name, value) in git_safe_env_pairs() {
+            let line = format!("{name}={value}");
+            assert!(lines.contains(&line.as_str()), "missing {line}");
+        }
+        assert!(lines.contains(&"GIT_CONFIG_KEY_0=core.fsmonitor"));
+        let allowed: Vec<String> = git_safe_env_pairs().into_iter().map(|(n, _)| n).collect();
+        for line in lines {
+            if let Some((name, _)) = line.split_once('=')
+                && name.starts_with("GIT_")
+            {
+                assert!(allowed.iter().any(|n| n == name), "leaked {name}");
+            }
+        }
     }
 
     #[tokio::test]

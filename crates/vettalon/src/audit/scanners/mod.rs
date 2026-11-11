@@ -20,10 +20,15 @@
 
 pub mod cargo_audit;
 mod exec;
+#[cfg(all(test, unix))]
+pub(crate) use exec::{GIT_SAFE_ENV, git_test_command_bare, git_version};
 pub use exec::{
     RunLimits as SubprocessLimits, RunOutcome as SubprocessOutcome,
     run_capped as run_bounded_subprocess,
 };
+/// Test fixtures that build Git repositories use the same environment.
+#[cfg(test)]
+pub(crate) use exec::{git_for_security_test, git_test_command};
 pub mod gitleaks;
 pub mod semgrep;
 

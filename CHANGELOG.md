@@ -4,10 +4,16 @@
 
 ## [Unreleased]
 
-### Fixed
+## [0.7.1] - 2026-11-11
 
-- 修正 Git 背景維護在 metadata 檢查期間移除暫存檔時，掃描可能失敗的問題。
-  Fixed scans failing when Git background maintenance removes a temporary file during the metadata check.
+安全修補版，只包含下面兩項修正。兩者都影響 0.7.0 以前的版本，請盡快升級。Desktop 沒有更新。
+
+### Security
+
+- 讀取受掃描儲存庫的 Git 指令不再會觸發 partial clone 的延遲抓取（lazy fetch），也不會使用儲存庫自行設定的遠端傳輸，或執行巢狀儲存庫（submodule）裡的 `core.fsmonitor`、filter driver 等設定；這些都可能在主機上執行指令。0.7.0 的一般 `scan` 就會走到這兩條路徑。`.git/config` 設定自訂 upload-pack、`protocol` 或 `credential`，或未知 extension 的儲存庫會被拒絕；遠端 URL、`url.<base>.insteadOf` 或 `pushInsteadOf` 改寫，以及 `.git/remotes/`、`.git/branches/` 裡的舊式遠端檔，只要本身寫的是 `ext::` 之類的傳輸 helper 形式也會被拒絕。這項檢查只看設定裡寫出來的字串；改寫後才組成的 helper URL 不會被它擋下，但 Vettalon 啟動的 Git 只允許一個不存在的傳輸協定，所以任何遠端傳輸都無法啟動。`git clone --filter` 建立的 partial clone 仍可掃描，除非設定了自訂傳輸。含 submodule 的儲存庫一律不視為乾淨的工作樹，`--since-last` 會改跑完整掃描；`--diff-base` 會把 submodule 路徑及其下的所有路徑都算進變更範圍。
+  Git reads of scanned repositories can no longer trigger partial-clone lazy fetches, use remote transports configured by the repository, or run settings such as `core.fsmonitor` or a filter driver from a nested repository (submodule); any of these could run a command on the host. In 0.7.0 a plain `scan` reaches both paths. Repositories whose `.git/config` sets a custom upload-pack, `protocol` or `credential` settings, or unknown extensions are refused. So are repositories that use a transport-helper form such as `ext::` in a remote URL, in a `url.<base>.insteadOf` or `pushInsteadOf` rewrite, or in a legacy remote file under `.git/remotes/` or `.git/branches/`. This check reads the strings as written; a helper URL that only appears after a rewrite is not caught by it, but every Git process Vettalon starts allows only a nonexistent transport protocol, so no remote transport can start. Partial clones made with `git clone --filter` can still be scanned unless they configure a custom transport. A repository with submodules is never reported as a clean working tree, so `--since-last` runs a full scan, and `--diff-base` counts each submodule path and every path beneath it as changed.
+- `fix check`（含 MCP `vettalon_check_fix` 與 `--poc` 掃描中的修補檢查）與掃描當下的 PoC oracle，先前讓專案程式碼和 harness runner 在同一個 Python 行程執行。修補 diff 或被掃描的程式碼可以讀到單次 marker 並印出假的判定行，讓沒修好漏洞的 diff 得到 `fix_verified`，或讓掃描記下沒發生的效果。現在 sink、adapter 與專案程式碼改在子行程執行，輸出全部丟棄，結果經 JSON 檔傳回 runner。判定只有在 runner 以結束碼 0 結束、且該 marker 只有一行 `effect=` 時才算數。單次 marker 經 stdin 交給 runner，不寫入任何檔案。runner 是容器的 PID 1，自行限制執行時間，無法讓自己變成不可 dump（non-dumpable）時就拒絕執行。修補副本沒有給出可用判定（非零結束、逾時、沒有／無效／重複的判定行，或 runner 回報 `error=true` 且沒有效果）時，該輸入不算已擋下，其餘輸入與良性對照照跑；沒有其他失敗時，回歸檢查記為無法判定（reason `fixed_copy_no_verdict`），結果是 `fix_unverified`。被檢查程式碼拋出的 Python 例外（`raised=true`）仍算已擋下，由良性對照抓出總是拋例外的修補。在 `fix check` 與 `reproduce` 的 runner 中，專案程式碼執行後會檢查證據檔的內容，也檢查檔案是否被改名、替換或改過權限，即使事後又改回原狀也算；會寫入 SQLite 資料庫的目標函式因此會被記為無法判定。`reproduce --emit-test` 使用的回歸測試 red check 也套用同樣的強化。runner 內容改變，同一份 diff 的 `harness_sha256` 會跟著變。harness 現為 `vettalon-three-class-oracle-v3`；0.7.0 以前產生的收據仍可讀，但不再算完整綁定，請用 0.7.1 重跑依賴的修補檢查。限制：檢查副本中的程式碼與 harness 以同一個使用者執行，仍可能偵測到 harness，或以完整性檢查抓不到的方式改動檔案，所以 `fix_verified` 不能當作對抗性 diff 的證據。
+  `fix check` (including MCP `vettalon_check_fix` and fix checks in a `--poc` scan) and the scan-time PoC oracle ran project code in the same Python process as the harness runner. A fix diff or scanned code could read the one-time marker and print a forged verdict line, so a diff that did not fix the bug could get `fix_verified`, and a scan could record an effect that never happened. The sink, the adapter and project code now run in a child process whose output is discarded, and the result comes back to the runner through a JSON file. A verdict counts only when the runner exits 0 and prints exactly one `effect=` line for the marker. The marker reaches the runner on stdin and is never written to a file. The runner is PID 1 of its container, enforces its own time limit, and refuses to run unless it can make itself non-dumpable. When the fixed copy gives no usable verdict (non-zero exit, timeout, no, an invalid or a duplicate verdict line, or `error=true` from its runner with no effect), that input is not counted as blocked and the remaining inputs and the benign control still run; with no other failure the regression check is inconclusive (reason `fixed_copy_no_verdict`) and the outcome is `fix_unverified`. A Python exception from the checked code (`raised=true`) still counts as blocked; the benign control catches a fix that always raises. In the `fix check` and `reproduce` runners, evidence files are checked after the project code ran: their content, and whether a file was renamed, replaced or had its permissions changed, even if the change was undone. A target function that writes to the SQLite database is therefore inconclusive. The regression red check used by `reproduce --emit-test` got the same hardening. The runner text changed, so `harness_sha256` for an unchanged diff changes. The harness is now `vettalon-three-class-oracle-v3`; receipts from 0.7.0 and earlier still read but no longer count as a complete binding, so rerun the fix checks you rely on with 0.7.1. Limit: code in the checked copy runs as the same user as the harness and can still detect it or alter files in ways the integrity check does not catch, so `fix_verified` is not evidence against an adversarial diff.
 
 ## [0.7.0] - 2026-11-02
 
@@ -34,6 +40,11 @@
   Evidence funnel: the scan summary and SARIF (`vettalon.funnel`) show candidates, refuted, needs_human, poc_differential, fix_verified and human_confirmed, with scanner findings counted separately. It is derived from the report and does not change the schema.
 - 用量上限斷路器：見升級須知。比對各家 CLI 失敗時的額度訊息與 HTTP `insufficient_quota`，暫時性 429 不算，prompt 裡出現的相同字句也不算。實際額度耗盡的情境還沒有用真實帳號驗證過。
   Usage-limit breaker: see the upgrade notes. It matches each CLI's quota message on failure and HTTP `insufficient_quota`; transient 429s and phrases also present in the prompt do not count. It has not been exercised against a truly exhausted account.
+
+### Fixed
+
+- 修正 Git 背景維護在 metadata 檢查期間移除暫存檔時，掃描可能失敗的問題。
+  Fixed scans failing when Git background maintenance removes a temporary file during the metadata check.
 
 ## [0.6.1] - 2026-10-29
 

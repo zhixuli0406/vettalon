@@ -32,6 +32,23 @@ const POC_LABEL: &str = "vettalon.poc=1";
 const POC_OWNER_KEY: &str = "vettalon.poc.owner";
 /// `timeout` inside the container: a little over the host-side limit.
 const IN_CONTAINER_LIMIT_SECS: &str = "125";
+
+/// What runs as PID 1 inside a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pid1 {
+    /// coreutils `timeout -s KILL 125` is PID 1 and runs `cmd` as its child
+    /// (direct PoC scripts, test commands in a tree copy).
+    Timeout,
+    /// `cmd` itself is PID 1 and enforces its own in-container hard limit.
+    /// Used for the harness runner (`poc_oracle::runner_source`), which makes
+    /// itself non-dumpable before any checked code starts: wrapping it in
+    /// `timeout` would leave a dumpable, same-uid PID 1 that checked code
+    /// could ptrace where the host allows it, and exec-ing through `timeout`
+    /// would reset the dumpable flag. `--init=false` keeps a daemon-default
+    /// init process from becoming PID 1 instead. The host-side timeout and
+    /// the container guard stay the outer bound.
+    Command,
+}
 /// Cap on any single `docker` housekeeping call.
 const DOCKER_CALL_LIMIT: Duration = Duration::from_secs(30);
 
@@ -190,7 +207,7 @@ impl DockerSandbox {
     /// The unmounted `docker run` argument vector for a direct PoC. Pure, so
     /// the isolation flags and absence of host mounts are unit-tested.
     pub fn run_args(&self, name: &str, cmd: &[String]) -> Vec<String> {
-        self.build_run_args(name, &[], "/tmp", true, cmd)
+        self.build_run_args(name, &[], "/tmp", true, Pid1::Timeout, cmd)
     }
 
     /// Build an invocation with explicit read-only mounts. Only harness-owned
@@ -203,7 +220,7 @@ impl DockerSandbox {
         workdir: &str,
         cmd: &[String],
     ) -> Vec<String> {
-        self.build_run_args(name, mounts, workdir, false, cmd)
+        self.build_run_args(name, mounts, workdir, false, Pid1::Timeout, cmd)
     }
 
     fn build_run_args(
@@ -212,6 +229,7 @@ impl DockerSandbox {
         mounts: &[(&Path, &str)],
         workdir: &str,
         interactive: bool,
+        pid1: Pid1,
         cmd: &[String],
     ) -> Vec<String> {
         let owner_label = format!("{POC_OWNER_KEY}={}", std::process::id());
@@ -259,14 +277,23 @@ impl DockerSandbox {
                 source.display()
             ));
         }
-        args.push(self.image.clone());
-        // In-container hard limit too, so the PoC dies even if vettalon is
-        // killed before its own timeout fires.
-        args.extend(
-            ["timeout", "-s", "KILL", IN_CONTAINER_LIMIT_SECS]
-                .iter()
-                .map(|s| s.to_string()),
-        );
+        match pid1 {
+            Pid1::Timeout => {
+                args.push(self.image.clone());
+                // In-container hard limit too, so the PoC dies even if
+                // vettalon is killed before its own timeout fires.
+                args.extend(
+                    ["timeout", "-s", "KILL", IN_CONTAINER_LIMIT_SECS]
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
+            }
+            Pid1::Command => {
+                // `cmd` is PID 1 and carries its own hard limit; no init.
+                args.push("--init=false".to_string());
+                args.push(self.image.clone());
+            }
+        }
         args.extend(cmd.iter().cloned());
         args
     }
@@ -292,32 +319,53 @@ impl DockerSandbox {
     /// harness uses this to mount a harness-authored runner next to the
     /// model-authored PoC. Same isolation, same hard `timeout`, same host rule:
     /// any failure to get a real container returns `Err`.
+    ///
+    /// `input`, when given, is streamed to the command's stdin and never
+    /// written to a file: the oracle passes its per-run verdict marker this
+    /// way so it is not on disk where checked code could read it.
+    ///
+    /// `cmd` runs as PID 1 with no `timeout` wrapper (see `Pid1::Command`),
+    /// so it must enforce its own in-container hard limit, as the harness
+    /// runner does. The host-side `timeout` still applies.
     pub async fn run_workspace(
         &self,
         files: &[(&str, &str)],
         cmd: &[String],
+        input: Option<&str>,
         timeout: Duration,
     ) -> Result<(i64, String), String> {
         let scratch = write_scratch(files, false)?;
-        self.run_mounted(&[(scratch.path(), "/workspace")], "/tmp", cmd, timeout)
-            .await
+        self.run_mounted(
+            &[(scratch.path(), "/workspace")],
+            "/tmp",
+            Pid1::Command,
+            cmd,
+            input,
+            timeout,
+        )
+        .await
     }
 
     /// O19: [`run_workspace`](Self::run_workspace) plus a prepared directory
     /// (a temporary copy of the scanned tree, never the user's own files)
-    /// mounted read-only at `/workspace/tree`. Same isolation, same timeout.
+    /// mounted read-only at `/workspace/tree`. Same isolation, same timeout,
+    /// same stdin `input` handling, and `cmd` is likewise PID 1 and must
+    /// enforce its own in-container hard limit.
     pub async fn run_workspace_with_tree(
         &self,
         files: &[(&str, &str)],
         tree: &Path,
         cmd: &[String],
+        input: Option<&str>,
         timeout: Duration,
     ) -> Result<(i64, String), String> {
         let scratch = write_scratch(files, true)?;
         self.run_mounted(
             &[(scratch.path(), "/workspace"), (tree, "/workspace/tree")],
             "/tmp",
+            Pid1::Command,
             cmd,
+            input,
             timeout,
         )
         .await
@@ -332,15 +380,24 @@ impl DockerSandbox {
         cmd: &[String],
         timeout: Duration,
     ) -> Result<(i64, String), String> {
-        self.run_mounted(&[(tree, "/workspace")], "/workspace", cmd, timeout)
-            .await
+        self.run_mounted(
+            &[(tree, "/workspace")],
+            "/workspace",
+            Pid1::Timeout,
+            cmd,
+            None,
+            timeout,
+        )
+        .await
     }
 
     async fn run_mounted(
         &self,
         mounts: &[(&Path, &str)],
         workdir: &str,
+        pid1: Pid1,
         cmd: &[String],
+        input: Option<&str>,
         timeout: Duration,
     ) -> Result<(i64, String), String> {
         // `--mount` is comma-separated key=value: a source path holding a
@@ -352,8 +409,8 @@ impl DockerSandbox {
             return Err(format!("unsupported mount path {}", bad.display()));
         }
         let name = format!("vettalon-poc-{}", uuid::Uuid::new_v4().simple());
-        let args = self.run_args_mounted(&name, mounts, workdir, cmd);
-        self.run_container(&name, &args, None, timeout).await
+        let args = self.build_run_args(&name, mounts, workdir, input.is_some(), pid1, cmd);
+        self.run_container(&name, &args, input, timeout).await
     }
 
     async fn run_container(
@@ -1303,6 +1360,78 @@ ghi789 notapid
         let wd = a.iter().position(|x| x == "--workdir").unwrap();
         assert_eq!(a[wd + 1], "/workspace");
         assert!(!a.iter().any(|x| x == "-i"));
+        // A mounted run with stdin input (the oracle marker) is interactive
+        // and keeps the same mounts and flags.
+        let b = sb.build_run_args(
+            "n",
+            &[(Path::new("/tmp/h"), "/workspace")],
+            "/tmp",
+            true,
+            Pid1::Timeout,
+            &["python3".into()],
+        );
+        assert_eq!(b[2], "-i");
+        assert!(b.iter().any(|x| x == "--network=none"));
+        assert!(
+            b.iter()
+                .any(|x| x == "type=bind,source=/tmp/h,target=/workspace,readonly")
+        );
+        // A test command in a tree copy keeps the `timeout` wrapper.
+        let img = a.iter().position(|x| x == "img").unwrap();
+        assert_eq!(
+            &a[img + 1..],
+            &["timeout", "-s", "KILL", "125", "sh", "-c", "pytest"]
+        );
+        assert!(!a.iter().any(|x| x == "--init=false"));
+    }
+
+    /// Harness runs (scan oracle, raw and typed fix check) put the runner
+    /// itself at PID 1: no `timeout` wrapper and no init, with every
+    /// isolation flag and the read-only mounts unchanged.
+    #[test]
+    fn harness_run_args_make_the_command_pid_1() {
+        let sb = DockerSandbox {
+            docker_bin: "docker".into(),
+            image: "img".into(),
+        };
+        let cmd: Vec<String> = ["python3", "-I", "-B", "/workspace/runner.py"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = sb.build_run_args(
+            "n",
+            &[
+                (Path::new("/tmp/h"), "/workspace"),
+                (Path::new("/tmp/t"), "/workspace/tree"),
+            ],
+            "/tmp",
+            true,
+            Pid1::Command,
+            &cmd,
+        );
+        assert_eq!(a[2], "-i");
+        for flag in [
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--rm",
+            "--pull=never",
+            "--pids-limit=128",
+            "--memory-swap=512m",
+        ] {
+            assert!(a.iter().any(|x| x == flag), "missing {flag}: {a:?}");
+        }
+        assert!(
+            a.iter()
+                .filter(|x| x.starts_with("type=bind"))
+                .all(|x| x.ends_with(",readonly"))
+        );
+        assert!(!a.iter().any(|x| x == "timeout"), "{a:?}");
+        assert!(!a.iter().any(|x| x == IN_CONTAINER_LIMIT_SECS), "{a:?}");
+        let img = a.iter().position(|x| x == "img").unwrap();
+        assert_eq!(a[img - 1], "--init=false");
+        assert_eq!(&a[img + 1..], cmd.as_slice());
     }
 
     #[tokio::test]
@@ -1321,7 +1450,12 @@ ghi789 notapid
             .unwrap_err();
         assert!(e.contains("unsupported mount path"), "{e}");
         let e = sb
-            .run_workspace(&[("tree", "x")], &["true".into()], Duration::from_secs(1))
+            .run_workspace(
+                &[("tree", "x")],
+                &["true".into()],
+                None,
+                Duration::from_secs(1),
+            )
             .await
             .unwrap_err();
         assert!(e.contains("invalid workspace file name"), "{e}");
@@ -1358,6 +1492,7 @@ ghi789 notapid
                 .run_workspace(
                     &[(bad, "print(1)")],
                     &["python3".into()],
+                    Some("input"),
                     Duration::from_secs(1),
                 )
                 .await

@@ -26,9 +26,28 @@ pub(super) struct DiffSelection {
     pub scope: DiffScope,
     pub changed: BTreeSet<String>,
     pub tracked_dependencies: BTreeSet<String>,
+    /// Gitlinks (nested repositories), also listed in `changed`. Their
+    /// contents are never inspected, so each covers every path beneath it.
+    pub gitlinks: BTreeSet<String>,
+}
+
+/// `path` is the gitlink itself or lies beneath it.
+fn under_gitlink(path: &str, gitlink: &str) -> bool {
+    path.strip_prefix(gitlink)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 impl DiffSelection {
+    /// Whether a repo-relative path is in scope: an exact match for normal
+    /// files, or any path at or beneath a gitlink.
+    pub fn path_changed(&self, path: &str) -> bool {
+        self.changed.contains(path)
+            || self
+                .gitlinks
+                .iter()
+                .any(|gitlink| under_gitlink(path, gitlink))
+    }
+
     /// Preserve both snapshots' scope; module selection still describes the start.
     pub fn reconcile(&mut self, final_selection: Self) -> Result<(), String> {
         if self.scope.head != final_selection.scope.head {
@@ -42,6 +61,7 @@ impl DiffSelection {
         }
         self.scope.changed_during_scan = final_selection.changed.difference(&self.changed).count();
         self.changed.extend(final_selection.changed);
+        self.gitlinks.extend(final_selection.gitlinks);
         self.scope.changed_files = self.changed.len();
         self.scope.worktree_changes = final_selection.scope.worktree_changes;
         self.scope.untracked = final_selection.scope.untracked;
@@ -52,7 +72,7 @@ impl DiffSelection {
     }
 
     pub fn contains_module(&self, module: &ModuleTarget) -> bool {
-        module.files.iter().any(|file| self.changed.contains(file))
+        module.files.iter().any(|file| self.path_changed(file))
     }
 
     pub fn annotate_findings(&self, findings: &mut [Finding]) {
@@ -87,7 +107,7 @@ impl DiffSelection {
         {
             return true;
         }
-        scope_path(finding).is_none_or(|path| self.changed.contains(path))
+        scope_path(finding).is_none_or(|path| self.path_changed(path))
     }
 }
 
@@ -177,15 +197,33 @@ pub(super) fn outside_diff_scope(finding: &Finding) -> bool {
         })
 }
 
+/// The runner captures UTF-8 lossily; reject replacement characters so
+/// undecodable names cannot alias a different source path. Changed paths
+/// are later read and hashed, so they must also be portable repo paths.
+fn is_safe_changed_path(path: &str) -> bool {
+    !path.contains('\u{fffd}') && vettalon_contract::safe_path::SafeRepoPath::parse(path).is_ok()
+}
+
+/// Index entries are only listed and compared here, never opened, so a
+/// name merely reserved on Windows (`aux.c`, `con.h`) is fine. Git never
+/// stores an absolute path or an empty, `.` or `..` component, so any such
+/// entry (or a NUL-bearing one) means malformed output. Undecodable (U+FFFD)
+/// and newline-bearing names are legal on Linux and are deliberately kept:
+/// `compute_with` counts them as invalid changed paths, and the tracked set
+/// is only compared against, never opened or hashed.
+fn is_index_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 fn parse_paths(output: &str) -> (BTreeSet<String>, usize) {
     let mut paths = BTreeSet::new();
     let mut invalid = 0;
     for path in output.split_terminator('\0') {
-        // The runner captures UTF-8 lossily; reject replacement characters so
-        // undecodable names cannot alias a different source path.
-        if !path.contains('\u{fffd}')
-            && vettalon_contract::safe_path::SafeRepoPath::parse(path).is_ok()
-        {
+        if is_safe_changed_path(path) {
             paths.insert(path.to_owned());
         } else {
             invalid += 1;
@@ -195,6 +233,16 @@ fn parse_paths(output: &str) -> (BTreeSet<String>, usize) {
 }
 
 async fn git_read(git: &str, git_dir: &Path, root: &Path, args: &[&str]) -> Result<String, String> {
+    git_read_capped(git, git_dir, root, args, 4 * 1024 * 1024).await
+}
+
+async fn git_read_capped(
+    git: &str,
+    git_dir: &Path,
+    root: &Path,
+    args: &[&str],
+    max_output_bytes: usize,
+) -> Result<String, String> {
     let dir = format!("--git-dir={}", git_dir.display());
     let mut command = vec!["--no-pager", "--no-replace-objects", dir.as_str()];
     command.extend_from_slice(args);
@@ -204,7 +252,7 @@ async fn git_read(git: &str, git_dir: &Path, root: &Path, args: &[&str]) -> Resu
         root,
         &SubprocessLimits {
             timeout: std::time::Duration::from_secs(30),
-            max_output_bytes: 4 * 1024 * 1024,
+            max_output_bytes,
         },
     )
     .await;
@@ -233,6 +281,58 @@ fn parse_changed_paths(output: &str) -> Result<BTreeSet<String>, String> {
         ));
     }
     Ok(paths)
+}
+
+/// Name-only diff flags shared by every scope read. `dirty` still reports a
+/// changed submodule commit but never starts a Git child inside a nested
+/// repository, whose own config (`core.fsmonitor`, filters) is not validated.
+/// Renames stay off so both the deleted and added paths stay in scope.
+const DIFF_ARGS: &[&str] = &[
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--ignore-submodules=dirty",
+    "--name-only",
+    "-z",
+    "--no-renames",
+];
+
+/// The stage listing carries ~50 bytes of mode/OID per path; keep its cap
+/// well above the plain path listings so large repositories still fit.
+const INDEX_LISTING_CAP: usize = 16 * 1024 * 1024;
+
+/// Split `ls-files --stage -z` into every tracked path and the gitlinks
+/// (mode 160000, nested repositories) among them. Git does not look inside
+/// a gitlink for these reads, so its contents are unknown, not unchanged.
+/// Paths are checked with [`is_index_path`]; anything malformed fails closed.
+fn parse_index(output: &str) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+    if !output.is_empty() && !output.ends_with('\0') {
+        return Err("Git returned an unterminated index listing".into());
+    }
+    let mut tracked = BTreeSet::new();
+    let mut gitlinks = BTreeSet::new();
+    for entry in output.split_terminator('\0') {
+        let (meta, path) = entry
+            .split_once('\t')
+            .ok_or("Git returned a malformed index entry")?;
+        if !is_index_path(path) {
+            return Err("Git returned a malformed index path".into());
+        }
+        if meta.starts_with("160000 ") {
+            gitlinks.insert(path.to_owned());
+        }
+        tracked.insert(path.to_owned());
+    }
+    Ok((tracked, gitlinks))
+}
+
+async fn read_index(
+    git: &str,
+    git_dir: &Path,
+    root: &Path,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+    let args = ["ls-files", "--stage", "-z", "--"];
+    parse_index(&git_read_capped(git, git_dir, root, &args, INDEX_LISTING_CAP).await?)
 }
 
 fn parse_oid(output: &str) -> Result<String, String> {
@@ -282,11 +382,25 @@ pub(super) struct RepoState {
     pub commit: String,
     /// Unknown when index flags can hide edits; never eligible for skipping.
     pub clean: Option<bool>,
+    /// The index tracks a gitlink (submodule); `clean` is then `None`.
+    /// Only diagnostic: false also when index flags returned early.
+    pub submodules: bool,
 }
 
 /// Read metadata without interpreting filenames or enabling Git write paths.
 pub(super) async fn repo_state(root: &Path) -> Result<RepoState, String> {
     let (git, git_dir) = super::intake::prepare_readonly_git(root).await?;
+    repo_state_with(&git, &git_dir, root).await
+}
+
+/// [`repo_state`] after metadata validation; tests call it directly to prove
+/// the reads stay safe even when validation is bypassed.
+pub(super) async fn repo_state_with(
+    git: &str,
+    git_dir: &Path,
+    root: &Path,
+) -> Result<RepoState, String> {
+    let (git, git_dir) = (git.to_owned(), git_dir.to_owned());
     let commit = parse_oid(
         &git_read(
             &git,
@@ -306,20 +420,30 @@ pub(super) async fn repo_state(root: &Path) -> Result<RepoState, String> {
         return Ok(RepoState {
             commit,
             clean: None,
+            submodules: false,
         });
     }
-    let diff_args = [
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--ignore-submodules=none",
-        "--name-only",
-        "-z",
-        "--no-renames",
-    ];
-    let mut staged_args = diff_args.to_vec();
+    // Nested repository contents are never inspected, so cleanliness is unknown.
+    let (tracked, gitlinks) = read_index(&git, &git_dir, root).await?;
+    // Fail closed: a non-UTF-8 or newline-bearing tracked name cannot be
+    // represented faithfully, so cleanliness is unknown (clean = None).
+    if tracked.iter().any(|p| p.contains(['\u{fffd}', '\n'])) {
+        return Ok(RepoState {
+            commit,
+            clean: None,
+            submodules: !gitlinks.is_empty(),
+        });
+    }
+    if !gitlinks.is_empty() {
+        return Ok(RepoState {
+            commit,
+            clean: None,
+            submodules: true,
+        });
+    }
+    let mut staged_args = DIFF_ARGS.to_vec();
     staged_args.extend(["--cached", "--end-of-options", &commit, "--"]);
-    let mut unstaged_args = diff_args.to_vec();
+    let mut unstaged_args = DIFF_ARGS.to_vec();
     unstaged_args.push("--");
     let staged = git_read(&git, &git_dir, root, &staged_args).await?;
     let unstaged = git_read(&git, &git_dir, root, &unstaged_args).await?;
@@ -333,12 +457,26 @@ pub(super) async fn repo_state(root: &Path) -> Result<RepoState, String> {
     Ok(RepoState {
         commit,
         clean: Some(staged.is_empty() && unstaged.is_empty() && untracked.is_empty()),
+        submodules: false,
     })
 }
 
 pub(super) async fn compute(root: &Path, base: &str) -> Result<DiffSelection, String> {
     validate_ref(base)?;
     let (git, git_dir) = super::intake::prepare_readonly_git(root).await?;
+    compute_with(&git, &git_dir, root, base).await
+}
+
+/// [`compute`] after metadata validation; tests call it directly to prove
+/// the reads stay safe even when validation is bypassed.
+pub(super) async fn compute_with(
+    git: &str,
+    git_dir: &Path,
+    root: &Path,
+    base: &str,
+) -> Result<DiffSelection, String> {
+    validate_ref(base)?;
+    let (git, git_dir) = (git.to_owned(), git_dir.to_owned());
     // Even an empty file or dangling symlink must not silently alter ancestry.
     match std::fs::symlink_metadata(git_dir.join("info/grafts")) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -371,22 +509,12 @@ pub(super) async fn compute(root: &Path, base: &str) -> Result<DiffSelection, St
     let merge_base = parse_oid(&git_read(&git, &git_dir, root,
         &["merge-base", "--end-of-options", &base_oid, &head]).await
         .map_err(|reason| format!("cannot find merge-base (shallow or unrelated history): {reason}; fetch the base ref and use fetch-depth: 0"))?)?;
-    // Disable rename collapsing so both the deleted and added paths stay in
-    // scope. Read index and worktree separately: their changes can cancel.
-    let diff_args = [
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--ignore-submodules=none",
-        "--name-only",
-        "-z",
-        "--no-renames",
-    ];
-    let mut committed_args = diff_args.to_vec();
+    // Read index and worktree separately: their changes can cancel.
+    let mut committed_args = DIFF_ARGS.to_vec();
     committed_args.extend(["--end-of-options", &merge_base, &head, "--"]);
-    let mut staged_args = diff_args.to_vec();
+    let mut staged_args = DIFF_ARGS.to_vec();
     staged_args.extend(["--cached", "--end-of-options", &head, "--"]);
-    let mut unstaged_args = diff_args.to_vec();
+    let mut unstaged_args = DIFF_ARGS.to_vec();
     unstaged_args.push("--");
     let committed = git_read(&git, &git_dir, root, &committed_args).await?;
     let staged = git_read(&git, &git_dir, root, &staged_args).await?;
@@ -398,8 +526,8 @@ pub(super) async fn compute(root: &Path, base: &str) -> Result<DiffSelection, St
         &["ls-files", "--others", "--exclude-standard", "-z", "--"],
     )
     .await?;
-    let tracked = git_read(&git, &git_dir, root, &["ls-files", "-z", "--"]).await?;
-    let tracked_dependencies = parse_changed_paths(&tracked)?
+    let (tracked, gitlinks) = read_index(&git, &git_dir, root).await?;
+    let tracked_dependencies = tracked
         .into_iter()
         .filter(|path| is_dependency_file(path))
         .collect();
@@ -416,6 +544,20 @@ pub(super) async fn compute(root: &Path, base: &str) -> Result<DiffSelection, St
     // path may be counted in both committed changes and worktree changes.
     changed.extend(worktree.iter().cloned());
     changed.extend(untracked.iter().cloned());
+    // Nested repository contents are never inspected; assume they changed,
+    // including every path beneath them. The index listing accepts names
+    // reserved on Windows, but `changed` paths may be read, so a gitlink
+    // must pass the same check as any other changed path.
+    let invalid_gitlinks = gitlinks
+        .iter()
+        .filter(|path| !is_safe_changed_path(path))
+        .count();
+    if invalid_gitlinks != 0 {
+        return Err(format!(
+            "diff scope refused: {invalid_gitlinks} invalid repo-relative changed paths"
+        ));
+    }
+    changed.extend(gitlinks.iter().cloned());
     Ok(DiffSelection {
         scope: DiffScope {
             mode: DiffScopeMode::Diff,
@@ -431,6 +573,7 @@ pub(super) async fn compute(root: &Path, base: &str) -> Result<DiffSelection, St
         },
         changed,
         tracked_dependencies,
+        gitlinks,
     })
 }
 
@@ -560,6 +703,310 @@ pub(super) mod tests {
         }
     }
 
+    #[test]
+    fn index_listing_separates_gitlinks_and_fails_closed() {
+        let oid = "0".repeat(40);
+        let listing = format!(
+            "100644 {oid} 0\tsrc/a b.rs\0160000 {oid} 0\tvendor/nested\0120000 {oid} 0\tlink\0"
+        );
+        let (tracked, gitlinks) = parse_index(&listing).unwrap();
+        assert_eq!(
+            tracked,
+            BTreeSet::from(["src/a b.rs".into(), "vendor/nested".into(), "link".into()])
+        );
+        assert_eq!(gitlinks, BTreeSet::from(["vendor/nested".into()]));
+        assert_eq!(parse_index("").unwrap(), (BTreeSet::new(), BTreeSet::new()));
+        assert!(parse_index(&format!("100644 {oid} 0\ta.rs")).is_err());
+        assert!(parse_index("no-tab\0").is_err());
+        assert!(parse_index(&format!("160000 {oid} 0\t../escape\0")).is_err());
+        for bad in ["", "/abs", "a/../b", "a//b", "./a", "a/", "a\0b"] {
+            assert!(
+                parse_index(&format!("100644 {oid} 0\t{bad}\0")).is_err(),
+                "{bad:?}"
+            );
+        }
+        // Non-UTF-8 (lossy U+FFFD) and newline names are kept, not parse
+        // errors, so compute_with can count them as invalid changed paths.
+        let (tracked, _) = parse_index(&format!(
+            "100644 {oid} 0\ta/\u{fffd}.c\0100644 {oid} 0\tx\ny\0"
+        ))
+        .unwrap();
+        assert_eq!(
+            tracked,
+            BTreeSet::from(["a/\u{fffd}.c".into(), "x\ny".into()])
+        );
+    }
+
+    /// Names reserved on Windows are legal tracked files elsewhere; listing
+    /// them must not make the index unreadable.
+    #[test]
+    fn index_listing_accepts_windows_reserved_names() {
+        let oid = "0".repeat(40);
+        let listing = format!(
+            "100644 {oid} 0\taux.c\0100644 {oid} 0\tsrc/con.h\0100644 {oid} 0\tnul.txt\0160000 {oid} 0\tlpt1\0"
+        );
+        let (tracked, gitlinks) = parse_index(&listing).unwrap();
+        assert_eq!(
+            tracked,
+            BTreeSet::from([
+                "aux.c".into(),
+                "src/con.h".into(),
+                "nul.txt".into(),
+                "lpt1".into()
+            ])
+        );
+        assert_eq!(gitlinks, BTreeSet::from(["lpt1".into()]));
+    }
+
+    /// Windows itself cannot create these files, so the fixture is Unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracked_windows_reserved_names_keep_repo_state_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        if crate::audit::scanners::git_for_security_test(root).is_none() {
+            return;
+        }
+        git(root, &["init", "-q"]).await;
+        for name in ["aux.c", "con.h", "nul.txt", "main.rs"] {
+            std::fs::write(root.join(name), "int x;\n").unwrap();
+        }
+        commit(root).await;
+        let state = repo_state(root).await.unwrap();
+        assert_eq!(state.clean, Some(true));
+        assert!(!state.submodules);
+        let selection = compute(root, "HEAD").await.unwrap();
+        assert!(selection.changed.is_empty(), "{:?}", selection.changed);
+        assert!(selection.gitlinks.is_empty());
+
+        std::fs::write(root.join("main.rs"), "int y;\n").unwrap();
+        assert_eq!(repo_state(root).await.unwrap().clean, Some(false));
+    }
+
+    #[test]
+    fn gitlink_covers_every_path_beneath_it() {
+        let mut scope = selection(&["src/a.rs", "vendor/nested"]);
+        scope.gitlinks = BTreeSet::from(["vendor/nested".into()]);
+        for path in [
+            "vendor/nested",
+            "vendor/nested/a.py",
+            "vendor/nested/deep/b.py",
+            "src/a.rs",
+        ] {
+            assert!(scope.path_changed(path), "{path}");
+        }
+        for path in [
+            "vendor/nestedX/a.py",
+            "vendor/nested.py",
+            "vendor/other.py",
+            "vendor",
+            "src/a.rs/x",
+            "src/b.rs",
+        ] {
+            assert!(!scope.path_changed(path), "{path}");
+        }
+        let inside = finding("semgrep", FindingKind::StaticAnalysis, "vendor/nested/a.py");
+        let sibling = finding(
+            "semgrep",
+            FindingKind::StaticAnalysis,
+            "vendor/nestedX/a.py",
+        );
+        let other = finding("semgrep", FindingKind::StaticAnalysis, "vendor/other.py");
+        assert!(scope.contains_finding(&inside));
+        assert!(!scope.contains_finding(&sibling));
+        assert!(!scope.contains_finding(&other));
+        let mut findings = vec![inside, sibling, other];
+        scope.annotate_findings(&mut findings);
+        assert!(!outside_diff_scope(&findings[0]));
+        assert!(outside_diff_scope(&findings[1]));
+        assert!(outside_diff_scope(&findings[2]));
+
+        // A plain changed file never covers paths beneath its name.
+        let plain = selection(&["vendor/nested"]);
+        assert!(!plain.path_changed("vendor/nested/a.py"));
+
+        // Gitlinks survive reconciliation with a later snapshot.
+        let mut initial = selection(&[]);
+        initial.reconcile(scope).unwrap();
+        assert!(initial.path_changed("vendor/nested/a.py"));
+    }
+
+    #[cfg(unix)]
+    fn fsmonitor_hook(marker: &Path) -> String {
+        // The hook runs through a shell; `#` drops the arguments Git appends.
+        format!("touch '{}' #", marker.display())
+    }
+
+    /// A nested repository's own config is never validated, so no scope read
+    /// may start a Git child inside it (`diff --ignore-submodules=none` runs
+    /// `status` there), and its unknown contents never count as clean.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_repository_config_never_runs_and_gitlinks_are_not_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let nested = root.join("s");
+        std::fs::create_dir_all(&nested).unwrap();
+        let Some(binary) = crate::audit::scanners::git_for_security_test(&root) else {
+            return;
+        };
+        git(&root, &["init", "-q"]).await;
+        git(&nested, &["init", "-q"]).await;
+        std::fs::write(nested.join("lib.rs"), "fn nested() {}\n").unwrap();
+        commit(&nested).await;
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        commit(&root).await;
+        let marker = temp.path().join("marker");
+        git(
+            &nested,
+            &["config", "core.fsmonitor", &fsmonitor_hook(&marker)],
+        )
+        .await;
+        // Give a recursing read real work inside the nested worktree.
+        std::fs::write(nested.join("lib.rs"), "fn changed() {}\n").unwrap();
+
+        let state = repo_state(&root).await.unwrap();
+        assert_eq!(state.clean, None, "a gitlink must not be reported clean");
+        let selection = compute(&root, "HEAD").await.unwrap();
+        assert!(selection.changed.contains("s"), "{:?}", selection.changed);
+        assert!(!marker.exists(), "nested repository config ran on the host");
+
+        // Control: a recursing diff without the hardening runs the hook, so
+        // the assertions above are not vacuous for this Git and fixture.
+        let control = crate::audit::scanners::git_test_command_bare(&binary)
+            .args(["diff", "--ignore-submodules=none", "--name-only"])
+            .current_dir(&root)
+            .envs([
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ])
+            .output()
+            .unwrap();
+        assert!(control.status.success(), "{control:?}");
+        assert!(marker.exists(), "fixture did not reproduce the nested hook");
+    }
+
+    /// A nested repository's own filter driver (`clean`, `smudge` or a
+    /// long-running `process`) selected by its `.gitattributes` never runs:
+    /// no scope read starts a Git child inside the gitlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_repository_filter_driver_never_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let nested = root.join("s");
+        std::fs::create_dir_all(&nested).unwrap();
+        let Some(binary) = crate::audit::scanners::git_for_security_test(&root) else {
+            return;
+        };
+        git(&root, &["init", "-q"]).await;
+        git(&nested, &["init", "-q"]).await;
+        // Committed before the driver exists, so fixture setup cannot run it.
+        std::fs::write(nested.join(".gitattributes"), "* filter=mark\n").unwrap();
+        std::fs::write(nested.join("lib.rs"), "fn nested() {}\n").unwrap();
+        commit(&nested).await;
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        commit(&root).await;
+        let marker = temp.path().join("marker");
+        let driver = fsmonitor_hook(&marker);
+        for var in ["clean", "smudge", "process"] {
+            let key = format!("filter.mark.{var}");
+            git(&nested, &["config", &key, &driver]).await;
+        }
+        // Same size, new content: a status inside the nested repository must
+        // hash the file through the driver to tell it changed.
+        std::fs::write(nested.join("lib.rs"), "fn nestex() {}\n").unwrap();
+
+        let state = repo_state(&root).await.unwrap();
+        assert_eq!(state.clean, None, "a gitlink must not be reported clean");
+        assert!(state.submodules);
+        let selection = compute(&root, "HEAD").await.unwrap();
+        assert!(
+            selection.path_changed("s/lib.rs"),
+            "{:?}",
+            selection.changed
+        );
+        // The same reads with root validation bypassed.
+        let git_dir = root.join(".git");
+        let _ = repo_state_with(&binary, &git_dir, &root).await;
+        let _ = compute_with(&binary, &git_dir, &root, "HEAD").await;
+        assert!(
+            !marker.exists(),
+            "nested repository filter driver ran on the host"
+        );
+
+        // Control: a plain status inside the nested repository runs the
+        // driver, so the assertion above is not vacuous for this Git. A
+        // failed process-filter handshake may fail the status; only the
+        // marker matters.
+        let control = crate::audit::scanners::git_test_command_bare(&binary)
+            .args(["status", "--porcelain"])
+            .current_dir(&nested)
+            .envs([
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "fixture did not reproduce the nested filter driver: {control:?}"
+        );
+    }
+
+    /// Even with config validation bypassed, the runner's command-scoped
+    /// `core.fsmonitor=false` keeps a repository hook from running on plain
+    /// `diff`/`status` and on the production scope reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_fsmonitor_never_runs_through_the_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let Some(binary) = crate::audit::scanners::git_for_security_test(&root) else {
+            return;
+        };
+        if crate::audit::scanners::git_version(&binary).is_none_or(|v| v < (2, 31)) {
+            return; // GIT_CONFIG_COUNT needs Git 2.31+.
+        }
+        git(&root, &["init", "-q"]).await;
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        commit(&root).await;
+        std::fs::write(root.join("main.rs"), "fn changed() {}\n").unwrap();
+        let marker = temp.path().join("marker");
+        git(
+            &root,
+            &["config", "core.fsmonitor", &fsmonitor_hook(&marker)],
+        )
+        .await;
+        let git_dir = root.join(".git");
+
+        for args in [&["diff", "--name-only"][..], &["status", "--porcelain"][..]] {
+            git(&root, args).await;
+        }
+        let _ = repo_state_with(&binary, &git_dir, &root).await;
+        let _ = compute_with(&binary, &git_dir, &root, "HEAD").await;
+        assert!(
+            !marker.exists(),
+            "repository core.fsmonitor ran through the runner"
+        );
+
+        let control = crate::audit::scanners::git_test_command_bare(&binary)
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .envs([
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ])
+            .output()
+            .unwrap();
+        assert!(control.status.success(), "{control:?}");
+        assert!(
+            marker.exists(),
+            "fixture did not reproduce the fsmonitor hook"
+        );
+    }
+
     fn selection(paths: &[&str]) -> DiffSelection {
         DiffSelection {
             scope: DiffScope {
@@ -576,6 +1023,7 @@ pub(super) mod tests {
             },
             changed: paths.iter().map(|p| (*p).into()).collect(),
             tracked_dependencies: BTreeSet::from(["Cargo.lock".into()]),
+            gitlinks: BTreeSet::new(),
         }
     }
 
