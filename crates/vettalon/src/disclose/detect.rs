@@ -33,11 +33,10 @@ fn read_small(repo: &Path, path: &Path) -> Option<String> {
     {
         return None;
     }
-    let meta = std::fs::metadata(&resolved).ok()?;
-    if meta.len() > META_MAX_BYTES {
-        return None;
-    }
-    std::fs::read_to_string(resolved).ok()
+    // Regular files only: a FIFO (`.git/HEAD`, a ref, SECURITY.md, a
+    // manifest) would otherwise block `hunt`/`disclose` until killed.
+    let bytes = crate::util::read_regular_file(&resolved, META_MAX_BYTES).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// `owner/repo` from a GitHub repository URL (https, ssh, scp-style,
