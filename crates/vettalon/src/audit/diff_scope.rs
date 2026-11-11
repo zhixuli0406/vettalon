@@ -346,11 +346,21 @@ fn parse_oid(output: &str) -> Result<String, String> {
 /// Bound ignored-file enumeration before applying intake's shared path predicate.
 /// Errors and count overflow are conservative presence, never an empty list.
 pub(super) async fn ignored_intake_count(root: &Path) -> Result<usize, String> {
-    const MAX_IGNORED_FILES: usize = 10_000;
     let (git, git_dir) = super::intake::prepare_readonly_git(root).await?;
+    ignored_intake_count_with(&git, &git_dir, root).await
+}
+
+/// [`ignored_intake_count`] after metadata validation; tests call it directly
+/// to prove the read stays safe even when validation is bypassed.
+pub(super) async fn ignored_intake_count_with(
+    git: &str,
+    git_dir: &Path,
+    root: &Path,
+) -> Result<usize, String> {
+    const MAX_IGNORED_FILES: usize = 10_000;
     let output = git_read(
-        &git,
-        &git_dir,
+        git,
+        git_dir,
         root,
         &[
             "ls-files",

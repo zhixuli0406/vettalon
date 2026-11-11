@@ -41,6 +41,15 @@ pub(crate) const GIT_CONFIG_OVERRIDES: &[(&str, &str)] = &[
     ("diff.ignoreSubmodules", "dirty"),
     ("submodule.recurse", "false"),
     ("log.showSignature", "false"),
+    // Paths Git opens during read-only commands (`log`, `diff`, `ls-files`).
+    // A repository value could name a FIFO (hangs the scan) or, on Windows,
+    // a `//host/share/…` path (leaks NTLM credentials). The null device
+    // reads as an empty file for each of them.
+    ("core.excludesFile", GIT_NULL_CONFIG),
+    ("core.attributesFile", GIT_NULL_CONFIG),
+    ("mailmap.file", GIT_NULL_CONFIG),
+    ("diff.orderFile", GIT_NULL_CONFIG),
+    ("log.mailmap", "false"),
 ];
 
 /// Set on every bounded subprocess (scanners included: some invoke Git

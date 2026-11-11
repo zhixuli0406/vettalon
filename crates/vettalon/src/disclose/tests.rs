@@ -158,6 +158,38 @@ fn project_detection_keeps_leaf_symlinks_fail_closed() {
     assert!(m.security_emails.is_empty());
 }
 
+/// A FIFO in place of `.git/HEAD`'s ref, SECURITY.md or the manifest is
+/// treated as unreadable instead of blocking `hunt`/`disclose` on a writer.
+#[cfg(unix)]
+#[test]
+fn project_detection_never_blocks_on_a_fifo() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let d = repo();
+    for rel in [".git/refs/heads/main", "SECURITY.md", "Cargo.toml"] {
+        let path = d.path().join(rel);
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated C string for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+    let root = d.path().to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(detect_project(&root));
+    });
+    let m = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("project detection blocked on a FIFO");
+    assert_eq!(m.commit, None);
+    assert_eq!(m.security_policy, None);
+    assert!(m.security_emails.is_empty());
+    assert_eq!(m.ecosystem, None);
+    assert_eq!(m.version, None);
+    // The git remote is a regular file and is still read.
+    assert_eq!(m.github.as_deref(), Some("acme/shop"));
+}
+
 #[cfg(unix)]
 #[test]
 fn project_detection_accepts_an_operator_selected_repo_symlink() {
