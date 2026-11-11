@@ -18,8 +18,8 @@ use serde_json::Value;
 use super::fix_diff;
 use super::poc::{POC_TIMEOUT, PocBudget};
 use super::poc_oracle::{
-    OracleClass, OracleSecrets, benign_input, classify, fixture_inputs,
-    target_runner as oracle_target_runner,
+    OracleClass, OracleSecrets, benign_input, classify, fixture_inputs, runner_command,
+    runner_input, target_runner as oracle_target_runner,
 };
 use super::regression_test::{self, RegressionTestRecord};
 use super::schema::{Finding, sha256_hex};
@@ -35,7 +35,9 @@ const TARGET_CALL_MAX_BYTES: usize = 8 * 1024;
 const TARGET_MAX_ARGS: usize = 16;
 const TARGET_LITERAL_MAX_DEPTH: usize = 8;
 const TARGET_SOURCE_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const TARGET_HARNESS_VERSION: &str = "vettalon-target-oracle-v1";
+/// v2: the marker reaches the runner on stdin only, the runner is PID 1
+/// and non-dumpable, and a raising target call reports `raised=true`.
+const TARGET_HARNESS_VERSION: &str = "vettalon-target-oracle-v2";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -167,11 +169,16 @@ import types
 PLAN = json.loads(bytes.fromhex({plan_hex:?}).decode('utf-8'))
 TARGET_PATH = {target:?}
 EXPECTED_SHA256 = {expected:?}
+class _HarnessError(Exception):
+    pass
 def _load_target():
     loader = importlib.machinery.SourceFileLoader('_vettalon_target', TARGET_PATH)
-    source = loader.get_data(TARGET_PATH)
+    try:
+        source = loader.get_data(TARGET_PATH)
+    except OSError as exc:
+        raise _HarnessError('target source unreadable') from exc
     if hashlib.sha256(source).hexdigest() != EXPECTED_SHA256:
-        raise RuntimeError('target source identity mismatch')
+        raise _HarnessError('target source identity mismatch')
     spec = importlib.util.spec_from_loader('_vettalon_target', loader, origin=TARGET_PATH)
     module = importlib.util.module_from_spec(spec) if spec is not None else types.ModuleType('_vettalon_target')
     module.__file__ = TARGET_PATH
@@ -182,22 +189,30 @@ def run(payload):
     module = _load_target()
     function = module.__dict__.get(PLAN['function'])
     if not callable(function):
-        raise RuntimeError('target function unavailable')
+        raise _HarnessError('target function unavailable')
     args = [payload if item['kind'] == 'payload' else item['value'] for item in PLAN['args']]
     result = function(*args)
     if inspect.isawaitable(result):
-        raise RuntimeError('async target unsupported')
+        raise _HarnessError('async target unsupported')
     return str(result)
 def _main():
     if len(sys.argv) != 3:
-        raise RuntimeError('invalid target invocation')
+        raise _HarnessError('invalid target invocation')
     try:
         payload = json.loads(bytes.fromhex(sys.argv[1]).decode('utf-8'))
     except Exception as exc:
-        raise RuntimeError('invalid target payload') from exc
+        raise _HarnessError('invalid target payload') from exc
     if not isinstance(payload, str):
-        raise RuntimeError('invalid target payload')
-    encoded = json.dumps({{'result': run(payload)}}, ensure_ascii=True, separators=(',', ':')).encode('utf-8')
+        raise _HarnessError('invalid target payload')
+    # A Python exception from the target module or call is reported as
+    # `raised` (exit 0); a harness failure above stays a non-zero exit.
+    try:
+        record = {{'result': run(payload)}}
+    except _HarnessError:
+        raise
+    except Exception as exc:
+        record = {{'raised': type(exc).__name__[:64]}}
+    encoded = json.dumps(record, ensure_ascii=True, separators=(',', ':')).encode('utf-8')
     if len(encoded) > 65536:
         raise RuntimeError('target result too large')
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
@@ -326,7 +341,16 @@ impl TargetPocReceipt {
 #[async_trait::async_trait]
 pub trait TargetSandbox: Send + Sync {
     fn image_id(&self) -> &str;
-    async fn run(&self, tree: &Path, runner: &str, adapter: &str) -> Result<(i64, String), String>;
+    /// `input` goes to the runner's stdin (the oracle runner and the
+    /// regression red runner both read their per-run marker from it). The
+    /// runner runs as PID 1 of its container.
+    async fn run(
+        &self,
+        tree: &Path,
+        runner: &str,
+        adapter: &str,
+        input: &str,
+    ) -> Result<(i64, String), String>;
 }
 
 struct DockerTargetSandbox<'a> {
@@ -340,7 +364,13 @@ impl TargetSandbox for DockerTargetSandbox<'_> {
         &self.sandbox.image
     }
 
-    async fn run(&self, tree: &Path, runner: &str, adapter: &str) -> Result<(i64, String), String> {
+    async fn run(
+        &self,
+        tree: &Path,
+        runner: &str,
+        adapter: &str,
+        input: &str,
+    ) -> Result<(i64, String), String> {
         if !self.budget.try_claim() {
             return Err("target_poc_budget_exhausted".into());
         }
@@ -348,12 +378,8 @@ impl TargetSandbox for DockerTargetSandbox<'_> {
             .run_workspace_with_tree(
                 &[("runner.py", runner), ("sink.py", adapter)],
                 tree,
-                &[
-                    "python3".into(),
-                    "-I".into(),
-                    "-B".into(),
-                    "/workspace/runner.py".into(),
-                ],
+                &runner_command(),
+                Some(input),
                 POC_TIMEOUT,
             )
             .await
@@ -501,11 +527,15 @@ async fn red_check<S: TargetSandbox>(
         Ok(source) => source,
         Err(reason) => return (RegressionTestRecord::refused(reason), None),
     };
-    let marker = OracleSecrets::fresh().marker;
-    let runner = regression_test::red_runner(&marker);
-    let verdict = match sandbox.run(&snapshot.path, &runner, &source).await {
-        Ok((0, output)) => regression_test::parse_red_verdict(&output, &marker),
-        Ok(_) => Err("regression_test_execution_error"),
+    let secrets = OracleSecrets::fresh();
+    // The red runner holds no marker; it reads it from stdin, like the
+    // oracle runner, and only a run that exits 0 counts.
+    let runner = regression_test::red_runner();
+    let verdict = match sandbox
+        .run(&snapshot.path, &runner, &source, &runner_input(&secrets))
+        .await
+    {
+        Ok((exit, output)) => regression_test::parse_red_verdict(exit, &output, &secrets.marker),
         Err(_) => Err("incomplete_sandbox_capture"),
     };
     let sha256 = Some(sha256_hex(source.as_bytes()));
@@ -638,7 +668,9 @@ async fn phases<S: TargetSandbox>(
         let secrets = OracleSecrets::fresh();
         let runner = target_runner(class, &secrets, payload);
         let started = Instant::now();
-        let result = sandbox.run(&snapshot.path, &runner, &adapter).await;
+        let result = sandbox
+            .run(&snapshot.path, &runner, &adapter, &runner_input(&secrets))
+            .await;
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let mut phase = TargetPocPhase {
             name: name.into(),
@@ -655,9 +687,11 @@ async fn phases<S: TargetSandbox>(
                 phase.exit_code = Some(exit);
                 phase.transcript_sha256 = Some(sha256_hex(output.as_bytes()));
                 match parse_verdict(&output, &secrets.marker) {
-                    Ok((effect, functional, error)) if exit == 0 && !error => {
-                        phase.effect = Some(effect);
-                        phase.functional = functional;
+                    // A raising target call stays an execution error here,
+                    // as before `raised=` existed.
+                    Ok(v) if exit == 0 && !v.error && !v.raised => {
+                        phase.effect = Some(v.effect);
+                        phase.functional = v.functional;
                     }
                     Ok(_) => phase.reason = Some("target_execution_error".into()),
                     Err(reason) => phase.reason = Some(reason.into()),
@@ -918,13 +952,24 @@ fn declares_top_level_async_function(source: &str, function: &str) -> bool {
     source.lines().any(|line| line.starts_with(&asynchronous))
 }
 
-pub(super) fn parse_verdict(
-    output: &str,
-    marker: &str,
-) -> Result<(bool, Option<bool>, bool), &'static str> {
+/// The fields of a runner's marked verdict line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HarnessVerdict {
+    pub effect: bool,
+    /// The benign input's known good result (`None` when the class has none).
+    pub functional: Option<bool>,
+    /// A harness-side failure: timeout, non-zero child exit, missing,
+    /// oversized or invalid result, or evidence altered while the sink ran.
+    pub error: bool,
+    /// The adapter or the target code raised a Python exception.
+    pub raised: bool,
+}
+
+pub(super) fn parse_verdict(output: &str, marker: &str) -> Result<HarnessVerdict, &'static str> {
     let mut effect = None;
     let mut functional = None;
     let mut error = false;
+    let mut raised = false;
     let mut marked = 0usize;
     for line in output.lines().map(str::trim) {
         let Some(rest) = line.strip_prefix("__VTL_ORACLE__ ") else {
@@ -953,15 +998,22 @@ pub(super) fn parse_verdict(
                 functional = Some(parse_bool(raw)?);
             } else if let Some(raw) = part.strip_prefix("error=") {
                 error |= parse_bool(raw)?;
+            } else if let Some(raw) = part.strip_prefix("raised=") {
+                raised |= parse_bool(raw)?;
             } else {
                 return Err("invalid_target_verdict");
             }
         }
     }
-    if marked == 0 || effect.is_none() {
+    let Some(effect) = effect.filter(|_| marked > 0) else {
         return Err("target_verdict_missing");
-    }
-    Ok((effect.unwrap_or(false), functional, error))
+    };
+    Ok(HarnessVerdict {
+        effect,
+        functional,
+        error,
+        raised,
+    })
 }
 
 #[cfg(test)]

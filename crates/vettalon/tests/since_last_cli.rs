@@ -230,7 +230,13 @@ async fn changed_runs_chain_through_partial_base_and_merge_newer_incomplete_gap(
     git(&f.root, &["commit", "-qam", "third"]).await;
     let mut incomplete = r.clone();
     incomplete["repo_commit"] = git(&f.root, &["rev-parse", "HEAD"]).await.trim().into();
-    incomplete["started_at"] = "2026-11-03T00:00:00Z".into();
+    // The base came from a real scan, so date the newer run relative to it.
+    let base_started_at = chrono::DateTime::parse_from_rfc3339(r["started_at"].as_str().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    incomplete["started_at"] = (base_started_at + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        .into();
     incomplete["run_status"] = "incomplete".into();
     incomplete["incomplete_reason"] = "units_failed".into();
     let c = incomplete["coverage"]
@@ -1165,7 +1171,14 @@ async fn supplements_are_limited_to_five_newest_compatible_reports() {
     let mut truly_newer = base.clone();
     truly_newer["run_status"] = "incomplete".into();
     truly_newer["incomplete_reason"] = "units_failed".into();
-    truly_newer["started_at"] = "2026-11-03T00:00:00Z".into();
+    // The base came from a real scan, so date the newer run relative to it.
+    let base_started_at =
+        chrono::DateTime::parse_from_rfc3339(base["started_at"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+    truly_newer["started_at"] = (base_started_at + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        .into();
     f.save("20261031T000000Z.json", &truly_newer);
     f.scanner_raw("[]");
     std::fs::write(f.root.join("new/b.rs"), "fn next() {}\n").unwrap();

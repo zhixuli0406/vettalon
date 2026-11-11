@@ -196,10 +196,9 @@ impl PriorIndex {
         diff: &super::diff_scope::DiffSelection,
         modules: &[super::ai_audit::ModuleTarget],
     ) {
-        self.open_findings
-            .retain(|f| diff.changed.contains(&f.file));
+        self.open_findings.retain(|f| diff.path_changed(&f.file));
         self.by_fingerprint.retain(|_, entries| {
-            entries.retain(|e| diff.changed.contains(&e.file));
+            entries.retain(|e| diff.path_changed(&e.file));
             !entries.is_empty()
         });
         let changed_modules: HashSet<&str> = modules
