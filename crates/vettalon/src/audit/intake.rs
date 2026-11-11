@@ -92,9 +92,15 @@ impl RootIgnoredDirs {
         if !root.join(".git").exists() {
             return Self::default();
         }
-        match std::fs::read_to_string(root.join(".gitignore")) {
-            Ok(text) => Self::parse(&text),
-            Err(_) => Self::default(),
+        // A FIFO, symlink or oversized file is treated as "no .gitignore":
+        // that only ever skips less, and never blocks the walk.
+        const MAX_GITIGNORE_BYTES: u64 = 1024 * 1024;
+        match crate::util::read_regular_file(&root.join(".gitignore"), MAX_GITIGNORE_BYTES)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(text) => Self::parse(&text),
+            None => Self::default(),
         }
     }
 
@@ -437,6 +443,9 @@ async fn head_commit_epoch(git_bin: &str, git_dir: &Path, repo_root: &Path) -> O
             git_dir_arg.as_str(),
             "log",
             "--no-show-signature",
+            // `log` reads the mailmap by default (Git 2.29+), and
+            // `mailmap.file` names an arbitrary path.
+            "--no-use-mailmap",
             "--no-ext-diff",
             "--no-textconv",
             "--no-renames",
@@ -551,7 +560,47 @@ fn forbidden_git_config_key(key: &str) -> bool {
         || (key.starts_with("diff.") && (key.ends_with(".command") || key.ends_with(".textconv")))
         || (key.starts_with("filter.")
             && (key.ends_with(".clean") || key.ends_with(".smudge") || key.ends_with(".process")))
+        // Names a file Git may open during the read-only commands (`log`,
+        // `diff`, `ls-files`, `blame`): a FIFO there hangs the scan, and on
+        // Windows a `//host/share/…` path sends the user's NTLM credentials
+        // to that host.
+        || key == "mailmap.file"
+        || key == "diff.orderfile"
+        || key == "core.excludesfile"
+        || key == "core.attributesfile"
+        || key == "init.templatedir"
+        // Names a file or program Git may open or run for a pager, editor,
+        // prompt, browser or interactive filter.
+        || key == "core.askpass"
+        || key == "core.editor"
+        || key == "sequence.editor"
+        || key == "core.pager"
+        || key.starts_with("pager.")
+        || key == "web.browser"
+        || key == "interactive.difffilter"
+        // Names a program a merge driver runs.
+        || (key.starts_with("merge.") && key.ends_with(".driver"))
+        // Names a file the HTTP transport opens, as `http.<var>` or
+        // `http.<url>.<var>` (matched on the last segment because URLs
+        // contain dots). `http.<url>.extraHeader` is not a path and stays
+        // allowed.
+        || key
+            .strip_prefix("http.")
+            .map(|rest| rest.rsplit_once('.').map_or(rest, |(_, var)| var))
+            .is_some_and(|var| FORBIDDEN_HTTP_FILE_VARS.contains(&var))
 }
+
+/// `http.*` variables naming a file; see [`forbidden_git_config_key`].
+const FORBIDDEN_HTTP_FILE_VARS: &[&str] = &[
+    "cookiefile",
+    "sslcert",
+    "sslkey",
+    "sslcainfo",
+    "sslcapath",
+    "proxysslcert",
+    "proxysslkey",
+    "proxysslcainfo",
+];
 
 /// Each legacy remote file is read up to this size; a larger one is refused.
 const MAX_LEGACY_REMOTE_BYTES: u64 = 64 * 1024;
@@ -651,51 +700,165 @@ fn legacy_remote_has_helper(text: &str) -> bool {
     })
 }
 
+/// Why [`list_git_config_file`] produced no listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigListError {
+    /// The empty directory would lie inside the scanned repository (e.g.
+    /// `TMPDIR` pointing into it), where its contents are not trusted.
+    TempDirInsideRepository,
+    /// Directory creation, a non-UTF-8 path, spawn error, timeout,
+    /// truncation or a non-zero exit.
+    Failed,
+}
+
+const TEMP_DIR_INSIDE_REPOSITORY: &str = if cfg!(windows) {
+    "the system temporary directory is inside the scanned repository; set TMP and TEMP to a directory outside it"
+} else {
+    "the system temporary directory is inside the scanned repository; set TMPDIR to a directory outside it"
+};
+
+/// A fresh, empty, owner-only directory created in `temp_base` (the system
+/// temporary directory in production) and outside `repo_root`, used as both
+/// the `--git-dir` and the working directory of [`list_git_config_file`].
+/// The directory (still empty) is removed when the returned guard is
+/// dropped. Fails closed when it cannot be created or checked, and reports
+/// separately when it would lie inside the scanned repository.
+fn empty_dir_outside(
+    temp_base: &Path,
+    repo_root: &Path,
+) -> Result<tempfile::TempDir, ConfigListError> {
+    let failed = |_: std::io::Error| ConfigListError::Failed;
+    // Check before creating anything, so nothing lands in the scanned tree.
+    let root = std::fs::canonicalize(repo_root).map_err(failed)?;
+    let base = std::fs::canonicalize(temp_base).map_err(failed)?;
+    if base.starts_with(&root) {
+        return Err(ConfigListError::TempDirInsideRepository);
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("vettalon-nogit-")
+        .tempdir_in(temp_base)
+        .map_err(failed)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(failed)?;
+    }
+    let canonical = std::fs::canonicalize(dir.path()).map_err(failed)?;
+    if canonical.starts_with(&root) {
+        return Err(ConfigListError::TempDirInsideRepository);
+    }
+    if std::fs::read_dir(dir.path())
+        .map_err(failed)?
+        .next()
+        .is_some()
+    {
+        return Err(ConfigListError::Failed);
+    }
+    Ok(dir)
+}
+
+/// `git config --file <config_path> --null --list --no-includes`, run so
+/// that Git never reads anything but that one file. `--no-includes` alone is
+/// not enough: before running the command Git decides on a pager and (on
+/// macOS, for a non-ASCII argument) on `core.precomposeunicode`, and both
+/// read the config of the repository *discovered from the working
+/// directory* with includes enabled. With the scanned repository as cwd, an
+/// `[include] path = …` in its untrusted `.git/config` was opened: a FIFO
+/// hung the check, and on Windows a `//host/share/…` path sent the user's
+/// NTLM credentials to that host.
+///
+/// - `--no-pager` makes Git skip the pager decision, so no pager config is
+///   read (with or without includes).
+/// - `--git-dir=<empty dir>` disables repository discovery: the empty
+///   directory is not a repository, so Git reads no repository config at
+///   all and never looks at the `HEAD`/`commondir` of any parent directory.
+///   The empty directory is also the working directory, outside the scan.
+///
+/// Returns the `--null --list` output, or the [`ConfigListError`] on any
+/// failure.
+async fn list_git_config_file(
+    git_bin: &str,
+    config_path: &Path,
+    repo_root: &Path,
+    temp_base: &Path,
+) -> Result<String, ConfigListError> {
+    let empty = empty_dir_outside(temp_base, repo_root)?;
+    let config_abs = std::path::absolute(config_path).map_err(|_| ConfigListError::Failed)?;
+    let config_arg = config_abs.to_str().ok_or(ConfigListError::Failed)?;
+    let empty_arg = empty.path().to_str().ok_or(ConfigListError::Failed)?;
+    let git_dir_arg = format!("--git-dir={empty_arg}");
+    let out = crate::audit::scanners::run_bounded_subprocess(
+        git_bin,
+        &[
+            "--no-pager",
+            git_dir_arg.as_str(),
+            "config",
+            "--file",
+            config_arg,
+            "--null",
+            "--list",
+            "--no-includes",
+        ],
+        empty.path(),
+        &crate::audit::scanners::SubprocessLimits {
+            timeout: std::time::Duration::from_secs(5),
+            max_output_bytes: 1024 * 1024,
+        },
+    )
+    .await;
+    drop(empty);
+    if out.exit_code != Some(0)
+        || out.timed_out
+        || out.stdout_truncated
+        || out.spawn_error.is_some()
+        || out.cleanup_error.is_some()
+    {
+        return Err(ConfigListError::Failed);
+    }
+    Ok(out.stdout)
+}
+
 /// Parse repository config with Git itself, but explicitly disable includes
 /// while parsing. This catches BOM, quoting, whitespace, case and includeIf
-/// variants without first following attacker-selected external paths.
+/// variants without first following attacker-selected external paths; see
+/// [`list_git_config_file`] for why Git also must not see the repository.
 async fn validate_git_configs(
     git_bin: &str,
     git_dir: &Path,
     repo_root: &Path,
+) -> Result<(), String> {
+    validate_git_configs_in(git_bin, git_dir, repo_root, &std::env::temp_dir()).await
+}
+
+/// [`validate_git_configs`] with the empty Git directory created in
+/// `temp_base`; tests pass a base inside the repository.
+async fn validate_git_configs_in(
+    git_bin: &str,
+    git_dir: &Path,
+    repo_root: &Path,
+    temp_base: &Path,
 ) -> Result<(), String> {
     validate_legacy_remotes(git_dir)?;
     for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
         if !config.is_file() {
             continue;
         }
-        let config_arg = config.to_string_lossy().into_owned();
-        let out = crate::audit::scanners::run_bounded_subprocess(
-            git_bin,
-            &[
-                "config",
-                "--file",
-                config_arg.as_str(),
-                "--null",
-                "--list",
-                "--no-includes",
-            ],
-            repo_root,
-            &crate::audit::scanners::SubprocessLimits {
-                timeout: std::time::Duration::from_secs(5),
-                max_output_bytes: 1024 * 1024,
-            },
-        )
-        .await;
-        if out.exit_code != Some(0)
-            || out.timed_out
-            || out.stdout_truncated
-            || out.spawn_error.is_some()
-            || out.cleanup_error.is_some()
-        {
-            return Err(format!(
-                "cannot safely parse {}",
-                config.strip_prefix(git_dir).unwrap_or(&config).display()
-            ));
-        }
+        let listing = match list_git_config_file(git_bin, &config, repo_root, temp_base).await {
+            Ok(listing) => listing,
+            Err(ConfigListError::TempDirInsideRepository) => {
+                return Err(TEMP_DIR_INSIDE_REPOSITORY.into());
+            }
+            Err(ConfigListError::Failed) => {
+                return Err(format!(
+                    "cannot safely parse {}",
+                    config.strip_prefix(git_dir).unwrap_or(&config).display()
+                ));
+            }
+        };
         // `--null` prints `key\nvalue\0`, or just `key\0` for a bare boolean.
         // Only the key is reported; values may hold arbitrary text.
-        for entry in out.stdout.split('\0') {
+        for entry in listing.split('\0') {
             let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
             let key = key.trim();
             if key.is_empty() {
@@ -723,7 +886,14 @@ pub(super) async fn prepare_readonly_git(
         .map_err(|reason| format!("Git metadata is not self-contained: {reason}"))?;
     validate_git_configs(&git_bin, &git_dir, repo_root)
         .await
-        .map_err(|reason| format!("Git metadata is not self-contained: {reason}"))?;
+        .map_err(|reason| {
+            // Not a property of the repository's metadata; report it as is.
+            if reason == TEMP_DIR_INSIDE_REPOSITORY {
+                reason
+            } else {
+                format!("Git metadata is not self-contained: {reason}")
+            }
+        })?;
     Ok((git_bin, git_dir))
 }
 
@@ -784,6 +954,9 @@ async fn git_history_with(git_bin: &str, git_dir: &Path, repo_root: &Path) -> Gi
         // Defense in depth: even if Git learns another signature-related
         // config key, history inspection must never invoke a GPG helper.
         "--no-show-signature",
+        // Never open the file `mailmap.file` names (read by default since
+        // Git 2.29); the subject line does not use author names anyway.
+        "--no-use-mailmap",
         "--no-ext-diff",
         "--no-textconv",
         // Rename detection would read blob contents, which a partial clone
@@ -1403,6 +1576,385 @@ mod tests {
             std::fs::remove_file(&file).unwrap();
         }
         prepare_readonly_git(root).await.unwrap();
+    }
+
+    /// `git init` in `root`, then append `[include] path = <include>` to its
+    /// `.git/config` (forward slashes: a backslash is an escape in Git config).
+    async fn init_with_include(root: &Path, include: &Path) {
+        crate::audit::diff_scope::tests::git(root, &["init", "-q"]).await;
+        let config = root.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        let include = include.display().to_string().replace('\\', "/");
+        text.push_str(&format!("[include]\n\tpath = {include}\n"));
+        std::fs::write(&config, text).unwrap();
+    }
+
+    /// The include points at an invalid config file outside the repository.
+    /// Git must never open it: had it done so, `git config` would exit 128
+    /// ("bad config line 1") and validation would report "cannot safely
+    /// parse" instead of refusing the key.
+    async fn assert_include_refused_unopened(outside: &Path, root: &Path) {
+        let bad = outside.join("bad.cfg");
+        std::fs::write(&bad, "this is [ not valid\n").unwrap();
+        init_with_include(root, &bad).await;
+        let error = prepare_readonly_git(root).await.unwrap_err();
+        assert!(
+            error.contains("unsafe Git config key is not allowed: include.path"),
+            "{error}"
+        );
+        assert!(!error.contains("cannot safely parse"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn config_validation_never_opens_repository_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        if crate::audit::scanners::git_for_security_test(&root).is_none() {
+            return;
+        }
+        assert_include_refused_unopened(dir.path(), &root).await;
+    }
+
+    /// On macOS a non-ASCII argument makes Git read `core.precomposeunicode`
+    /// from the discovered repository, with includes.
+    #[tokio::test]
+    async fn config_validation_never_opens_repository_includes_from_a_non_ascii_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("倉庫");
+        std::fs::create_dir(&root).unwrap();
+        if crate::audit::scanners::git_for_security_test(&root).is_none() {
+            return;
+        }
+        assert_include_refused_unopened(dir.path(), &root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_validation_never_blocks_on_a_fifo_include() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        if crate::audit::scanners::git_for_security_test(&root).is_none() {
+            return;
+        }
+        let fifo = dir.path().join("include.fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated C string for the call.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            eprintln!(
+                "skipping: mkfifo failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        init_with_include(&root, &fifo).await;
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            prepare_readonly_git(&root),
+        )
+        .await
+        .expect("config validation hung on a FIFO include")
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            error.contains("unsafe Git config key is not allowed: include.path"),
+            "{error}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "config validation waited {elapsed:?} on a FIFO include"
+        );
+    }
+
+    /// Keys naming a file or program Git may open or run are refused, in
+    /// any case and in their subsection forms; names and booleans are not.
+    #[test]
+    fn git_config_keys_naming_files_or_programs_are_rejected() {
+        for key in [
+            "mailmap.file",
+            "mailmap.File",
+            "diff.orderFile",
+            "DIFF.ORDERFILE",
+            "core.excludesFile",
+            " core.excludesfile ",
+            "core.attributesFile",
+            "init.templateDir",
+            "core.askPass",
+            "core.editor",
+            "sequence.editor",
+            "core.pager",
+            "pager.log",
+            "pager.diff",
+            "Pager.Status",
+            "web.browser",
+            "interactive.diffFilter",
+            "merge.ours.driver",
+            "merge.a.b.driver",
+            "http.cookieFile",
+            "http.sslCert",
+            "http.sslKey",
+            "http.sslCAInfo",
+            "http.sslCAPath",
+            "http.https://example.com/.cookieFile",
+            "http.https://example.com/.sslCert",
+            "HTTP.https://example.com/.SSLKEY",
+            "http.https://a.b.example/path.sslCAInfo",
+            "http.proxySSLCert",
+            "http.proxySSLKey",
+            "http.proxySSLCAInfo",
+            "http.https://example.com/.proxySSLCert",
+            "HTTP.https://example.com/.PROXYSSLKEY",
+            "http.https://a.b.example/path.proxySSLCAInfo",
+            "http.https://example.com/.sslCAPath",
+            // Already refused before; kept here so the group stays covered.
+            "core.sshCommand",
+            "core.hooksPath",
+            "diff.external",
+            "diff.owned.command",
+        ] {
+            assert!(forbidden_git_config_key(key), "missed {key}");
+        }
+        for key in [
+            "mailmap.blob",
+            "log.mailmap",
+            "core.autocrlf",
+            "core.ignoreCase",
+            "diff.renames",
+            "diff.algorithm",
+            "merge.ours.name",
+            "merge.renormalize",
+            "blame.date",
+            "blame.ignoreRevsFile",
+            "commit.template",
+            "init.defaultBranch",
+            "commit.gpgSign",
+            "http.sslVerify",
+            "http.extraHeader",
+            // actions/checkout persists its token this way.
+            "http.https://github.com/.extraheader",
+            "http.https://cookiefile.example/.sslVerify",
+        ] {
+            assert!(!forbidden_git_config_key(key), "wrongly refused {key}");
+        }
+    }
+
+    const PATH_KEYS: [&str; 4] = [
+        "mailmap.file",
+        "diff.orderFile",
+        "core.excludesFile",
+        "core.attributesFile",
+    ];
+
+    #[tokio::test]
+    async fn config_validation_refuses_keys_naming_paths_git_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let Some(git) = crate::audit::scanners::git_for_security_test(root) else {
+            return;
+        };
+        crate::audit::diff_scope::tests::git(root, &["init", "-q"]).await;
+        let git_dir = root.join(".git");
+        validate_git_configs(&git, &git_dir, root).await.unwrap();
+        for key in PATH_KEYS {
+            crate::audit::diff_scope::tests::git(root, &["config", key, "/nonexistent/x"]).await;
+            let error = validate_git_configs(&git, &git_dir, root)
+                .await
+                .unwrap_err();
+            let expected = format!(
+                "unsafe Git config key is not allowed: {}",
+                key.to_ascii_lowercase()
+            );
+            assert_eq!(error, expected);
+            crate::audit::diff_scope::tests::git(root, &["config", "--unset", key]).await;
+        }
+        validate_git_configs(&git, &git_dir, root).await.unwrap();
+    }
+
+    /// With validation bypassed, every production Git read must still finish
+    /// promptly with each path key pointing at a FIFO: `--no-use-mailmap` and the
+    /// runner's command-scoped overrides keep Git from opening it. A control
+    /// proves each FIFO really blocks plain Git, so the test is not vacuous.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_config_fifos_never_block_git_reads_when_validation_is_bypassed() {
+        use crate::audit::diff_scope;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let Some(git) = crate::audit::scanners::git_for_security_test(&root) else {
+            return;
+        };
+        if crate::audit::scanners::git_version(&git).is_none_or(|v| v < (2, 31)) {
+            return; // GIT_CONFIG_COUNT needs Git 2.31+.
+        }
+        diff_scope::tests::git(&root, &["init", "-q"]).await;
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        diff_scope::tests::commit(&root).await;
+        std::fs::write(root.join("main.rs"), "fn main() { auth(); }\n").unwrap();
+        diff_scope::tests::git(&root, &["add", "--all"]).await;
+        diff_scope::tests::git(&root, &["commit", "-qm", "fix: auth bypass"]).await;
+        // Worktree, untracked and ignored changes give every read real work.
+        std::fs::write(root.join("main.rs"), "fn main() { auth2(); }\n").unwrap();
+        std::fs::write(root.join("new.rs"), "fn new() {}\n").unwrap();
+        std::fs::write(root.join("debug.log"), "x\n").unwrap();
+
+        let fifo = dir.path().join("path.fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated C string for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let fifo_arg = fifo.display().to_string();
+        let git_dir = root.join(".git");
+        let limit = std::time::Duration::from_secs(5);
+
+        for (key, control) in [
+            ("mailmap.file", &["log", "-1"][..]),
+            ("diff.orderFile", &["diff", "--name-only", "HEAD"][..]),
+            (
+                "core.excludesFile",
+                &["ls-files", "--others", "--ignored", "--exclude-standard"][..],
+            ),
+            ("core.attributesFile", &["diff", "--name-only", "HEAD"][..]),
+        ] {
+            diff_scope::tests::git(&root, &["config", key, &fifo_arg]).await;
+
+            let history = tokio::time::timeout(limit, git_history_with(&git, &git_dir, &root))
+                .await
+                .unwrap_or_else(|_| panic!("git log blocked on a FIFO {key}"));
+            assert!(
+                matches!(history, GitHistoryStatus::Available { .. }),
+                "{key}: {history:?}"
+            );
+            let state =
+                tokio::time::timeout(limit, diff_scope::repo_state_with(&git, &git_dir, &root))
+                    .await
+                    .unwrap_or_else(|_| panic!("repo state blocked on a FIFO {key}"));
+            assert_eq!(state.map(|s| s.clean).unwrap(), Some(false), "{key}");
+            let scope = tokio::time::timeout(
+                limit,
+                diff_scope::compute_with(&git, &git_dir, &root, "HEAD~1"),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("diff scope blocked on a FIFO {key}"));
+            assert!(scope.is_ok(), "{key}: {scope:?}");
+            let ignored = tokio::time::timeout(
+                limit,
+                diff_scope::ignored_intake_count_with(&git, &git_dir, &root),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("ignored listing blocked on a FIFO {key}"));
+            assert!(ignored.is_ok(), "{key}: {ignored:?}");
+
+            // Control: Git without the hardening opens the FIFO and waits.
+            let mut child = crate::audit::scanners::git_test_command_bare(&git)
+                .args(control)
+                .current_dir(&root)
+                .envs([
+                    ("GIT_CONFIG_NOSYSTEM", "1"),
+                    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let finished = child.try_wait().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                finished.is_none(),
+                "fixture did not reproduce the FIFO hang for {key} ({control:?})"
+            );
+
+            diff_scope::tests::git(&root, &["config", "--unset", key]).await;
+        }
+    }
+
+    #[test]
+    fn empty_config_dir_inside_the_repository_is_reported_separately() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside = repo.path().join("tmp");
+        std::fs::create_dir(&inside).unwrap();
+        assert_eq!(
+            empty_dir_outside(&inside, repo.path()).unwrap_err(),
+            ConfigListError::TempDirInsideRepository
+        );
+        assert_eq!(
+            empty_dir_outside(repo.path(), repo.path()).unwrap_err(),
+            ConfigListError::TempDirInsideRepository
+        );
+        let ok = empty_dir_outside(outside.path(), repo.path()).unwrap();
+        assert!(ok.path().is_dir());
+        // A base that does not exist is a plain failure, not "inside".
+        assert_eq!(
+            empty_dir_outside(&outside.path().join("missing"), repo.path()).unwrap_err(),
+            ConfigListError::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn config_validation_names_a_temp_dir_inside_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let Some(git) = crate::audit::scanners::git_for_security_test(root) else {
+            return;
+        };
+        crate::audit::diff_scope::tests::git(root, &["init", "-q"]).await;
+        let inside = root.join("tmp");
+        std::fs::create_dir(&inside).unwrap();
+        let git_dir = root.join(".git");
+        let error = validate_git_configs_in(&git, &git_dir, root, &inside)
+            .await
+            .unwrap_err();
+        assert_eq!(error, TEMP_DIR_INSIDE_REPOSITORY);
+        assert!(
+            error.contains("temporary directory is inside the scanned repository"),
+            "{error}"
+        );
+        assert!(!error.contains("cannot safely parse"), "{error}");
+        // The same repository validates with a base outside it.
+        let outside = tempfile::tempdir().unwrap();
+        validate_git_configs_in(&git, &git_dir, root, outside.path())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn root_gitignore_that_is_not_a_regular_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join(".gitignore")).unwrap();
+        let ignored = RootIgnoredDirs::load(dir.path());
+        assert!(ignored.anchored.is_empty() && ignored.names.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_gitignore_fifo_never_blocks_the_walk() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let fifo = dir.path().join(".gitignore");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated C string for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let root = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ignored = RootIgnoredDirs::load(&root);
+            let _ = tx.send(ignored.anchored.is_empty() && ignored.names.is_empty());
+        });
+        let empty = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("loading a FIFO .gitignore blocked");
+        assert!(empty);
     }
 
     #[tokio::test]

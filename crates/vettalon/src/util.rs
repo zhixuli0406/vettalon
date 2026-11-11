@@ -257,19 +257,92 @@ pub fn validate_local_git_metadata(repo_root: &Path) -> Result<PathBuf, String> 
     validate_git_tree_has_no_symlinks(&git_dir)?;
 
     for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
-        let Ok(metadata) = std::fs::metadata(&config) else {
-            continue;
-        };
         const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
-        if metadata.len() > MAX_GIT_CONFIG_BYTES {
-            return Err(format!(
-                "{} exceeds the validation limit",
-                config.strip_prefix(&git_dir).unwrap_or(&config).display()
-            ));
+        let name = config.strip_prefix(&git_dir).unwrap_or(&config).display();
+        match read_regular_file(&config, MAX_GIT_CONFIG_BYTES) {
+            Ok(_) => {}
+            Err(RegularFileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(RegularFileError::NotRegular) => {
+                return Err(format!("{name} is not a regular file"));
+            }
+            Err(RegularFileError::TooLarge) => {
+                return Err(format!("{name} exceeds the validation limit"));
+            }
+            Err(RegularFileError::Io(error)) => {
+                return Err(format!("cannot read {}: {error}", config.display()));
+            }
         }
-        std::fs::read(&config).map_err(|e| format!("cannot read {}: {e}", config.display()))?;
     }
     Ok(git_dir)
+}
+
+/// Why [`read_regular_file`] refused or failed.
+#[derive(Debug)]
+pub enum RegularFileError {
+    /// A symlink, directory, FIFO, socket or device.
+    NotRegular,
+    /// Larger than the caller's cap.
+    TooLarge,
+    /// Missing (`NotFound`) or unreadable.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for RegularFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRegular => f.write_str("is not a regular file"),
+            Self::TooLarge => f.write_str("exceeds the size limit"),
+            Self::Io(error) => write!(f, "cannot be read: {error}"),
+        }
+    }
+}
+
+/// Read an untrusted path only if it is a regular file of at most `cap`
+/// bytes. Never follows a final symlink and never blocks on a FIFO: the
+/// path is checked with `symlink_metadata`, opened with `O_NOFOLLOW |
+/// O_NONBLOCK` on Unix (so a FIFO swapped in after the check does not wait
+/// for a writer), checked again through the open handle, and read up to
+/// `cap + 1` bytes so a file that grows meanwhile is still refused.
+pub fn read_regular_file(path: &Path, cap: u64) -> Result<Vec<u8>, RegularFileError> {
+    use std::io::Read;
+    let metadata = std::fs::symlink_metadata(path).map_err(RegularFileError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(RegularFileError::NotRegular);
+    }
+    if metadata.len() > cap {
+        return Err(RegularFileError::TooLarge);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        // ELOOP: the path became a symlink after the check.
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(RegularFileError::NotRegular);
+        }
+        Err(error) => return Err(RegularFileError::Io(error)),
+    };
+    let opened = file.metadata().map_err(RegularFileError::Io)?;
+    if !opened.file_type().is_file() {
+        return Err(RegularFileError::NotRegular);
+    }
+    if opened.len() > cap {
+        return Err(RegularFileError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(RegularFileError::Io)?;
+    if bytes.len() as u64 > cap {
+        return Err(RegularFileError::TooLarge);
+    }
+    Ok(bytes)
 }
 
 fn validate_git_tree_has_no_symlinks(git_dir: &Path) -> Result<(), String> {
@@ -922,6 +995,100 @@ mod tests {
                 .unwrap_err()
                 .contains("symlink")
         );
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated C string for the call.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_refuses_a_fifo_config_without_blocking() {
+        for name in ["config", "config.worktree"] {
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::create_dir(repo.path().join(".git")).unwrap();
+            make_fifo(&repo.path().join(".git").join(name));
+            let root = repo.path().to_path_buf();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(validate_local_git_metadata(&root));
+            });
+            let result = rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap_or_else(|_| panic!("validation blocked on a FIFO {name}"));
+            let error = result.unwrap_err();
+            assert!(error.contains("is not a regular file"), "{error}");
+        }
+    }
+
+    #[test]
+    fn read_regular_file_reads_a_small_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"abc").unwrap();
+        assert_eq!(read_regular_file(&file, 3).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn read_regular_file_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_regular_file(dir.path(), 1024),
+            Err(RegularFileError::NotRegular)
+        ));
+    }
+
+    #[test]
+    fn read_regular_file_refuses_an_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big");
+        std::fs::write(&file, b"abcd").unwrap();
+        assert!(matches!(
+            read_regular_file(&file, 3),
+            Err(RegularFileError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn read_regular_file_reports_a_missing_file_as_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        match read_regular_file(&dir.path().join("gone"), 1024) {
+            Err(RegularFileError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound)
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_file_never_follows_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"secret").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            read_regular_file(&link, 1024),
+            Err(RegularFileError::NotRegular)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_file_refuses_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        make_fifo(&fifo);
+        assert!(matches!(
+            read_regular_file(&fifo, 1024),
+            Err(RegularFileError::NotRegular)
+        ));
     }
 
     // ── B3b: result-text masking ─────────────────────────
