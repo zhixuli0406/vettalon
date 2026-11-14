@@ -5,7 +5,11 @@
 //! whose `repo` equals the current canonical repo path and whose
 //! `schema_version` is supported by this binary. Unparsable and unsupported reports for the
 //! same repo are skipped with one stderr line each; the search continues
-//! with the next-newest file.
+//! with the next-newest file. A report saved before the per-CWE trust
+//! policy is migrated on read
+//! ([`super::trust_policy::migrate_capped_refutations`]: its model-only
+//! refutations of capped CWEs become `NeedsHuman`, one stderr note) and then
+//! strictly validated.
 //!
 //! Matching is by `root_fingerprint` (semantic identity) AND `file_hash`
 //! (the file bytes are unchanged). Rules, applied to every current
@@ -14,7 +18,13 @@
 //! - prior `Suppressed`, same hash ⇒ `Suppressed`, evidence
 //!   `carried_from_prior: <file>`, zero LLM;
 //! - prior `Refuted`, same hash ⇒ `Refuted`, same evidence, and therefore
-//!   no verifier call;
+//!   no verifier call — except for a CWE the per-CWE trust policy caps
+//!   (CWE-327/328/501/614, [`super::trust_policy`]): there the refutation is
+//!   carried only when every same-hash prior `Refuted` was closed by an
+//!   operator, a failed pre-check or a marked carry of either (the finding
+//!   then also gets `trust_policy: carried_refutation CWE-<n>`); a
+//!   model-only prior refutation is not carried, and the finding is
+//!   re-assessed with a `trust_policy: prior_refutation_not_carried` note;
 //! - prior `Confirmed`, same hash ⇒ stays `Candidate` (re-verified on the
 //!   current path), evidence `prior_confirmed_same_source`, counted in
 //!   `revalidated_prior_confirmed`;
@@ -38,6 +48,8 @@ use std::io::Read;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+
+use super::trust_policy::{self, TrustRule};
 
 use super::schema::{
     AuditReport, CARRIED_FROM_PRIOR_PREFIX, CURRENT_SCHEMA_VERSION, ChangedUnrediscovered,
@@ -66,6 +78,26 @@ pub struct PriorEntry {
     pub file: String,
     pub status: FindingStatus,
     pub file_hash: Option<String>,
+    /// The prior finding's CWE, when the per-CWE trust policy caps it.
+    pub capped_cwe: Option<&'static TrustRule>,
+    /// The prior finding was closed by an operator, a failed pre-check or a
+    /// marked carry of either, not by a model alone
+    /// ([`trust_policy::is_deterministic_refutation`]).
+    pub deterministic_refutation: bool,
+}
+
+impl PriorEntry {
+    fn of(f: &Finding) -> Self {
+        let capped_cwe = trust_policy::llm_refute_cap(f.cwe.as_deref());
+        PriorEntry {
+            id: f.id.clone(),
+            file: f.file.clone(),
+            status: f.status,
+            file_hash: f.file_hash.clone(),
+            capped_cwe,
+            deterministic_refutation: trust_policy::is_deterministic_refutation(f, capped_cwe),
+        }
+    }
 }
 
 /// The prior report, indexed by root fingerprint.
@@ -88,12 +120,7 @@ impl PriorIndex {
             by_fingerprint
                 .entry(f.root_fingerprint.clone())
                 .or_default()
-                .push(PriorEntry {
-                    id: f.id.clone(),
-                    file: f.file.clone(),
-                    status: f.status,
-                    file_hash: f.file_hash.clone(),
-                });
+                .push(PriorEntry::of(f));
         }
         PriorIndex {
             report_file: report_file.to_string(),
@@ -496,7 +523,7 @@ pub fn load_prior(home_dir: &Path, canonical_repo: &str) -> Option<PriorIndex> {
                 continue;
             }
         };
-        let report: AuditReport = match serde_json::from_str(&raw) {
+        let mut report: AuditReport = match serde_json::from_str(&raw) {
             Ok(r) => r,
             Err(_) => {
                 eprintln!(
@@ -522,6 +549,19 @@ pub fn load_prior(home_dir: &Path, canonical_repo: &str) -> Option<PriorIndex> {
                 )
             );
             continue;
+        }
+        // A report saved before the per-CWE trust policy: its model-only
+        // refutations of capped CWEs are reopened before the strict check
+        // (a reopened finding is `NeedsHuman`, so it is never carried).
+        let migrated = super::trust_policy::migrate_capped_refutations(&mut report);
+        if migrated > 0 {
+            eprintln!(
+                "[vettalon] {}",
+                super::trust_policy::migration_note(
+                    &crate::tr!("先前報告", "previous report"),
+                    migrated
+                )
+            );
         }
         if !super::validator::validate_report(&report).is_empty() {
             // Report names and validator details can contain attacker data.
@@ -578,6 +618,49 @@ pub fn decide(current_hash: Option<&str>, prior: &[PriorEntry]) -> CarryDecision
         return CarryDecision::Refuted;
     }
     CarryDecision::None
+}
+
+/// How the per-CWE trust policy treats a [`CarryDecision::Refuted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CappedCarry {
+    /// Neither the finding nor a same-hash prior entry has a capped CWE.
+    NotCapped,
+    /// Capped, and every same-hash prior `Refuted` was closed without a
+    /// model alone: carried, with [`trust_policy::carried_detail`].
+    Deterministic(&'static TrustRule),
+    /// Capped, and some same-hash prior `Refuted` rests on a model verdict
+    /// (or nothing recorded): not carried, re-assessed.
+    ModelOnly(&'static TrustRule),
+}
+
+/// Pure trust-policy check for a [`CarryDecision::Refuted`]: `cwe` is the
+/// current finding's, `prior` the entries sharing its fingerprint. The cap
+/// applies when the current CWE or any same-hash prior entry's CWE is capped.
+pub fn capped_carry(
+    cwe: Option<&str>,
+    current_hash: Option<&str>,
+    prior: &[PriorEntry],
+) -> CappedCarry {
+    let same: Vec<&PriorEntry> = match current_hash {
+        Some(h) => prior
+            .iter()
+            .filter(|p| p.file_hash.as_deref() == Some(h))
+            .collect(),
+        None => Vec::new(),
+    };
+    let Some(rule) =
+        trust_policy::llm_refute_cap(cwe).or_else(|| same.iter().find_map(|p| p.capped_cwe))
+    else {
+        return CappedCarry::NotCapped;
+    };
+    let model_only = same
+        .iter()
+        .any(|p| p.status == FindingStatus::Refuted && !p.deterministic_refutation);
+    if model_only {
+        CappedCarry::ModelOnly(rule)
+    } else {
+        CappedCarry::Deterministic(rule)
+    }
 }
 
 /// P2-2: distinct prior statuses at one fingerprint, in a stable order, as a
@@ -655,15 +738,31 @@ pub fn apply_prior(findings: &mut [Finding], prior: &PriorIndex) -> PriorRunInfo
                 info.carried_suppressed += 1;
             }
             CarryDecision::Refuted => {
-                f.status = FindingStatus::Refuted;
-                push_prior_evidence(
-                    f,
-                    format!(
-                        "{CARRIED_FROM_PRIOR_PREFIX} {} (prior status refuted, source unchanged)",
-                        prior.report_file
-                    ),
-                );
-                info.carried_refuted += 1;
+                match capped_carry(f.cwe.as_deref(), f.file_hash.as_deref(), entries) {
+                    // Per-CWE trust policy: a model-only refutation of a
+                    // capped CWE is not carried; the finding is re-assessed,
+                    // as on changed source, with a note naming the report.
+                    CappedCarry::ModelOnly(rule) => {
+                        push_prior_evidence(
+                            f,
+                            super::trust_policy::not_carried_detail(rule, &prior.report_file),
+                        );
+                    }
+                    carry => {
+                        f.status = FindingStatus::Refuted;
+                        push_prior_evidence(
+                            f,
+                            format!(
+                                "{CARRIED_FROM_PRIOR_PREFIX} {} (prior status refuted, source unchanged)",
+                                prior.report_file
+                            ),
+                        );
+                        if let CappedCarry::Deterministic(rule) = carry {
+                            push_prior_evidence(f, super::trust_policy::carried_detail(rule));
+                        }
+                        info.carried_refuted += 1;
+                    }
+                }
             }
             CarryDecision::RevalidateConfirmed => {
                 push_prior_evidence(
@@ -924,7 +1023,190 @@ mod tests {
             file: "src/a.rs".into(),
             status,
             file_hash: Some(h.into()),
+            capped_cwe: None,
+            deterministic_refutation: false,
         }
+    }
+
+    #[test]
+    fn capped_carry_needs_every_same_hash_refutation_to_be_non_model() {
+        use FindingStatus::*;
+        let rule = trust_policy::llm_refute_cap(Some("CWE-328")).unwrap();
+        let capped = |status: FindingStatus, h: &str, deterministic: bool| PriorEntry {
+            capped_cwe: Some(rule),
+            deterministic_refutation: deterministic,
+            ..e(status, h)
+        };
+        // Neither side capped: the old rule.
+        assert_eq!(
+            capped_carry(Some("CWE-78"), Some("h"), &[e(Refuted, "h")]),
+            CappedCarry::NotCapped
+        );
+        assert_eq!(
+            capped_carry(None, Some("h"), &[e(Refuted, "h")]),
+            CappedCarry::NotCapped
+        );
+        // The current CWE alone, or a same-hash prior CWE alone, caps it.
+        assert_eq!(
+            capped_carry(Some("CWE-328"), Some("h"), &[e(Refuted, "h")]),
+            CappedCarry::ModelOnly(rule)
+        );
+        assert_eq!(
+            capped_carry(None, Some("h"), &[capped(Refuted, "h", false)]),
+            CappedCarry::ModelOnly(rule)
+        );
+        assert_eq!(
+            capped_carry(Some("cwe-328"), Some("h"), &[capped(Refuted, "h", true)]),
+            CappedCarry::Deterministic(rule)
+        );
+        // A suppression next to a deterministic refutation is fine; one
+        // model-only refutation among them is not.
+        assert_eq!(
+            capped_carry(
+                Some("CWE-328"),
+                Some("h"),
+                &[capped(Refuted, "h", true), e(Suppressed, "h")]
+            ),
+            CappedCarry::Deterministic(rule)
+        );
+        assert_eq!(
+            capped_carry(
+                Some("CWE-328"),
+                Some("h"),
+                &[capped(Refuted, "h", true), capped(Refuted, "h", false)]
+            ),
+            CappedCarry::ModelOnly(rule)
+        );
+        // Entries on other source are not consulted.
+        assert_eq!(
+            capped_carry(
+                Some("CWE-328"),
+                Some("h"),
+                &[capped(Refuted, "h", true), capped(Refuted, "old", false)]
+            ),
+            CappedCarry::Deterministic(rule)
+        );
+    }
+
+    #[test]
+    fn a_model_only_prior_refutation_of_a_capped_cwe_is_reassessed_not_carried() {
+        let home = tempfile::tempdir().unwrap();
+        let with_cwe = |file: &str, rule: &str, status: FindingStatus, hash: &str, cwe: &str| {
+            let mut f = finding(file, rule, status, Some(hash));
+            f.cwe = Some(cwe.into());
+            f
+        };
+        let mut prior = report(
+            "/repo",
+            CURRENT_SCHEMA_VERSION,
+            vec![
+                with_cwe("a.rs", "r-md5", FindingStatus::Refuted, "h1", "CWE-328"),
+                with_cwe("b.rs", "r-des", FindingStatus::Refuted, "h2", "CWE-327"),
+                with_cwe("c.rs", "r-cmd", FindingStatus::Refuted, "h3", "CWE-78"),
+            ],
+        );
+        // The fixture records an operator decision on every closed finding.
+        // a.rs and c.rs become pre-policy model-only refutations.
+        let model_only = EvidenceItem {
+            kind: EvidenceKind::AdversarialReview,
+            source: "verifier".into(),
+            detail: "refuted: not used for security".into(),
+            recorded_at: "2026-10-01T00:00:00Z".into(),
+        };
+        for i in [0, 2] {
+            prior.findings[i].evidence = vec![model_only.clone()];
+        }
+        prior.summary = Summary::from_findings(&prior.findings, 0, 0, GatePolicy::default(), &[]);
+        assert_eq!(
+            super::super::validator::validate_report(&prior).len(),
+            1,
+            "strict validation flags the model-only CWE-328 refutation"
+        );
+        // Read back from disk, the pre-policy report is migrated (a.rs is
+        // reopened at needs_human), then strictly validated.
+        write(home.path(), "20261001T000000Z.json", &prior);
+        let loaded = load_prior(home.path(), "/repo").expect("the migrated report is readable");
+        let a_fp = prior.findings[0].root_fingerprint.clone();
+        assert!(
+            loaded.by_fingerprint[&a_fp]
+                .iter()
+                .all(|p| p.status == FindingStatus::NeedsHuman),
+            "migrated on read"
+        );
+        let mut current = vec![with_cwe(
+            "a.rs",
+            "r-md5",
+            FindingStatus::Candidate,
+            "h1",
+            "CWE-328",
+        )];
+        apply_prior(&mut current, &loaded);
+        assert_eq!(current[0].status, FindingStatus::Candidate, "not carried");
+        assert!(current[0].evidence.is_empty(), "{:?}", current[0].evidence);
+
+        // An unmigrated index (built in memory) still never carries the
+        // model-only refutation: re-assessed, with a note naming the report.
+        let idx = PriorIndex::from_report("20261001T000000Z.json", &prior);
+        let mut current = vec![
+            with_cwe("a.rs", "r-md5", FindingStatus::Candidate, "h1", "CWE-328"),
+            with_cwe("b.rs", "r-des", FindingStatus::Candidate, "h2", "CWE-327"),
+            with_cwe("c.rs", "r-cmd", FindingStatus::Candidate, "h3", "CWE-78"),
+        ];
+        let info = apply_prior(&mut current, &idx);
+        assert_eq!(current[0].status, FindingStatus::Candidate);
+        let notes: Vec<&str> = current[0]
+            .evidence
+            .iter()
+            .map(|e| e.detail.as_str())
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with(
+                "trust_policy: prior_refutation_not_carried CWE-328: 20261001T000000Z.json "
+            ),
+            "{notes:?}"
+        );
+        // Operator decision, capped: carried, with the carried marker.
+        assert_eq!(current[1].status, FindingStatus::Refuted);
+        assert!(
+            current[1]
+                .evidence
+                .iter()
+                .any(|e| e.detail == "trust_policy: carried_refutation CWE-327")
+        );
+        // Not capped: carried as before, no trust-policy line.
+        assert_eq!(current[2].status, FindingStatus::Refuted);
+        assert!(
+            !current[2]
+                .evidence
+                .iter()
+                .any(|e| e.detail.starts_with(trust_policy::TRUST_POLICY_PREFIX))
+        );
+        assert_eq!((info.carried_refuted, info.changed_source), (2, 0));
+
+        // Next run: the carried marker alone keeps the operator's verdict,
+        // and the carried report passes strict validation.
+        let mut next = report("/repo", CURRENT_SCHEMA_VERSION, current);
+        for f in &mut next.findings {
+            f.evidence
+                .retain(|e| e.kind != EvidenceKind::OperatorReview);
+        }
+        next.summary = Summary::from_findings(&next.findings, 0, 0, GatePolicy::default(), &[]);
+        assert_eq!(super::super::validator::validate_report(&next), vec![]);
+        let idx = PriorIndex::from_report("20261002T000000Z.json", &next);
+        let mut again = vec![with_cwe(
+            "b.rs",
+            "r-des",
+            FindingStatus::Candidate,
+            "h2",
+            "CWE-327",
+        )];
+        apply_prior(&mut again, &idx);
+        assert_eq!(again[0].status, FindingStatus::Refuted);
+        assert!(trust_policy::is_deterministic_refutation(
+            &again[0],
+            trust_policy::llm_refute_cap(Some("CWE-327"))
+        ));
     }
 
     #[test]

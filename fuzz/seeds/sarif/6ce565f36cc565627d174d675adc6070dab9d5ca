@@ -1,0 +1,1 @@
+{"$srsion":"2.1.0","runs":[{"tooloperties":{"tags":["security","external/cwe/cwe-327","external/cwe/cwe-079"],"vettalon.severity":"high"}}],"supportedTaxonomies{":[{"name":"CWE","index":0}]}

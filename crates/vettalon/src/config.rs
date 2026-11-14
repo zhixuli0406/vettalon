@@ -92,6 +92,39 @@ pub struct ModelConfig {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit_param: Option<TokenLimitParam>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub omit_temperature: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens_worst: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenLimitParam {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl TokenLimitParam {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -265,6 +298,10 @@ impl Config {
                 api_key_env: None,
                 max_tokens: None,
                 temperature: None,
+                token_limit_param: None,
+                omit_temperature: false,
+                reasoning_effort: None,
+                max_output_tokens_worst: None,
             })
             .collect();
         (
@@ -302,6 +339,14 @@ impl Config {
             }
             if m.roles.is_empty() {
                 return Err(format!("model {:?} has no roles", m.id));
+            }
+            if let Some(worst) = m.max_output_tokens_worst
+                && worst < m.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)
+            {
+                return Err(format!(
+                    "model {:?}: max_output_tokens_worst must be >= max_tokens",
+                    m.id
+                ));
             }
             match m.backend {
                 Backend::Cli => {
@@ -772,6 +817,10 @@ impl ModelConfig {
                     api_key_env: self.api_key_env.clone(),
                     max_tokens: self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
                     temperature: self.temperature.unwrap_or(0.0),
+                    token_limit_param: self.token_limit_param.unwrap_or_default(),
+                    omit_temperature: self.omit_temperature,
+                    reasoning_effort: self.reasoning_effort,
+                    max_output_tokens_worst: self.max_output_tokens_worst,
                     timeout: self.timeout(),
                 };
                 Arc::new(RefusalAware {
@@ -790,6 +839,43 @@ impl ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_request_settings_are_strict() {
+        let base = "[[model]]\nid = 'm'\nbackend = 'openai'\nfamily = 'test'\nmodel = 'm'\nbase_url = 'https://example.com'\nmax_tokens = 1024\n";
+        for fields in [
+            "token_limit_param = 'max_tokens'\nomit_temperature = false\nreasoning_effort = 'medium'\nmax_output_tokens_worst = 1024",
+            "token_limit_param = 'max_completion_tokens'\nomit_temperature = true\nreasoning_effort = 'low'\nmax_output_tokens_worst = 8192",
+            "reasoning_effort = 'high'",
+        ] {
+            let cfg: Config = toml::from_str(&format!("{base}{fields}")).unwrap();
+            cfg.validate().unwrap();
+            let info = cfg.models[0].handle().unwrap().caller.meter_info().unwrap();
+            assert_eq!(
+                info.max_output_tokens,
+                cfg.models[0].max_output_tokens_worst.unwrap_or(1024)
+            );
+        }
+        for fields in [
+            "token_limit_param = 'auto'",
+            "reasoning_effort = 'none'",
+            "omit_temperature = 'true'",
+            "max_output_tokens_worst = -1",
+            "max_output_tokens_worst = 1.5",
+            "max_output_tokens_worst = true",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!("{base}{fields}")).is_err(),
+                "{fields}"
+            );
+        }
+        let cfg: Config = toml::from_str(&format!("{base}max_output_tokens_worst = 1023")).unwrap();
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("max_output_tokens_worst")
+        );
+    }
 
     const SAMPLE: &str = r#"
 [[model]]
@@ -897,6 +983,10 @@ roles = ["finder", "verifier"]
             api_key_env: None,
             max_tokens: None,
             temperature: None,
+            token_limit_param: None,
+            omit_temperature: false,
+            reasoning_effort: None,
+            max_output_tokens_worst: None,
         };
         assert!(matches!(grok.isolation(), Isolation::Container(_)));
         let mut host = grok.clone();

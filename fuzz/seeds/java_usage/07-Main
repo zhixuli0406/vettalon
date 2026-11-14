@@ -1,0 +1,11 @@
+package com.ex;
+
+import java.security.KeyPairGenerator;
+
+public class Main implements Keys {
+    public static void main(String[] args) throws Exception {
+        String a = CURVE_ALG;
+        KeyPairGenerator g = KeyPairGenerator.getInstance(a);
+        System.out.println(g.getAlgorithm());
+    }
+}

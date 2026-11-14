@@ -480,6 +480,14 @@ fn incomplete_reason(r: vettalon_contract::coverage::IncompleteReason) -> &'stat
             "偵測到疑似 prompt injection 的模組，因本次只有單一模型家族，無法交叉覆審（建議加入不同家族的模型）",
             "modules with suspected prompt injection could not be cross-checked because only one model family was available (add a model from another family)",
         ),
+        R::PocBudgetExhausted => pick(
+            "PoC 執行次數上限已到，部分 PoC 未執行",
+            "the PoC run cap was reached, so some PoCs did not run",
+        ),
+        R::FixCheckCapReached => pick(
+            "單次掃描的修補檢查次數上限已到，後面的修補建議沒有檢查",
+            "the per-scan fix-check cap was reached, so later suggested fixes were not checked",
+        ),
     }
 }
 
@@ -577,10 +585,7 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
             who(&v.verifier_agent)
         ),
     };
-    out.push_str(&tr!(
-        "  覆核獨立性：{line}\n",
-        "  Verifier independence: {line}\n"
-    ));
+    out.push_str(&tr!("  覆核模型組成：{line}\n", "  Verifier mix: {line}\n"));
     // Findings, not votes: repeated refuter runs add one vote per run.
     let self_reviews = report
         .findings
@@ -648,6 +653,17 @@ fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
         out.push_str(&tr!(
             "  註解影響判斷：{sensitive} 筆發現在「看得到註解」與「去除註解」兩種覆核下結論相反（見 comment_sensitivity；可能是註解植入攻擊）\n",
             "  Comment-sensitive: {sensitive} findings got opposite verdicts with and without code comments (see comment_sensitivity; possible comment injection)\n"
+        ));
+    }
+    let capped = report
+        .findings
+        .iter()
+        .filter(|f| super::trust_policy::capped_rule(f).is_some())
+        .count();
+    if capped > 0 {
+        out.push_str(&tr!(
+            "  信任政策：{capped} 筆加密／政策類弱點被模型推翻，但模型推翻不能單獨結案，改列 needs_human（見 trust_policy）\n",
+            "  Trust policy: {capped} crypto/policy findings were refuted by a model; a model refutation alone cannot close them, so they are needs_human (see trust_policy)\n"
         ));
     }
     let tier_split = report

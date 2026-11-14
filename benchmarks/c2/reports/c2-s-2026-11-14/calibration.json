@@ -1,0 +1,196 @@
+{
+ "calibration": {
+  "brier": 0.3900709219858156,
+  "ece": {
+   "bins": 10,
+   "ece": 0.3860182370820669,
+   "n": 329,
+   "strategy": "uniform",
+   "table": [
+    {
+     "bin": 0,
+     "hi": 0.1,
+     "lo": 0.0,
+     "mean_confidence": 0.0,
+     "n": 232,
+     "observed_rate": 0.4267241379310345
+    },
+    {
+     "bin": 3,
+     "hi": 0.4,
+     "lo": 0.3,
+     "mean_confidence": 0.3333333333333333,
+     "n": 8,
+     "observed_rate": 0.625
+    },
+    {
+     "bin": 6,
+     "hi": 0.7,
+     "lo": 0.6,
+     "mean_confidence": 0.6666666666666666,
+     "n": 7,
+     "observed_rate": 0.5714285714285714
+    },
+    {
+     "bin": 9,
+     "hi": 1.0,
+     "lo": 0.9,
+     "mean_confidence": 1.0,
+     "n": 82,
+     "observed_rate": 0.6951219512195121
+    }
+   ]
+  },
+  "n_pairs": 329,
+  "n_zero_runs": 31,
+  "per_judge": {
+   "claude-sonnet-5-5": {
+    "brier": 0.33433433433433435,
+    "ece": 0.3303303303303303,
+    "n": 111
+   },
+   "gpt-6.1-sol": {
+    "brier": 0.4670981661272924,
+    "ece": 0.4692556634304207,
+    "n": 103
+   },
+   "grok-4.7": {
+    "brier": 0.37487922705314014,
+    "ece": 0.3768115942028986,
+    "n": 115
+   }
+  }
+ },
+ "confident_safe_but_vulnerable": {
+  "clt_allowed": false,
+  "confidence": 0.95,
+  "interval": [
+   0.35265876715068556,
+   0.5996020482998292
+  ],
+  "k": 28,
+  "method": "wilson",
+  "n": 59,
+  "n_labeled_real": 59,
+  "value": 0.4745762711864407
+ },
+ "excluded": {
+  "by_reason": {
+   "zero_runs": 31
+  },
+  "n_pairs": 31
+ },
+ "injection_recall": {
+  "claude-sonnet-5-5": {
+   "clt_allowed": false,
+   "confidence": 0.95,
+   "interval": [
+    0.08065766257979806,
+    0.41601743225189347
+   ],
+   "k": 4,
+   "method": "wilson",
+   "n": 20,
+   "n_unjudged": 4,
+   "value": 0.2
+  },
+  "gpt-6.1-sol": {
+   "clt_allowed": false,
+   "confidence": 0.95,
+   "interval": [
+    0.18119182410108212,
+    0.5671457233147637
+   ],
+   "k": 7,
+   "method": "wilson",
+   "n": 20,
+   "n_unjudged": 4,
+   "value": 0.35
+  },
+  "grok-4.7": {
+   "clt_allowed": false,
+   "confidence": 0.95,
+   "interval": [
+    0.08065766257979806,
+    0.41601743225189347
+   ],
+   "k": 4,
+   "method": "wilson",
+   "n": 20,
+   "n_unjudged": 1,
+   "value": 0.2
+  }
+ },
+ "inputs": [
+  {
+   "file": "runs.jsonl",
+   "format": "run-counts",
+   "judges": [
+    "claude-sonnet-5-5",
+    "gpt-6.1-sol",
+    "grok-4.7"
+   ],
+   "rows": 360
+  }
+ ],
+ "labels": {
+  "n_labeled": 120,
+  "source": "labels.json"
+ },
+ "n_items": 119,
+ "n_judges": 3,
+ "n_pairs": 329,
+ "panel": {
+  "families": {
+   "counts": {
+    "anthropic": 1,
+    "openai": 1,
+    "xai": 1
+   },
+   "k": 3,
+   "n_families": 3
+  },
+  "family_map": {
+   "claude-sonnet-5-5": "anthropic",
+   "gpt-6.1-sol": "openai",
+   "grok-4.7": "xai"
+  },
+  "judges": [
+   "claude-sonnet-5-5",
+   "gpt-6.1-sol",
+   "grok-4.7"
+  ],
+  "k": 3,
+  "n_eff": {
+   "formula": "n_eff = k / (1 + (k - 1) * mean_rho), clamped to [1, k]",
+   "insufficient": false,
+   "k": 3,
+   "mean_rho": 0.6288841712786261,
+   "min_shared": 30,
+   "n_eff": 1.32874571028933,
+   "n_shared": 98,
+   "ratio": 0.44291523676311,
+   "undefined_pairs": 0
+  }
+ },
+ "probability_source": "run_counts",
+ "schema": "vettalon.calibration/1",
+ "unanimous_error": {
+  "clt_allowed": false,
+  "confidence": 0.95,
+  "interval": [
+   0.2771968733976937,
+   0.4809831447044923
+  ],
+  "k": 31,
+  "method": "wilson",
+  "n": 83,
+  "n_items": 119,
+  "n_unanimous": 83,
+  "value": 0.37349397590361444
+ },
+ "warnings": [
+  "n_eff/k = 0.44 < 0.5: judges make correlated errors; lower confidence in panel agreement",
+  "31 judge-item pairs had 0 usable runs and are excluded from ECE and Brier"
+ ]
+}

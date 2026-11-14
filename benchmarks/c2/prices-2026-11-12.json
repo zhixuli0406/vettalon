@@ -1,0 +1,40 @@
+{
+  "schema": "vettalon.prices/1",
+  "retrieved": "2026-11-12",
+  "source": [
+    "https://platform.claude.com/docs/en/about-claude/pricing",
+    "https://developers.openai.com/api/docs/pricing",
+    "https://docs.x.ai/docs/models",
+    "https://aistudio.google.com/docs/pricing"
+  ],
+  "models": {
+    "claude-sonnet-5-5": {
+      "input": 2,
+      "cached_input": 0.10,
+      "output": 10
+    },
+    "gpt-6.1-sol": {
+      "input": 2,
+      "cached_input": 0.10,
+      "output": 10,
+      "max_billed_output_tokens": 4096
+    },
+    "grok-4.7": {
+      "input": 2,
+      "cached_input": 0.50,
+      "output": 6,
+      "max_billed_output_tokens": 4096
+    },
+    "claude-opus-5-5": {
+      "input": 4,
+      "cached_input": 0.20,
+      "output": 20
+    },
+    "gemini-3.1-pro-preview": {
+      "input": 2,
+      "cached_input": 0.20,
+      "output": 12,
+      "max_billed_output_tokens": 4096
+    }
+  }
+}

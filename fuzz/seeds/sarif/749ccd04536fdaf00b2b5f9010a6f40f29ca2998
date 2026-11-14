@@ -1,0 +1,1 @@
+{"$schema":"https://docs.oasis-open.org/sarif/sarif/v1.1.0/errata01/os/schemas/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"namez":"vettalon","ru]les":[{"id":"rule/x","shortDescriptedTaxonomies":[{"name":"CWE","%ndex":0}]}},                                                 ","level":"error","message":{"teuted: x"}tatus":"refuted"}}]}]}

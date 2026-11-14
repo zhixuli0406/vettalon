@@ -28,6 +28,247 @@ pub struct KnownVuln {
     pub aliases: Vec<String>,
 }
 
+/// Longest `summary` / `details` text kept from an OSV record.
+const MAX_DETAIL_CHARS: usize = 4096;
+const MAX_ID_CHARS: usize = 128;
+const MAX_ALIASES: usize = 10;
+const MAX_CWE_IDS: usize = 20;
+const MAX_CWE_ID_CHARS: usize = 32;
+/// Advisories kept from one `/v1/query` response for the duplicate check.
+pub const MAX_DETAIL_VULNS: usize = 200;
+/// Largest `/v1/query` response body read.
+pub const MAX_QUERY_BODY_BYTES: usize = 1024 * 1024;
+
+/// Read a response body, refusing one larger than `cap` bytes (checked on
+/// the declared length and again while streaming).
+pub(crate) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return Err("response exceeds the size cap".into());
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len() + chunk.len() > cap {
+            return Err("response exceeds the size cap".into());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Visitor methods that read any scalar as `Default::default()` (an oddly
+/// shaped optional OSV field is empty, never an error).
+macro_rules! scalars_as_default {
+    () => {
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+    };
+}
+
+/// Skip every element of a sequence without keeping it.
+fn skip_seq<'de, A: serde::de::SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
+    while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+/// Skip every entry of a map without keeping it.
+fn skip_map<'de, A: serde::de::MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
+    while map
+        .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+        .is_some()
+    {}
+    Ok(())
+}
+
+/// One `cwe_ids` element: kept (bounded) when it is a string.
+#[derive(Default)]
+struct CweItem(Option<String>);
+
+impl<'de> Deserialize<'de> for CweItem {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = CweItem;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a CWE id")
+            }
+            scalars_as_default!();
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<CweItem, E> {
+                Ok(CweItem(Some(bounded(s, MAX_CWE_ID_CHARS))))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<CweItem, A::Error> {
+                skip_seq(seq).map(|_| CweItem(None))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<CweItem, A::Error> {
+                skip_map(map).map(|_| CweItem(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// `database_specific.cwe_ids`: string elements only, at most
+/// [`MAX_CWE_IDS`] of them, each bounded; anything else is empty.
+#[derive(Default)]
+struct CweIds(Vec<String>);
+
+impl<'de> Deserialize<'de> for CweIds {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = CweIds;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a list of CWE ids")
+            }
+            scalars_as_default!();
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<CweIds, E> {
+                Ok(CweIds::default())
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<CweIds, A::Error> {
+                let mut out = Vec::new();
+                while out.len() < MAX_CWE_IDS {
+                    match seq.next_element::<CweItem>()? {
+                        Some(CweItem(Some(id))) => out.push(id),
+                        Some(CweItem(None)) => {}
+                        None => return Ok(CweIds(out)),
+                    }
+                }
+                skip_seq(seq)?;
+                Ok(CweIds(out))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<CweIds, A::Error> {
+                skip_map(map).map(|_| CweIds::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// An OSV record's `database_specific`, keeping only `cwe_ids`; every other
+/// key is skipped without being kept, and a value that is not an object is
+/// empty, not an error.
+#[derive(Default)]
+struct DatabaseSpecific {
+    cwe_ids: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for DatabaseSpecific {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = DatabaseSpecific;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an OSV database_specific object")
+            }
+            scalars_as_default!();
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<DatabaseSpecific, E> {
+                Ok(DatabaseSpecific::default())
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<DatabaseSpecific, A::Error> {
+                skip_seq(seq).map(|_| DatabaseSpecific::default())
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<DatabaseSpecific, A::Error> {
+                let mut out = DatabaseSpecific::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "cwe_ids" {
+                        out.cwe_ids = map.next_value::<CweIds>()?.0;
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// One advisory with the descriptive fields the pre-send duplicate check
+/// compares against a finding. All text is bounded; the fields are optional
+/// in OSV (a missing one stays empty).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VulnDetail {
+    pub id: String,
+    pub aliases: Vec<String>,
+    pub summary: String,
+    pub details: String,
+    /// `database_specific.cwe_ids` (GitHub advisory records carry it).
+    pub cwe_ids: Vec<String>,
+}
+
+fn bounded(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Parse an OSV `/v1/query` response keeping `summary`, `details` and
+/// `database_specific.cwe_ids`. A missing or oddly shaped optional field is
+/// left empty, never an error. At most [`MAX_DETAIL_VULNS`] records are
+/// kept, each with bounded text.
+pub fn parse_osv_details_response(body: &str) -> Result<Vec<VulnDetail>, String> {
+    #[derive(Deserialize)]
+    struct Resp {
+        #[serde(default)]
+        vulns: Vec<Vuln>,
+    }
+    #[derive(Deserialize)]
+    struct Vuln {
+        id: String,
+        #[serde(default)]
+        aliases: Vec<String>,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        details: Option<String>,
+        #[serde(default)]
+        database_specific: Option<DatabaseSpecific>,
+    }
+    let r: Resp =
+        serde_json::from_str(body).map_err(|e| format!("OSV response is not valid JSON: {e}"))?;
+    Ok(r.vulns
+        .into_iter()
+        .take(MAX_DETAIL_VULNS)
+        .map(|v| {
+            let cwe_ids = v.database_specific.map(|d| d.cwe_ids).unwrap_or_default();
+            VulnDetail {
+                id: bounded(&v.id, MAX_ID_CHARS),
+                aliases: v
+                    .aliases
+                    .iter()
+                    .take(MAX_ALIASES)
+                    .map(|a| bounded(a, MAX_ID_CHARS))
+                    .collect(),
+                summary: bounded(v.summary.as_deref().unwrap_or(""), MAX_DETAIL_CHARS),
+                details: bounded(v.details.as_deref().unwrap_or(""), MAX_DETAIL_CHARS),
+                cwe_ids,
+            }
+        })
+        .collect())
+}
+
 /// The OSV ecosystem string for an [`Ecosystem`].
 pub fn osv_ecosystem(e: Ecosystem) -> &'static str {
     match e {
@@ -105,6 +346,26 @@ pub fn parse_osv_batch_response(body: &str) -> Result<Vec<Vec<KnownVuln>>, Strin
 pub trait OsvClient: Send + Sync {
     async fn known_vulns(&self, target: &DependencyTarget) -> Result<Vec<KnownVuln>, String>;
 
+    /// Like [`Self::known_vulns`] but keeping each record's summary, details
+    /// and CWE ids (for the pre-send duplicate check). The default has only
+    /// ids and aliases to offer; [`HttpOsvClient`] overrides it. Same single
+    /// request to the same host, nothing more.
+    async fn known_vuln_details(
+        &self,
+        target: &DependencyTarget,
+    ) -> Result<Vec<VulnDetail>, String> {
+        Ok(self
+            .known_vulns(target)
+            .await?
+            .into_iter()
+            .map(|k| VulnDetail {
+                id: k.id,
+                aliases: k.aliases,
+                ..Default::default()
+            })
+            .collect())
+    }
+
     /// Classify many dependencies at once. The default loops [`Self::known_vulns`]
     /// (what a test mock needs); [`HttpOsvClient`] overrides it with OSV's
     /// batch endpoint so a large `--include-transitive` hunt makes a handful
@@ -179,11 +440,10 @@ impl HttpOsvClient {
                 .expect("static OSV HTTP client configuration"),
         }
     }
-}
 
-#[async_trait]
-impl OsvClient for HttpOsvClient {
-    async fn known_vulns(&self, target: &DependencyTarget) -> Result<Vec<KnownVuln>, String> {
+    /// The raw `/v1/query` response body for one dependency, at most
+    /// [`MAX_QUERY_BODY_BYTES`].
+    async fn query_text(&self, target: &DependencyTarget) -> Result<String, String> {
         let body = serde_json::json!({
             "version": target.version,
             "package": { "name": target.name, "ecosystem": osv_ecosystem(target.ecosystem) },
@@ -196,17 +456,32 @@ impl OsvClient for HttpOsvClient {
             .await
             .map_err(|e| format!("OSV request failed: {e}"))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("OSV read failed: {e}"))?;
+        let body = read_body_capped(resp, MAX_QUERY_BODY_BYTES).await;
         if !status.is_success() {
+            let text = body
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
             return Err(format!(
                 "OSV returned {status}: {}",
                 crate::util::truncate_bytes(&text, 200)
             ));
         }
-        parse_osv_response(&text)
+        let body = body.map_err(|e| format!("OSV read failed: {e}"))?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+}
+
+#[async_trait]
+impl OsvClient for HttpOsvClient {
+    async fn known_vulns(&self, target: &DependencyTarget) -> Result<Vec<KnownVuln>, String> {
+        parse_osv_response(&self.query_text(target).await?)
+    }
+
+    async fn known_vuln_details(
+        &self,
+        target: &DependencyTarget,
+    ) -> Result<Vec<VulnDetail>, String> {
+        parse_osv_details_response(&self.query_text(target).await?)
     }
 
     async fn known_vulns_batch(
@@ -237,14 +512,12 @@ impl OsvClient for HttpOsvClient {
                     .await
                     .map_err(|e| format!("OSV batch request failed: {e}"))?;
                 let status = resp.status();
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| format!("OSV batch read failed: {e}"))?;
+                let bytes = read_body_capped(resp, MAX_QUERY_BODY_BYTES).await;
                 if !status.is_success() {
                     return Err(format!("OSV batch returned {status}"));
                 }
-                parse_osv_batch_response(&text)
+                let bytes = bytes.map_err(|e| format!("OSV batch read failed: {e}"))?;
+                parse_osv_batch_response(&String::from_utf8_lossy(&bytes))
             }
             .await;
             let mut rows = parsed?;
@@ -370,6 +643,134 @@ mod tests {
     #[test]
     fn parse_osv_response_malformed_is_an_error() {
         assert!(parse_osv_response("not json").is_err());
+    }
+
+    #[test]
+    fn parse_osv_details_keeps_summary_details_and_cwe_ids_bounded() {
+        let long = "x".repeat(10_000);
+        let body = serde_json::json!({"vulns": [
+            {"id": "GHSA-a", "aliases": ["CVE-1"], "summary": "SQLi in db.py",
+             "details": long, "database_specific": {"cwe_ids": ["CWE-89", 7]}},
+            {"id": "GHSA-b", "database_specific": {"cwe_ids": "odd"}},
+            {"id": "GHSA-c", "database_specific": 5},
+        ]})
+        .to_string();
+        let v = parse_osv_details_response(&body).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].summary, "SQLi in db.py");
+        assert_eq!(v[0].details.chars().count(), MAX_DETAIL_CHARS);
+        assert_eq!(v[0].cwe_ids, ["CWE-89"]);
+        assert_eq!(v[0].aliases, ["CVE-1"]);
+        assert!(v[1].cwe_ids.is_empty() && v[1].summary.is_empty());
+        assert!(v[2].cwe_ids.is_empty());
+        assert!(parse_osv_details_response("{}").unwrap().is_empty());
+        assert!(parse_osv_details_response("nope").is_err());
+    }
+
+    #[test]
+    fn parse_osv_details_caps_vulns_cwe_ids_and_skips_other_database_specific_keys() {
+        // `database_specific` keeps only bounded string cwe_ids; other keys
+        // (however large or nested) and other shapes are skipped.
+        let many: Vec<String> = (0..50).map(|i| format!("CWE-{i}")).collect();
+        let body = serde_json::json!({"vulns": [
+            {"id": "A", "database_specific": {
+                "severity": "HIGH",
+                "nested": {"deep": [[[{"x": 1}]]], "big": "y".repeat(50_000)},
+                "cwe_ids": many,
+                "github_reviewed": true}},
+            {"id": "B", "database_specific": {"cwe_ids": [
+                format!("CWE-{}", "9".repeat(100)), null, {"o": 1}, ["CWE-1"], "CWE-79"]}},
+            {"id": "C", "database_specific": ["CWE-89"]},
+            {"id": "D", "database_specific": "CWE-89"},
+            {"id": "E", "database_specific": null},
+            {"id": "F", "database_specific": {"cwe_ids": {"0": "CWE-89"}}},
+        ]})
+        .to_string();
+        let v = parse_osv_details_response(&body).unwrap();
+        assert_eq!(v.len(), 6);
+        assert_eq!(v[0].cwe_ids.len(), MAX_CWE_IDS);
+        assert_eq!(v[0].cwe_ids[0], "CWE-0");
+        assert_eq!(v[1].cwe_ids.len(), 2, "{:?}", v[1].cwe_ids);
+        assert_eq!(v[1].cwe_ids[0].chars().count(), MAX_CWE_ID_CHARS);
+        assert_eq!(v[1].cwe_ids[1], "CWE-79");
+        for d in &v[2..] {
+            assert!(d.cwe_ids.is_empty(), "{d:?}");
+        }
+        // Record count is capped before classification.
+        let vulns: Vec<serde_json::Value> = (0..MAX_DETAIL_VULNS + 50)
+            .map(|i| serde_json::json!({"id": format!("V{i}"), "summary": "s"}))
+            .collect();
+        let body = serde_json::json!({ "vulns": vulns }).to_string();
+        let v = parse_osv_details_response(&body).unwrap();
+        assert_eq!(v.len(), MAX_DETAIL_VULNS);
+        assert_eq!(v[0].id, "V0");
+    }
+
+    /// One plain-HTTP reply on loopback with a body of `len` bytes, with or
+    /// without a declared length.
+    async fn serve_once(len: usize, declare_len: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            let head = if declare_len {
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n")
+            } else {
+                "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n".to_string()
+            };
+            let _ = s.write_all(head.as_bytes()).await;
+            let _ = s.write_all(&vec![b'x'; len]).await;
+            let _ = s.shutdown().await;
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn response_bodies_are_read_with_a_cap() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |url: String| {
+            let client = client.clone();
+            async move { client.get(url).send().await.unwrap() }
+        };
+        let ok = read_body_capped(get(serve_once(1000, true).await).await, 1000).await;
+        assert_eq!(ok.unwrap().len(), 1000);
+        for declare_len in [true, false] {
+            let resp = get(serve_once(1001, declare_len).await).await;
+            let err = read_body_capped(resp, 1000).await.unwrap_err();
+            assert!(err.contains("size cap"), "{declare_len}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_batch_response_is_read_with_the_same_cap() {
+        let url = serve_once(MAX_QUERY_BODY_BYTES + 1, true).await;
+        let client = HttpOsvClient {
+            base: url.trim_end_matches('/').to_string(),
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let err = client
+            .known_vulns_batch(&[target("a", "1.0.0")])
+            .await
+            .unwrap_err();
+        assert!(err.contains("size cap"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn details_default_falls_back_to_ids_and_aliases() {
+        let client = MockClient(vec![KnownVuln {
+            id: "GHSA-x".into(),
+            aliases: vec!["CVE-2".into()],
+        }]);
+        let v = client
+            .known_vuln_details(&target("a", "1.0.0"))
+            .await
+            .unwrap();
+        assert_eq!(v[0].id, "GHSA-x");
+        assert_eq!(v[0].aliases, ["CVE-2"]);
+        assert!(v[0].cwe_ids.is_empty());
     }
 
     #[test]

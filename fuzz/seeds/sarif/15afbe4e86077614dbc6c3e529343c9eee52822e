@@ -1,0 +1,14 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"&extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-injection","shortDescription":{"texropertiesion":{"uri":"src/api.py","
+
+
+
+
+
+
+
+
+                                
+
+
+
+index{"v":0}},"me":"py/sqiB"},"ree

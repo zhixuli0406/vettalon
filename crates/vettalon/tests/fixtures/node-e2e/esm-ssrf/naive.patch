@@ -1,0 +1,10 @@
+--- a/app.mjs
++++ b/app.mjs
+@@ -1,4 +1,7 @@
+ export async function run(url) {
++  if (['127.0.0.1', 'localhost'].some(host => url.includes(host))) {
++    throw new Error('Blocked address');
++  }
+   const response = await fetch(url);
+   return await response.text();
+ }

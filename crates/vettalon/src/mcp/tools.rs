@@ -67,6 +67,8 @@ pub fn schemas() -> Vec<Value> {
                 required.push("target");
                 if *name == "vettalon_reproduce" {
                     properties["emit_test"] = json!({"type":"boolean","default":false});
+                    properties["replays"] = json!({"type":"integer","minimum":1,
+                        "maximum":crate::audit::target_poc::MAX_REPLAYS,"default":1});
                 } else {
                     properties["diff"] = json!({"type":"string","maxLength":crate::audit::SUGGESTED_FIX_MAX_BYTES});
                     required.push("diff");

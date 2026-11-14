@@ -12,11 +12,23 @@
 //!
 //! Rules every draft follows:
 //! - evidence gate ([`eligibility`]): by default only findings at
-//!   `poc_effect_no_control` or above; `--allow-unproven` admits the refuter
-//!   levels with an UNPROVEN banner; `static_only` is never drafted;
+//!   `poc_differential` or above; `--allow-unproven` admits
+//!   `poc_effect_no_control` and the refuter levels with an UNPROVEN banner;
+//!   `static_only` is never drafted;
 //! - a fixed AI use statement naming a human reviewer pseudonym and review
 //!   date ([`ai_use`]); no reviewer, no draft;
-//! - severity is never filled in by the tool (a human-set severity is);
+//! - severity is never filled in by the tool (a human-set severity is), and
+//!   no draft carries a CVSS vector or score;
+//! - template text is capped at 8,000 characters by shortening only the
+//!   analysis, trace and PoC transcript (the AI use statement, reviewer line
+//!   and disclosure section are never cut); the Details section names the
+//!   commit (or says it is unknown);
+//! - an optional reproduce receipt is tied to the finding (file, file hash,
+//!   function, outcome re-derived from its phases) and quoted by name,
+//!   SHA-256 and outcome ([`receipt`]); its signature is not verified here,
+//!   and the draft says so;
+//! - the target's out-of-scope statements are a reviewer-notes hint only
+//!   ([`scope`]);
 //! - target policy files are data ([`policy`]);
 //! - one unanswered draft per project at a time ([`ledger`]);
 //! - dependency findings keep "upstream vulnerable" and "does this project
@@ -32,9 +44,11 @@ pub mod ai_use;
 pub mod dedupe;
 mod detect;
 pub mod eligibility;
-mod formats;
+pub(crate) mod formats;
 pub mod ledger;
 pub mod policy;
+pub mod receipt;
+pub mod scope;
 mod upstream;
 
 pub use crate::audit::evidence_level::{EvidenceLevel, ProofGap};
@@ -43,6 +57,8 @@ pub use dedupe::{DedupeReport, DedupeSource};
 pub use detect::{detect_project, detect_project_as, github_slug, recommend};
 pub use eligibility::{Eligibility, draft_eligibility};
 pub use ledger::ThrottleStatus;
+pub use receipt::ReceiptNote;
+pub use scope::ScopeCheck;
 pub use upstream::{UpstreamOrigin, go_module_url, normalize_github};
 
 /// Where a report can be filed.
@@ -135,6 +151,15 @@ pub struct ProjectMeta {
     /// Requirement-looking lines from the security policy, quoted as data
     /// for human confirmation. Never acted on.
     pub policy_requirements: Vec<String>,
+    /// Out-of-scope lines of the policy / threat-model files, for the
+    /// reviewer-notes scope hint. Not serialized.
+    #[serde(skip)]
+    pub scope_docs: Vec<scope::ScopeDoc>,
+}
+
+/// The finding's CWE id (its own, else the one its rule kind maps to).
+pub fn finding_cwe(f: &Finding) -> Option<String> {
+    formats::finding_cwe(f)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -278,6 +303,11 @@ pub struct DisclosurePackage {
     pub severity: SeverityReview,
     pub dedupe: DedupeReport,
     pub dependency_scope: Option<DependencyScope>,
+    /// Hint from the target's out-of-scope statements (reviewer notes only;
+    /// never changes eligibility or the draft).
+    pub scope_check: ScopeCheck,
+    /// The reproduce receipt quoted in the PoC section, when attached.
+    pub receipt: Option<ReceiptNote>,
     pub throttle: ThrottleStatus,
     pub warnings: Vec<String>,
 }
@@ -331,6 +361,10 @@ pub struct DraftOptions {
     pub ledger_path: PathBuf,
     /// The run's model roster (families and roles for the AI use statement).
     pub roster: Vec<ModelInfo>,
+    /// A `vettalon reproduce` receipt for the finding (`--receipt`).
+    pub receipt: Option<PathBuf>,
+    /// Its signature bundle (`--receipt-bundle`); needs `receipt`.
+    pub receipt_bundle: Option<PathBuf>,
 }
 
 impl DraftOptions {
@@ -343,6 +377,18 @@ impl DraftOptions {
             force_throttle: None,
             ledger_path: ledger::default_path(home),
             roster: Vec::new(),
+            receipt: None,
+            receipt_bundle: None,
+        }
+    }
+
+    /// Read and check the receipt files for `f` (none asked: `Ok(None)`).
+    /// A bundle without a receipt is refused.
+    pub fn load_receipt(&self, f: &Finding) -> Result<Option<ReceiptNote>, String> {
+        match (&self.receipt, &self.receipt_bundle) {
+            (Some(r), b) => receipt::load(r, b.as_deref(), f).map(Some),
+            (None, Some(_)) => Err("--receipt-bundle requires --receipt".into()),
+            (None, None) => Ok(None),
         }
     }
 }
@@ -370,18 +416,64 @@ pub(crate) struct DraftContext<'a> {
     pub ai_use: &'a AiUseStatement,
     pub severity: &'a SeverityReview,
     pub dependency: Option<&'a DependencyScope>,
+    pub receipt: Option<&'a ReceiptNote>,
 }
 
-/// Show bidi overrides/isolates and zero-width characters as `[U+XXXX]`.
-/// Titles and paths in a draft come from the audited code; an invisible
-/// U+202E would make the maintainer read a different file name than the one
-/// meant ("Trojan Source") in a message that is copied and sent verbatim.
-fn show_invisible(s: &str) -> String {
+/// A character that renders as nothing (or as blank space) and can hide or
+/// reorder text: every code point of Unicode general categories Cf (format),
+/// Zl and Zp, plus the fillers and selectors that display empty (U+00AD,
+/// U+034F, U+115F, U+1160, U+3164, U+FFA0, U+180E, variation selectors
+/// U+FE00–FE0F and U+E0100–E01EF) and the tag block U+E0000–E007F.
+/// Explicit ranges (Unicode 15.1), so no Unicode-table dependency.
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(
+        c as u32,
+        // Cf
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            // Zl, Zp
+            | 0x2028
+            | 0x2029
+            // Fillers, grapheme joiner, variation selectors
+            | 0x034F
+            | 0x115F
+            | 0x1160
+            | 0x3164
+            | 0xFFA0
+            | 0xFE00..=0xFE0F
+            | 0xE0100..=0xE01EF
+            // Tags (Cf: U+E0001, U+E0020–E007F; the rest of the block too)
+            | 0xE0000..=0xE007F
+    )
+}
+
+/// Show invisible characters ([`is_invisible`]: bidi overrides/isolates,
+/// zero-width and other format characters, line/paragraph separators,
+/// fillers, variation selectors, tags) as `[U+XXXX]`. Titles and paths in a
+/// draft come from the audited code; an invisible U+202E would make the
+/// maintainer read a different file name than the one meant ("Trojan
+/// Source") in a message that is copied and sent verbatim.
+pub(crate) fn show_invisible(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        let cp = c as u32;
-        if matches!(cp, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2069 | 0xFEFF) {
-            out.push_str(&format!("[U+{cp:04X}]"));
+        if is_invisible(c) {
+            out.push_str(&format!("[U+{:04X}]", c as u32));
         } else {
             out.push(c);
         }
@@ -412,21 +504,314 @@ pub fn notes_end_marker(zh: bool) -> &'static str {
     if zh { NOTES_END_ZH } else { NOTES_END_EN }
 }
 
+/// ASCII `-` and the characters that look like it. The list cannot be
+/// complete, so [`defang_markers`] also defangs the marker phrases.
+fn is_dash_like(c: char) -> bool {
+    matches!(
+        c,
+        '-' | '\u{02D7}'
+            | '\u{207B}'
+            | '\u{208B}'
+            | '\u{2010}'..='\u{2015}'
+            | '\u{2043}'
+            | '\u{2212}'
+            | '\u{23AF}'
+            | '\u{2500}'
+            | '\u{2501}'
+            | '\u{2574}'..='\u{257F}'
+            | '\u{2796}'
+            | '\u{2E3A}'
+            | '\u{2E3B}'
+            | '\u{30FC}'
+            | '\u{4E00}'
+            | '\u{FE31}'
+            | '\u{FE32}'
+            | '\u{FE58}'
+            | '\u{FE63}'
+            | '\u{FF0D}'
+            // Armenian hyphen, Hebrew maqaf, Ogham space mark.
+            | '\u{058A}'
+            | '\u{05BE}'
+            | '\u{1680}'
+            // Hangul EU (compatibility jamo and jungseong).
+            | '\u{1173}'
+            | '\u{3161}'
+            // Kangxi radical one, straightness symbol.
+            | '\u{2F00}'
+            | '\u{23E4}'
+            // Dashed box-drawing lines.
+            | '\u{2504}'
+            | '\u{2505}'
+            | '\u{2508}'
+            | '\u{2509}'
+            | '\u{254C}'
+            | '\u{254D}'
+    )
+}
+
+/// The words shared by the start and end markers of the reviewer-notes
+/// block ([`NOTES_START_EN`]/[`NOTES_END_EN`]: "REVIEWER NOTES";
+/// [`NOTES_START_ZH`]/[`NOTES_END_ZH`]: "審閱備註").
+const MARKER_PHRASES: &[&[&str]] = &[&["REVIEWER", "NOTES"], &["審閱備註"]];
+
+/// Characters skipped between two letters of a marker phrase: whitespace,
+/// punctuation and invisible characters (anything not alphanumeric), at
+/// most this many in a row and never a line break.
+const MARKER_PHRASE_MAX_GAP: usize = 8;
+
+/// The Latin letter a mathematical alphanumeric symbol is styled from
+/// (bold, italic, script, fraktur, double-struck, sans-serif, monospace
+/// and their combinations), or the Greek letter for the mathematical Greek
+/// blocks, which [`marker_letter`] then folds like plain Greek.
+fn math_alphanumeric_base(c: char) -> Option<char> {
+    let cp = c as u32;
+    match cp {
+        // 13 styles of A-Z then a-z. The holes are reserved (unassigned)
+        // code points whose letters live in Letterlike Symbols; they are
+        // mapped here too, so `marker_letter` must not call this for a
+        // non-alphanumeric character.
+        0x1D400..=0x1D6A3 => {
+            let i = ((cp - 0x1D400) % 52) as u8;
+            Some(if i < 26 {
+                char::from(b'A' + i)
+            } else {
+                char::from(b'a' + i - 26)
+            })
+        }
+        // Mathematical italic dotless i.
+        0x1D6A4 => Some('\u{0131}'),
+        // 5 styles of 58 Greek symbols: 25 capitals (U+0391..), nabla,
+        // 25 small letters (U+03B1..), then symbol variants.
+        0x1D6A8..=0x1D7C9 => {
+            let i = (cp - 0x1D6A8) % 58;
+            match i {
+                0..=24 => char::from_u32(0x0391 + i),
+                26..=50 => char::from_u32(0x03B1 + i - 26),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The marker letter `c` reads as: ASCII letters uppercased, fullwidth
+/// and mathematical Latin letters as ASCII, the lookalikes below as the
+/// Latin letter of "REVIEWER NOTES" they imitate, and variant or
+/// simplified forms of 審閱備註 as the traditional character. Any other
+/// character is returned as is.
+///
+/// This confusables table is kept in one place and cannot be complete
+/// (Unicode has more lookalikes, and fonts differ), so it only narrows the
+/// gap: the dash-run defanging in [`defang_markers`] does not depend on it.
+/// Every entry must be alphanumeric, because the phrase matcher treats
+/// non-alphanumeric characters as gaps. A non-alphanumeric `c` is returned
+/// as is before any mapping: the reserved holes of the mathematical
+/// alphanumeric block (unassigned, so not alphanumeric) would otherwise
+/// fold to a Latin letter.
+fn marker_letter(c: char) -> char {
+    if !c.is_alphanumeric() {
+        return c;
+    }
+    let c = match c {
+        '\u{FF21}'..='\u{FF3A}' | '\u{FF41}'..='\u{FF5A}' => {
+            char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+        }
+        _ => math_alphanumeric_base(c).unwrap_or(c),
+    };
+    // Lowercase L reads as a capital I in many fonts.
+    let c = if c == 'l' {
+        'I'
+    } else {
+        c.to_ascii_uppercase()
+    };
+    match c {
+        // Small capital, Cherokee E/SV, Lisu ZHA, script/fraktur/
+        // double-struck R.
+        '\u{0280}' | '\u{13A1}' | '\u{13D2}' | '\u{A4E3}' | '\u{211B}' | '\u{211C}'
+        | '\u{211D}' => 'R',
+        // Cyrillic Е е, Greek Ε ε, small capital, Cherokee, Lisu, script.
+        '\u{0415}' | '\u{0435}' | '\u{0395}' | '\u{03B5}' | '\u{1D07}' | '\u{13AC}'
+        | '\u{A4F0}' | '\u{2130}' | '\u{212F}' => 'E',
+        // Cyrillic izhitsa, Greek nu, small capital, Roman numeral five,
+        // Cherokee, Lisu.
+        '\u{0474}' | '\u{0475}' | '\u{03BD}' | '\u{1D20}' | '\u{2164}' | '\u{2174}'
+        | '\u{13D9}' | '\u{A4E6}' => 'V',
+        // Cyrillic І і Ӏ ӏ, Greek Ι ι, Roman numeral one, small capital,
+        // dotless i, script/fraktur I, dental click, Lisu, Coptic.
+        '\u{0406}' | '\u{0456}' | '\u{04C0}' | '\u{04CF}' | '\u{0399}' | '\u{03B9}'
+        | '\u{2160}' | '\u{2170}' | '\u{026A}' | '\u{0131}' | '\u{2110}' | '\u{2111}'
+        | '\u{01C0}' | '\u{A4F2}' | '\u{2C92}' => 'I',
+        // Cyrillic Ԝ ԝ ѡ, small capital, Cherokee LA/TA, Lisu.
+        '\u{051C}' | '\u{051D}' | '\u{0461}' | '\u{1D21}' | '\u{13B3}' | '\u{13D4}'
+        | '\u{A4EA}' => 'W',
+        // Greek Ν, small capital, Lisu, double-struck, Coptic.
+        '\u{039D}' | '\u{0274}' | '\u{A4E0}' | '\u{2115}' | '\u{2C9A}' => 'N',
+        // Cyrillic О о, Greek Ο ο, small capital, Armenian oh, Coptic,
+        // Lisu, script o, ideographic zero.
+        '\u{041E}' | '\u{043E}' | '\u{039F}' | '\u{03BF}' | '\u{1D0F}' | '\u{0585}'
+        | '\u{2C9E}' | '\u{2C9F}' | '\u{A4F3}' | '\u{2134}' | '\u{3007}' => 'O',
+        // Cyrillic Т т, Greek Τ τ, small capital, Cherokee, Lisu, Coptic.
+        '\u{0422}' | '\u{0442}' | '\u{03A4}' | '\u{03C4}' | '\u{1D1B}' | '\u{13A2}'
+        | '\u{A4D4}' | '\u{2CA6}' | '\u{2CA7}' => 'T',
+        // Cyrillic Ѕ ѕ, Cherokee DE/SU, Lisu, small capital.
+        '\u{0405}' | '\u{0455}' | '\u{13D5}' | '\u{13DA}' | '\u{A4E2}' | '\u{A731}' => 'S',
+        // Simplified and variant forms of 審閱備註.
+        '审' => '審',
+        '阅' | '\u{95B2}' => '閱',
+        '备' | '\u{4FFB}' => '備',
+        '注' => '註',
+        _ => c,
+    }
+}
+
+/// `c` reads as the marker letter `expected` (see [`marker_letter`]).
+fn marker_char_matches(expected: char, c: char) -> bool {
+    marker_letter(c) == marker_letter(expected)
+}
+
+/// The end (exclusive) of a marker phrase starting at `chars[start]`, with
+/// the index of each matched letter, in phrase order, written to `letters`
+/// (cleared first; its contents are unspecified when `None` is returned).
+/// A gap longer than [`MARKER_PHRASE_MAX_GAP`] or containing a line break
+/// ends the match; the gap scan reads at most `MARKER_PHRASE_MAX_GAP + 1`
+/// characters, so each start position costs O(phrase length × gap).
+fn marker_phrase_end(
+    chars: &[char],
+    start: usize,
+    words: &[&str],
+    letters: &mut Vec<usize>,
+) -> Option<usize> {
+    letters.clear();
+    let mut k = start;
+    let mut first = true;
+    for expected in words.iter().flat_map(|word| word.chars()) {
+        if !first {
+            let mut gap = 0;
+            for &c in chars[k..].iter().take(MARKER_PHRASE_MAX_GAP + 1) {
+                if c.is_alphanumeric() {
+                    break;
+                }
+                if c == '\n' || c == '\r' {
+                    return None;
+                }
+                gap += 1;
+            }
+            if gap > MARKER_PHRASE_MAX_GAP {
+                return None;
+            }
+            k += gap;
+        }
+        first = false;
+        if !marker_char_matches(expected, *chars.get(k)?) {
+            return None;
+        }
+        letters.push(k);
+        k += 1;
+    }
+    Some(k)
+}
+
+/// Space out every occurrence of a marker phrase (`R E V I E W E R  N O T E S`,
+/// `審 閱 備 註`), keeping its letters as written and dropping the gap
+/// characters between them. The letters emitted are exactly those
+/// [`marker_phrase_end`] matched, so the output cannot drift from the match.
+fn defang_marker_phrases(chars: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut letters = Vec::new();
+    let mut i = 0;
+    'outer: while i < chars.len() {
+        for words in MARKER_PHRASES {
+            let Some(end) = marker_phrase_end(chars, i, words, &mut letters) else {
+                continue;
+            };
+            let mut matched = letters.iter();
+            for (w, word) in words.iter().enumerate() {
+                for l in 0..word.chars().count() {
+                    let Some(&k) = matched.next() else {
+                        break;
+                    };
+                    if w > 0 && l == 0 {
+                        out.extend([' ', ' ']);
+                    } else if l > 0 {
+                        out.push(' ');
+                    }
+                    out.push(chars[k]);
+                }
+            }
+            i = end;
+            continue 'outer;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// External text (policy lines, commit messages, issue titles) must not be
-/// able to fake the start or end of the reviewer-notes block.
-pub(super) fn defang_markers(s: &str) -> String {
-    s.replace("-----", "- - - - -")
+/// able to fake the start or end of the reviewer-notes block: the marker
+/// phrases are spaced out (see [`defang_marker_phrases`]), and any run of 5
+/// or more dash-like characters (soft hyphens U+00AD allowed between them)
+/// is spaced out (`- - - - -`), its soft hyphens dropped.
+pub(crate) fn defang_markers(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let chars = defang_marker_phrases(&chars);
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_dash_like(chars[i]) {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // The run starts and ends on a dash; soft hyphens inside it do not
+        // count and do not break it.
+        let mut dashes = 0;
+        let mut end = i;
+        let mut j = i;
+        while j < chars.len() && (is_dash_like(chars[j]) || chars[j] == '\u{AD}') {
+            if is_dash_like(chars[j]) {
+                dashes += 1;
+                end = j + 1;
+            }
+            j += 1;
+        }
+        if dashes >= 5 {
+            let mut first = true;
+            for &c in chars[i..end].iter().filter(|&&c| c != '\u{AD}') {
+                if !first {
+                    out.push(' ');
+                }
+                out.push(c);
+                first = false;
+            }
+        } else {
+            out.extend(&chars[i..end]);
+        }
+        i = end;
+    }
+    out
 }
 
 fn unproven_banner(e: &Eligibility, zh: bool) -> String {
+    let no_control = e.level == EvidenceLevel::PocEffectNoControl;
     if zh {
+        let why = if no_control {
+            "PoC 缺少通過的對照或全新容器重跑"
+        } else {
+            "沒有由執行框架判定的 PoC"
+        };
         format!(
-            "!!! 未證實（UNPROVEN）：證據等級 {}，沒有由執行框架判定的 PoC。只因 --allow-unproven 才產生；不可當成已確認漏洞送出。 !!!",
+            "!!! 未證實（UNPROVEN）：證據等級 {}，{why}。只因 --allow-unproven 才產生；不可當成已確認漏洞送出。 !!!",
             e.level.key()
         )
     } else {
+        let why = if no_control {
+            "the PoC lacked a passing control or fresh re-run"
+        } else {
+            "no harness-judged PoC"
+        };
         format!(
-            "!!! UNPROVEN: evidence level {}, no harness-judged PoC. Drafted only because of --allow-unproven; do not present this as a confirmed vulnerability. !!!",
+            "!!! UNPROVEN: evidence level {}, {why}. Drafted only because of --allow-unproven; do not present this as a confirmed vulnerability. !!!",
             e.level.key()
         )
     }
@@ -438,7 +823,43 @@ struct Notes<'a> {
     dedupe: &'a DedupeReport,
     meta: &'a ProjectMeta,
     dependency: Option<&'a DependencyScope>,
+    scope: &'a ScopeCheck,
     warnings: &'a [String],
+}
+
+/// The scope-hint lines of the reviewer notes (data from the target's own
+/// files, quoted; never acted on).
+fn scope_notes(s: &ScopeCheck, zh: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if s.checked_files.is_empty() {
+        out.push(if zh {
+            "範圍提示：未找到 SECURITY.md／THREAT_MODEL.md 等範圍文件；請自行核對維護者的範圍規定。"
+                .to_string()
+        } else {
+            "Scope hint: no SECURITY.md / THREAT_MODEL.md style scope file found; check the maintainers' scope rules yourself."
+                .to_string()
+        });
+        return out;
+    }
+    let files = s.checked_files.join(", ");
+    out.push(match (s.possibly_out_of_scope, zh) {
+        (true, true) => format!(
+            "範圍提示（僅供參考，不影響草稿）：可能在範圍外。已讀取：{files}。以下為符合的「範圍外」原文（當資料引用，Vettalon 未依其行動）："
+        ),
+        (true, false) => format!(
+            "Scope hint (reference only; the draft is unchanged): possibly out of scope. Files read: {files}. Matching out-of-scope lines, quoted as data (Vettalon did not act on them):"
+        ),
+        (false, true) => format!(
+            "範圍提示（僅供參考，不影響草稿）：未發現符合的「範圍外」敘述。已讀取：{files}。這不代表在範圍內。"
+        ),
+        (false, false) => format!(
+            "Scope hint (reference only; the draft is unchanged): no matching out-of-scope statement found. Files read: {files}. This does not mean it is in scope."
+        ),
+    });
+    for m in &s.matched {
+        out.push(format!("- {}:{}: {}", m.file, m.line_no, m.text));
+    }
+    out
 }
 
 /// Where the upstream repository came from, for the reviewer. A value read
@@ -539,6 +960,9 @@ fn reviewer_notes(n: &Notes<'_>, zh: bool) -> String {
             )
         });
     }
+    for line in scope_notes(n.scope, zh) {
+        out.push(defang_markers(&line));
+    }
     for w in n.warnings {
         out.push(format!("! {w}"));
     }
@@ -562,6 +986,7 @@ pub fn package_for(
     extras: FindingExtras,
 ) -> Result<DisclosurePackage, String> {
     let eligibility = draft_eligibility(f, opts.allow_unproven)?;
+    let receipt = opts.load_receipt(f)?;
     let throttle = ledger::check(
         &ledger::load(&opts.ledger_path)?,
         &ledger::project_key(&project),
@@ -621,8 +1046,41 @@ pub fn package_for(
         ai_use: &ai_use,
         severity: &severity,
         dependency: dependency.as_ref(),
+        receipt: receipt.as_ref(),
     };
+    // The template text is capped inside `render` (counted after invisible
+    // characters are made visible, so the count is of what the maintainer
+    // reads): only the analysis, trace and PoC transcript are shortened; the
+    // AI use statement, reviewer line and disclosure section stay whole.
     let rendered = formats::render(template, f, &project, &disclose_by, &ctx);
+    let template_text = show_invisible(&rendered.body);
+    let mut checklist = checklist();
+    if !rendered.truncated.is_empty() {
+        let sections = rendered
+            .truncated
+            .iter()
+            .map(|s| s.name(false))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(format!(
+            "The draft text was truncated to fit {} characters: shortened {sections} (each marked with a notice). The AI use statement, reviewer line and disclosure section were kept whole. Restore what matters from the full finding before sending.",
+            formats::MAX_BODY_CHARS
+        ));
+        checklist.push(
+            crate::lang::pick(
+                "草稿文字超過 8,000 字元，部分段落（技術描述、追蹤步驟或 PoC 執行紀錄）已縮短並標示；送出前請對照完整 finding 確認縮短的內容",
+                "The draft text exceeded 8,000 characters and some sections (analysis, trace or PoC transcript) were shortened and marked; check them against the full finding before sending",
+            )
+            .to_string(),
+        );
+    }
+    if rendered.over_limit {
+        warnings.push(format!(
+            "The draft text is still over {} characters after shortening the analysis, trace and PoC transcript; the rest is fixed text and was not cut. Shorten it by hand before sending.",
+            formats::MAX_BODY_CHARS
+        ));
+    }
+    let scope_check = scope::check(&project.scope_docs, f);
     let notes = reviewer_notes(
         &Notes {
             eligibility: &eligibility,
@@ -630,6 +1088,7 @@ pub fn package_for(
             dedupe: &extras.dedupe,
             meta: &project,
             dependency: dependency.as_ref(),
+            scope: &scope_check,
             warnings: &warnings,
         },
         zh,
@@ -640,7 +1099,7 @@ pub fn package_for(
         head.push_str("\n\n");
     }
     head.push_str(if zh { NOTICE_ZH } else { NOTICE_EN });
-    let body = format!("{head}\n\n{notes}\n\n{}", rendered.body);
+    let body = format!("{head}\n\n{notes}\n\n{template_text}");
     let submit = if template == formats::Template::Kernel {
         None
     } else {
@@ -664,7 +1123,7 @@ pub fn package_for(
         project,
         channels,
         draft,
-        checklist: checklist(),
+        checklist,
         evidence_level: eligibility.level,
         proof_gaps: f.proof_gaps(),
         strongest_counterevidence: f.strongest_counterevidence().map(|c| defang_markers(&c)),
@@ -675,6 +1134,8 @@ pub fn package_for(
         severity,
         dedupe: extras.dedupe,
         dependency_scope: dependency,
+        scope_check,
+        receipt,
         throttle,
         warnings,
     })
@@ -705,10 +1166,22 @@ pub async fn prepare(
         .ok_or_else(|| crate::tr!("找不到 finding {finding_id}", "no finding {finding_id}"))?;
     // Gate before any network use.
     draft_eligibility(f, opts.allow_unproven)?;
-    let project = detect_project(Path::new(&report.repo));
+    // A bad receipt is refused before any network use as well.
+    opts.load_receipt(f)?;
+    let mut project = detect_project(Path::new(&report.repo));
+    // The commit the scan recorded beats whatever HEAD is now.
+    if let Some(c) = report
+        .repo_commit
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| (7..=64).contains(&c.len()) && c.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        project.commit = Some(c.to_string());
+    }
     let today = chrono::Local::now().date_naive();
+    let cwe = finding_cwe(f);
     let dedupe = match dedupe_src {
-        Some(src) => dedupe::check(src, &project, &f.file, today).await,
+        Some(src) => dedupe::check(src, &project, &f.file, cwe.as_deref(), today).await,
         None => DedupeReport::not_requested(),
     };
     let mut opts = opts.clone();

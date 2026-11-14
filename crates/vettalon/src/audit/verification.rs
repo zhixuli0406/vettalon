@@ -26,6 +26,7 @@ const MAX_REGISTRY_FILES: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileInput {
+    pub runtime: Option<super::verification_context::RuntimeIdentity>,
     pub finding_id: String,
     pub file: String,
     pub line: Option<u32>,
@@ -38,22 +39,42 @@ pub struct CompileInput {
 }
 
 pub fn compile_ir(input: &CompileInput) -> Result<VerificationIr, &'static str> {
-    if !input.file.ends_with(".py") {
-        return Err("unsupported_verification_language");
+    let language = match input.file.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("py") => Language::Python,
+        Some("js" | "mjs" | "cjs") => Language::JavaScript,
+        Some("ts" | "mts" | "cts") => Language::TypeScript,
+        _ => return Err("unsupported_verification_language"),
+    };
+    if (language == Language::Python) != input.runtime.is_none()
+        || input
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.valid())
+    {
+        return Err("invalid_verification_runtime");
     }
     let (effect_id, effect_kind) = match input.cwe.as_str() {
         "CWE-77" | "CWE-78" => ("command_execution", EffectKind::CommandExecution),
         "CWE-22" | "CWE-73" => ("file_read_outside_root", EffectKind::FileReadOutsideRoot),
         "CWE-89" => ("sql_state_change", EffectKind::SqlStateChange),
+        "CWE-918" => ("loopback_http_request", EffectKind::NetworkEgress),
         _ => return Err("unsupported_effect_spec"),
     };
+    let mut capabilities = vec![
+        Capability::ReadPreparedTree,
+        Capability::WriteEphemeralTemp,
+        Capability::SpawnBoundedProcess,
+    ];
+    if input.cwe == "CWE-918" {
+        capabilities.push(Capability::LoopbackNetwork);
+    }
     let ir = VerificationIr {
         schema: VERIFICATION_IR_SCHEMA.into(),
         subject: SubjectRef {
             file: input.file.clone(),
             line: input.line,
             symbol: Some(input.symbol.clone()),
-            language: Language::Python,
+            language,
         },
         effect: EffectSpec {
             id: effect_id.into(),
@@ -72,12 +93,9 @@ pub fn compile_ir(input: &CompileInput) -> Result<VerificationIr, &'static str> 
                 required: true,
             },
         ],
-        capabilities: vec![
-            Capability::ReadPreparedTree,
-            Capability::WriteEphemeralTemp,
-            Capability::SpawnBoundedProcess,
-        ],
+        capabilities,
         binding: BindingManifest {
+            runtime: input.runtime.clone(),
             finding_id: input.finding_id.clone(),
             source_sha256: input.source_sha256.clone(),
             target_file_sha256: input.target_file_sha256.clone(),

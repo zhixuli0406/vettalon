@@ -58,3 +58,24 @@ path = "fuzz_targets/redaction.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cbom"
+path = "fuzz_targets/cbom.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sarif"
+path = "fuzz_targets/sarif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "java_usage"
+path = "fuzz_targets/java_usage.rs"
+test = false
+doc = false
+bench = false

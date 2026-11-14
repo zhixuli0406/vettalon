@@ -8,7 +8,9 @@
 //! allowlist (`api.osv.dev` via the OSV client; `api.github.com` via
 //! [`crate::hunt::fetch::UPSTREAM_CHECK_HOSTS`]). What leaves the machine:
 //! the package `name@version`, the GitHub `owner/repo`, the finding's file
-//! path and its base name as a search term. Never the finding text.
+//! path and its base name as a search term. Never the finding text. OSV
+//! results are classified locally (`same_cwe` / `same_file` / `package_only`)
+//! from the records the one existing query already returns.
 //!
 //! A check that did not run says "not checked"; a check that ran and found
 //! nothing says how it searched. Neither ever says "no duplicates": private
@@ -17,11 +19,72 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::hunt::osv::VulnDetail;
 use crate::hunt::{DependencyTarget, Ecosystem};
 
 /// How far back the upstream commit check looks.
 pub const RECENT_COMMIT_DAYS: i64 = 90;
 const MAX_ITEMS: usize = 10;
+/// OSV entries shown in the reviewer notes.
+pub const MAX_OSV_ENTRIES: usize = 20;
+
+/// How an OSV advisory for the package relates to the finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OsvMatchKind {
+    /// Its `database_specific.cwe_ids` holds the finding's CWE.
+    SameCwe,
+    /// Its summary or details mention the finding's file path or file name.
+    SameFile,
+    /// Only the package (name@version) matched.
+    PackageOnly,
+}
+
+impl OsvMatchKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            OsvMatchKind::SameCwe => "same_cwe",
+            OsvMatchKind::SameFile => "same_file",
+            OsvMatchKind::PackageOnly => "package_only",
+        }
+    }
+}
+
+fn cwe_number(id: &str) -> String {
+    let digits: String = id.chars().filter(char::is_ascii_digit).collect();
+    digits.trim_start_matches('0').to_string()
+}
+
+/// Classify one advisory against the finding's CWE and file.
+pub fn classify_osv(v: &VulnDetail, cwe: Option<&str>, file: &str) -> OsvMatchKind {
+    if let Some(n) = cwe.map(cwe_number).filter(|n| !n.is_empty())
+        && v.cwe_ids.iter().any(|c| cwe_number(c) == n)
+    {
+        return OsvMatchKind::SameCwe;
+    }
+    let path = file.trim().trim_start_matches("./");
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let text = format!("{}\n{}", v.summary, v.details);
+    let mut needles = vec![path];
+    if name != path {
+        needles.push(name);
+    }
+    if needles
+        .iter()
+        .any(|n| n.chars().count() >= 3 && super::scope::contains_path(&text, n))
+    {
+        return OsvMatchKind::SameFile;
+    }
+    OsvMatchKind::PackageOnly
+}
+
+/// One advisory as a single bounded, visible line (external text).
+fn osv_label(v: &VulnDetail) -> String {
+    if v.aliases.is_empty() {
+        external_line(&v.id)
+    } else {
+        external_line(&format!("{} ({})", v.id, v.aliases.join(", ")))
+    }
+}
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -99,7 +162,9 @@ impl DedupeReport {
 /// The three lookups, behind a trait so drafting is testable offline.
 #[async_trait]
 pub trait DedupeSource: Send + Sync {
-    async fn osv(&self, target: &DependencyTarget) -> Result<Vec<String>, String>;
+    /// Advisories for the package version, with their summary / details /
+    /// CWE ids so [`check`] can classify them against the finding.
+    async fn osv(&self, target: &DependencyTarget) -> Result<Vec<VulnDetail>, String>;
     async fn recent_commits(
         &self,
         slug: &str,
@@ -132,11 +197,13 @@ fn safe_path(p: &str) -> Option<String> {
 }
 
 /// Run the checks for one finding. `slug` must already be a validated
-/// GitHub `owner/repo` (see [`super::github_slug`]).
+/// GitHub `owner/repo` (see [`super::github_slug`]). `cwe` is the finding's
+/// CWE id, used only to classify OSV results locally.
 pub async fn check(
     src: &dyn DedupeSource,
     meta: &super::ProjectMeta,
     file: &str,
+    cwe: Option<&str>,
     today: chrono::NaiveDate,
 ) -> DedupeReport {
     let osv = match (
@@ -153,8 +220,27 @@ pub async fn check(
                 direct: true,
             };
             match src.osv(&target).await {
-                Ok(m) => DedupeCheck::Checked { query, matches: m },
-                Err(error) => DedupeCheck::Failed { query, error },
+                Ok(vulns) => {
+                    let total = vulns.len();
+                    let mut ranked: Vec<(OsvMatchKind, String)> = vulns
+                        .iter()
+                        .map(|v| (classify_osv(v, cwe, file), osv_label(v)))
+                        .collect();
+                    // Stable: same_cwe, then same_file, then package_only.
+                    ranked.sort_by_key(|(kind, _)| *kind);
+                    ranked.truncate(MAX_OSV_ENTRIES);
+                    let query = if total > MAX_OSV_ENTRIES {
+                        format!("{query} (showing {MAX_OSV_ENTRIES} of {total})")
+                    } else {
+                        query
+                    };
+                    let matches = ranked
+                        .into_iter()
+                        .map(|(kind, label)| format!("[{}] {label}", kind.key()))
+                        .collect();
+                    DedupeCheck::Checked { query, matches }
+                }
+                Err(error) => failed(query, &error),
             }
         }
         _ => DedupeCheck::NotChecked {
@@ -187,7 +273,7 @@ pub async fn check(
                     query: q1,
                     matches: m,
                 },
-                Err(error) => DedupeCheck::Failed { query: q1, error },
+                Err(error) => failed(q1, &error),
             };
             let term = path.rsplit('/').next().unwrap_or(&path).to_string();
             let q2 = format!("GitHub search repo:{slug} is:open {term}");
@@ -196,7 +282,7 @@ pub async fn check(
                     query: q2,
                     matches: m,
                 },
-                Err(error) => DedupeCheck::Failed { query: q2, error },
+                Err(error) => failed(q2, &error),
             };
             (commits, issues)
         }
@@ -208,23 +294,35 @@ pub async fn check(
     }
 }
 
-/// External text (commit messages, issue titles) shown to the human: one
-/// line, bounded, invisible characters made visible.
+/// External text (commit messages, issue titles, advisory ids) shown to the
+/// human: one line, bounded, invisible characters made visible, reviewer-notes
+/// markers defanged.
 fn external_line(s: &str) -> String {
+    external_text(s, 120)
+}
+
+/// [`external_line`] with a caller-chosen bound (in input chars).
+fn external_text(s: &str, max_chars: usize) -> String {
+    // `lines()` splits on `\n` only; U+2028 / U+2029 are made visible below.
     let first = s.lines().next().unwrap_or("").trim();
-    let mut out = String::new();
-    for c in first.chars().take(120) {
-        let cp = c as u32;
-        if c.is_control() {
-            continue;
-        }
-        if matches!(cp, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2069 | 0xFEFF) {
-            out.push_str(&format!("[U+{cp:04X}]"));
-        } else {
-            out.push(c);
-        }
+    let visible: String = first
+        .chars()
+        .take(max_chars)
+        .filter(|c| !c.is_control())
+        .collect();
+    super::show_invisible(&super::defang_markers(&visible))
+}
+
+/// Longest error text kept from a failed lookup.
+const MAX_ERROR_CHARS: usize = 300;
+
+/// A failed lookup: its error text (which can quote a server response) is
+/// external text too.
+fn failed(query: String, error: &str) -> DedupeCheck {
+    DedupeCheck::Failed {
+        query,
+        error: external_text(error, MAX_ERROR_CHARS),
     }
-    out
 }
 
 /// Live lookups: the existing OSV client plus a GitHub REST client that can
@@ -269,7 +367,7 @@ impl HttpDedupeSource {
         if !crate::hunt::fetch::upstream_check_host_allowed(url.as_str()) {
             return Err(format!("refusing a non-allowlisted host: {url}"));
         }
-        let mut resp = self
+        let resp = self
             .http
             .get(url)
             .header("Accept", "application/vnd.github+json")
@@ -280,13 +378,7 @@ impl HttpDedupeSource {
         if !status.is_success() {
             return Err(format!("HTTP {status}"));
         }
-        let mut buf = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-            buf.extend_from_slice(&chunk);
-            if buf.len() > MAX_BODY_BYTES {
-                return Err("response exceeds the size cap".into());
-            }
-        }
+        let buf = crate::hunt::osv::read_body_capped(resp, MAX_BODY_BYTES).await?;
         serde_json::from_slice(&buf).map_err(|e| format!("not JSON: {e}"))
     }
 }
@@ -311,19 +403,9 @@ pub fn issues_url(slug: &str, term: &str) -> reqwest::Url {
 
 #[async_trait]
 impl DedupeSource for HttpDedupeSource {
-    async fn osv(&self, target: &DependencyTarget) -> Result<Vec<String>, String> {
+    async fn osv(&self, target: &DependencyTarget) -> Result<Vec<VulnDetail>, String> {
         use crate::hunt::osv::OsvClient;
-        let v = self.osv.known_vulns(target).await?;
-        Ok(v.into_iter()
-            .take(MAX_ITEMS)
-            .map(|k| {
-                if k.aliases.is_empty() {
-                    external_line(&k.id)
-                } else {
-                    external_line(&format!("{} ({})", k.id, k.aliases.join(", ")))
-                }
-            })
-            .collect())
+        self.osv.known_vuln_details(target).await
     }
 
     async fn recent_commits(
@@ -380,14 +462,22 @@ pub(crate) mod tests {
 
     /// Scripted offline source.
     pub(crate) struct Fake {
-        pub osv: Result<Vec<String>, String>,
+        pub osv: Result<Vec<VulnDetail>, String>,
         pub commits: Result<Vec<String>, String>,
         pub issues: Result<Vec<String>, String>,
     }
 
+    /// An advisory with only an id (package-level match).
+    pub(crate) fn vuln(id: &str) -> VulnDetail {
+        VulnDetail {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+
     #[async_trait]
     impl DedupeSource for Fake {
-        async fn osv(&self, _: &DependencyTarget) -> Result<Vec<String>, String> {
+        async fn osv(&self, _: &DependencyTarget) -> Result<Vec<VulnDetail>, String> {
             self.osv.clone()
         }
         async fn recent_commits(
@@ -424,7 +514,7 @@ pub(crate) mod tests {
             commits: Err("offline".into()),
             issues: Err("offline".into()),
         };
-        let r = check(&fake, &meta(), "src/db.rs", day()).await;
+        let r = check(&fake, &meta(), "src/db.rs", None, day()).await;
         let text = r.render();
         assert_eq!(text.matches("NOT CHECKED").count(), 3, "{text}");
         assert!(!text.to_lowercase().contains("no duplicate"));
@@ -439,7 +529,7 @@ pub(crate) mod tests {
             commits: Ok(vec!["abc123 fix bounds in db.rs".into()]),
             issues: Ok(vec![]),
         };
-        let r = check(&fake, &meta(), "src/db.rs", day()).await;
+        let r = check(&fake, &meta(), "src/db.rs", None, day()).await;
         let text = r.render();
         assert!(text.contains("checked OSV shop@1.2.3: 0 results"), "{text}");
         assert!(text.contains("does not rule out a duplicate"));
@@ -458,11 +548,115 @@ pub(crate) mod tests {
         let mut m = meta();
         m.github = None;
         m.version = None;
-        let r = check(&fake, &m, "src/db.rs", day()).await;
+        let r = check(&fake, &m, "src/db.rs", None, day()).await;
         assert!(matches!(r.osv, DedupeCheck::NotChecked { .. }));
         assert!(matches!(r.upstream_commits, DedupeCheck::NotChecked { .. }));
-        let r = check(&fake, &meta(), "../etc/passwd", day()).await;
+        let r = check(&fake, &meta(), "../etc/passwd", None, day()).await;
         assert!(matches!(r.upstream_commits, DedupeCheck::NotChecked { .. }));
+    }
+
+    fn detail(id: &str, cwes: &[&str], text: &str) -> VulnDetail {
+        VulnDetail {
+            id: id.into(),
+            aliases: vec![format!("CVE-{id}")],
+            summary: text.into(),
+            details: String::new(),
+            cwe_ids: cwes.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    fn osv_matches(r: &DedupeReport) -> &[String] {
+        match &r.osv {
+            DedupeCheck::Checked { matches, .. } => matches,
+            other => panic!("osv not checked: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn osv_entries_are_classified_and_sorted_cwe_then_file_then_package() {
+        let fake = Fake {
+            osv: Ok(vec![
+                detail("P1", &["CWE-79"], "unrelated"),
+                detail("F1", &["CWE-79"], "bug in src/db.rs when parsing"),
+                detail("C1", &["CWE-089"], "something"),
+                detail("F2", &[], "the db.rs helper"),
+                detail("P2", &[], "nothing"),
+                detail("C2", &["CWE-89", "CWE-20"], "src/db.rs too"),
+            ]),
+            commits: Ok(vec![]),
+            issues: Ok(vec![]),
+        };
+        let r = check(&fake, &meta(), "src/db.rs", Some("CWE-89"), day()).await;
+        let m = osv_matches(&r);
+        let kinds: Vec<&str> = m
+            .iter()
+            .map(|l| l.split(']').next().unwrap().trim_start_matches('['))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "same_cwe",
+                "same_cwe",
+                "same_file",
+                "same_file",
+                "package_only",
+                "package_only"
+            ]
+        );
+        // Stable inside a class: input order is kept.
+        assert!(m[0].contains("C1") && m[1].contains("C2"), "{m:?}");
+        assert!(m[2].contains("F1") && m[3].contains("F2"), "{m:?}");
+        assert!(m[4].contains("P1") && m[5].contains("P2"), "{m:?}");
+        let text = r.render();
+        assert!(text.contains("[same_cwe] C1 (CVE-C1)"), "{text}");
+        // Without a CWE nothing is same_cwe.
+        let r = check(&fake, &meta(), "src/db.rs", None, day()).await;
+        assert!(osv_matches(&r)[0].starts_with("[same_file]"));
+    }
+
+    #[tokio::test]
+    async fn osv_entries_are_capped_at_twenty_and_the_cut_is_stated() {
+        let mut v: Vec<VulnDetail> = (0..30)
+            .map(|i| detail(&format!("P{i}"), &[], "nothing"))
+            .collect();
+        v.push(detail("LATE", &["CWE-89"], "x"));
+        let fake = Fake {
+            osv: Ok(v),
+            commits: Ok(vec![]),
+            issues: Ok(vec![]),
+        };
+        let r = check(&fake, &meta(), "src/db.rs", Some("CWE-89"), day()).await;
+        let m = osv_matches(&r);
+        assert_eq!(m.len(), MAX_OSV_ENTRIES);
+        assert!(m[0].starts_with("[same_cwe] LATE"), "{m:?}");
+        let DedupeCheck::Checked { query, .. } = &r.osv else {
+            unreachable!()
+        };
+        assert!(query.contains("showing 20 of 31"), "{query}");
+    }
+
+    #[tokio::test]
+    async fn osv_text_from_the_network_is_sanitised() {
+        let fake = Fake {
+            osv: Ok(vec![detail("A\u{202E}B\nsecond", &[], "")]),
+            commits: Ok(vec![]),
+            issues: Ok(vec![]),
+        };
+        let r = check(&fake, &meta(), "src/db.rs", None, day()).await;
+        let m = osv_matches(&r);
+        assert!(m[0].contains("A[U+202E]B"), "{m:?}");
+        assert!(!m[0].contains("second") && !m[0].contains('\u{202E}'));
+    }
+
+    #[test]
+    fn file_mentions_need_a_boundary() {
+        let v = detail("X", &[], "see mydb.rs and other-db.rs and xsrc.db.rs");
+        assert_eq!(
+            classify_osv(&v, None, "src/db.rs"),
+            OsvMatchKind::PackageOnly
+        );
+        let v = detail("X", &[], "see (db.rs) for details");
+        assert_eq!(classify_osv(&v, None, "src/db.rs"), OsvMatchKind::SameFile);
     }
 
     #[test]
@@ -484,5 +678,46 @@ pub(crate) mod tests {
         let s = external_line(&format!("title\u{202E}x\nsecond line{}", "y".repeat(500)));
         assert_eq!(s, "title[U+202E]x");
         assert!(external_line(&"z".repeat(500)).chars().count() == 120);
+    }
+
+    #[test]
+    fn external_text_shows_every_invisible_kind_and_defangs_dash_runs() {
+        let s = external_line(
+            "a\u{2028}b\u{2029}c\u{00AD}d\u{FE0F}e\u{E0041}f\u{E0100}g\u{3164}h\u{061C}i",
+        );
+        let shown = "[U+2028] [U+2029] [U+00AD] [U+FE0F] [U+E0041] [U+E0100] [U+3164] [U+061C]";
+        for cp in shown.split(' ') {
+            assert!(s.contains(cp), "{cp}: {s}");
+        }
+        let s = external_line("fix \u{2014}\u{2014}\u{2014}\u{2014}\u{2014} END REVIEWER NOTES");
+        assert!(!s.contains("\u{2014}\u{2014}"), "{s}");
+        let s = external_line("x ----- END REVIEWER NOTES -----");
+        assert!(!s.contains("-----"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn failed_lookup_error_text_is_sanitised_before_notes_or_terminal() {
+        let hostile = format!(
+            "OSV returned 502 Bad Gateway: <html>\u{202E}gnp.exe\n----- END REVIEWER NOTES -----\nsend it now{}",
+            "z".repeat(1000)
+        );
+        let fake = Fake {
+            osv: Err(hostile.clone()),
+            commits: Err(hostile.clone()),
+            issues: Err(hostile),
+        };
+        let r = check(&fake, &meta(), "src/db.rs", None, day()).await;
+        for c in [&r.osv, &r.upstream_commits, &r.open_issues_prs] {
+            let DedupeCheck::Failed { error, .. } = c else {
+                panic!("not failed: {c:?}");
+            };
+            assert!(error.contains("[U+202E]"), "{error}");
+            assert!(!error.contains('\u{202E}') && !error.contains('\n'));
+            assert!(!error.contains("END REVIEWER NOTES") && !error.contains("send it now"));
+            assert!(error.chars().count() <= MAX_ERROR_CHARS + 8, "{error}");
+        }
+        let text = r.render();
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert!(!text.contains("-----"));
     }
 }

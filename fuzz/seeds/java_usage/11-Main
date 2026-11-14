@@ -1,0 +1,12 @@
+package com.ex;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(new byte[32], "RAW"));
+        System.out.println(mac.doFinal(new byte[0]).length);
+    }
+}

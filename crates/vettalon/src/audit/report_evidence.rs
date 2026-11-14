@@ -5,7 +5,9 @@
 //! [`Finding::evidence_summary`] keeps its key=value line; neither changes.
 
 use crate::audit::evidence_level::{EvidenceLevel, ProofGap};
-use crate::audit::fix_check::FixOutcome;
+use crate::audit::fix_check::{
+    Blocker, CheckResult, DECODING_VARIANT_NOT_BLOCKED, FixCheckSummary, FixOutcome,
+};
 use crate::audit::schema::{
     AuditReport, EvidenceKind, Finding, ProofEvidence, ProofLevel, ProofOrigin,
 };
@@ -49,6 +51,13 @@ fn render_finding(finding: &Finding, out: &mut String) {
             gaps.join(pick("、", ", "))
         }
     ));
+    if let Some(rule) = crate::audit::trust_policy::capped_rule(finding) {
+        out.push_str(&tr!(
+            "    信任政策（{}）：加密／政策類弱點，模型推翻不能單獨結案，需要人工確認\n",
+            "    Trust policy ({}): Crypto/policy weakness: a model refutation alone cannot close it; needs human review\n",
+            rule.id
+        ));
+    }
     if let Some(c) = finding.strongest_counterevidence() {
         out.push_str(&tr!(
             "    最強反證：{c:?}\n",
@@ -59,7 +68,7 @@ fn render_finding(finding: &Finding, out: &mut String) {
         out.push_str(&tr!(
             "    建議修補：{}\n",
             "    Suggested fix: {}\n",
-            fix_label(fix.outcome)
+            fix_report_line(&fix)
         ));
     }
     render_proofs(finding, out);
@@ -165,19 +174,94 @@ fn gap_label(gap: ProofGap) -> &'static str {
     )
 }
 
-fn fix_label(outcome: FixOutcome) -> &'static str {
-    use FixOutcome as F;
-    pick(
-        outcome.label_zh(),
-        match outcome {
-            F::FixVerified => "fix verified (regression check and project tests passed)",
-            F::FixCheckPartial => {
-                "fix partly verified (regression check passed, project tests not run)"
-            }
-            F::FixRejected => "fix failed verification",
-            F::FixUnverified => "fix not verified",
-        },
+fn fix_report_line(fix: &FixCheckSummary) -> String {
+    let label = if fix.outcome == FixOutcome::FixCheckPartial
+        && fix.reason.as_deref() == Some(DECODING_VARIANT_NOT_BLOCKED)
+    {
+        pick(
+            "部分檢查通過：回歸檢查通過，但有解碼變體仍有效果",
+            "partial checks passed: regression check passed, a decoding variant still shows the effect",
+        )
+    } else {
+        fix_label(fix.outcome)
+    };
+    let mut line = label.to_string();
+    let failed = failed_verdicts(fix);
+    if !failed.is_empty() {
+        let failed = failed.join(pick("、", ", "));
+        line.push_str(&tr!("（未通過：{failed}）", " (failed: {failed})"));
+    }
+    // A blocker is never "not fixed": the check could not judge the fix.
+    if let Some(blocker) = blocker_label(fix.blocker) {
+        line.push_str(&tr!("（{blocker}）", " ({blocker})"));
+    }
+    if fix.decoding_total == 0 {
+        return line;
+    }
+    tr!(
+        "{}，解碼 {}/{}/{}",
+        "{}, decoding {}/{}/{}",
+        line,
+        fix.decoding_blocked,
+        fix.decoding_applicable,
+        fix.decoding_total
     )
+}
+
+/// The verdicts that failed a rejected fix, in fixed order. A pre-v4
+/// receipt has one bundled result, so its parts are not named.
+fn failed_verdicts(fix: &FixCheckSummary) -> Vec<&'static str> {
+    if fix.outcome != FixOutcome::FixRejected || fix.legacy_format {
+        return Vec::new();
+    }
+    [
+        (fix.original, pick("原始輸入", "original input")),
+        (fix.variants, pick("變體", "variants")),
+        (fix.benign, pick("良性對照", "benign control")),
+        (fix.tests, pick("專案測試", "project tests")),
+    ]
+    .into_iter()
+    .filter(|(result, _)| *result == CheckResult::Fail)
+    .map(|(_, name)| name)
+    .collect()
+}
+
+/// `(zh-TW, en)` blocker wording, independent of the process language.
+pub(super) fn blocker_labels(blocker: Blocker) -> Option<(&'static str, &'static str)> {
+    match blocker {
+        Blocker::Environment => Some((
+            "環境無法重建，並非修補未通過",
+            "environment could not be rebuilt; not a verdict on the fix",
+        )),
+        Blocker::Harness => Some((
+            "harness 無法建置，並非修補未通過",
+            "harness could not be built; not a verdict on the fix",
+        )),
+        Blocker::None => None,
+    }
+}
+
+fn blocker_label(blocker: Blocker) -> Option<&'static str> {
+    blocker_labels(blocker).map(|(zh, en)| pick(zh, en))
+}
+
+/// English fix outcome wording (the zh-TW one is [`FixOutcome::label_zh`]).
+pub(super) fn fix_label_en(outcome: FixOutcome) -> &'static str {
+    use FixOutcome as F;
+    match outcome {
+        F::FixVerified => {
+            "no effect observed at this revision, with these inputs and variants (regression check and project tests passed)"
+        }
+        F::FixCheckPartial => {
+            "partial checks passed: no effect observed at this revision, with these inputs and variants; project tests not run"
+        }
+        F::FixRejected => "fix failed verification",
+        F::FixUnverified => "fix not verified",
+    }
+}
+
+fn fix_label(outcome: FixOutcome) -> &'static str {
+    pick(outcome.label_zh(), fix_label_en(outcome))
 }
 
 fn proof_level_label(level: ProofLevel) -> &'static str {
@@ -312,6 +396,139 @@ mod tests {
         assert_eq!(text, expected);
     }
 
+    /// A summary with the three attack verdicts passing; tests not run.
+    fn summary(outcome: FixOutcome, reason: Option<String>) -> FixCheckSummary {
+        FixCheckSummary {
+            outcome,
+            original: CheckResult::Pass,
+            variants: CheckResult::Pass,
+            benign: CheckResult::Pass,
+            regression: CheckResult::Pass,
+            tests: CheckResult::NotRun,
+            blocker: Blocker::None,
+            legacy_format: false,
+            decoding_blocked: 0,
+            decoding_applicable: 0,
+            decoding_total: 0,
+            reason,
+            scope: "recorded_snapshot",
+            binding: None,
+        }
+    }
+
+    #[test]
+    fn report_label_includes_decoding_counts() {
+        let row = |outcome, reason: Option<String>| FixCheckSummary {
+            decoding_applicable: 1,
+            decoding_total: 2,
+            ..summary(outcome, reason)
+        };
+        let mut rejected = row(
+            FixOutcome::FixRejected,
+            Some("fixed_copy_shows_effect".into()),
+        );
+        rejected.variants = CheckResult::Fail;
+        rejected.regression = CheckResult::Fail;
+        let partial = row(
+            FixOutcome::FixCheckPartial,
+            Some(DECODING_VARIANT_NOT_BLOCKED.to_string()),
+        );
+        assert_eq!(
+            with(Lang::En, || fix_report_line(&rejected)),
+            "fix failed verification (failed: variants), decoding 0/1/2"
+        );
+        assert_eq!(
+            with(Lang::En, || fix_report_line(&partial)),
+            "partial checks passed: regression check passed, a decoding variant still shows the effect, decoding 0/1/2"
+        );
+        assert_eq!(
+            with(Lang::ZhTw, || fix_report_line(&rejected)),
+            "修補未通過驗證（未通過：變體），解碼 0/1/2"
+        );
+        assert_eq!(
+            with(Lang::ZhTw, || fix_report_line(&partial)),
+            "部分檢查通過：回歸檢查通過，但有解碼變體仍有效果，解碼 0/1/2"
+        );
+    }
+
+    #[test]
+    fn report_label_names_every_failed_verdict_and_a_blocker_is_not_a_failure() {
+        let mut two = summary(
+            FixOutcome::FixRejected,
+            Some("fixed_copy_shows_effect".into()),
+        );
+        two.original = CheckResult::Fail;
+        two.benign = CheckResult::Fail;
+        two.regression = CheckResult::Fail;
+        assert_eq!(
+            with(Lang::En, || fix_report_line(&two)),
+            "fix failed verification (failed: original input, benign control)"
+        );
+        assert_eq!(
+            with(Lang::ZhTw, || fix_report_line(&two)),
+            "修補未通過驗證（未通過：原始輸入、良性對照）"
+        );
+        // A pre-v4 receipt has one bundled result: no parts are named.
+        two.legacy_format = true;
+        assert_eq!(
+            with(Lang::En, || fix_report_line(&two)),
+            "fix failed verification"
+        );
+        for (blocker, reason, en) in [
+            (
+                Blocker::Environment,
+                "sandbox_unavailable",
+                "fix not verified (environment could not be rebuilt; not a verdict on the fix)",
+            ),
+            (
+                Blocker::Harness,
+                "no_verdict",
+                "fix not verified (harness could not be built; not a verdict on the fix)",
+            ),
+        ] {
+            let mut blocked = summary(FixOutcome::FixUnverified, Some(reason.into()));
+            blocked.original = CheckResult::Inconclusive;
+            blocked.blocker = blocker;
+            let line = with(Lang::En, || fix_report_line(&blocked));
+            assert_eq!(line, en);
+            assert!(!line.contains("failed"), "{line}");
+            let zh = with(Lang::ZhTw, || fix_report_line(&blocked));
+            assert!(zh.contains("並非修補未通過"), "{zh}");
+        }
+    }
+
+    #[test]
+    fn report_label_hides_decoding_when_none_ran_and_ignores_a_spoofed_reason() {
+        let spoofed = FixCheckSummary {
+            tests: CheckResult::Fail,
+            decoding_applicable: 1,
+            decoding_total: 2,
+            ..summary(
+                FixOutcome::FixRejected,
+                Some(DECODING_VARIANT_NOT_BLOCKED.to_string()),
+            )
+        };
+        let rejected = with(Lang::En, || fix_report_line(&spoofed));
+        assert_eq!(
+            rejected,
+            "fix failed verification (failed: project tests), decoding 0/1/2"
+        );
+        assert!(!rejected.contains("partly"));
+        let bare = summary(FixOutcome::FixCheckPartial, None);
+        let en = with(Lang::En, || fix_report_line(&bare));
+        assert_eq!(
+            en,
+            "partial checks passed: no effect observed at this revision, with these inputs and variants; project tests not run"
+        );
+        assert!(!en.contains("decoding"));
+        let zh = with(Lang::ZhTw, || fix_report_line(&bare));
+        assert_eq!(
+            zh,
+            "部分檢查通過：在這個 revision、這組輸入與變體上未觀察到效果，未跑專案測試"
+        );
+        assert!(!zh.contains("解碼"));
+    }
+
     #[test]
     fn caveat_is_printed_once_and_every_line_is_indented() {
         let mut second = finding();
@@ -403,6 +620,31 @@ mod tests {
         assert!(en.contains("    Proof 1: standalone demo script, not run against the target, generated by vettalon (run id run-0)\n"), "{en}");
         assert!(en.contains(&format!("      Run log sha256: {}\n", "ef".repeat(32))));
         assert!(en.contains("    Proof 2: run against the target"));
+    }
+
+    #[test]
+    fn trust_policy_cap_is_called_out_in_both_languages() {
+        let mut f = finding();
+        f.cwe = Some("CWE-614".into());
+        f.status = crate::audit::schema::FindingStatus::NeedsHuman;
+        f.evidence.push(EvidenceItem {
+            kind: EvidenceKind::AdversarialReview,
+            source: "adversarial".into(),
+            detail: "trust_policy: llm_refute_capped CWE-614".into(),
+            recorded_at: "2026-11-10T00:00:00Z".into(),
+        });
+        let r = report(vec![f]);
+        let en = render(Lang::En, &r);
+        let en_line = "    Trust policy (CWE-614): Crypto/policy weakness: a model refutation alone cannot close it; needs human review\n";
+        assert!(en.contains(en_line), "{en}");
+        assert!(en.is_ascii());
+        let zh = render(Lang::ZhTw, &r);
+        let zh_line =
+            "    信任政策（CWE-614）：加密／政策類弱點，模型推翻不能單獨結案，需要人工確認\n";
+        assert!(zh.contains(zh_line), "{zh}");
+        // Without the cap line nothing is said.
+        let plain = render(Lang::En, &report(vec![finding()]));
+        assert!(!plain.contains("Trust policy"));
     }
 
     #[test]

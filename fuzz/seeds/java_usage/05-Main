@@ -1,0 +1,14 @@
+package com.ex;
+
+import javax.crypto.Mac;
+
+public class Main {
+    static String macName() {
+        return "HmacSHA256";
+    }
+
+    public static void main(String[] args) throws Exception {
+        Mac m = Mac.getInstance(macName());
+        System.out.println(m.getAlgorithm());
+    }
+}

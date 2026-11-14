@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"namules":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-injection","omponent":{"in44dex":0}}],"locations"

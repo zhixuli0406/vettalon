@@ -1,0 +1,1 @@
+{"$schema":"https://docs.osaos-iepn.org/sar1.0/errata01/os/schemas/sarif-schema-2.1.0.json","version":"2.1&0","runs":[{"tool":{"driver":{"name":"vettalon","rules":[{"id":"rule/x","shor{"versio)n":"21

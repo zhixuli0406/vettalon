@@ -13,13 +13,23 @@
 //!   `Confirmed` is valid only with that operator provenance (either
 //!   marker). `Refuted` and `Suppressed` are valid with operator provenance
 //!   OR an `adversarial_review` evidence item (verifier verdict, pre-check,
-//!   or `carried_from_prior:`).
+//!   or `carried_from_prior:`). For a CWE the per-CWE trust policy caps
+//!   (`trust_policy::RULES`), `Refuted` additionally needs an operator
+//!   decision, a failed pre-check or the carried-refutation line
+//!   `trust_policy: carried_refutation <cwe>`: a `refuted:` model line alone
+//!   is a violation. A report saved before the policy existed is not read
+//!   with a tolerant check: every load path first runs
+//!   `trust_policy::migrate_capped_refutations` (the finding is reopened at
+//!   `NeedsHuman`), then this strict validator.
 //! - Summary after a dashboard edit: the gateway recomputes
 //!   `by_severity` / `needs_human_by_severity` (rule:
 //!   `schema::severity_buckets`) and `ai_audit_refuted` /
 //!   `ai_audit_needs_human`, so every summary field is compared strictly,
 //!   operator-edited or not. Blockers left on a
 //!   former `NeedsHuman` finding the operator settled are allowed.
+//! - `NeedsHuman` needs a `plausible:` verdict, or the per-CWE trust-policy
+//!   line `trust_policy: llm_refute_capped <the finding's own capped CWE>`
+//!   (a model refutation that may not close the finding on its own).
 //! - `verifier.independence = not_run` means no finding carries evidence
 //!   from the verifier (`source == "adversarial"`).
 //! - A finding the pre-check refuted keeps the model's claim verbatim (it
@@ -73,6 +83,14 @@ pub enum ReportViolation {
     },
     RefutedWithoutReviewEvidence {
         id: String,
+    },
+    /// Per-CWE trust policy: a `Refuted` finding of a capped CWE has no
+    /// operator decision, failed pre-check or carried non-model refutation
+    /// (`trust_policy: carried_refutation <cwe>`); a model `refuted:` line
+    /// alone may not close it.
+    RefutedCappedCweByModelOnly {
+        id: String,
+        cwe: &'static str,
     },
     NeedsHumanWithoutPlausible {
         id: String,
@@ -147,6 +165,10 @@ impl fmt::Display for ReportViolation {
             RefutedWithoutReviewEvidence { id } => write!(
                 f,
                 "finding {id}: refuted without adversarial_review evidence (verifier, precheck or carried) or an operator decision"
+            ),
+            RefutedCappedCweByModelOnly { id, cwe } => write!(
+                f,
+                "finding {id}: refuted {cwe} without an operator decision, a failed pre-check or a carried non-model refutation (a model refutation alone cannot close {cwe})"
             ),
             NeedsHumanWithoutPlausible { id } => {
                 write!(
@@ -265,11 +287,27 @@ fn check_finding(f: &Finding, out: &mut Vec<ReportViolation>) {
         FindingStatus::Refuted if !(has_review || by_operator) => {
             out.push(ReportViolation::RefutedWithoutReviewEvidence { id: id() })
         }
+        FindingStatus::Refuted => {
+            // Per-CWE trust policy: a capped CWE is closed only by an
+            // operator, a failed pre-check or a carried refutation of that
+            // kind, never by a `refuted:` model line alone.
+            if let Some(rule) = super::trust_policy::llm_refute_cap(f.cwe.as_deref())
+                && !super::trust_policy::is_deterministic_refutation(f, Some(rule))
+            {
+                out.push(ReportViolation::RefutedCappedCweByModelOnly {
+                    id: id(),
+                    cwe: rule.id,
+                });
+            }
+        }
         FindingStatus::NeedsHuman => {
             let plausible = f.evidence.iter().any(|e| {
                 e.kind == EvidenceKind::AdversarialReview && e.detail.starts_with(PLAUSIBLE_PREFIX)
             });
-            if !plausible {
+            // Per-CWE trust policy: a model refutation of a capped CWE is
+            // parked here instead of closing the finding.
+            let capped = super::trust_policy::capped_rule(f).is_some();
+            if !plausible && !capped {
                 out.push(ReportViolation::NeedsHumanWithoutPlausible { id: id() });
             }
             if f.blockers.is_empty() {
@@ -1211,6 +1249,160 @@ mod tests {
         assert!(v.contains(&ReportViolation::NeedsHumanWithoutPlausible { id: id.clone() }));
         assert!(v.contains(&ReportViolation::NeedsHumanWithoutBlockers { id: id.clone() }));
         assert!(v.contains(&ReportViolation::NeedsHumanWithoutValidationPlan { id }));
+    }
+
+    #[test]
+    fn needs_human_from_a_trust_policy_cap_needs_its_own_cwe_line() {
+        let mut f = needs_human("src/a.rs");
+        f.evidence.clear();
+        f.cwe = Some("CWE-327".into());
+        f.evidence.push(ev("adversarial", "refuted: r"));
+        f.evidence
+            .push(ev("adversarial", "trust_policy: llm_refute_capped CWE-327"));
+        assert_eq!(only(&report(vec![f.clone()], vec![])), vec![]);
+        // The line must name the finding's own (capped) CWE.
+        f.cwe = Some("CWE-78".into());
+        let id = f.id.clone();
+        assert_eq!(
+            only(&report(vec![f], vec![])),
+            vec![ReportViolation::NeedsHumanWithoutPlausible { id }]
+        );
+    }
+
+    #[test]
+    fn refuted_capped_cwe_needs_an_operator_precheck_or_carried_basis() {
+        let mut f = scanner("src/a.rs");
+        f.status = FindingStatus::Refuted;
+        f.cwe = Some("external/cwe/cwe-614".into());
+        f.evidence
+            .push(ev("adversarial", "refuted: cookie is not sensitive"));
+        f.evidence.push(ev(
+            "prior_run",
+            "carried_from_prior: 2026.json (prior status refuted, source unchanged)",
+        ));
+        let model_only = report(vec![f.clone()], vec![]);
+        let want = ReportViolation::RefutedCappedCweByModelOnly {
+            id: f.id.clone(),
+            cwe: "CWE-614",
+        };
+        assert_eq!(only(&model_only), vec![want.clone()]);
+        assert!(
+            want.to_string()
+                .contains("model refutation alone cannot close CWE-614")
+        );
+        // A carried non-model refutation for this CWE is a basis.
+        let mut carried = f.clone();
+        carried
+            .evidence
+            .push(ev("prior_run", "trust_policy: carried_refutation CWE-614"));
+        assert_eq!(only(&report(vec![carried], vec![])), vec![]);
+        // ...but not for another CWE.
+        let mut wrong = f.clone();
+        wrong
+            .evidence
+            .push(ev("prior_run", "trust_policy: carried_refutation CWE-327"));
+        assert_eq!(only(&report(vec![wrong], vec![])), vec![want]);
+        // An operator decision or a failed pre-check is a basis.
+        let mut op = f.clone();
+        op.evidence.push(EvidenceItem {
+            kind: EvidenceKind::OperatorReview,
+            source: "dashboard".into(),
+            detail: "operator_decision: refuted".into(),
+            recorded_at: "t".into(),
+        });
+        op.severity_basis = SeverityBasis::Operator;
+        assert_eq!(only(&report(vec![op], vec![])), vec![]);
+        let mut pre = f.clone();
+        crate::audit::precheck::apply_precheck(&mut pre, vec!["line out of range".into()]);
+        pre.status = FindingStatus::Refuted;
+        assert_eq!(only(&report(vec![pre], vec![])), vec![]);
+        // Uncapped CWEs keep the old rule.
+        let mut uncapped = f.clone();
+        uncapped.cwe = Some("CWE-78".into());
+        assert_eq!(only(&report(vec![uncapped], vec![])), vec![]);
+    }
+
+    /// N1: a report saved before the trust policy is migrated on read, then
+    /// validated strictly.
+    #[test]
+    fn migration_reopens_pre_policy_model_refutations_then_validates_strictly() {
+        use crate::audit::trust_policy::migrate_capped_refutations;
+        let refuted = |file: &str, cwe: &str| {
+            let mut f = ai(file);
+            f.status = FindingStatus::Refuted;
+            f.cwe = Some(cwe.into());
+            f.evidence.push(ev("adversarial", "refuted: constant key"));
+            f
+        };
+        let model_only = refuted("src/a.rs", "CWE-327");
+        let mut op = refuted("src/b.rs", "CWE-328");
+        op.evidence.push(EvidenceItem {
+            kind: EvidenceKind::OperatorReview,
+            source: "dashboard".into(),
+            detail: "operator_decision: refuted".into(),
+            recorded_at: "t".into(),
+        });
+        op.severity_basis = SeverityBasis::Operator;
+        let mut carried = refuted("src/c.rs", "CWE-501");
+        carried
+            .evidence
+            .push(ev("prior_run", "trust_policy: carried_refutation CWE-501"));
+        let uncapped = refuted("src/d.rs", "CWE-78");
+        let mut no_review = ai("src/e.rs");
+        no_review.status = FindingStatus::Refuted;
+        no_review.cwe = Some("CWE-614".into());
+        let mut r = report(
+            vec![model_only, op, carried, uncapped, no_review.clone()],
+            vec![],
+        );
+        let mut strict = only(&r);
+        strict.retain(|v| !matches!(v, ReportViolation::RefutedWithoutReviewEvidence { .. }));
+        assert_eq!(
+            strict,
+            vec![ReportViolation::RefutedCappedCweByModelOnly {
+                id: r.findings[0].id.clone(),
+                cwe: "CWE-327"
+            }]
+        );
+        // The finding with no review evidence is not the policy's case: it
+        // stays invalid (migration does not repair other violations).
+        r.findings.pop();
+        r.summary = Summary::from_findings(&r.findings, 0, 0, GatePolicy::default(), &[]);
+        let before_refuted = r.summary.ai_audit_refuted;
+        let before = r.clone();
+        assert_eq!(migrate_capped_refutations(&mut r), 1);
+        let f = &r.findings[0];
+        assert_eq!(f.status, FindingStatus::NeedsHuman);
+        assert_eq!(f.blockers.len(), 1);
+        assert!(f.validation_plan.as_ref().is_some_and(|p| !p.is_empty()));
+        let line = f.evidence.last().unwrap();
+        assert_eq!(line.detail, "trust_policy: llm_refute_capped CWE-327");
+        assert_eq!(line.recorded_at, r.started_at, "deterministic on re-read");
+        assert_eq!(
+            line.source,
+            crate::audit::trust_policy::MIGRATION_SOURCE,
+            "no verifier ran"
+        );
+        // Operator, carried and uncapped refutations are untouched.
+        assert_eq!(
+            serde_json::to_value(&r.findings[1..]).unwrap(),
+            serde_json::to_value(&before.findings[1..]).unwrap()
+        );
+        // The summary follows the findings, and the strict check passes.
+        assert_eq!(r.summary.ai_audit_refuted, before_refuted - 1);
+        assert_eq!(only(&r), vec![]);
+        // Idempotent.
+        let once = r.clone();
+        assert_eq!(migrate_capped_refutations(&mut r), 0);
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            serde_json::to_string(&once).unwrap()
+        );
+        // A refuted finding without review evidence is left for the
+        // validator to reject.
+        let mut bad = report(vec![no_review], vec![]);
+        assert_eq!(migrate_capped_refutations(&mut bad), 0);
+        assert!(!only(&bad).is_empty());
     }
 
     #[test]

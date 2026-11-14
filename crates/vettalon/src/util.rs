@@ -254,55 +254,165 @@ pub fn validate_local_git_metadata(repo_root: &Path) -> Result<PathBuf, String> 
         }
     }
 
-    validate_git_tree_has_no_symlinks(&git_dir)?;
+    validate_git_tree_entries(&git_dir)?;
 
+    // Only a regular file is read: a FIFO (possible in a directory unpacked
+    // from an archive) would block the read, and so the scan, forever. The
+    // tree walk above already refuses one; this re-check covers a swap.
+    const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
     for config in [git_dir.join("config"), git_dir.join("config.worktree")] {
-        const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
-        let name = config.strip_prefix(&git_dir).unwrap_or(&config).display();
+        let name = config.strip_prefix(&git_dir).unwrap_or(&config);
         match read_regular_file(&config, MAX_GIT_CONFIG_BYTES) {
             Ok(_) => {}
-            Err(RegularFileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(RegularFileError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(RegularFileError::NotRegular) => {
-                return Err(format!("{name} is not a regular file"));
+                return Err(format!("{name:?} is not a regular file"));
             }
             Err(RegularFileError::TooLarge) => {
-                return Err(format!("{name} exceeds the validation limit"));
+                return Err(format!("{} exceeds the validation limit", name.display()));
             }
-            Err(RegularFileError::Io(error)) => {
-                return Err(format!("cannot read {}: {error}", config.display()));
+            Err(RegularFileError::Io(e)) => {
+                return Err(format!("cannot read {}: {e}", config.display()));
             }
         }
     }
     Ok(git_dir)
 }
 
-/// Why [`read_regular_file`] refused or failed.
+/// Working-tree files Git opens without checking their type.
+#[cfg(unix)]
+const GIT_WORKTREE_INPUT_FILES: [&str; 3] = [".gitignore", ".gitattributes", ".gitmodules"];
+
+/// Refuse a repository whose working-tree Git input files would make a
+/// read-only Git command block. Git opens in-tree `.gitignore` /
+/// `.gitattributes` (and, for `git diff` with a gitlink, the root
+/// `.gitmodules`) without checking their type, so a FIFO there (possible in
+/// a directory unpacked from an archive) stalls every
+/// `git status`/`diff`/`log`/`ls-files` until the command timeout. A FIFO or
+/// device inside `.git` itself is refused by [`validate_local_git_metadata`].
+///
+/// Only `lstat` is used: none of these files is opened, and a symlink's
+/// target is never inspected (a `stat` of an attacker-chosen target could
+/// reach an automounted network path). Git >= 2.32 does not follow symlinked
+/// `.gitignore` / `.gitattributes`; any other read is still bounded by the
+/// per-command Git timeout. A FIFO or device is refused; regular files,
+/// directories, sockets, symlinks and missing paths are accepted. The
+/// root-level files are checked first, then the working tree is walked: the
+/// walk skips entries named exactly `.git`, never follows directory symlinks
+/// and is bounded; when a bound is hit, checking stops without refusing.
+/// Call it after [`validate_local_git_metadata`] succeeds. On non-Unix
+/// platforms it does nothing.
+pub fn validate_git_input_files(repo_root: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        // Checked explicitly so the walk's bounds can never skip them.
+        for name in GIT_WORKTREE_INPUT_FILES {
+            if let Ok(metadata) = std::fs::symlink_metadata(repo_root.join(name))
+                && is_fifo_or_device(&metadata.file_type())
+            {
+                return Err(format!("{name:?} is not a regular file"));
+            }
+        }
+        validate_in_tree_git_input_files(repo_root)?;
+    }
+    #[cfg(not(unix))]
+    let _ = repo_root;
+    Ok(())
+}
+
+/// Whether opening a file of this type can block (a FIFO) or reaches a
+/// device. Sockets are not included: opening one fails with `ENXIO` instead
+/// of blocking, and macOS Git's builtin fsmonitor keeps
+/// `.git/fsmonitor--daemon.ipc`.
+#[cfg(unix)]
+fn is_fifo_or_device(file_type: &std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_fifo() || file_type.is_block_device() || file_type.is_char_device()
+}
+
+#[cfg(not(unix))]
+fn is_fifo_or_device(_file_type: &std::fs::FileType) -> bool {
+    false
+}
+
+/// Walk the working tree for `.gitignore` / `.gitattributes` /
+/// `.gitmodules` that are a FIFO or device. Names are matched
+/// ASCII-case-insensitively (Git opens them so on case-insensitive file
+/// systems; elsewhere this only over-refuses), but only an entry named
+/// exactly `.git` is skipped, since on a case-sensitive file system Git
+/// treats `.GIT` as an ordinary directory and descends into it.
+#[cfg(unix)]
+fn validate_in_tree_git_input_files(repo_root: &Path) -> Result<(), String> {
+    // When a bound is hit, the walk stops without refusing: the root-level
+    // files were already checked, and any remaining FIFO only stalls a Git
+    // command until its per-command timeout. MAX_DIRS bounds the memory of
+    // the pending-directory stack.
+    const MAX_ENTRIES: usize = 200_000;
+    const MAX_DIRS: usize = 50_000;
+    const MAX_DEPTH: usize = 256;
+    let mut stack = vec![(repo_root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    let mut dirs = 1usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            visited += 1;
+            if visited > MAX_ENTRIES {
+                return Ok(());
+            }
+            let name = entry.file_name();
+            if name.as_os_str() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            // `DirEntry::file_type` does not follow symlinks.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if depth < MAX_DEPTH && dirs < MAX_DIRS {
+                    dirs += 1;
+                    stack.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            if !GIT_WORKTREE_INPUT_FILES
+                .iter()
+                .any(|input| name.eq_ignore_ascii_case(input))
+            {
+                continue;
+            }
+            // A symlink is accepted without inspecting its target.
+            if is_fifo_or_device(&file_type) {
+                let path = entry.path();
+                let rel = path.strip_prefix(repo_root).unwrap_or(&path);
+                return Err(format!("{rel:?} is not a regular file"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why [`read_regular_file`] refused a path.
 #[derive(Debug)]
 pub enum RegularFileError {
-    /// A symlink, directory, FIFO, socket or device.
+    /// A FIFO, socket, device, directory or symlink.
     NotRegular,
-    /// Larger than the caller's cap.
+    /// Larger than the cap.
     TooLarge,
-    /// Missing (`NotFound`) or unreadable.
+    /// Could not be inspected, opened or read (`NotFound` when missing).
     Io(std::io::Error),
 }
 
-impl std::fmt::Display for RegularFileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotRegular => f.write_str("is not a regular file"),
-            Self::TooLarge => f.write_str("exceeds the size limit"),
-            Self::Io(error) => write!(f, "cannot be read: {error}"),
-        }
-    }
-}
-
-/// Read an untrusted path only if it is a regular file of at most `cap`
-/// bytes. Never follows a final symlink and never blocks on a FIFO: the
-/// path is checked with `symlink_metadata`, opened with `O_NOFOLLOW |
-/// O_NONBLOCK` on Unix (so a FIFO swapped in after the check does not wait
-/// for a writer), checked again through the open handle, and read up to
-/// `cap + 1` bytes so a file that grows meanwhile is still refused.
+/// Read at most `cap` bytes of `path`, only when it is a regular file. The
+/// type is checked with `symlink_metadata` before opening (a symlink, FIFO,
+/// socket, device or directory is refused) and again on the opened file, so
+/// a swap in between is caught. On Unix the open uses `O_NOFOLLOW |
+/// O_NONBLOCK`, so it neither follows a symlink nor blocks on a FIFO.
 pub fn read_regular_file(path: &Path, cap: u64) -> Result<Vec<u8>, RegularFileError> {
     use std::io::Read;
     let metadata = std::fs::symlink_metadata(path).map_err(RegularFileError::Io)?;
@@ -319,21 +429,9 @@ pub fn read_regular_file(path: &Path, cap: u64) -> Result<Vec<u8>, RegularFileEr
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        // ELOOP: the path became a symlink after the check.
-        #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(RegularFileError::NotRegular);
-        }
-        Err(error) => return Err(RegularFileError::Io(error)),
-    };
-    let opened = file.metadata().map_err(RegularFileError::Io)?;
-    if !opened.file_type().is_file() {
+    let file = options.open(path).map_err(RegularFileError::Io)?;
+    if !file.metadata().map_err(RegularFileError::Io)?.is_file() {
         return Err(RegularFileError::NotRegular);
-    }
-    if opened.len() > cap {
-        return Err(RegularFileError::TooLarge);
     }
     let mut bytes = Vec::new();
     file.take(cap.saturating_add(1))
@@ -345,7 +443,13 @@ pub fn read_regular_file(path: &Path, cap: u64) -> Result<Vec<u8>, RegularFileEr
     Ok(bytes)
 }
 
-fn validate_git_tree_has_no_symlinks(git_dir: &Path) -> Result<(), String> {
+/// `lstat` every entry under `git_dir` and refuse symlinks, FIFOs and
+/// devices. Git opens files there (HEAD, index, refs, packed-refs, shallow,
+/// info/*, objects, packs, commit-graph, ...) without checking their type,
+/// so a FIFO anywhere in `.git` (possible in a directory unpacked from an
+/// archive) would stall every Git command, even `git config --file`.
+/// Sockets are allowed (see [`is_fifo_or_device`]).
+fn validate_git_tree_entries(git_dir: &Path) -> Result<(), String> {
     const MAX_GIT_METADATA_ENTRIES: usize = 250_000;
     const MAX_GIT_METADATA_DEPTH: usize = 64;
     let mut stack = vec![(git_dir.to_path_buf(), 0usize)];
@@ -374,11 +478,12 @@ fn validate_git_tree_has_no_symlinks(git_dir: &Path) -> Result<(), String> {
             let Some(metadata) = inspect_entry(&path)? else {
                 continue;
             };
+            let rel = path.strip_prefix(git_dir).unwrap_or(&path);
             if metadata.file_type().is_symlink() {
-                return Err(format!(
-                    "Git metadata symlink is not allowed: {}",
-                    path.strip_prefix(git_dir).unwrap_or(&path).display()
-                ));
+                return Err(format!("Git metadata symlink is not allowed: {rel:?}"));
+            }
+            if is_fifo_or_device(&metadata.file_type()) {
+                return Err(format!("{rel:?} is not a regular file"));
             }
             if metadata.is_dir() {
                 stack.push((path, depth + 1));
@@ -704,7 +809,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), git_dir.path().join("objects-link")).unwrap();
         assert!(
-            super::validate_git_tree_has_no_symlinks(git_dir.path())
+            super::validate_git_tree_entries(git_dir.path())
                 .unwrap_err()
                 .contains("symlink")
         );
@@ -714,7 +819,7 @@ mod tests {
     fn git_metadata_walk_errors_when_root_is_missing() {
         let parent = tempfile::tempdir().unwrap();
         let missing = parent.path().join("missing-git-dir");
-        let error = super::validate_git_tree_has_no_symlinks(&missing).unwrap_err();
+        let error = super::validate_git_tree_entries(&missing).unwrap_err();
         assert!(error.contains("cannot inspect Git metadata"));
         assert!(Path::new(&missing).is_absolute() || error.contains("missing-git-dir"));
     }
@@ -997,98 +1102,266 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    fn make_fifo(path: &Path) {
-        use std::os::unix::ffi::OsStrExt;
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `c_path` is a valid NUL-terminated C string for the call.
-        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
-        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
-    }
-
+    /// A FIFO as `.git/config` or `.git/config.worktree` (possible in a
+    /// directory unpacked from an archive) is refused quickly instead of
+    /// blocking the read forever. Run on a thread so a regression fails the
+    /// test instead of hanging it.
     #[cfg(unix)]
     #[test]
     fn git_metadata_refuses_a_fifo_config_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
         for name in ["config", "config.worktree"] {
             let repo = tempfile::tempdir().unwrap();
             std::fs::create_dir(repo.path().join(".git")).unwrap();
-            make_fifo(&repo.path().join(".git").join(name));
+            let fifo = repo.path().join(".git").join(name);
+            let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path; mkfifo only creates a node.
+            assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
             let root = repo.path().to_path_buf();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(validate_local_git_metadata(&root));
             });
-            let result = rx
+            let error = rx
                 .recv_timeout(std::time::Duration::from_secs(3))
-                .unwrap_or_else(|_| panic!("validation blocked on a FIFO {name}"));
-            let error = result.unwrap_err();
-            assert!(error.contains("is not a regular file"), "{error}");
+                .unwrap_or_else(|_| panic!("validation blocked on a FIFO {name}"))
+                .unwrap_err();
+            assert!(
+                error.contains(&format!("{name:?} is not a regular file")),
+                "{error}"
+            );
         }
     }
 
+    /// Run [`validate_local_git_metadata`] on a thread so a regression that
+    /// opens a FIFO fails the test instead of hanging it.
+    #[cfg(unix)]
+    fn validate_local_git_metadata_bounded(root: &std::path::Path) -> Result<PathBuf, String> {
+        let root = root.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(validate_local_git_metadata(&root));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .expect("validate_local_git_metadata blocked")
+    }
+
+    /// A FIFO anywhere in `.git` (HEAD, index, refs, info files, object
+    /// metadata) would block every Git command, so it is refused by the
+    /// metadata walk without being opened.
+    #[cfg(unix)]
     #[test]
-    fn read_regular_file_reads_a_small_regular_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("f");
-        std::fs::write(&file, b"abc").unwrap();
-        assert_eq!(read_regular_file(&file, 3).unwrap(), b"abc");
+    fn git_metadata_refuses_fifos_anywhere_in_git_dir_without_blocking() {
+        for rel in [
+            "HEAD",
+            "index",
+            "packed-refs",
+            "refs/heads/main",
+            "info/attributes",
+            "info/exclude",
+            "info/sparse-checkout",
+            "objects/info/commit-graph",
+        ] {
+            let repo = git_input_fixture();
+            let fifo = repo.path().join(".git").join(rel);
+            std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+            make_fifo(&fifo);
+            let error = validate_local_git_metadata_bounded(repo.path()).unwrap_err();
+            assert!(
+                error.contains(&format!("{rel:?} is not a regular file")),
+                "{rel}: {error}"
+            );
+        }
+    }
+
+    /// A symlinked `.git/info/exclude` is refused like any symlink in `.git`,
+    /// so its target (here a FIFO) is never opened.
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_refuses_symlinked_info_file_to_fifo() {
+        let repo = git_input_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let fifo = outside.path().join("pipe");
+        make_fifo(&fifo);
+        std::os::unix::fs::symlink(&fifo, repo.path().join(".git/info/exclude")).unwrap();
+        let error = validate_local_git_metadata_bounded(repo.path()).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(error.contains("info/exclude"), "{error}");
+    }
+
+    /// macOS Git's builtin fsmonitor keeps a socket in `.git`; opening a
+    /// socket fails instead of blocking, so it is accepted.
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_accepts_a_socket_in_git_dir() {
+        let repo = git_input_fixture();
+        // A short name keeps the path under the `sun_path` limit.
+        let _listener =
+            std::os::unix::net::UnixListener::bind(repo.path().join(".git/ipc")).unwrap();
+        assert!(validate_local_git_metadata_bounded(repo.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates a node.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// Run [`validate_git_input_files`] on a thread so a regression that
+    /// opens a FIFO fails the test instead of hanging it.
+    #[cfg(unix)]
+    fn validate_git_input_files_bounded(root: &std::path::Path) -> Result<(), String> {
+        let root = root.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(validate_git_input_files(&root));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .expect("validate_git_input_files blocked")
+    }
+
+    #[cfg(unix)]
+    fn git_input_fixture() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git/info")).unwrap();
+        repo
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_git_input_files_refuses_in_tree_fifos() {
+        for name in [".gitattributes", ".gitignore", ".gitmodules"] {
+            let repo = git_input_fixture();
+            std::fs::create_dir_all(repo.path().join("subdir/deeper")).unwrap();
+            make_fifo(&repo.path().join("subdir/deeper").join(name));
+            let error = validate_git_input_files_bounded(repo.path()).unwrap_err();
+            assert!(
+                error.contains(&format!("\"subdir/deeper/{name}\" is not a regular file")),
+                "{error}"
+            );
+        }
+        for name in [".gitattributes", ".gitignore", ".gitmodules"] {
+            let repo = git_input_fixture();
+            make_fifo(&repo.path().join(name));
+            let error = validate_git_input_files_bounded(repo.path()).unwrap_err();
+            assert!(
+                error.starts_with(&format!("\"{name}\" is not a regular file")),
+                "{error}"
+            );
+        }
+    }
+
+    /// Attacker-chosen names are escaped in the message, so a newline or an
+    /// ANSI escape cannot reach a report or terminal raw.
+    #[cfg(unix)]
+    #[test]
+    fn validate_git_input_files_escapes_the_reported_path() {
+        let repo = git_input_fixture();
+        let dir = repo.path().join("evil\n\u{1b}[31mname");
+        std::fs::create_dir(&dir).unwrap();
+        make_fifo(&dir.join(".gitignore"));
+        let error = validate_git_input_files_bounded(repo.path()).unwrap_err();
+        assert!(
+            !error.contains('\n') && !error.contains('\u{1b}'),
+            "{error:?}"
+        );
+        assert!(error.contains("\\n"), "{error:?}");
+    }
+
+    /// Only an entry named exactly `.git` is skipped: on a case-sensitive
+    /// file system Git descends into `.GIT` like any directory.
+    #[cfg(unix)]
+    #[test]
+    fn validate_git_input_files_walks_differently_cased_git_dirs() {
+        // No `.git` here: on a case-insensitive file system `.GIT` would
+        // collide with it.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".GIT")).unwrap();
+        make_fifo(&repo.path().join(".GIT/.gitignore"));
+        let error = validate_git_input_files_bounded(repo.path()).unwrap_err();
+        assert!(
+            error.contains("\".GIT/.gitignore\" is not a regular file"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_git_input_files_does_not_walk_symlinked_directories_or_git_dirs() {
+        let repo = git_input_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        make_fifo(&outside.path().join(".gitignore"));
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("linked")).unwrap();
+        // A nested `.git` directory is Git metadata, not working-tree input.
+        std::fs::create_dir_all(repo.path().join("nested/.git")).unwrap();
+        make_fifo(&repo.path().join("nested/.git/.gitattributes"));
+        assert_eq!(validate_git_input_files_bounded(repo.path()), Ok(()));
+    }
+
+    /// A symlinked input file is accepted without inspecting its target
+    /// (which could be an automounted network path); Git >= 2.32 does not
+    /// follow it, and older Git is bounded by the per-command timeout.
+    #[cfg(unix)]
+    #[test]
+    fn validate_git_input_files_does_not_follow_symlinked_input_files() {
+        let repo = git_input_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let fifo = outside.path().join("pipe");
+        make_fifo(&fifo);
+        std::fs::create_dir(repo.path().join("sub")).unwrap();
+        for rel in [".gitignore", ".gitmodules", "sub/.gitattributes"] {
+            std::os::unix::fs::symlink(&fifo, repo.path().join(rel)).unwrap();
+        }
+        assert_eq!(validate_git_input_files_bounded(repo.path()), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_git_input_files_accepts_regular_and_missing_files() {
+        let repo = git_input_fixture();
+        assert_eq!(validate_git_input_files_bounded(repo.path()), Ok(()));
+        std::fs::write(repo.path().join(".git/info/exclude"), "*.log\n").unwrap();
+        std::fs::write(repo.path().join(".git/info/attributes"), "* text\n").unwrap();
+        std::fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/.gitattributes"), "*.rs diff\n").unwrap();
+        // A directory named like an input file is left to Git.
+        std::fs::create_dir(repo.path().join("src/.gitignore")).unwrap();
+        assert_eq!(validate_git_input_files_bounded(repo.path()), Ok(()));
+        // No `.git` at all: the function still only inspects.
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(validate_git_input_files_bounded(plain.path()), Ok(()));
     }
 
     #[test]
-    fn read_regular_file_refuses_a_directory() {
+    fn read_regular_file_refuses_directories_and_oversized_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
-            read_regular_file(dir.path(), 1024),
+            read_regular_file(dir.path(), 16),
             Err(RegularFileError::NotRegular)
         ));
-    }
-
-    #[test]
-    fn read_regular_file_refuses_an_oversized_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("big");
-        std::fs::write(&file, b"abcd").unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"0123456789").unwrap();
+        assert_eq!(read_regular_file(&file, 10).unwrap(), b"0123456789");
         assert!(matches!(
-            read_regular_file(&file, 3),
+            read_regular_file(&file, 9),
             Err(RegularFileError::TooLarge)
         ));
-    }
-
-    #[test]
-    fn read_regular_file_reports_a_missing_file_as_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        match read_regular_file(&dir.path().join("gone"), 1024) {
-            Err(RegularFileError::Io(error)) => {
-                assert_eq!(error.kind(), std::io::ErrorKind::NotFound)
-            }
-            other => panic!("unexpected: {other:?}"),
+        assert!(matches!(
+            read_regular_file(&dir.path().join("missing"), 16),
+            Err(RegularFileError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound
+        ));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(matches!(
+                read_regular_file(&link, 16),
+                Err(RegularFileError::NotRegular)
+            ));
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_regular_file_never_follows_a_symlink() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
-        std::fs::write(&target, b"secret").unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(matches!(
-            read_regular_file(&link, 1024),
-            Err(RegularFileError::NotRegular)
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_regular_file_refuses_a_fifo() {
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("fifo");
-        make_fifo(&fifo);
-        assert!(matches!(
-            read_regular_file(&fifo, 1024),
-            Err(RegularFileError::NotRegular)
-        ));
     }
 
     // ── B3b: result-text masking ─────────────────────────

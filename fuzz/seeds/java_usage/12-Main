@@ -1,0 +1,11 @@
+package com.ex;
+
+import org.bouncycastle.crypto.digests.SHA3Digest;
+
+public class Main {
+    public static void main(String[] args) {
+        SHA3Digest d = new SHA3Digest(256);
+        d.update(new byte[0], 0, 0);
+        System.out.println(d.getAlgorithmName());
+    }
+}

@@ -6,6 +6,7 @@
 //! (`vettalon-contract`); a reply that breaks it is discarded, never
 //! repaired.
 
+pub mod attest;
 pub mod audit;
 pub mod budget;
 pub mod config;
@@ -13,6 +14,8 @@ pub mod disclose;
 pub mod explain;
 pub mod guard;
 pub mod hunt;
+#[doc(hidden)]
+pub mod inbound;
 pub mod joern;
 pub mod kb;
 pub mod lang;

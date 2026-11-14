@@ -1,0 +1,313 @@
+{
+  "schema": "vettalon.retest-record/1",
+  "vettalon_version": "sample-version",
+  "languages": [
+    "zh-TW",
+    "en"
+  ],
+  "mapping_version": "retest-mapping/1",
+  "limits": [
+    "limit.outcome"
+  ],
+  "sources": [
+    {
+      "kind": "retest",
+      "path": "receipts/retest/sample.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bytes": 100,
+      "signature": null
+    },
+    {
+      "kind": "reproduce",
+      "path": "receipts/reproduce/original.json",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "bytes": 100,
+      "signature": null
+    },
+    {
+      "kind": "fix_check",
+      "path": "receipts/fix-check/check.json",
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "bytes": 100,
+      "signature": null
+    }
+  ],
+  "revisions": {
+    "old_report_sha256": null,
+    "report_sha256": null,
+    "report_included": false,
+    "old_repo_commit": "1111111111111111111111111111111111111111",
+    "new_repo_commit": "2222222222222222222222222222222222222222",
+    "new_tree_clean": null,
+    "tree_warning": {
+      "zh-TW": "新版本工作目錄未確認乾淨。",
+      "en": "The new working tree is not confirmed clean."
+    },
+    "old_scan_started_at": null,
+    "retest_started_at": null,
+    "replays_requested": 2
+  },
+  "summary": {
+    "retest": {
+      "still_observed": 0,
+      "not_observed": 1,
+      "inconclusive": 0,
+      "environment_unavailable": 0,
+      "target_missing": 0,
+      "not_reproducible_before": 0,
+      "retest_cap_reached": 0
+    },
+    "fix_outcomes": {
+      "fix_check_partial": 1
+    }
+  },
+  "engagement": {
+    "id": null,
+    "client": "Example <script>alert(1)</script>",
+    "vendor": null,
+    "tester": null,
+    "reviewer": null,
+    "scope": null,
+    "scope_approval_ref": null,
+    "method_note": null,
+    "test_command_note": null,
+    "original_test_start": null,
+    "original_test_end": null,
+    "retest_date": null
+  },
+  "findings": [
+    {
+      "id": "F-1‮",
+      "id_source": "retest",
+      "binding_note": null,
+      "title": {
+        "text": "Example finding",
+        "truncated": false,
+        "full_sha256": null,
+        "origin": "report_text"
+      },
+      "cwe": {
+        "text": "CWE-22",
+        "truncated": false,
+        "full_sha256": null,
+        "origin": "report_text"
+      },
+      "file": {
+        "text": "src/a|b.py",
+        "truncated": false,
+        "full_sha256": null,
+        "origin": "report_text"
+      },
+      "function": {
+        "text": "lookup`name",
+        "truncated": false,
+        "full_sha256": null,
+        "origin": "report_text"
+      },
+      "line": 7,
+      "runtime": "python",
+      "oracle_class": "file_read",
+      "original": {
+        "receipt_version": 3,
+        "outcome": "effect_observed",
+        "label": {
+          "zh-TW": "觀察到效果",
+          "en": "effect observed"
+        },
+        "reason": null,
+        "replays": {
+          "requested": 2,
+          "completed": 2,
+          "observed": 2,
+          "absent": 0,
+          "inconclusive": 0
+        },
+        "phases": [
+          {
+            "name": "probe",
+            "effect": false,
+            "functional": true,
+            "reached": null,
+            "transcript_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        ],
+        "environment": {
+          "image_id": "sha256:sample",
+          "harness_sha256": null,
+          "harness_version": null,
+          "policy_version": null,
+          "adapter_sha256": null,
+          "source_tree_sha256": null,
+          "node": null,
+          "sandbox_settings": null
+        },
+        "started_at": null,
+        "producer_version": null,
+        "evidence": {
+          "file": "receipts/reproduce/original.json",
+          "file_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "pointer": "",
+          "object_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      },
+      "retest": {
+        "status": "not_observed",
+        "label": {
+          "zh-TW": "本次未觀察到效果（限此 revision、此組輸入與變體）",
+          "en": "No effect observed at this revision, with these inputs and variants"
+        },
+        "reason": null,
+        "rebound": true,
+        "old_file_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "new_file_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "run": {
+          "receipt_version": 3,
+          "outcome": "effect_absent",
+          "label": {
+            "zh-TW": "未觀察到效果（限此 revision、此組輸入）",
+            "en": "no effect observed at this revision, with these inputs"
+          },
+          "reason": null,
+          "replays": {
+            "requested": 2,
+            "completed": 2,
+            "observed": 0,
+            "absent": 2,
+            "inconclusive": 0
+          },
+          "phases": [
+            {
+              "name": "probe",
+              "effect": false,
+              "functional": true,
+              "reached": null,
+              "transcript_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          ],
+          "environment": {
+            "image_id": "sha256:sample",
+            "harness_sha256": null,
+            "harness_version": null,
+            "policy_version": null,
+            "adapter_sha256": null,
+            "source_tree_sha256": null,
+            "node": null,
+            "sandbox_settings": null
+          },
+          "started_at": null,
+          "producer_version": null
+        },
+        "evidence": {
+          "file": "receipts/retest/sample.json",
+          "file_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "pointer": "/results/0/receipt",
+          "object_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "fix_checks": [
+        {
+          "outcome": "fix_check_partial",
+          "label": {
+            "zh-TW": "部分檢查通過：在這個 revision、這組輸入與變體上未觀察到效果，未跑專案測試",
+            "en": "partial checks passed: no effect observed at this revision, with these inputs and variants; project tests not run"
+          },
+          "original": "pass",
+          "variants": "pass",
+          "benign": "pass",
+          "tests": "not_run",
+          "inputs": {
+            "blocked": 1,
+            "total": 1
+          },
+          "decoding": {
+            "blocked": 0,
+            "applicable": 0,
+            "total": 0
+          },
+          "blocker": "none",
+          "blocker_label": null,
+          "reason": null,
+          "legacy_format": false,
+          "diff_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "variant_set_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+          "variant_generator_version": null,
+          "test_command_sha256": null,
+          "per_input": [
+            {
+              "id": "base",
+              "fixed_copy": "blocked"
+            }
+          ],
+          "environment": {
+            "image_id": null,
+            "harness_sha256": null,
+            "harness_version": null,
+            "policy_version": null,
+            "adapter_sha256": null,
+            "source_tree_sha256": null,
+            "node": null,
+            "sandbox_settings": null
+          },
+          "started_at": null,
+          "producer_version": null,
+          "evidence": {
+            "file": "receipts/fix-check/check.json",
+            "file_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "pointer": "",
+            "object_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          }
+        }
+      ],
+      "inputs": {
+        "determinable": true,
+        "note": null,
+        "items": [
+          {
+            "role": "base",
+            "id": "base",
+            "text": "<script>```payload````</script>",
+            "truncated": false,
+            "text_sha256": null,
+            "fixed_copy": "blocked",
+            "original_copy": "effect"
+          }
+        ]
+      },
+      "call": {
+        "supplied": true,
+        "note": null,
+        "plan_sha256s": [
+          "7777777777777777777777777777777777777777777777777777777777777777"
+        ],
+        "file": {
+          "text": "src/a|b.py",
+          "truncated": false,
+          "full_sha256": null,
+          "origin": "report_text"
+        },
+        "function": {
+          "text": "lookup`name",
+          "truncated": false,
+          "full_sha256": null,
+          "origin": "report_text"
+        },
+        "args": [
+          {
+            "kind": "payload",
+            "value": null,
+            "truncated": false,
+            "value_sha256": null
+          }
+        ]
+      },
+      "operator": {
+        "id": null,
+        "original_test_ref": null,
+        "risk_rating": null,
+        "location": null,
+        "correction_summary": null,
+        "tester_conclusion": "fixed / secure / 已修補 — tester statement"
+      }
+    }
+  ]
+}

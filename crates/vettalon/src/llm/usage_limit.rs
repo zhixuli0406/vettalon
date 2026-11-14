@@ -103,6 +103,26 @@ impl LlmCaller for LimitedCaller {
         }
         result
     }
+
+    fn meter_info(&self) -> Option<crate::llm::MeterInfo> {
+        self.inner.meter_info()
+    }
+
+    async fn complete_metered(&self, prompt: &str) -> crate::llm::Metered {
+        if self.state.load(Ordering::SeqCst) {
+            return crate::llm::Metered {
+                result: Err(LlmError::UsageLimit(self.id.clone())),
+                usage: None,
+                http_status: None,
+            };
+        }
+        let mut m = self.inner.complete_metered(prompt).await;
+        if matches!(m.result, Err(LlmError::UsageLimit(_))) {
+            self.state.store(true, Ordering::SeqCst);
+            m.result = Err(LlmError::UsageLimit(self.id.clone()));
+        }
+        m
+    }
 }
 
 #[cfg(test)]

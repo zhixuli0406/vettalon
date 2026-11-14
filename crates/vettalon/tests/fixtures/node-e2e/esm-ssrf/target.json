@@ -1,0 +1,9 @@
+{
+  "file": "app.mjs",
+  "function": "run",
+  "args": [
+    {
+      "kind": "payload"
+    }
+  ]
+}

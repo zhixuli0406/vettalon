@@ -1,0 +1,5 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/section","shortDescription":{"text":"SQL queection","index":0,"toolCompon%nt":{"index":0}},"
+
+
+
+perties":{"tags":["security","externe/lver":{"name":"CodeQL","rules":[]},"extensions":[{"name":"c,"riBaseId":"WEB"},"region":{"startLine":4}}}}]}]}]}]}]}

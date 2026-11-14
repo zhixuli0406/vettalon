@@ -1,0 +1,1 @@
+{"$schema":"https://docs.oasis-open.org/sarib/sarif/v2.1rif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"vettalon","rulms":[{"id":"rule/x","shortDescription":{"t!!!!!tags":["security","external/cwe/cwe-327",																																							d":"external","justif"refuted"}}]}]}

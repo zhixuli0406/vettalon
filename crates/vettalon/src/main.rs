@@ -9,8 +9,9 @@ use vettalon::audit::{self, ScanOptions};
 use vettalon::config::{Config, Role};
 use vettalon::llm::ModelHandle;
 use vettalon::remediation::{
-    preflight_new_output, read_regular_capped, remediation_context, write_new_remediation_output,
-    write_new_remediation_pair, write_new_text_output,
+    preflight_new_output, preflight_repo_test_output, read_regular_capped, remediation_context,
+    remediation_finding, write_new_remediation_output, write_new_remediation_pair,
+    write_new_repo_test_output,
 };
 
 #[derive(Parser)]
@@ -216,10 +217,30 @@ struct ScanArgs {
 }
 
 #[derive(Args)]
+struct CbomCheckArgs {
+    /// Independently inventory Java crypto calls (up to 50,000); include sweep in the receipt.
+    #[arg(long)]
+    sweep: bool,
+    /// CycloneDX 1.6/1.7 CBOM (JSON) produced by PQCA CBOMkit.
+    #[arg(long)]
+    cbom: PathBuf,
+    /// Project root (Python and Java sources) the CBOM describes.
+    #[arg(long)]
+    root: PathBuf,
+    /// Extra entry point `module.path:func` (Python) or `package.Class:method` (Java); repeatable.
+    #[arg(long = "entry", value_name = "SPEC")]
+    entry: Vec<String>,
+    /// Write the hashed JSON receipt here (an existing file is never overwritten).
+    #[arg(long, value_name = "FILE")]
+    json: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct VerifyArgs {
     /// Repository root the findings point into.
     path: PathBuf,
-    /// Scan report or claims file to verify.
+    /// Scan report, claims file (vettalon.claims/1) or SARIF 2.1.0 log to
+    /// verify (at most 32 MiB).
     #[arg(long)]
     input: PathBuf,
     /// Roster model id that reviews (exactly one).
@@ -269,9 +290,31 @@ struct VerifyArgs {
     /// Per-call trace (JSON Lines), as `scan --trace`.
     #[arg(long)]
     trace: Option<PathBuf>,
-    /// No extra refuter run starts after this many seconds (at least 60).
+    /// No finding is started, and no extra refuter run starts, after this
+    /// many seconds (at least 60); findings not started stay unverified and
+    /// mark the run incomplete.
     #[arg(long, value_name = "SECS")]
     time_budget: Option<u64>,
+    /// Most findings one run may review (any input format; SARIF counts
+    /// results after skipped ones and duplicates). More is an error before
+    /// any model call. Each finding costs up to --refuter-runs calls.
+    #[arg(long, value_name = "N",
+          default_value_t = vettalon::audit::verify_only::DEFAULT_MAX_CLAIMS as u64,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    max_claims: u64,
+    /// Stop before model spend would exceed this many US dollars (list prices
+    /// from --price-table). A single call whose billed output exceeds the
+    /// expected maximum can overshoot once; the run then stops. Only HTTP
+    /// verifier backends are allowed.
+    #[arg(long, value_name = "USD", requires = "price_table")]
+    spend_cap_usd: Option<f64>,
+    /// Price table (vettalon.prices/1) used by --spend-cap-usd.
+    #[arg(long, value_name = "PATH", requires = "spend_cap_usd")]
+    price_table: Option<PathBuf>,
+    /// Benchmark option: apply --refuter-runs to every claim, not only High
+    /// and Critical.
+    #[arg(long)]
+    refuter_runs_all_severities: bool,
 }
 
 /// Drafting options shared by `disclose` and `hunt --disclose-dir`.
@@ -285,10 +328,21 @@ struct DraftArgs {
     /// Date of the human review, YYYY-MM-DD (default: today).
     #[arg(long, value_name = "DATE")]
     review_date: Option<String>,
-    /// Also draft findings below the PoC evidence threshold (refuter-only),
-    /// marked UNPROVEN. Scanner-only findings are never drafted.
+    /// Also draft findings below the default PoC evidence threshold
+    /// (poc_differential): PoC effect without a control run, and refuter-only
+    /// levels, marked UNPROVEN. Scanner-only findings are never drafted.
     #[arg(long)]
     allow_unproven: bool,
+    /// A `vettalon reproduce` receipt (JSON, at most 16 MiB) for this finding:
+    /// its file name, SHA-256 and outcome are quoted in the PoC section.
+    /// Refused unless its target file is the finding's file and its outcome
+    /// is effect_observed. The signature is not verified here. `disclose` only.
+    #[arg(long, value_name = "FILE")]
+    receipt: Option<PathBuf>,
+    /// The receipt's signature bundle (needs --receipt): its file name and
+    /// SHA-256 are quoted with the `vettalon receipt verify` command text.
+    #[arg(long, value_name = "FILE")]
+    receipt_bundle: Option<PathBuf>,
     /// Draft body format: ghsa | minimal | kernel | email (default: the
     /// channel's own form).
     #[arg(long, value_name = "FORMAT")]
@@ -326,6 +380,11 @@ fn draft_options(
         .map(str::parse::<vettalon::disclose::DraftFormat>)
         .transpose()?;
     o.include_patch = !a.no_patch;
+    if a.receipt_bundle.is_some() && a.receipt.is_none() {
+        return Err("--receipt-bundle requires --receipt".into());
+    }
+    o.receipt = a.receipt.clone();
+    o.receipt_bundle = a.receipt_bundle.clone();
     if let Some(reason) = &a.force_throttle {
         if reason.trim().is_empty() {
             return Err("--force-throttle needs a reason".into());
@@ -368,14 +427,211 @@ struct ReproduceArgs {
     /// Local sandbox image; never pulled automatically.
     #[arg(long, default_value = vettalon::sandbox::DEFAULT_POC_IMAGE)]
     poc_image: String,
+    /// Local Node sandbox image; build with `vettalon poc-node build`.
+    #[arg(long, value_name = "TAG", default_value = vettalon::sandbox::default_node_poc_image())]
+    node_image: String,
+    /// Node auth fixture JSON; only its digest is stored in receipts.
+    #[arg(long, value_name = "PATH")]
+    fixture: Option<PathBuf>,
     /// Write the versioned target-PoC receipt here (0600).
     #[arg(long)]
     out: PathBuf,
-    /// Also write a standalone Python regression test here (0600), once the
+    /// Write a standalone Python or Node (.mjs) test to a safe repo-relative path (0600), once the
     /// sandbox has seen it fail on this source. It passes when this input no
     /// longer has the effect; the finding's status does not change.
     #[arg(long, value_name = "PATH")]
     emit_test: Option<PathBuf>,
+    /// Run the full three-phase protocol N times (1-20), each in fresh
+    /// containers with fresh nonces. Observed or absent only when every
+    /// replay agrees; any mix is inconclusive (replay_inconsistent).
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..=20))]
+    replays: u32,
+}
+
+#[derive(Args)]
+struct RetestArgs {
+    /// Repository at the NEW revision; must be the old report's repository.
+    path: PathBuf,
+    /// Old validator-clean report. Omit to use the newest saved report the
+    /// `scan --since-last` rules trust for this repository. Never modified.
+    #[arg(long)]
+    report: Option<PathBuf>,
+    /// Closed JSON object mapping exact finding ids to the TargetCall JSON
+    /// `reproduce --target` accepts. Required. Findings without a plan are
+    /// not run; a plan for a finding that cannot be re-run refuses the run.
+    #[arg(long, value_name = "JSON")]
+    targets: PathBuf,
+    /// Run the three-phase protocol N times (1-20) per finding.
+    /// N * --max-findings * 3 must not exceed 120 containers.
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..=20))]
+    replays: u32,
+    /// Re-run at most M findings (1-20), in report order.
+    #[arg(long, value_name = "M", default_value_t = 20,
+          value_parser = clap::value_parser!(u32).range(1..=20))]
+    max_findings: u32,
+    /// Wall-clock budget in seconds (1-86400). Checked before each finding
+    /// and each replay; findings not run in time are retest_cap_reached
+    /// (deadline_exceeded).
+    #[arg(long, value_name = "SECONDS", default_value_t = 3600,
+          value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    deadline: u64,
+    /// Local sandbox image; never pulled automatically.
+    #[arg(long, default_value = vettalon::sandbox::DEFAULT_POC_IMAGE)]
+    poc_image: String,
+    /// Local Node sandbox image; build with `vettalon poc-node build`.
+    #[arg(long, value_name = "TAG", default_value = vettalon::sandbox::default_node_poc_image())]
+    node_image: String,
+    /// Node auth fixture JSON; only its digest is stored in receipts.
+    #[arg(long, value_name = "PATH")]
+    fixture: Option<PathBuf>,
+    /// Write the versioned retest report here (0600, never replaced).
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct IntakeArgs {
+    /// Repository root the report points into.
+    path: PathBuf,
+    /// The pasted vulnerability report (Markdown or plain text, UTF-8, at
+    /// most 256 KiB), or `-` for stdin. Its text is never sent to a model, a
+    /// container or any service.
+    #[arg(long, value_name = "FILE|-")]
+    input: PathBuf,
+    /// Write the intake result JSON (vettalon.intake/1) here (new file, 0600).
+    #[arg(long, value_name = "FILE")]
+    out: PathBuf,
+    /// Roster model id that reviews the single claim (exactly one). Required
+    /// unless --claims-only.
+    #[arg(
+        long,
+        required_unless_present = "claims_only",
+        conflicts_with = "claims_only"
+    )]
+    verifier: Option<String>,
+    /// Model roster (default: ~/.vettalon/config.toml, else the claude CLI).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Independent refuter runs for High and above (1-5); lower severities
+    /// get one.
+    #[arg(long, default_value_t = audit::DEFAULT_REFUTER_RUNS, value_parser = parse_refuter_runs)]
+    refuter_runs: usize,
+    /// Correction calls when a refuter reply breaks the reply contract:
+    /// 0 or 1 (default 1).
+    #[arg(long, default_value_t = audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64,
+          value_parser = clap::value_parser!(u64).range(0..=audit::DEFAULT_VERIFIER_PARSE_RETRIES as u64))]
+    verifier_parse_retries: u64,
+    /// The claim is not started after this many seconds (at least 60) and
+    /// stays unverified; the run is marked incomplete.
+    #[arg(long, value_name = "SECS")]
+    time_budget: Option<u64>,
+    /// Per-call trace (JSON Lines), as `verify --trace`.
+    #[arg(long, value_name = "FILE")]
+    trace: Option<PathBuf>,
+    /// Extract and check the location, write the claim, and stop: no model
+    /// call, no reproduction, no lookup.
+    #[arg(long, conflicts_with_all = ["verifier", "target", "check_duplicates"])]
+    claims_only: bool,
+    /// Also write the claims/1 document here (new file, 0600), for
+    /// `vettalon verify --input`.
+    #[arg(long, value_name = "FILE")]
+    claims_out: Option<PathBuf>,
+    /// Operator location FILE[:LINE] (repeatable, at most 10). Replaces the
+    /// locations found in the report; the first is the primary one. The
+    /// line is taken after the last colon.
+    #[arg(long, value_name = "FILE:LINE", value_parser = parse_intake_location)]
+    location: Vec<(String, Option<u32>)>,
+    /// CWE id (e.g. CWE-79) instead of the one found in the report.
+    #[arg(long, value_name = "CWE-N")]
+    cwe: Option<String>,
+    /// Claim title (at most 200 characters). Default: a neutral title built
+    /// from the verified location and CWE; report text is never used.
+    #[arg(long, value_name = "TEXT")]
+    title: Option<String>,
+    /// Severity of the claim; the reporter's own severity is ignored.
+    #[arg(long, default_value = "medium",
+          value_parser = ["low", "medium", "high", "critical"])]
+    severity: String,
+    /// Operator TargetCall JSON (as `reproduce --target`) to reproduce the
+    /// claim with. The report's PoC text is never run. Needs --receipt-out.
+    #[arg(long, value_name = "FILE", requires = "receipt_out")]
+    target: Option<PathBuf>,
+    /// Write the reproduction receipt here (new file, 0600). Needs --target.
+    #[arg(long, value_name = "FILE", requires = "target")]
+    receipt_out: Option<PathBuf>,
+    /// Local sandbox image for --target; never pulled automatically.
+    #[arg(long, value_name = "IMG")]
+    poc_image: Option<String>,
+    /// Run the reproduction protocol N times (1-20) with --target.
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..=20))]
+    replays: u32,
+    /// Look for duplicates online (read-only): OSV, upstream GitHub commits
+    /// touching the file (90 days) and open issues/PRs. Off: "not checked".
+    #[arg(long)]
+    check_duplicates: bool,
+}
+
+/// `FILE` or `FILE:LINE`; the line is split from the right, so a path with a
+/// colon in it is refused rather than misread.
+fn parse_intake_location(s: &str) -> Result<(String, Option<u32>), String> {
+    const HELP: &str = "expected FILE or FILE:LINE (LINE a positive whole number)";
+    let Some((file, line)) = s.rsplit_once(':') else {
+        if s.is_empty() {
+            return Err(HELP.to_string());
+        }
+        return Ok((s.to_string(), None));
+    };
+    if file.is_empty() || line.is_empty() || !line.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(HELP.to_string());
+    }
+    match line.parse::<u32>() {
+        Ok(n) if n >= 1 => Ok((file.to_string(), Some(n))),
+        _ => Err(HELP.to_string()),
+    }
+}
+
+#[derive(Args)]
+struct BisectArgs {
+    /// Repository root named by the validated report. Read-only: each tree is
+    /// read with `git ls-tree` and `git cat-file` into a private temporary
+    /// directory (no attributes or filters; symlinks and submodules skipped).
+    path: PathBuf,
+    /// Validator-clean scan report containing the finding.
+    #[arg(long)]
+    report: PathBuf,
+    /// Exact finding id, or a unique prefix.
+    #[arg(long)]
+    finding: String,
+    /// Regression test from `vettalon reproduce --emit-test` (at most 1 MiB).
+    #[arg(long, value_name = "TEST.py")]
+    test: PathBuf,
+    /// Revision known not to have the behaviour (exclusive bound; not re-run).
+    /// Default: test the oldest first-parent commit.
+    #[arg(long, value_name = "REV")]
+    good: Option<String>,
+    /// Revision where the test fails.
+    #[arg(long, value_name = "REV", default_value = "HEAD")]
+    bad: String,
+    /// Test runs (one container each), 1..=40.
+    #[arg(long, value_name = "N", default_value_t = audit::bisect::DEFAULT_MAX_STEPS,
+          value_parser = parse_bisect_max_steps)]
+    max_steps: usize,
+    /// Local sandbox image; never pulled automatically.
+    #[arg(long, default_value = vettalon::sandbox::DEFAULT_POC_IMAGE)]
+    poc_image: String,
+    /// Write the versioned bisect receipt here (new file, 0600).
+    #[arg(long)]
+    out: PathBuf,
+}
+
+fn parse_bisect_max_steps(value: &str) -> Result<usize, String> {
+    let steps = value
+        .parse::<usize>()
+        .map_err(|_| "--max-steps must be a number".to_string())?;
+    audit::bisect::validate_max_steps(steps)
 }
 
 #[derive(Args)]
@@ -403,6 +659,12 @@ struct FixCheckArgs {
     /// Local sandbox image; never pulled automatically.
     #[arg(long, default_value = vettalon::sandbox::DEFAULT_POC_IMAGE)]
     poc_image: String,
+    /// Local Node sandbox image; build with `vettalon poc-node build`.
+    #[arg(long, value_name = "TAG", default_value = vettalon::sandbox::default_node_poc_image())]
+    node_image: String,
+    /// Node auth fixture JSON; only its digest is stored in receipts.
+    #[arg(long, value_name = "PATH")]
+    fixture: Option<PathBuf>,
     /// Write the versioned bound fix-check receipt here (0600).
     #[arg(long)]
     out: PathBuf,
@@ -416,6 +678,103 @@ struct FixCheckArgs {
 enum FixAction {
     /// Check a suggested/operator diff on private before/after copies. Never applies it.
     Check(FixCheckArgs),
+}
+
+#[derive(Args)]
+struct ReceiptSignArgs {
+    /// A `reproduce --out` or `fix check --out` receipt, or a `retest --out` report. Other files are refused.
+    receipt: PathBuf,
+    /// Local cosign private key file. Remote, KMS and token references are
+    /// refused. Vettalon never reads it; cosign reads COSIGN_PASSWORD from the
+    /// environment.
+    #[arg(long)]
+    key: PathBuf,
+    /// Sigstore bundle to write (0600, never replaced). Default: <RECEIPT>.sigstore.json.
+    #[arg(long, value_name = "BUNDLE")]
+    out: Option<PathBuf>,
+    /// Optional local ML-DSA-65 PEM private key (requires OpenSSL 3.5+).
+    #[arg(long)]
+    pq_key: Option<PathBuf>,
+    /// ML-DSA sidecar to create (0600). Default: <RECEIPT>.mldsa.json.
+    #[arg(long, requires = "pq_key")]
+    pq_out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ReceiptVerifyArgs {
+    /// The receipt that was signed.
+    receipt: PathBuf,
+    /// Local cosign public key file, obtained from the signer by a channel you
+    /// trust. Remote, KMS and token references are refused.
+    #[arg(long)]
+    key: PathBuf,
+    /// Sigstore bundle written by `receipt sign`.
+    #[arg(long)]
+    bundle: PathBuf,
+    /// Trusted ML-DSA-65 public PEM key; requires both signature layers to verify.
+    #[arg(long, requires = "pq_sig")]
+    pq_pub: Option<PathBuf>,
+    /// Canonical ML-DSA sidecar. Never auto-discovered.
+    #[arg(long, requires = "pq_pub")]
+    pq_sig: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ReceiptPackageArgs {
+    #[arg(long)]
+    retest: Option<PathBuf>,
+    #[arg(long)]
+    reproduce: Vec<PathBuf>,
+    #[arg(long)]
+    fix_check: Vec<PathBuf>,
+    #[arg(long)]
+    report: Option<PathBuf>,
+    #[arg(long, requires = "report")]
+    include_report: bool,
+    #[arg(long)]
+    targets: Option<PathBuf>,
+    #[arg(long)]
+    bundle: Vec<PathBuf>,
+    #[arg(long)]
+    pq_sig: Vec<PathBuf>,
+    #[arg(long, requires = "key", requires = "pq_sig")]
+    pq_pub: Option<PathBuf>,
+    #[arg(long)]
+    key: Option<PathBuf>,
+    #[arg(long)]
+    engagement: Option<PathBuf>,
+    #[arg(long, default_value = "both", value_parser = ["zh-TW", "en", "both", "zh-TW,en"])]
+    lang: String,
+    /// New package directory, or ZIP filename with --zip. Never overwritten.
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long)]
+    zip: bool,
+}
+
+#[derive(Subcommand)]
+enum ReceiptAction {
+    /// Sign a receipt as an in-toto Statement with your cosign v3 key (no transparency log).
+    Sign(ReceiptSignArgs),
+    /// Verify a receipt, its bundle and public key offline with cosign v3.
+    Verify(ReceiptVerifyArgs),
+    /// Build a deterministic, independently verifiable retest delivery package.
+    Package(ReceiptPackageArgs),
+    /// Verify a package directory or ZIP without extracting archive members.
+    /// Verified signature claims require --key; missing keys or invalid claims exit 2.
+    /// The supplied key hash must match; both cosign versions must be v3.
+    VerifyPackage {
+        path: PathBuf,
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, requires = "key")]
+        pq_pub: Option<PathBuf>,
+    },
+    /// Print blank operator metadata as TOML.
+    EngagementTemplate {
+        #[arg(long, default_value = "zh-TW", value_parser = ["zh-TW", "en"])]
+        lang: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -547,9 +906,15 @@ enum Command {
     /// Validate a saved JSON report.
     Validate { report: PathBuf },
     /// Run the refuter on findings that already exist, with no finder call:
-    /// a `scan --report` file (its unreviewed AI candidates) or a claims file
-    /// (`{"schema": "vettalon.claims/1", "claims": [...]}`) from another tool.
+    /// a `scan --report` file (its unreviewed AI candidates), a claims file
+    /// (`{"schema": "vettalon.claims/1", "claims": [...]}`) or a SARIF 2.1.0
+    /// log (Semgrep, CodeQL, ...) from another tool.
     Verify(VerifyArgs),
+    /// (experimental) Label each crypto-asset occurrence of a CycloneDX CBOM
+    /// (PQCA CBOMkit; Python and Java sources) as reachable / not_observed / unknown
+    /// by name-based static analysis. not_observed is NOT proof of absence;
+    /// no VEX is emitted; the receipt is unsigned. --sweep adds a Java crypto inventory.
+    CbomCheck(CbomCheckArgs),
     /// Attach local proof artifact references; no commands run and no verdict changes.
     Evidence {
         #[command(subcommand)]
@@ -558,10 +923,28 @@ enum Command {
     /// Reproduce one finding against the exact selected Python source in
     /// three fresh, network-disabled containers. Never changes its status.
     Reproduce(ReproduceArgs),
+    /// Find the first first-parent commit where a `reproduce --emit-test`
+    /// regression test fails, one sandboxed container per tested commit.
+    /// That is not necessarily where the vulnerability was introduced.
+    Bisect(BisectArgs),
+    /// Re-run an old report's differential PoCs on a new revision of the
+    /// same repository. `not_observed` is not proof of a fix.
+    Retest(RetestArgs),
+    /// Turn one pasted vulnerability report into a checked claim and run the
+    /// refuter on it. The report text never reaches a model. Nothing is sent
+    /// anywhere; refuted is not proof the report is wrong.
+    Intake(IntakeArgs),
     /// Inspect a fix candidate without applying it to the live repository.
     Fix {
         #[command(subcommand)]
         action: FixAction,
+    },
+    /// Sign or verify a reproduce or fix check receipt, or a retest report, with cosign. A signature
+    /// shows who vouched for the receipt and that it is unchanged, not that
+    /// its conclusion is right.
+    Receipt {
+        #[command(subcommand)]
+        action: ReceiptAction,
     },
     /// Validate proof-carrying events, compare replays and track holdout lineage.
     Verification {
@@ -584,6 +967,11 @@ enum Command {
     Joern {
         #[command(subcommand)]
         action: JoernAction,
+    },
+    /// Manage the local Node image for JS/TS execution proof.
+    PocNode {
+        #[command(subcommand)]
+        action: PocNodeAction,
     },
     /// Draft a vulnerability report for a reviewed finding, in the format a
     /// destination expects (GitHub advisory, minimal, Linux kernel, project
@@ -821,6 +1209,14 @@ enum LedgerAction {
         #[arg(long)]
         note: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum PocNodeAction {
+    /// Build the Node PoC image from the definition in this binary.
+    Build,
+    /// Print the expected Node PoC image tag (no Docker call).
+    Image,
 }
 
 #[derive(Subcommand)]
@@ -1148,11 +1544,15 @@ async fn cmd_joern(action: JoernAction) -> i32 {
                 Ok(p) if p.is_dir() => p,
                 _ => return fail(format!("{} is not a directory", path.display())),
             };
-            let input = match std::fs::read_to_string(&claims)
-                .map_err(|e| format!("cannot read {}: {e}", claims.display()))
-                .and_then(|t| VerifyInput::parse(&t))
+            let input = match vettalon::audit::verify_only::read_input(&claims)
+                .and_then(|b| VerifyInput::parse_bytes(&b, Some(src.as_path())))
             {
                 Ok(VerifyInput::Claims(c)) => c,
+                Ok(VerifyInput::Sarif(_)) => {
+                    return fail(
+                        "`joern check` takes a claims file (vettalon.claims/1); SARIF input is read by `vettalon verify` only".into(),
+                    );
+                }
                 Ok(_) => {
                     return fail("`joern check` takes a claims file (vettalon.claims/1)".into());
                 }
@@ -1180,6 +1580,31 @@ async fn cmd_joern(action: JoernAction) -> i32 {
     }
 }
 
+/// Shared by `verify` and `intake`: load the roster, pick the one verifier
+/// and map every roster id to its family (for `VerifyOptions`).
+fn resolve_verifier_roster(
+    config: Option<&Path>,
+    repo: &Path,
+    verifier_id: &str,
+) -> Result<(ModelHandle, std::collections::HashMap<String, String>), String> {
+    let (cfg, source) = load_config(config, Some(repo))?;
+    let all = cfg.handles()?;
+    let Some(verifier) = all
+        .iter()
+        .find(|(m, _)| m.id == verifier_id)
+        .map(|(m, _)| m.clone())
+    else {
+        return Err(format!(
+            "--verifier {verifier_id:?} is not in the model roster ({source})"
+        ));
+    };
+    let families: std::collections::HashMap<String, String> = all
+        .iter()
+        .map(|(m, _)| (m.id.clone(), m.family.clone()))
+        .collect();
+    Ok((verifier, families))
+}
+
 async fn cmd_verify(a: VerifyArgs) -> i32 {
     use vettalon::audit::verify_only;
     let fail = |msg: String| {
@@ -1193,35 +1618,38 @@ async fn cmd_verify(a: VerifyArgs) -> i32 {
         Ok(p) if p.is_dir() => p,
         _ => return fail(format!("{} is not a directory", a.path.display())),
     };
-    let input = match std::fs::read_to_string(&a.input)
-        .map_err(|e| format!("cannot read {}: {e}", a.input.display()))
-        .and_then(|t| verify_only::VerifyInput::parse(&t))
+    let input = match verify_only::read_input(&a.input)
+        .and_then(|b| verify_only::VerifyInput::parse_bytes(&b, Some(repo.as_path())))
     {
         Ok(i) => i,
         Err(e) => return fail(e),
     };
-    let (cfg, source) = match load_config(a.config.as_deref(), Some(&repo)) {
-        Ok(c) => c,
-        Err(e) => return fail(e),
+    let max_claims = usize::try_from(a.max_claims).unwrap_or(usize::MAX);
+    if let Err(e) = verify_only::check_max_claims(&input, max_claims) {
+        return fail(e);
+    }
+    let (verifier, families) =
+        match resolve_verifier_roster(a.config.as_deref(), &repo, &a.verifier) {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        };
+    // Built before any model call; any error is exit 2.
+    let spend = match (a.spend_cap_usd, a.price_table.as_deref()) {
+        (Some(cap), Some(path)) => {
+            let guard = match vettalon::llm::spend::PriceTable::load(path)
+                .and_then(|t| vettalon::llm::spend::SpendGuard::new(cap, t))
+            {
+                Ok(g) => std::sync::Arc::new(g),
+                Err(e) => return fail(e),
+            };
+            if let Err(e) = verify_only::check_spend_ready(&verifier, &guard) {
+                return fail(e);
+            }
+            Some(guard)
+        }
+        (None, None) => None,
+        _ => return fail("--spend-cap-usd and --price-table must be given together".into()),
     };
-    let all = match cfg.handles() {
-        Ok(h) => h,
-        Err(e) => return fail(e),
-    };
-    let Some(verifier) = all
-        .iter()
-        .find(|(m, _)| m.id == a.verifier)
-        .map(|(m, _)| m.clone())
-    else {
-        return fail(format!(
-            "--verifier {:?} is not in the model roster ({source})",
-            a.verifier
-        ));
-    };
-    let families: std::collections::HashMap<String, String> = all
-        .iter()
-        .map(|(m, _)| (m.id.clone(), m.family.clone()))
-        .collect();
     let trace = if a.trace.is_some() {
         vettalon::llm::TraceLog::recording()
     } else {
@@ -1245,6 +1673,8 @@ async fn cmd_verify(a: VerifyArgs) -> i32 {
             joern: a
                 .joern_keep
                 .then(|| vettalon::joern::JoernSettings::new(a.joern_timeout)),
+            spend,
+            all_severities: a.refuter_runs_all_severities,
             trace: trace.clone(),
         },
     )
@@ -1278,6 +1708,30 @@ async fn cmd_verify(a: VerifyArgs) -> i32 {
         out.calls,
         a.out.display()
     );
+    if out.input == "sarif" {
+        eprintln!(
+            "[vettalon] {}",
+            vettalon::tr!(
+                "SARIF：{} 筆結果轉成發現，略過 {} 筆（其中 {} 筆無法覆核、{} 筆重複，見 sarif_skipped），{} 筆有位置被捨棄（見 sarif_dropped_locations）",
+                "SARIF: {} results became findings, {} skipped ({} could not be reviewed, {} duplicates, see sarif_skipped), {} lost locations (see sarif_dropped_locations)",
+                out.claim_ids.len(),
+                out.sarif_skipped.len(),
+                out.sarif_unreviewable,
+                out.sarif_duplicates,
+                out.sarif_dropped_locations.len()
+            )
+        );
+    }
+    if out.time_budget_skipped > 0 {
+        eprintln!(
+            "[vettalon] {}",
+            vettalon::tr!(
+                "時間預算用完：{} 筆發現沒有開始覆核，維持未覆核（見 time_budget_skipped）",
+                "time budget exhausted: {} findings were not started and stay unverified (see time_budget_skipped)",
+                out.time_budget_skipped
+            )
+        );
+    }
     0
 }
 
@@ -2008,6 +2462,16 @@ async fn cmd_hunt(args: HuntArgs) -> i32 {
     };
     // Drafting rules (reviewer, format) are checked before hours of auditing.
     let draft_opts = match &args.disclose_dir {
+        Some(_) if args.draft.receipt.is_some() || args.draft.receipt_bundle.is_some() => {
+            eprintln!(
+                "[vettalon] {}",
+                vettalon::tr!(
+                    "--receipt／--receipt-bundle 只適用於 `vettalon disclose`（一份收據對應一個 finding）。",
+                    "--receipt / --receipt-bundle apply only to `vettalon disclose` (one receipt belongs to one finding)."
+                )
+            );
+            return 2;
+        }
         Some(_) => match draft_options(&args.draft, cfg.disclosure_reviewer()) {
             Ok(o) => Some(o),
             Err(e) => {
@@ -2759,6 +3223,8 @@ mod remediation_output_tests {
             diff: Some(diff_path),
             test_command: Some("true".into()),
             poc_image: vettalon::sandbox::DEFAULT_POC_IMAGE.into(),
+            node_image: vettalon::sandbox::default_node_poc_image().into(),
+            fixture: None,
             out: receipt_path.clone(),
             report_out: updated_path.clone(),
         })
@@ -2800,6 +3266,7 @@ mod verification_cli_tests {
 
     fn event_fixture() -> VerificationEvent {
         let ir = vettalon::audit::verification::compile_ir(&CompileInput {
+            runtime: None,
             finding_id: "finding-1".into(),
             file: "app.py".into(),
             line: Some(7),
@@ -2863,6 +3330,46 @@ mod verification_cli_tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn verify_spend_flags_parse_together_and_alone_are_rejected() {
+        let base = [
+            "vettalon",
+            "verify",
+            ".",
+            "--input",
+            "in.json",
+            "--verifier",
+            "g",
+            "--out",
+            "o.json",
+        ];
+        let parse = |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra.iter()).copied());
+        assert!(parse(&["--spend-cap-usd", "1.5"]).is_err());
+        assert!(parse(&["--price-table", "p.json"]).is_err());
+        let Command::Verify(a) = parse(&[
+            "--spend-cap-usd",
+            "1.5",
+            "--price-table",
+            "p.json",
+            "--refuter-runs-all-severities",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("verify")
+        };
+        assert_eq!(a.spend_cap_usd, Some(1.5));
+        assert_eq!(
+            a.price_table.as_deref(),
+            Some(std::path::Path::new("p.json"))
+        );
+        assert!(a.refuter_runs_all_severities);
+        let Command::Verify(d) = parse(&[]).unwrap().command else {
+            panic!("verify")
+        };
+        assert!(d.spend_cap_usd.is_none() && !d.refuter_runs_all_severities);
     }
 
     #[test]
@@ -3171,14 +3678,26 @@ mod verification_cli_tests {
 }
 
 async fn cmd_reproduce(args: ReproduceArgs) -> i32 {
+    let node = match audit::node::dispatch::NodeOptions::read(
+        args.node_image.clone(),
+        args.fixture.as_deref(),
+        &args.path,
+    ) {
+        Ok(node) => node,
+        Err(error) => return remediation_fail(error),
+    };
     let (repo, _report, finding, target) =
         match remediation_context(&args.path, &args.report, &args.finding, &args.target) {
             Ok(value) => value,
             Err(error) => return remediation_fail(error),
         };
+    let output = match preflight_new_output(&args.out) {
+        Ok(output) => output,
+        Err(error) => return remediation_fail(error),
+    };
     if let Some(path) = args.emit_test.as_deref() {
-        let checked = preflight_new_output(path).and_then(|test| {
-            if test == preflight_new_output(&args.out)? {
+        let checked = preflight_repo_test_output(&repo, path).and_then(|test| {
+            if test == output.path() {
                 Err("--emit-test and --out must be different paths".to_string())
             } else {
                 Ok(())
@@ -3191,23 +3710,28 @@ async fn cmd_reproduce(args: ReproduceArgs) -> i32 {
     let audit::target_poc::TargetPocWithTest {
         receipt,
         test_source,
-    } = match args.emit_test {
-        Some(_) => {
-            audit::target_poc::run_target_poc_with_test(&repo, &finding, &target, &args.poc_image)
-                .await
-        }
-        None => audit::target_poc::TargetPocWithTest {
-            receipt: audit::target_poc::run_target_poc(&repo, &finding, &target, &args.poc_image)
-                .await,
-            test_source: None,
-        },
-    };
-    if let Err(error) = write_new_remediation_output(&args.out, &receipt) {
+    } = audit::target_poc::run_target_poc_with_node(
+        &repo,
+        &finding,
+        &target,
+        &args.poc_image,
+        &node,
+        args.replays,
+        args.emit_test.is_some(),
+    )
+    .await;
+    if let Err(error) = output.write_json(&receipt) {
         return remediation_fail(error);
     }
+    if receipt.reason.as_deref() == Some("node_runtime_unavailable") {
+        eprintln!("[vettalon] {}", audit::node::dispatch::RUNTIME_HELP);
+    }
+    let replays = receipt.replay_summary();
     eprintln!(
-        "[vettalon] target PoC: {:?}; status unchanged; receipt={}",
+        "[vettalon] target PoC: {:?}; replays {}/{} observed; status unchanged; receipt={}",
         receipt.outcome,
+        replays.observed,
+        replays.requested,
         args.out.display()
     );
     if let Some(path) = args.emit_test.as_deref() {
@@ -3219,7 +3743,7 @@ async fn cmd_reproduce(args: ReproduceArgs) -> i32 {
                 .unwrap_or("regression_test_unavailable");
             return remediation_fail(format!("no regression test written: {reason}"));
         };
-        if let Err(error) = write_new_text_output(path, &source) {
+        if let Err(error) = write_new_repo_test_output(&repo, path, &source) {
             return remediation_fail(error);
         }
         eprintln!(
@@ -3234,7 +3758,454 @@ async fn cmd_reproduce(args: ReproduceArgs) -> i32 {
     }
 }
 
+/// Exit status for a bisect outcome: 0 found, 1 not reproducible at the bad
+/// revision, 2 inconclusive, step cap, empty range (and refusals).
+fn bisect_exit_code(outcome: &audit::bisect::BisectOutcome) -> i32 {
+    use audit::bisect::BisectOutcome as O;
+    match outcome {
+        O::IntroducedIn { .. } | O::PresentSinceOldest => 0,
+        O::NotReproducibleAtBad => 1,
+        O::Inconclusive { .. } | O::StepCapReached { .. } | O::EmptyRange => 2,
+    }
+}
+
+#[cfg(test)]
+mod bisect_cli_tests {
+    use super::*;
+    use audit::bisect::{BisectOutcome, CommitId};
+
+    const BASE: &str = "vettalon bisect repo --report r.json --finding f1 --test t.py --out o";
+
+    fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv: Vec<&str> = BASE.split(' ').collect();
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn bisect_arguments_have_bounded_defaults() {
+        let Command::Bisect(args) = parse(&[]).unwrap().command else {
+            panic!("expected the bisect subcommand");
+        };
+        assert_eq!(args.max_steps, audit::bisect::DEFAULT_MAX_STEPS);
+        assert_eq!(args.bad, "HEAD");
+        assert!(args.good.is_none());
+        assert_eq!(args.poc_image, vettalon::sandbox::DEFAULT_POC_IMAGE);
+        for ok in ["1", "20", "40"] {
+            assert!(parse(&["--max-steps", ok]).is_ok(), "{ok}");
+        }
+        for bad in ["0", "41", "1000", "-1", "x", ""] {
+            assert!(parse(&["--max-steps", bad]).is_err(), "{bad:?}");
+        }
+        let cli = parse(&["--good", "v1.0", "--bad", "main"]).unwrap();
+        let Command::Bisect(args) = cli.command else {
+            panic!("expected the bisect subcommand");
+        };
+        assert_eq!(args.good.as_deref(), Some("v1.0"));
+        assert_eq!(args.bad, "main");
+    }
+
+    #[test]
+    fn bisect_requires_test_and_out() {
+        for missing in ["--test", "--out", "--report", "--finding"] {
+            let mut argv: Vec<&str> = BASE.split(' ').collect();
+            let at = argv.iter().position(|a| *a == missing).unwrap();
+            argv.remove(at);
+            argv.remove(at);
+            assert!(Cli::try_parse_from(argv).is_err(), "{missing}");
+        }
+    }
+
+    #[test]
+    fn bisect_exit_codes() {
+        let id = CommitId::parse(&"a".repeat(40)).unwrap();
+        let found = BisectOutcome::IntroducedIn {
+            commit: id.clone(),
+            last_passing: None,
+        };
+        assert_eq!(bisect_exit_code(&found), 0);
+        assert_eq!(bisect_exit_code(&BisectOutcome::PresentSinceOldest), 0);
+        assert_eq!(bisect_exit_code(&BisectOutcome::NotReproducibleAtBad), 1);
+        let inconclusive = BisectOutcome::Inconclusive {
+            lo: None,
+            hi: id.clone(),
+            reason: "x".into(),
+        };
+        assert_eq!(bisect_exit_code(&inconclusive), 2);
+        let cap = BisectOutcome::StepCapReached { lo: None, hi: id };
+        assert_eq!(bisect_exit_code(&cap), 2);
+        assert_eq!(bisect_exit_code(&BisectOutcome::EmptyRange), 2);
+    }
+}
+
+fn bisect_bound(id: Option<&audit::bisect::CommitId>) -> String {
+    id.map_or_else(|| "none".into(), ToString::to_string)
+}
+
+async fn cmd_bisect(args: BisectArgs) -> i32 {
+    use audit::bisect::{self, BisectOutcome};
+    let (repo, _report, finding) =
+        match remediation_finding(&args.path, &args.report, &args.finding) {
+            Ok(value) => value,
+            Err(error) => return remediation_fail(error),
+        };
+    let max_steps = match bisect::validate_max_steps(args.max_steps) {
+        Ok(steps) => steps,
+        Err(error) => return remediation_fail(error),
+    };
+    let output = match preflight_new_output(&args.out) {
+        Ok(output) => output,
+        Err(error) => return remediation_fail(error),
+    };
+    let test = match read_regular_capped(&args.test, bisect::MAX_TEST_BYTES, "regression test") {
+        Ok(test) => test,
+        Err(error) => return remediation_fail(error),
+    };
+    if let Err(error) = bisect::check_git(&repo).await {
+        return remediation_fail(error);
+    }
+    // The bounds are resolved once; the receipt names the ids actually searched.
+    let good_rev = args.good.as_deref();
+    let range = bisect::first_parent_range(&repo, good_rev, &args.bad, bisect::MAX_COMMITS);
+    let bisect::FirstParentRange { commits, good, bad } = match range.await {
+        Ok(range) => range,
+        Err(error) => return remediation_fail(error),
+    };
+    let file = finding.file.as_str();
+    let runner = bisect::docker_step_runner(&repo, file, test.clone(), &args.poc_image, max_steps);
+    let mut runner = match runner.await {
+        Ok(runner) => runner,
+        Err(error) => return remediation_fail(error),
+    };
+    eprintln!(
+        "[vettalon] bisect: {} first-parent commits; at most {max_steps} sandboxed test runs",
+        commits.len()
+    );
+    let search = bisect::bisect(&commits, good.as_ref(), &mut runner, max_steps);
+    let result = search.await;
+    let receipt = bisect::BisectReceipt::new(bad, good, result, max_steps, test.as_bytes());
+    if let Err(error) = output.write_json(&receipt) {
+        return remediation_fail(error);
+    }
+    let summary = match &receipt.outcome {
+        BisectOutcome::IntroducedIn {
+            commit,
+            last_passing,
+        } => {
+            let last = bisect_bound(last_passing.as_ref());
+            format!("introduced_in {commit} (last passing: {last})")
+        }
+        BisectOutcome::PresentSinceOldest => "present_since_oldest".into(),
+        BisectOutcome::NotReproducibleAtBad => {
+            "not_reproducible_at_bad: the test does not fail at the bad revision".into()
+        }
+        BisectOutcome::Inconclusive { lo, hi, reason } => {
+            let lo = bisect_bound(lo.as_ref());
+            format!("inconclusive between {lo} and {hi}: {reason}")
+        }
+        BisectOutcome::StepCapReached { lo, hi } => {
+            let lo = bisect_bound(lo.as_ref());
+            format!("step_cap_reached between {lo} and {hi}; raise --max-steps or pass --good")
+        }
+        BisectOutcome::EmptyRange => "empty_range".into(),
+    };
+    eprintln!(
+        "[vettalon] bisect: {summary}; {} test runs; receipt={}",
+        receipt.steps.len(),
+        args.out.display()
+    );
+    if matches!(
+        receipt.outcome,
+        BisectOutcome::IntroducedIn { .. } | BisectOutcome::PresentSinceOldest
+    ) {
+        eprintln!(
+            "[vettalon] bisect: first commit where this test fails; not necessarily where the \
+             vulnerability was introduced"
+        );
+    }
+    if receipt.non_monotonic {
+        eprintln!(
+            "[vettalon] bisect: history is non-monotonic (the test passed again after failing); \
+             the answer is one transition, not necessarily the first"
+        );
+    }
+    bisect_exit_code(&receipt.outcome)
+}
+
+async fn cmd_retest(args: RetestArgs) -> i32 {
+    let node = match audit::node::dispatch::NodeOptions::read(
+        args.node_image.clone(),
+        args.fixture.as_deref(),
+        &args.path,
+    ) {
+        Ok(node) => node,
+        Err(error) => return remediation_fail(error),
+    };
+    use audit::retest;
+
+    // Container product cap: refused before anything is read or run.
+    if let Err(error) =
+        retest::validate_limits(args.replays, args.max_findings as usize, args.deadline)
+    {
+        return remediation_fail(error);
+    }
+    let output = match preflight_new_output(&args.out) {
+        Ok(output) => output,
+        Err(error) => return remediation_fail(error),
+    };
+    let (repo, old) =
+        match retest::load_old_report(&args.path, args.report.as_deref(), &home_dir()).await {
+            Ok(value) => value,
+            Err(error) => return remediation_fail(error),
+        };
+    let plans = match retest::read_target_plans(&args.targets) {
+        Ok(plans) => plans,
+        Err(error) => return remediation_fail(error),
+    };
+    eprintln!(
+        "[vettalon] retest: old report {} (sha256 {}); {} target plan(s)",
+        retest::terminal_safe(&old.path.to_string_lossy()),
+        old.sha256,
+        plans.len()
+    );
+    let report = match retest::run_retest_with_node(
+        &repo,
+        &old,
+        &plans,
+        &args.poc_image,
+        args.replays,
+        args.max_findings as usize,
+        args.deadline,
+        &node,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => return remediation_fail(error),
+    };
+    if let Err(error) = output.write_json(&report) {
+        return remediation_fail(error);
+    }
+    if report
+        .results
+        .iter()
+        .any(|result| result.reason.as_deref() == Some("node_runtime_unavailable"))
+    {
+        eprintln!("[vettalon] {}", audit::node::dispatch::RUNTIME_HELP);
+    }
+    eprint!("{}", retest::render_text(&report));
+    eprintln!(
+        "[vettalon] retest: old report unchanged; finding statuses unchanged; report={}",
+        args.out.display()
+    );
+    report.exit_code()
+}
+
+/// Exit: 0 = run complete (any verdict); 1 = no verified location or
+/// incomplete; 2 = refused input or error. Errors never include report text.
+async fn cmd_intake(a: IntakeArgs) -> i32 {
+    use vettalon::audit::verify_only;
+    use vettalon::inbound::{extract, run, summary};
+    let fail = |msg: String| {
+        eprintln!("[vettalon] {}", audit::retest::terminal_safe(&msg));
+        2
+    };
+
+    // 1. Every output is a new file, checked before anything is read or any
+    //    model is called.
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut outputs = Vec::new();
+    for path in [
+        Some(&a.out),
+        a.claims_out.as_ref(),
+        a.receipt_out.as_ref(),
+        a.trace.as_ref(),
+    ] {
+        let output = match path.map(|p| preflight_new_output(p)).transpose() {
+            Ok(output) => output,
+            Err(e) => return fail(e),
+        };
+        if let Some(output) = &output {
+            if seen.iter().any(|p| p == output.path()) {
+                return fail(
+                    "--out, --claims-out, --receipt-out and --trace must be different files".into(),
+                );
+            }
+            seen.push(output.path().to_path_buf());
+        }
+        outputs.push(output);
+    }
+    let trace_output = outputs.pop().unwrap();
+    let receipt_output = outputs.pop().unwrap();
+    let claims_output = outputs.pop().unwrap();
+    let output = outputs.pop().unwrap().unwrap();
+    if a.time_budget.is_some_and(|s| s < 60) {
+        return fail("--time-budget must be at least 60 seconds".into());
+    }
+    let repo = match a.path.canonicalize() {
+        Ok(p) if p.is_dir() => p,
+        _ => return fail(format!("{} is not a directory", a.path.display())),
+    };
+    let overrides = extract::Overrides {
+        locations: a.location.clone(),
+        cwe: a.cwe.clone(),
+        title: a.title.clone(),
+        severity: Some(a.severity.clone()),
+    };
+    if let Err(e) = extract::validate_overrides(&overrides) {
+        return fail(e);
+    }
+
+    // 2. Read the report (stdin for `-`), hash and size what was read.
+    let source = if a.input.as_os_str() == "-" {
+        extract::InputSource::Stdin
+    } else {
+        extract::InputSource::Path(&a.input)
+    };
+    let text = match extract::read_input(source) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+    let input_sha256 = audit::schema::sha256_hex(text.as_bytes());
+    let input_bytes = text.len();
+
+    // 3. Verifier, as `verify` resolves it.
+    let trace = if a.trace.is_some() {
+        vettalon::llm::TraceLog::recording()
+    } else {
+        vettalon::llm::TraceLog::default()
+    };
+    let families: std::collections::HashMap<String, String>;
+    let verify_opts = if a.claims_only {
+        None
+    } else {
+        let Some(id) = a.verifier.as_deref() else {
+            return fail("a verifier is required unless --claims-only".into());
+        };
+        let (verifier, fams) = match resolve_verifier_roster(a.config.as_deref(), &repo, id) {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        };
+        families = fams;
+        let deadline = a
+            .time_budget
+            .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+        Some(verify_only::VerifyOptions {
+            verifier,
+            families: &families,
+            refuter_runs: a.refuter_runs,
+            deadline,
+            parse_retries: a.verifier_parse_retries as usize,
+            policy: audit::RefuterPolicy::default(),
+            score: false,
+            score_threshold: None,
+            joern: None,
+            spend: None,
+            all_severities: false,
+            trace: trace.clone(),
+        })
+    };
+    let target = match (&a.target, receipt_output) {
+        (Some(t), Some(r)) => Some(run::TargetSpec {
+            target_path: t.clone(),
+            receipt_out: r,
+            poc_image: a.poc_image.clone(),
+            replays: a.replays,
+        }),
+        _ => None,
+    };
+
+    // 4. Run.
+    let mut out = match run::run_intake(run::IntakeRequest {
+        repo_root: &repo,
+        text,
+        input_sha256,
+        input_bytes,
+        overrides,
+        severity: a.severity.clone(),
+        claims_only: a.claims_only,
+        verify_opts,
+        target,
+        check_duplicates: a.check_duplicates,
+    })
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return fail(e),
+    };
+
+    // 5. The result first: whatever fails after this, intake.json (which
+    //    also embeds the claims document) stays on disk. `claims_file` names
+    //    the path written next; if that write fails the run exits 2.
+    let claims_to_write = match (claims_output, &out.claims) {
+        (Some(path), Some(claims)) => {
+            out.claims_file = Some(path.path().display().to_string());
+            Some((path, claims.clone()))
+        }
+        (Some(_), None) => {
+            eprintln!("[vettalon] no claim was produced, so --claims-out was not written");
+            None
+        }
+        _ => None,
+    };
+    if let Err(e) = output.write_json(&out) {
+        return fail(e);
+    }
+    let mut write_failed = false;
+
+    // 6. Claims file (a new file, as preflighted).
+    if let Some((path, claims)) = claims_to_write
+        && let Err(e) = path.write_json(&claims)
+    {
+        eprintln!(
+            "[vettalon] {} (the intake result was written)",
+            audit::retest::terminal_safe(&e)
+        );
+        write_failed = true;
+    }
+
+    // 7. Trace (JSON Lines), a new 0600 file like the other outputs.
+    if let Some(path) = trace_output {
+        let mut lines = String::new();
+        for e in trace.snapshot() {
+            if let Ok(l) = serde_json::to_string(&e) {
+                lines.push_str(&l);
+                lines.push('\n');
+            }
+        }
+        if let Err(e) = path.write_text(&lines) {
+            eprintln!(
+                "[vettalon] {} (the intake result was written)",
+                audit::retest::terminal_safe(&e)
+            );
+            write_failed = true;
+        }
+    }
+
+    // 8. Human summary.
+    for line in summary::render_summary(&out) {
+        println!("{line}");
+    }
+
+    // 9. Exit code. Files already written are left in place.
+    if write_failed {
+        2
+    } else if !out.triage.located || out.incomplete {
+        1
+    } else {
+        0
+    }
+}
+
 async fn cmd_fix_check(args: FixCheckArgs) -> i32 {
+    let node = match audit::node::dispatch::NodeOptions::read(
+        args.node_image.clone(),
+        args.fixture.as_deref(),
+        &args.path,
+    ) {
+        Ok(node) => node,
+        Err(error) => return remediation_fail(error),
+    };
     let (repo, mut report, finding, target) =
         match remediation_context(&args.path, &args.report, &args.finding, &args.target) {
             Ok(value) => value,
@@ -3258,15 +4229,20 @@ async fn cmd_fix_check(args: FixCheckArgs) -> i32 {
     if let Err(reason) = audit::validate_fix_diff(&diff) {
         return remediation_fail(format!("fix diff refused: {reason}"));
     }
-    let run = audit::fix_check::run_target_fix(
+    let run = audit::fix_check::run_target_fix_with_node(
         &repo,
         &finding,
         &target,
         &diff,
         args.test_command.as_deref(),
         &args.poc_image,
+        None,
+        &node,
     )
     .await;
+    if run.reason().as_deref() == Some("node_runtime_unavailable") {
+        eprintln!("[vettalon] {}", audit::node::dispatch::RUNTIME_HELP);
+    }
     let Some(updated_finding) = report
         .findings
         .iter_mut()
@@ -3289,6 +4265,153 @@ async fn cmd_fix_check(args: FixCheckArgs) -> i32 {
         args.report_out.display()
     );
     usize::from(run.outcome() != audit::fix_check::FixOutcome::FixVerified) as i32
+}
+
+/// Exit 0 when signed/verified, 1 when verification failed, 2 when the input
+/// or key was refused (including a missing, non-regular, remote or KMS key)
+/// or cosign is missing, the wrong version or could not run. Nothing is
+/// written unsigned.
+async fn cmd_receipt(action: ReceiptAction) -> i32 {
+    match action {
+        ReceiptAction::Sign(args) => cmd_receipt_sign(args).await,
+        ReceiptAction::Verify(args) => cmd_receipt_verify(args).await,
+        ReceiptAction::Package(args) => {
+            use vettalon::audit::retest_package::{
+                PackageRequest,
+                write::{WriteOptions, write_package},
+            };
+            let request = PackageRequest {
+                retest: args.retest,
+                reproduce: args.reproduce,
+                fix_check: args.fix_check,
+                report: args.report,
+                include_report: args.include_report,
+                targets: args.targets,
+                bundles: args.bundle,
+                pq_sigs: args.pq_sig,
+                pq_key: args.pq_pub,
+                key: args.key,
+            };
+            let languages = match args.lang.as_str() {
+                "both" | "zh-TW,en" => vec!["en".into(), "zh-TW".into()],
+                _ => vec![args.lang],
+            };
+            let options = WriteOptions {
+                out: args.out,
+                zip: args.zip,
+                languages,
+                engagement: args.engagement,
+            };
+            match write_package(&request, &options) {
+                Ok(id) => {
+                    println!("package built: sha256:{id}");
+                    0
+                }
+                Err(error) => {
+                    // Only fixed refusal tokens reach the terminal; inputs may contain secrets.
+                    eprintln!("[vettalon] package refused: {}", error.token);
+                    if matches!(error.token, "name_invalid" | "name_duplicate") {
+                        eprintln!(
+                            "rename inputs to distinct ASCII basenames (letters, digits, dot, underscore, hyphen; maximum 100 characters)"
+                        );
+                    }
+                    if error.token == "report_required_for_verification" {
+                        eprintln!(
+                            "--report requires --include-report for deterministic verification"
+                        );
+                    }
+                    2
+                }
+            }
+        }
+        ReceiptAction::VerifyPackage { path, key, pq_pub } => {
+            match vettalon::audit::retest_package::verify::verify_package_with_pq(
+                &path,
+                key.as_deref(),
+                pq_pub.as_deref(),
+            ) {
+                Ok(result) => {
+                    println!("package sha256:{}: {}", result.package_id, result.checked);
+                    result.exit_code
+                }
+                Err(error) => {
+                    eprintln!("[vettalon] package verification: {}", error.token);
+                    error.exit_code
+                }
+            }
+        }
+        ReceiptAction::EngagementTemplate { lang: _lang } => {
+            print!(
+                "{}",
+                vettalon::audit::retest_package::engagement::engagement_template()
+            );
+            0
+        }
+    }
+}
+
+async fn cmd_receipt_sign(args: ReceiptSignArgs) -> i32 {
+    let out = args.out.as_deref();
+    let pq = args
+        .pq_key
+        .as_deref()
+        .map(|key| (key, args.pq_out.as_deref()));
+    match vettalon::attest::sign_receipt_hybrid(&args.receipt, &args.key, out, pq).await {
+        Ok(signed) => {
+            eprintln!(
+                "[vettalon] receipt signed: kind={}; cosign {}; bundle={}",
+                signed.kind.key(),
+                signed.cosign_version,
+                signed.bundle.display()
+            );
+            if let Some(pq) = &signed.pq {
+                eprintln!(
+                    "[vettalon] ML-DSA-65 sidecar={}; {}; public key sha256:{}; self-verified",
+                    pq.sidecar.display(),
+                    pq.openssl_version,
+                    pq.public_key_sha256
+                );
+            }
+            eprintln!("[vettalon] local key only; nothing was uploaded to a transparency log");
+            eprintln!(
+                "[vettalon] the signed Statement matches the receipt; the cosign signature was not \
+                 checked here (run `vettalon receipt verify` with the public key)"
+            );
+            0
+        }
+        Err(error) => remediation_fail(format!("receipt not signed: {error}")),
+    }
+}
+
+async fn cmd_receipt_verify(args: ReceiptVerifyArgs) -> i32 {
+    use vettalon::attest::AttestError;
+
+    let pq = args.pq_pub.as_deref().zip(args.pq_sig.as_deref());
+    if pq.is_none() {
+        println!("ML-DSA layer: not checked (no --pq-sig)");
+    }
+    match vettalon::attest::verify_receipt_hybrid(&args.receipt, &args.key, &args.bundle, pq).await
+    {
+        Ok(verified) => {
+            println!(
+                "verified: {} receipt, signed with this key and unchanged (cosign {})",
+                verified.kind.key(),
+                verified.cosign_version
+            );
+            if verified.pq_verified {
+                println!("ML-DSA-65 layer: verified");
+            }
+            println!("this shows who vouched for the receipt, not that its conclusion is right");
+            0
+        }
+        Err(AttestError::Failed(error)) => {
+            eprintln!("[vettalon] receipt verification FAILED: {error}");
+            1
+        }
+        Err(AttestError::Refused(error)) => {
+            remediation_fail(format!("receipt not verified: {error}"))
+        }
+    }
 }
 
 const VERIFICATION_INPUT_MAX_BYTES: u64 = 128 * 1024;
@@ -3468,8 +4591,15 @@ fn cmd_verification(action: VerificationAction) -> i32 {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let package_languages = matches!(
+        &cli.command,
+        Command::Receipt {
+            action: ReceiptAction::Package(_)
+        }
+    );
     if let Some(l) = cli.lang.as_deref()
         && !matches!(l.to_ascii_lowercase().get(..2), Some("en" | "zh"))
+        && !(package_languages && l == "both")
     {
         eprintln!("[vettalon] --lang must be en or zh-TW (got {l:?})");
         return ExitCode::from(2);
@@ -3579,10 +4709,17 @@ async fn main() -> ExitCode {
         Command::Scan(args) => cmd_scan(args).await,
         Command::Validate { report } => audit::cmd_validate(&report).await,
         Command::Verify(args) => cmd_verify(args).await,
+        Command::CbomCheck(a) => {
+            audit::cbom_check::run_cli(&a.cbom, &a.root, &a.entry, a.json.as_deref(), a.sweep)
+        }
         Command::Reproduce(args) => cmd_reproduce(args).await,
+        Command::Bisect(args) => cmd_bisect(args).await,
+        Command::Retest(args) => cmd_retest(args).await,
+        Command::Intake(args) => cmd_intake(args).await,
         Command::Fix {
             action: FixAction::Check(args),
         } => cmd_fix_check(args).await,
+        Command::Receipt { action } => cmd_receipt(action).await,
         Command::Verification { action } => cmd_verification(action),
         Command::Evidence {
             action:
@@ -3650,6 +4787,22 @@ async fn main() -> ExitCode {
         Command::Toolchain { action } => cmd_toolchain(action).await,
         Command::Models { config, probe } => cmd_models(config, probe).await,
         Command::Joern { action } => cmd_joern(action).await,
+        Command::PocNode { action } => match action {
+            PocNodeAction::Image => {
+                println!("{}", vettalon::llm::container::poc_node_image());
+                0
+            }
+            PocNodeAction::Build => match vettalon::llm::container::build_poc_node_image().await {
+                Ok(()) => {
+                    println!("{}", vettalon::lang::pick("完成", "Done"));
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[vettalon] {e}");
+                    2
+                }
+            },
+        },
         Command::Agents { action } => {
             let r = match action {
                 AgentsAction::Build => vettalon::llm::container::build_images().await,
@@ -3686,6 +4839,13 @@ async fn main() -> ExitCode {
 mod hunt_intake_cli_tests {
     use super::*;
 
+    /// macOS tempdirs live under /var (a symlink to /private/var), and
+    /// preflight_new_output refuses symlinked parents, so use a canonical root.
+    fn intake_real_tempdir() -> tempfile::TempDir {
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        tempfile::Builder::new().tempdir_in(root).unwrap()
+    }
+
     #[tokio::test]
     async fn requested_hunt_report_write_failure_returns_error_for_valid_empty_source() {
         let dir = tempfile::tempdir().unwrap();
@@ -3717,6 +4877,125 @@ mod hunt_intake_cli_tests {
     }
     fn no_record(_: &vettalon::hunt::run::HuntDisclosure) -> Result<(), String> {
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_cli_refuses_fixture_inside_project_with_exit_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("auth.json");
+        std::fs::write(
+            &fixture,
+            r#"{"schema":"vettalon.node-fixture/1","env":{"TOKEN":"private-cli-token"}}"#,
+        )
+        .unwrap();
+        for command in [vec!["reproduce"], vec!["fix", "check"], vec!["retest"]] {
+            let mut argv = vec!["vettalon"];
+            argv.extend(command.clone());
+            argv.extend([
+                dir.path().to_str().unwrap(),
+                "--fixture",
+                fixture.to_str().unwrap(),
+                "--out",
+                "unused-receipt.json",
+            ]);
+            if command == ["retest"] {
+                argv.extend(["--targets", "unused-targets.json"]);
+            } else {
+                argv.extend([
+                    "--report",
+                    "unused-report.json",
+                    "--finding",
+                    "id",
+                    "--target",
+                    "unused-target.json",
+                ]);
+                if command == ["fix", "check"] {
+                    argv.extend(["--report-out", "unused-updated.json"]);
+                }
+            }
+            let code = match Cli::try_parse_from(argv).unwrap().command {
+                Command::Reproduce(args) => cmd_reproduce(args).await,
+                Command::Retest(args) => cmd_retest(args).await,
+                Command::Fix {
+                    action: FixAction::Check(args),
+                } => cmd_fix_check(args).await,
+                _ => panic!("unexpected command"),
+            };
+            assert_eq!(code, 2);
+        }
+    }
+
+    #[test]
+    fn node_cli_flags_defaults_and_overrides() {
+        for prefix in [
+            vec![
+                "vettalon",
+                "reproduce",
+                ".",
+                "--report",
+                "report.json",
+                "--finding",
+                "id",
+                "--target",
+                "target.json",
+                "--out",
+                "receipt.json",
+            ],
+            vec![
+                "vettalon",
+                "fix",
+                "check",
+                ".",
+                "--report",
+                "report.json",
+                "--finding",
+                "id",
+                "--target",
+                "target.json",
+                "--out",
+                "receipt.json",
+                "--report-out",
+                "updated.json",
+            ],
+            vec![
+                "vettalon",
+                "retest",
+                ".",
+                "--targets",
+                "targets.json",
+                "--out",
+                "receipt.json",
+            ],
+        ] {
+            for custom in [false, true] {
+                let mut argv = prefix.clone();
+                if custom {
+                    argv.extend(["--node-image", "local-node:test", "--fixture", "auth.json"]);
+                }
+                let parsed = Cli::try_parse_from(argv).unwrap();
+                let (image, fixture, python) = match parsed.command {
+                    Command::Reproduce(args) => (args.node_image, args.fixture, args.poc_image),
+                    Command::Retest(args) => (args.node_image, args.fixture, args.poc_image),
+                    Command::Fix {
+                        action: FixAction::Check(args),
+                    } => (args.node_image, args.fixture, args.poc_image),
+                    _ => panic!("unexpected command"),
+                };
+                assert_eq!(
+                    image,
+                    if custom {
+                        "local-node:test"
+                    } else {
+                        vettalon::sandbox::default_node_poc_image()
+                    }
+                );
+                assert_eq!(fixture, custom.then(|| PathBuf::from("auth.json")));
+                assert_eq!(python, vettalon::sandbox::DEFAULT_POC_IMAGE);
+            }
+            let mut argv = prefix;
+            argv.push("--fixture");
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
     }
 
     fn draft_fixture(id: &str) -> vettalon::hunt::run::HuntDisclosure {
@@ -3795,6 +5074,23 @@ mod hunt_intake_cli_tests {
         assert!(!o.include_patch && o.allow_unproven);
         assert_eq!(o.force_throttle.as_deref(), Some("urgent"));
         assert!(draft.check_duplicates);
+        assert!(o.receipt.is_none() && o.receipt_bundle.is_none());
+        let with_receipt = DraftArgs {
+            reviewer: Some("r".into()),
+            receipt: Some("a.json".into()),
+            receipt_bundle: Some("a.bundle".into()),
+            ..Default::default()
+        };
+        let o = draft_options(&with_receipt, None).unwrap();
+        assert_eq!(o.receipt.as_deref(), Some(Path::new("a.json")));
+        assert_eq!(o.receipt_bundle.as_deref(), Some(Path::new("a.bundle")));
+        let orphan = DraftArgs {
+            reviewer: Some("r".into()),
+            receipt_bundle: Some("a.bundle".into()),
+            ..Default::default()
+        };
+        let err = draft_options(&orphan, None).err().unwrap();
+        assert!(err.contains("requires --receipt"), "{err}");
         // No reviewer anywhere: refused.
         assert!(draft_options(&DraftArgs::default(), None).is_err());
         assert!(
@@ -3828,6 +5124,279 @@ mod hunt_intake_cli_tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::DiscloseLedger { .. }));
+    }
+
+    #[test]
+    fn reproduce_replays_default_to_one_and_are_bounded() {
+        let base = [
+            "vettalon",
+            "reproduce",
+            ".",
+            "--report",
+            "r.json",
+            "--finding",
+            "x",
+            "--target",
+            "t.json",
+            "--out",
+            "o.json",
+        ];
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(base.iter().chain(extra).copied()).map(|cli| match cli.command {
+                Command::Reproduce(args) => args.replays,
+                _ => panic!("reproduce parser"),
+            })
+        };
+        assert_eq!(parse(&[]).unwrap(), 1);
+        assert_eq!(parse(&["--replays", "1"]).unwrap(), 1);
+        assert_eq!(parse(&["--replays", "20"]).unwrap(), 20);
+        for refused in ["0", "21", "-1", "x"] {
+            assert!(parse(&["--replays", refused]).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn retest_args_default_and_are_bounded() {
+        let base = [
+            "vettalon",
+            "retest",
+            ".",
+            "--out",
+            "o.json",
+            "--targets",
+            "t.json",
+        ];
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(base.iter().chain(extra).copied()).map(|cli| match cli.command {
+                Command::Retest(args) => (
+                    args.replays,
+                    args.max_findings,
+                    args.report.is_none(),
+                    args.deadline,
+                ),
+                _ => panic!("retest parser"),
+            })
+        };
+        assert_eq!(parse(&[]).unwrap(), (1, 20, true, 3600));
+        assert_eq!(
+            parse(&["--replays", "20", "--max-findings", "1"]).unwrap(),
+            (20, 1, true, 3600)
+        );
+        assert_eq!(
+            parse(&["--report", "r.json"]).unwrap(),
+            (1, 20, false, 3600)
+        );
+        assert_eq!(
+            parse(&["--deadline", "86400"]).unwrap(),
+            (1, 20, true, 86_400)
+        );
+        for flag in ["--replays", "--max-findings"] {
+            for refused in ["0", "21", "-1", "x"] {
+                assert!(parse(&[flag, refused]).is_err(), "{flag} {refused}");
+            }
+        }
+        for refused in ["0", "86401", "-1", "x"] {
+            assert!(parse(&["--deadline", refused]).is_err(), "{refused}");
+        }
+    }
+
+    fn parse_intake(extra: &[&str]) -> Result<IntakeArgs, clap::Error> {
+        let base = [
+            "vettalon", "intake", ".", "--input", "r.md", "--out", "o.json",
+        ];
+        Cli::try_parse_from(base.iter().chain(extra).copied()).map(|cli| match cli.command {
+            Command::Intake(args) => args,
+            _ => panic!("intake parser"),
+        })
+    }
+
+    #[test]
+    fn intake_requires_input_out_and_a_verifier() {
+        for argv in [
+            vec![
+                "vettalon",
+                "intake",
+                ".",
+                "--out",
+                "o.json",
+                "--verifier",
+                "m",
+            ],
+            vec![
+                "vettalon",
+                "intake",
+                ".",
+                "--input",
+                "r.md",
+                "--verifier",
+                "m",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        assert!(parse_intake(&[]).is_err());
+        let a = parse_intake(&["--verifier", "m"]).unwrap();
+        assert_eq!(a.verifier.as_deref(), Some("m"));
+        assert_eq!((a.replays, a.severity.as_str()), (1, "medium"));
+        assert!(parse_intake(&["--claims-only"]).is_ok());
+        assert!(parse_intake(&["--verifier", "m", "--severity", "urgent"]).is_err());
+    }
+
+    #[test]
+    fn intake_flag_conflicts_are_refused() {
+        for extra in [
+            &["--claims-only", "--verifier", "x"][..],
+            &["--claims-only", "--check-duplicates"],
+            &[
+                "--claims-only",
+                "--target",
+                "t.json",
+                "--receipt-out",
+                "r.json",
+            ],
+            &["--verifier", "m", "--receipt-out", "r.json"],
+            &["--verifier", "m", "--target", "t.json"],
+        ] {
+            assert!(parse_intake(extra).is_err(), "{extra:?}");
+        }
+        assert!(
+            parse_intake(&[
+                "--verifier",
+                "m",
+                "--target",
+                "t.json",
+                "--receipt-out",
+                "r.json"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn intake_replays_are_bounded() {
+        for refused in ["0", "21"] {
+            assert!(
+                parse_intake(&["--verifier", "m", "--replays", refused]).is_err(),
+                "{refused}"
+            );
+        }
+        for ok in ["1", "20"] {
+            assert!(parse_intake(&["--verifier", "m", "--replays", ok]).is_ok());
+        }
+    }
+
+    #[test]
+    fn intake_location_parses_from_the_right() {
+        let a = parse_intake(&[
+            "--verifier",
+            "m",
+            "--location",
+            "a.py:12",
+            "--location",
+            "b/c.py",
+            "--location",
+            "d.py:3",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.location,
+            vec![
+                ("a.py".to_string(), Some(12)),
+                ("b/c.py".to_string(), None),
+                ("d.py".to_string(), Some(3)),
+            ]
+        );
+        assert_eq!(
+            parse_intake_location("x:y.py:9").unwrap(),
+            ("x:y.py".to_string(), Some(9))
+        );
+        for bad in ["a.py:", "a.py:x", "x:y.py", ":3", "a.py:0", "a.py:-1", ""] {
+            assert!(parse_intake_location(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn intake_existing_output_is_refused_before_reading_input() {
+        let dir = intake_real_tempdir();
+        let out = dir.path().join("o.json");
+        std::fs::write(&out, "x").unwrap();
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "intake",
+            dir.path().to_str().unwrap(),
+            "--input",
+            dir.path().join("missing.md").to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--claims-only",
+        ])
+        .unwrap();
+        let Command::Intake(args) = cli.command else {
+            panic!("intake parser");
+        };
+        assert_eq!(cmd_intake(args).await, 2);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn intake_claims_only_without_location_exits_1() {
+        let dir = intake_real_tempdir();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let input = dir.path().join("r.md");
+        std::fs::write(&input, "Something is wrong somewhere.\n").unwrap();
+        let out = dir.path().join("o.json");
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "intake",
+            repo.to_str().unwrap(),
+            "--input",
+            input.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--claims-only",
+        ])
+        .unwrap();
+        let Command::Intake(args) = cli.command else {
+            panic!("intake parser");
+        };
+        assert_eq!(cmd_intake(args).await, 1);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["schema"], "vettalon.intake/1");
+        assert_eq!(v["triage"]["located"], false);
+    }
+
+    #[test]
+    fn retest_requires_targets() {
+        let argv = ["vettalon", "retest", ".", "--out", "o.json"];
+        let missing = Cli::try_parse_from(argv).err().unwrap();
+        assert!(missing.to_string().contains("--targets"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn retest_container_product_is_refused_before_any_work() {
+        // 3 * 20 * 3 = 180 > 120: refused even though the report and plans
+        // do not exist, so nothing is read and no output is created.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("o.json");
+        let cli = Cli::try_parse_from([
+            "vettalon",
+            "retest",
+            dir.path().to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--targets",
+            dir.path().join("missing.json").to_str().unwrap(),
+            "--replays",
+            "3",
+        ])
+        .unwrap();
+        let Command::Retest(args) = cli.command else {
+            panic!("retest parser");
+        };
+        assert_eq!(cmd_retest(args).await, 2);
+        assert!(!out.exists());
     }
 
     #[tokio::test]

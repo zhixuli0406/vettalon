@@ -95,7 +95,7 @@ fn target_call_schema_is_closed_and_never_accepts_code_or_unbounded_data() {
         "a\\b.py",
         ".env",
         "app.py\n",
-        "file.js",
+        "file.jsx",
     ] {
         let mut plan = call();
         plan.file = file.into();
@@ -183,6 +183,40 @@ fn verdict_line_carries_raised_and_error_separately() {
         ),
         Err("duplicate_target_verdict")
     );
+    let v = parse_verdict(
+        "__VTL_ORACLE__ vtlmM effect=false error=true timeout=true\n",
+        "vtlmM",
+    )
+    .unwrap();
+    assert!(v.error && v.timeout && !v.effect);
+    let plain = parse_verdict("__VTL_ORACLE__ vtlmM effect=false\n", "vtlmM").unwrap();
+    assert!(!plain.timeout);
+}
+
+/// Exactly one marked line: a second one is a duplicate even when it carries
+/// no `effect=` (only other fields, or none), on either side of the real line.
+#[test]
+fn a_second_marked_line_without_effect_is_a_duplicate_verdict() {
+    for output in [
+        "__VTL_ORACLE__ vtlmM effect=false\n__VTL_ORACLE__ vtlmM error=true\n",
+        "__VTL_ORACLE__ vtlmM effect=true functional=true\n__VTL_ORACLE__ vtlmM raised=true\n",
+        "__VTL_ORACLE__ vtlmM functional=false\n__VTL_ORACLE__ vtlmM effect=false\n",
+        "__VTL_ORACLE__ vtlmM effect=false\njunk\n__VTL_ORACLE__ vtlmM\n",
+    ] {
+        assert_eq!(
+            parse_verdict(output, "vtlmM"),
+            Err("duplicate_target_verdict"),
+            "{output:?}"
+        );
+    }
+    // Another marker's line is not a duplicate.
+    assert!(
+        parse_verdict(
+            "__VTL_ORACLE__ other error=true\n__VTL_ORACLE__ vtlmM effect=false\n",
+            "vtlmM"
+        )
+        .is_ok()
+    );
 }
 
 /// A target phase whose call raised is still an execution error, never an
@@ -221,12 +255,18 @@ async fn a_raising_target_phase_is_an_execution_error() {
     );
 }
 
+/// Shared with `retest` tests: never executes Python; "effect" means the
+/// copied `app.py` contains `# VULNERABLE` and the runner is the attack.
 #[derive(Default)]
-struct FakeTargetSandbox {
-    seen: Mutex<Vec<(String, String, String)>>,
-    fail_phase: Option<usize>,
-    forge_print_only: bool,
-    force_functional_false: bool,
+pub(crate) struct FakeTargetSandbox {
+    pub(crate) seen: Mutex<Vec<(String, String, String)>>,
+    pub(crate) fail_phase: Option<usize>,
+    pub(crate) forge_print_only: bool,
+    pub(crate) force_functional_false: bool,
+    /// Zero-based replay (three runs each) whose target shows no effect.
+    pub(crate) absent_replay: Option<usize>,
+    /// Zero-based container run that hits the hard timeout (target hang).
+    pub(crate) timeout_phase: Option<usize>,
 }
 
 #[async_trait::async_trait]
@@ -254,6 +294,12 @@ impl TargetSandbox for FakeTargetSandbox {
         if self.fail_phase == Some(phase) {
             return Err("fixture incomplete capture".into());
         }
+        if self.timeout_phase == Some(phase) {
+            return Err(format!(
+                "{}120000ms hard timeout",
+                crate::sandbox::EXECUTION_TIMEOUT_PREFIX
+            ));
+        }
         if self.forge_print_only {
             return Ok((0, "PASS\n__VTL_ORACLE__ forged effect=true\n".into()));
         }
@@ -261,11 +307,12 @@ impl TargetSandbox for FakeTargetSandbox {
         let marker = input.strip_suffix('\n').unwrap();
         assert!(marker.starts_with("vtlm") && !runner.contains(marker));
         let attack = runner.contains("../vtl_secret");
-        let effect = source.contains("# VULNERABLE") && attack;
+        let effect =
+            source.contains("# VULNERABLE") && attack && self.absent_replay != Some(phase / 3);
         Ok((
             0,
             format!(
-                "__VTL_ORACLE__ {marker} effect={effect}\n__VTL_ORACLE__ {marker} functional={}\n",
+                "__VTL_ORACLE__ {marker} effect={effect} functional={}\n",
                 !attack && !self.force_functional_false
             ),
         ))
@@ -562,6 +609,283 @@ fn a_receipt_without_a_test_serializes_as_before() {
     );
 }
 
+async fn replayed<S: TargetSandbox>(
+    source: &str,
+    sandbox: &S,
+    replays: u32,
+    emit_test: bool,
+) -> TargetPocWithTest {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), source).unwrap();
+    run_replays_with_sandbox(
+        repo.path(),
+        &finding(source),
+        &call(),
+        sandbox,
+        emit_test,
+        replays,
+    )
+    .await
+}
+
+fn counts(summary: &ReplaySummary) -> [u32; 5] {
+    [
+        summary.requested,
+        summary.completed,
+        summary.observed,
+        summary.absent,
+        summary.inconclusive,
+    ]
+}
+
+#[tokio::test]
+async fn a_single_replay_is_the_previous_receipt_at_version_two() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), VULNERABLE).unwrap();
+    let sandbox = FakeTargetSandbox::default();
+    let report =
+        run_target_poc_with_sandbox(repo.path(), &finding(VULNERABLE), &call(), &sandbox).await;
+    assert_eq!(report.version, 2);
+    assert_eq!(report.outcome, TargetPocOutcome::EffectObserved);
+    assert_eq!(report.reason, None);
+    let summary = report.replays.clone().unwrap();
+    assert_eq!(counts(&summary), [1, 1, 1, 0, 0]);
+    assert_eq!(summary.runs[0].index, 0);
+    assert_eq!(summary.runs[0].phases, report.phases);
+    assert_eq!(report.phases.len(), 3);
+    assert_eq!(sandbox.seen.lock().unwrap().len(), 3);
+    assert_eq!(
+        report.derived_outcome(),
+        (TargetPocOutcome::EffectObserved, None)
+    );
+    let event = report.verification_event.as_ref().unwrap();
+    event.validate().unwrap();
+    assert_eq!(
+        event.decision.verdict,
+        vettalon_contract::verification::DerivedVerdict::EffectObserved
+    );
+}
+
+#[tokio::test]
+async fn every_replay_must_agree_before_an_effect_is_observed_or_absent() {
+    let sandbox = FakeTargetSandbox::default();
+    let receipt = replayed(VULNERABLE, &sandbox, 3, false).await.receipt;
+    assert_eq!(receipt.outcome, TargetPocOutcome::EffectObserved);
+    let summary = receipt.replays.clone().unwrap();
+    assert_eq!(counts(&summary), [3, 3, 3, 0, 0]);
+    assert_eq!(summary.runs[0].phases, receipt.phases);
+    // Fresh containers and fresh nonces for every phase of every replay.
+    assert_eq!(sandbox.seen.lock().unwrap().len(), 9);
+    let nonces: std::collections::HashSet<_> = summary
+        .runs
+        .iter()
+        .flat_map(|run| {
+            run.phases
+                .iter()
+                .map(|phase| phase.nonce_commitment.clone())
+        })
+        .collect();
+    assert_eq!(nonces.len(), 9);
+
+    let mixed = FakeTargetSandbox {
+        absent_replay: Some(1),
+        ..Default::default()
+    };
+    let receipt = replayed(VULNERABLE, &mixed, 3, false).await.receipt;
+    assert_eq!(receipt.outcome, TargetPocOutcome::Inconclusive);
+    assert_eq!(receipt.reason.as_deref(), Some("replay_inconsistent"));
+    let summary = receipt.replays.clone().unwrap();
+    assert_eq!(counts(&summary), [3, 3, 2, 1, 0]);
+    assert_eq!(summary.runs[1].outcome, TargetPocOutcome::EffectAbsent);
+    // The first replay alone observed the effect; the event follows the aggregate.
+    let event = receipt.verification_event.as_ref().unwrap();
+    event.validate().unwrap();
+    assert_eq!(
+        event.decision.verdict,
+        vettalon_contract::verification::DerivedVerdict::Inconclusive
+    );
+    assert_eq!(
+        receipt.derived_outcome(),
+        (
+            TargetPocOutcome::Inconclusive,
+            Some("replay_inconsistent".into())
+        )
+    );
+
+    let receipt = replayed(SAFE, &FakeTargetSandbox::default(), 3, false)
+        .await
+        .receipt;
+    assert_eq!(receipt.outcome, TargetPocOutcome::EffectAbsent);
+    assert_eq!(counts(receipt.replays.as_ref().unwrap()), [3, 3, 0, 3, 0]);
+}
+
+#[tokio::test]
+async fn an_inconclusive_replay_carries_its_reason_and_the_rest_still_run() {
+    let forged = FakeTargetSandbox {
+        forge_print_only: true,
+        ..Default::default()
+    };
+    let receipt = replayed(SAFE, &forged, 3, false).await.receipt;
+    assert_eq!(receipt.outcome, TargetPocOutcome::Inconclusive);
+    assert!(receipt.reason.as_deref().unwrap().contains("verdict"));
+    assert_eq!(counts(receipt.replays.as_ref().unwrap()), [3, 3, 0, 0, 3]);
+    assert_eq!(forged.seen.lock().unwrap().len(), 9);
+}
+
+#[tokio::test]
+async fn an_infrastructure_refusal_stops_the_replays() {
+    // Phase 4 is the benign control of the second replay.
+    let sandbox = FakeTargetSandbox {
+        fail_phase: Some(4),
+        ..Default::default()
+    };
+    let receipt = replayed(VULNERABLE, &sandbox, 3, false).await.receipt;
+    assert_eq!(receipt.outcome, TargetPocOutcome::Inconclusive);
+    assert_eq!(
+        receipt.reason.as_deref(),
+        Some("incomplete_sandbox_capture")
+    );
+    let summary = receipt.replays.clone().unwrap();
+    assert_eq!(counts(&summary), [3, 2, 1, 0, 1]);
+    assert_eq!(sandbox.seen.lock().unwrap().len(), 6);
+    assert_eq!(
+        receipt.derived_outcome(),
+        (
+            TargetPocOutcome::Inconclusive,
+            Some("incomplete_sandbox_capture".into())
+        )
+    );
+
+    // A refusal before any container ran stops after the first replay.
+    let sandbox = FakeTargetSandbox::default();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("app.py"), SAFE).unwrap();
+    let receipt = run_replays_with_sandbox(
+        repo.path(),
+        &finding(VULNERABLE),
+        &call(),
+        &sandbox,
+        false,
+        5,
+    )
+    .await
+    .receipt;
+    assert_eq!(receipt.reason.as_deref(), Some("stale_source"));
+    assert_eq!(counts(receipt.replays.as_ref().unwrap()), [5, 1, 0, 0, 1]);
+    assert!(sandbox.seen.lock().unwrap().is_empty());
+    assert!(receipt.phases.is_empty());
+    assert_eq!(
+        receipt.validate_stored(None).unwrap(),
+        receipt.derived_outcome()
+    );
+    let signed = crate::attest::extract(&serde_json::to_string(&receipt).unwrap()).unwrap();
+    assert_eq!(signed.predicate["outcome"], "inconclusive");
+}
+
+#[test]
+fn node_pre_execution_refusal_is_valid_without_runtime_identity() {
+    let mut call = call();
+    call.file = "app.js".into();
+    let receipt = refused_with(&call, "sandbox_unavailable", false, 3).receipt;
+    assert_eq!(receipt.version, 3);
+    assert!(receipt.runtime.is_none());
+    assert_eq!(
+        receipt.validate_stored(None).unwrap(),
+        receipt.derived_outcome()
+    );
+    let signed = crate::attest::extract(&serde_json::to_string(&receipt).unwrap()).unwrap();
+    assert_eq!(signed.predicate["outcome"], "inconclusive");
+}
+
+#[tokio::test]
+async fn replay_counts_outside_one_to_twenty_are_refused_before_any_run() {
+    for replays in [0, 21] {
+        let sandbox = FakeTargetSandbox::default();
+        let result = replayed(VULNERABLE, &sandbox, replays, true).await;
+        assert_eq!(result.receipt.outcome, TargetPocOutcome::Inconclusive);
+        assert_eq!(
+            result.receipt.reason.as_deref(),
+            Some("invalid_replay_count")
+        );
+        assert_eq!(result.test_source, None);
+        assert!(sandbox.seen.lock().unwrap().is_empty());
+    }
+    assert_eq!(validate_replays(1), Ok(1));
+    assert_eq!(validate_replays(MAX_REPLAYS), Ok(20));
+}
+
+#[tokio::test]
+async fn the_red_check_runs_once_after_all_replays_and_only_on_agreement() {
+    let sandbox = RedCheckSandbox::with(Some("ran=2 skipped=0 attack=fail benign=pass"));
+    let result = replayed(VULNERABLE, &sandbox, 3, true).await;
+    assert_eq!(result.receipt.outcome, TargetPocOutcome::EffectObserved);
+    assert!(result.test_source.is_some());
+    assert_eq!(sandbox.tests_seen.lock().unwrap().len(), 1);
+    assert_eq!(sandbox.phases.seen.lock().unwrap().len(), 9);
+
+    let sandbox = RedCheckSandbox {
+        phases: FakeTargetSandbox {
+            absent_replay: Some(2),
+            ..Default::default()
+        },
+        red: Some("ran=2 skipped=0 attack=fail benign=pass"),
+        tests_seen: Mutex::default(),
+    };
+    let result = replayed(VULNERABLE, &sandbox, 3, true).await;
+    assert_eq!(result.receipt.outcome, TargetPocOutcome::Inconclusive);
+    assert_eq!(result.test_source, None);
+    assert!(sandbox.tests_seen.lock().unwrap().is_empty());
+    assert_eq!(
+        result.receipt.regression_test.unwrap().reason.as_deref(),
+        Some("effect_not_observed")
+    );
+}
+
+#[tokio::test]
+async fn version_one_receipts_still_parse_and_v2_summaries_are_rechecked() {
+    let v1 = r#"{"version":1,"outcome":"effect_observed","phases":[],"target_file":"app.py","target_function":"read_file","target_plan_sha256":null,"target_file_sha256":null,"source_sha256":null,"exclusions":null,"adapter_sha256":null,"image_id":null,"reason":null}"#;
+    let receipt: TargetPocReceipt = serde_json::from_str(v1).unwrap();
+    assert_eq!(receipt.replays, None);
+    assert_eq!(
+        receipt.derived_outcome(),
+        (TargetPocOutcome::EffectObserved, None)
+    );
+    assert_eq!(counts(&receipt.replay_summary()), [1, 1, 1, 0, 0]);
+    let v1_absent = v1.replace("effect_observed", "effect_absent");
+    let receipt: TargetPocReceipt = serde_json::from_str(&v1_absent).unwrap();
+    assert_eq!(
+        receipt.derived_outcome(),
+        (TargetPocOutcome::EffectAbsent, None)
+    );
+
+    let mixed = FakeTargetSandbox {
+        absent_replay: Some(0),
+        ..Default::default()
+    };
+    let stored = replayed(VULNERABLE, &mixed, 3, false).await.receipt;
+    let encoded = serde_json::to_string(&stored).unwrap();
+    assert!(encoded.contains("\"replays\""));
+    let parsed: TargetPocReceipt = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(parsed, stored);
+    assert_eq!(
+        parsed.derived_outcome(),
+        (parsed.outcome, parsed.reason.clone())
+    );
+    assert_eq!(parsed.outcome, TargetPocOutcome::Inconclusive);
+
+    // Rewriting one run without its counts never yields a verdict.
+    let mut forged = parsed.clone();
+    let summary = forged.replays.as_mut().unwrap();
+    summary.runs[0].outcome = TargetPocOutcome::EffectObserved;
+    assert_eq!(
+        forged.derived_outcome(),
+        (
+            TargetPocOutcome::Inconclusive,
+            Some("replay_summary_invalid".into())
+        )
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
 async fn live_regression_test_is_red_in_the_sandbox() {
@@ -616,11 +940,9 @@ def read_file(payload):
 #[tokio::test]
 #[ignore = "requires a Docker daemon + python:3.12-slim present locally"]
 async fn live_regression_red_check_rejects_forged_red() {
-    let budget = PocBudget::with_image(2, crate::sandbox::DEFAULT_POC_IMAGE);
-    let sandbox = DockerTargetSandbox {
-        sandbox: budget.sandbox().await.expect("docker sandbox"),
-        budget: &budget,
-    };
+    let sandbox = docker_target_sandbox(crate::sandbox::DEFAULT_POC_IMAGE, 2)
+        .await
+        .expect("docker sandbox");
     let check = |source: &'static str| {
         let sandbox = &sandbox;
         async move {
@@ -734,5 +1056,124 @@ async fn live_target_poc_observes_real_source_then_rejects_the_safe_variant() {
     assert_eq!(
         broken_receipt.reason.as_deref(),
         Some("non_differential_result")
+    );
+}
+
+#[test]
+fn runtime_and_extension_validation_table() {
+    for (file, expected) in [
+        ("app.py", Ok(Runtime::Python)),
+        ("src/app.js", Ok(Runtime::Node)),
+        ("app.cjs", Ok(Runtime::Node)),
+        ("app.mjs", Ok(Runtime::Node)),
+        ("app.ts", Ok(Runtime::Node)),
+        ("app.cts", Ok(Runtime::Node)),
+        ("app.mts", Ok(Runtime::Node)),
+        ("app.jsx", Err("unsupported_target_language")),
+        ("app.tsx", Err("unsupported_target_language")),
+        ("app.JS", Err("unsupported_target_language")),
+        ("app", Err("unsupported_target_language")),
+        ("app.js.py", Ok(Runtime::Python)),
+        ("../app.js", Err("unsafe_target_path")),
+    ] {
+        let mut plan = call();
+        plan.file = file.into();
+        assert_eq!(plan.runtime(), expected, "{file}");
+        assert_eq!(plan.validate(), expected.map(|_| ()), "{file}");
+    }
+}
+
+#[test]
+fn node_export_identifier_table() {
+    for extension in ["js", "cjs", "mjs", "ts", "cts", "mts"] {
+        for (function, valid) in [
+            ("run", true),
+            ("$run_1", true),
+            ("_", true),
+            ("$", true),
+            ("default", true),
+            ("__run", true),
+            ("Default", true),
+            ("", false),
+            ("1run", false),
+            ("run.name", false),
+            ("run()", false),
+            ("run;exit()", false),
+            ("a\nb", false),
+            ("é", false),
+            ("\\u0061", false),
+            ("await", false),
+            ("yield", false),
+            ("class", false),
+            ("let", false),
+            ("enum", false),
+            ("implements", false),
+            ("null", false),
+            ("true", false),
+            ("false", false),
+            ("__proto__", false),
+            ("constructor", false),
+            ("prototype", false),
+        ] {
+            let mut plan = call();
+            plan.file = format!("app.{extension}");
+            plan.function = function.into();
+            assert_eq!(plan.validate().is_ok(), valid, "{extension}: {function:?}");
+        }
+        for (length, valid) in [(64, true), (65, false)] {
+            let mut plan = call();
+            plan.file = format!("app.{extension}");
+            plan.function = "a".repeat(length);
+            assert_eq!(plan.validate().is_ok(), valid);
+        }
+    }
+    // Python retains its original identifier rules, including no length cap.
+    for (function, valid) in [
+        ("$run".into(), false),
+        ("default".into(), true),
+        ("__run".into(), false),
+        ("a".repeat(65), true),
+    ] {
+        let mut plan = call();
+        plan.function = function;
+        assert_eq!(plan.validate().is_ok(), valid);
+    }
+}
+
+#[test]
+fn callback_argument_table_and_closed_schema() {
+    for extension in ["py", "js", "cjs", "mjs", "ts", "cts", "mts"] {
+        for callbacks in 0..=2 {
+            for payloads in 0..=2 {
+                let mut plan = call();
+                plan.file = format!("app.{extension}");
+                plan.args = vec![TargetArgument::Payload; payloads];
+                plan.args.extend(vec![TargetArgument::Callback; callbacks]);
+                let valid = payloads == 1 && callbacks <= usize::from(extension != "py");
+                assert_eq!(
+                    plan.validate().is_ok(),
+                    valid,
+                    "{extension}: {payloads} payloads, {callbacks} callbacks"
+                );
+            }
+        }
+    }
+    let raw = r#"{"file":"app.ts","function":"default","args":[{"kind":"callback"},{"kind":"payload"},{"kind":"literal","value":null}]}"#;
+    let plan = parse_target_call(raw).unwrap();
+    assert_eq!(serde_json::to_string(&plan).unwrap(), raw);
+    for raw in [
+        r#"{"file":"app.js","function":"run","args":[{"kind":"payload"},{"kind":"callback","value":null}]}"#,
+        r#"{"file":"app.js","function":"run","args":[{"kind":"payload"}],"callback":true}"#,
+    ] {
+        assert_eq!(parse_target_call(raw), Err("invalid_target_call"));
+    }
+}
+
+#[test]
+fn python_target_call_serialization_stays_byte_identical() {
+    let raw = r#"{"file":"app.py","function":"read_file","args":[{"kind":"payload"},{"kind":"literal","value":{"x":[1,null]}}]}"#;
+    assert_eq!(
+        serde_json::to_string(&parse_target_call(raw).unwrap()).unwrap(),
+        raw
     );
 }

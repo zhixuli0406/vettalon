@@ -1,0 +1,13 @@
+package com.ex;
+
+import java.security.MessageDigest;
+
+public class Main {
+    static final boolean FIPS = true;
+
+    public static void main(String[] args) throws Exception {
+        String alg = FIPS ? "SHA-256" : "MD5";
+        MessageDigest d = MessageDigest.getInstance(alg);
+        System.out.println(d.getAlgorithm());
+    }
+}

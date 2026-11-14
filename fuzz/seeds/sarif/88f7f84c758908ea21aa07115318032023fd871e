@@ -1,0 +1,14 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-injection","shortDescription":{"text":"SQL quetrolled sources"},"propertiesion":{"uri":"src/api.py","
+
+
+
+
+
+
+
+
+                                
+
+
+
+index":0}},"message":{"tEB"},"region":{"startLine":4}}}}]}]}]}]}]}

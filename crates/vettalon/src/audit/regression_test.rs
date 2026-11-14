@@ -1,6 +1,6 @@
 //! Standalone regression test for a finding the sandbox has reproduced.
 //!
-//! The generated file is ordinary Python `unittest` with no Vettalon
+//! The generated file uses Python `unittest` or Node `node:test` with no Vettalon
 //! dependency, so a developer can keep it in their repository. It uses the
 //! harness's own inputs and effect checks (`fixture_inputs`, `benign_input`):
 //! it fails while the effect is present and passes once that input no longer
@@ -31,11 +31,15 @@ const BENIGN_TEST: &str = "test_benign_input_still_works";
 pub struct RegressionTestRecord {
     /// Digest of the generated file; set only when it went through the check.
     pub sha256: Option<String>,
-    /// The attack test failed its assertion on the unfixed source.
+    /// The attack assertion failed and the protected parent confirmed the effect
+    /// on the unfixed source (see `red_check`).
     pub red_observed: bool,
     pub benign_passed: bool,
     /// Why no test was produced. `None` exactly when one was.
     pub reason: Option<String>,
+    /// Node runs the emitted test and independently checks its canary evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red_check: Option<String>,
 }
 
 impl RegressionTestRecord {
@@ -45,6 +49,7 @@ impl RegressionTestRecord {
             red_observed: false,
             benign_passed: false,
             reason: Some(reason.into()),
+            red_check: None,
         }
     }
 }
@@ -54,6 +59,7 @@ fn class_label(class: OracleClass) -> &'static str {
         OracleClass::CommandInjection => "command injection (CWE-78)",
         OracleClass::PathTraversal => "path traversal (CWE-22)",
         OracleClass::Sqli => "SQL injection (CWE-89)",
+        OracleClass::Ssrf => "unsupported oracle class (CWE-918)",
     }
 }
 
@@ -61,18 +67,21 @@ fn class_label(class: OracleClass) -> &'static str {
 /// paths stay fixed because a TargetCall literal may name them.
 fn class_body(class: OracleClass) -> &'static str {
     match class {
+        OracleClass::Ssrf => "raise RuntimeError('ssrf_emit_test_unsupported')\n",
         OracleClass::CommandInjection => {
             r#"def prepare(canary):
     write_new(SECRET, canary)
+    write_new(OUT, '', keep=True)
     return {}
 
 
 def effect(record, canary):
-    try:
-        with open(OUT, encoding='utf-8', errors='replace') as fh:
-            return fh.read().strip() == canary
-    except OSError:
-        return False
+    fd = OPEN_FILES[OUT]
+    before = os.fstat(fd)
+    after = os.lstat(OUT)
+    if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise RuntimeError('output file identity changed')
+    return os.pread(fd, 4096, 0).decode('utf-8', 'replace').strip() == canary
 
 
 FUNCTIONAL_TEXT = None
@@ -184,6 +193,7 @@ OUT = '/tmp/vtl_out'
 BASE = '/tmp/vtl_base'
 DB = '/tmp/vtl.db'
 CREATED = []
+OPEN_FILES = {}
 MADE_BASE = []
 CHILD = r'''@CHILD@'''
 
@@ -193,13 +203,17 @@ def refuse_existing(path):
         raise RuntimeError(path + ' already exists; remove it and rerun (tests sharing these paths cannot run in parallel)')
 
 
-def write_new(path, text):
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+def write_new(path, text, keep=False):
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     info = os.fstat(fd)
     CREATED.append((path, info.st_dev, info.st_ino))
-    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-        fh.write(text)
+    if keep:
+        OPEN_FILES[path] = fd
+        os.write(fd, text.encode('utf-8'))
+    else:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(text)
 
 
 def remove_created(canary):
@@ -212,14 +226,9 @@ def remove_created(canary):
         if (info.st_dev, info.st_ino) == (device, inode):
             os.unlink(path)
     CREATED.clear()
-    # The only file the target writes: it is ours if it holds this run's canary.
-    try:
-        with open(OUT, encoding='utf-8', errors='replace') as fh:
-            ours = fh.read().strip() == canary
-    except OSError:
-        ours = False
-    if ours:
-        os.unlink(OUT)
+    for fd in OPEN_FILES.values():
+        os.close(fd)
+    OPEN_FILES.clear()
     if MADE_BASE:
         MADE_BASE.clear()
         os.rmdir(BASE)
@@ -292,7 +301,13 @@ pub fn generate(
     class: OracleClass,
     call: &TargetCall,
 ) -> Result<String, &'static str> {
+    if class == OracleClass::Ssrf {
+        return Err("ssrf_emit_test_unsupported");
+    }
     call.validate()?;
+    if call.runtime()? == super::target_poc::Runtime::Node {
+        return generate_node(finding, class, call, None);
+    }
     if finding.id.is_empty()
         || !finding
             .id
@@ -316,6 +331,340 @@ pub fn generate(
         .replace("@CHILD@", CHILD)
         .replace("@CLASS_BODY@", class_body(class)))
 }
+
+// The same child bytes run standalone and in the independent canary check.
+const NODE_CHILD: &str = r#"import { registerHooks } from 'node:module';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { lstatSync, statSync, realpathSync, openSync, writeFileSync, closeSync, constants } from 'node:fs';
+import { resolve as resolvePath, relative, isAbsolute, sep } from 'node:path';
+import { inspect } from 'node:util';
+const stringify = JSON.stringify;
+const from = Buffer.from;
+const hasOwn = Object.hasOwn;
+const apply = Reflect.apply;
+const resolve = Promise.resolve.bind(Promise);
+const all = Promise.all.bind(Promise);
+const root = realpathSync(process.env.VETTALON_REPO_ROOT || process.cwd());
+let targetPath = root;
+const parts = PLAN.file.split('/');
+for (const [index, part] of parts.entries()) {
+    targetPath = resolvePath(targetPath, part);
+    let info;
+    try { info = lstatSync(targetPath); }
+    catch { throw new Error('unsafe target path: component is missing or inaccessible'); }
+    if (info.isSymbolicLink() || (index < parts.length - 1 ? !info.isDirectory() : !info.isFile())) {
+        throw new Error('unsafe target path: symlinks, non-directory parents and non-regular targets are refused');
+    }
+}
+const inside = relative(root, realpathSync(targetPath));
+if (!inside || inside === '..' || inside.startsWith('..' + sep) || isAbsolute(inside)) {
+    throw new Error('unsafe target path: canonical target must stay inside the repository');
+}
+const targetUrl = pathToFileURL(targetPath).href;
+const payload = JSON.parse(Buffer.from(process.argv[2], 'hex').toString('utf8'));
+const resultPath = process.argv[3];
+{
+    // Match the adapter's relative .js -> .ts fallback, keeping real drivers.
+    const kind = (path, entry = false) => {
+        try { return (entry ? lstatSync(path) : statSync(path)).isFile() ? 'file' : 'other'; }
+        catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return 'absent'; throw error; }
+    };
+    registerHooks({ resolve(specifier, context, nextResolve) {
+        if (/^\.{1,2}\//.test(specifier) && specifier.endsWith('.js') && context.parentURL?.startsWith('file:')) {
+            const js = new URL(specifier, context.parentURL);
+            const ts = new URL(js.href.slice(0, -3) + '.ts');
+            if (kind(fileURLToPath(js), true) === 'absent' && kind(fileURLToPath(ts)) === 'file') {
+                return nextResolve(fileURLToPath(ts), context);
+            }
+        }
+        return nextResolve(specifier, context);
+    } });
+}
+let ns;
+try { ns = await import(targetUrl); }
+catch { process.exit(3); }
+const name = PLAN.function;
+let receiver = ns;
+let fn = hasOwn(ns, name) ? ns[name] : undefined;
+if (typeof fn !== 'function' && ns.default != null && hasOwn(ns.default, name)) {
+    receiver = ns.default;
+    fn = ns.default[name];
+}
+if (typeof fn !== 'function') process.exit(3);
+let callbackResolve, callbackReject;
+const callbackResult = new Promise((resolve, reject) => { callbackResolve = resolve; callbackReject = reject; });
+callbackResult.catch(() => {});
+let usesCallback = false;
+const args = PLAN.args.map(item => {
+    if (item.kind === 'payload') return payload;
+    if (item.kind === 'callback') {
+        usesCallback = true;
+        return (err, value) => err == null ? callbackResolve(value) : callbackReject(err);
+    }
+    return item.value;
+});
+let record;
+try {
+    const returned = apply(fn, receiver, args);
+    const value = usesCallback ? (await all([resolve(returned), callbackResult]))[1] : await resolve(returned);
+    record = { result: typeof value === 'string' ? value : Buffer.isBuffer(value) ? value.toString('utf8')
+        : inspect(value, { depth: 4, maxStringLength: 65536, breakLength: Infinity, customInspect: false, getters: false }) };
+} catch { record = { raised: 'Error' }; }
+const encoded = from(stringify(record), 'utf8');
+if (encoded.length > 65536) process.exit(3);
+const fd = openSync(resultPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+try { writeFileSync(fd, encoded); } finally { closeSync(fd); }
+"#;
+
+const NODE_TEMPLATE: &str = r#"// Regression test generated by vettalon reproduce --emit-test.
+// Run: node --test vettalon-<id>.test.mjs (Node 24+ on a POSIX host).
+// Run from the repository root or set VETTALON_REPO_ROOT.
+// If reproduction used --fixture, set VETTALON_FIXTURE to that private JSON file.
+// This input passing does not prove the vulnerability is gone or change its status.
+// Fixed /tmp/vtl_* paths: do not run these tests concurrently with other generated files.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import { randomBytes, createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+const decode = hex => JSON.parse(Buffer.from(hex, 'hex').toString('utf8'));
+const DATA = decode('@DATA@');
+const CHILD = Buffer.from('@CHILD_HEX@', 'hex').toString('utf8');
+const SECRET = '/tmp/vtl_secret', OUT = '/tmp/vtl_out', BASE = '/tmp/vtl_base', DB = '/tmp/vtl.db';
+
+function fixture() {
+    if (!DATA.fixture_sha256) return {};
+    if (!process.env.VETTALON_FIXTURE) throw new Error('set VETTALON_FIXTURE to the private reproduction fixture');
+    const value = JSON.parse(fs.readFileSync(process.env.VETTALON_FIXTURE, 'utf8'));
+    const canonical = { schema: value.schema, env: Object.fromEntries(Object.entries(value.env || {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) };
+    if (value.sql_setup != null) canonical.sql_setup = value.sql_setup;
+    assert.equal(createHash('sha256').update(JSON.stringify(canonical)).digest('hex'), DATA.fixture_sha256, 'fixture has changed');
+    return canonical;
+}
+
+async function check(attack) {
+    if (process.platform === 'win32') throw new Error('fixed /tmp paths require a POSIX host');
+    for (const path of [SECRET, OUT, BASE, DB]) {
+        try { fs.lstatSync(path); }
+        catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+        throw new Error(path + ' already exists; remove it and rerun');
+    }
+    const config = fixture();
+    const canary = 'vtlc' + randomBytes(16).toString('hex');
+    const created = [];
+    let outFd;
+    let madeBase = false;
+    const scratch = fs.mkdtempSync('/tmp/vettalon-regression-');
+    const writeNew = (path, text, keep = false) => {
+        const fd = fs.openSync(path, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+        const info = fs.fstatSync(fd);
+        created.push([path, info.dev, info.ino]);
+        try { fs.writeFileSync(fd, text); } finally { if (!keep) fs.closeSync(fd); }
+        return fd;
+    };
+    try {
+        const env = { HOME: '/tmp', PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', ...config.env,
+            VETTALON_REPO_ROOT: process.env.VETTALON_REPO_ROOT || process.cwd() };
+        if (DATA.class === 'sql') {
+            writeNew(DB, '');
+            const { DatabaseSync } = await import('node:sqlite');
+            const db = new DatabaseSync(DB);
+            try {
+                if (config.sql_setup) db.exec(config.sql_setup);
+                db.exec("CREATE TABLE items(id INTEGER, name TEXT); INSERT INTO items VALUES (1, 'apple'); CREATE TABLE vtl_secret(token TEXT)");
+                db.prepare('INSERT INTO vtl_secret VALUES (?)').run(canary);
+            } finally { db.close(); }
+            env.VTL_DB = DB;
+        } else {
+            writeNew(SECRET, canary);
+            if (DATA.class === 'command') outFd = writeNew(OUT, '', true);
+            if (DATA.class === 'path') {
+                fs.mkdirSync(BASE, { mode: 0o700 });
+                madeBase = true;
+                writeNew(join(BASE, 'safe.txt'), 'vtl_safe_content');
+                env.VTL_BASE = BASE;
+            }
+        }
+        const out = join(scratch, 'result.json');
+        const value = Buffer.from(JSON.stringify(attack ? DATA.attack : DATA.benign)).toString('hex');
+        const child = spawnSync(process.execPath,
+            ['--input-type=module', '-e', CHILD, 'vettalon-child', value, out],
+            { env, stdio: ['ignore', 'ignore', 'pipe'], timeout: 30000, maxBuffer: 65536 });
+        if (child.error || child.status !== 0) {
+            const detail = child.stderr?.toString().includes('unsafe target path:') ? ': unsafe target path (symlink, file type or repository containment)' : '';
+            throw new Error('target failed to load or complete' + detail);
+        }
+        const record = JSON.parse(fs.readFileSync(out, 'utf8'));
+        if (!(Object.keys(record).length === 1 && (typeof record.result === 'string' || typeof record.raised === 'string'))) {
+            throw new Error('invalid target result');
+        }
+        let effect;
+        if (DATA.class === 'command') {
+            const before = fs.fstatSync(outFd), after = fs.lstatSync(OUT);
+            if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino) throw new Error('output file identity changed');
+            const bytes = Buffer.alloc(4096);
+            const count = fs.readSync(outFd, bytes, 0, bytes.length, 0);
+            effect = bytes.subarray(0, count).toString('utf8').trim() === canary;
+        } else { effect = (record.result || '').includes(canary); }
+        if (!attack) assert.equal(typeof record.result, 'string', 'the benign input raised');
+        assert.equal(effect, false, 'the input still has the effect Vettalon reproduced');
+        if (!attack && DATA.functional !== null) assert.ok(record.result.includes(DATA.functional), 'benign result missing');
+    } finally {
+        if (outFd !== undefined) fs.closeSync(outFd);
+        for (const [path, dev, ino] of created.reverse()) {
+            let info;
+            try { info = fs.lstatSync(path); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+            if (info.dev === dev && info.ino === ino) fs.unlinkSync(path);
+        }
+        if (madeBase) fs.rmdirSync(BASE);
+        fs.rmSync(scratch, { recursive: true });
+    }
+}
+test('test_attack_has_no_effect', () => check(true));
+test('test_benign_input_still_works', () => check(false));
+"#;
+
+pub(crate) fn node_child(call: &TargetCall) -> Result<String, &'static str> {
+    call.validate()?;
+    if call.runtime()? != super::target_poc::Runtime::Node {
+        return Err("unsupported_target_language");
+    }
+    let plan = hex::encode(serde_json::to_vec(call).map_err(|_| "invalid_target_call")?);
+    Ok(format!(
+        "const PLAN = JSON.parse(Buffer.from('{plan}', 'hex').toString('utf8'));\n{NODE_CHILD}"
+    ))
+}
+
+pub(crate) fn generate_node(
+    finding: &Finding,
+    class: OracleClass,
+    call: &TargetCall,
+    fixture_sha256: Option<&str>,
+) -> Result<String, &'static str> {
+    if class == OracleClass::Ssrf {
+        return Err("ssrf_emit_test_unsupported");
+    }
+    if finding.id.is_empty()
+        || !finding
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err("invalid_finding_id");
+    }
+    let child = node_child(call)?;
+    let (label, functional) = match class {
+        OracleClass::CommandInjection => ("command", None),
+        OracleClass::PathTraversal => ("path", Some("vtl_safe_content")),
+        OracleClass::Sqli => ("sql", Some("apple")),
+        OracleClass::Ssrf => return Err("ssrf_emit_test_unsupported"),
+    };
+    let data = serde_json::json!({
+        "finding": crate::util::mask_sensitive_text(crate::util::truncate_bytes(&finding.id, 256)),
+        "class": label, "functional": functional,
+        "attack": fixture_inputs(class)[0], "benign": benign_input(class),
+        "fixture_sha256": fixture_sha256,
+    });
+    Ok(NODE_TEMPLATE
+        .replace("@DATA@", &hex::encode(data.to_string()))
+        .replace("@CHILD_HEX@", &hex::encode(child)))
+}
+
+/// Run the emitted file with real dependencies first, then independently
+/// corroborate both phases with the protected parent's canary checks. TAP alone
+/// is not evidence: a target may write to another Node process's stdout via proc.
+pub(crate) fn node_red_runner(
+    class: OracleClass,
+    secrets: &super::poc_oracle::OracleSecrets,
+    child: &str,
+) -> String {
+    let phases: Vec<_> = [fixture_inputs(class)[0], benign_input(class)]
+        .into_iter()
+        .map(|payload| {
+            let runner = super::poc_oracle::node_regression_runner(class, secrets, payload);
+            let body = runner
+                .strip_prefix(super::poc_oracle::NODE_RUNNER_SETUP)
+                .expect("Node runner setup")
+                .strip_suffix("reap()\nemit(fields)\n")
+                .expect("Node runner final verdict");
+            hex::encode(body)
+        })
+        .collect();
+    format!(
+        "{}\nJS_CHILD = bytes.fromhex('{}').decode('utf-8')\nPHASES = {}\n{}",
+        super::poc_oracle::NODE_RUNNER_SETUP,
+        hex::encode(child),
+        serde_json::to_string(&phases).expect("trusted phase JSON"),
+        NODE_RED_BODY
+    )
+}
+
+const NODE_RED_BODY: &str = r#"import re, tempfile
+def reap():
+    while True:
+        try:
+            os.kill(-1, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            os.waitpid(-1, 0)
+        except ChildProcessError:
+            return
+# No fixture secrets or marker in argv; the test gets the same private fixture
+# bytes a developer supplies, while only PID 1 ever holds the verdict marker.
+env = {'HOME': '/tmp', 'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8',
+       'VETTALON_REPO_ROOT': '/workspace/tree'}
+if FIXTURE:
+    fixture_path = '/tmp/vtl_regression_fixture.json'
+    fd = os.open(fixture_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as fh:
+        json.dump(FIXTURE, fh)
+    env['VETTALON_FIXTURE'] = fixture_path
+with tempfile.TemporaryFile() as capture:
+    try:
+        test = subprocess.run(
+            ['/usr/local/bin/node', '--test', '--test-reporter=tap', '/workspace/sink.mjs'],
+            cwd='/workspace/tree', env=env, stdin=subprocess.DEVNULL,
+            stdout=capture, stderr=subprocess.DEVNULL, timeout=70, check=False)
+    finally:
+        reap()
+    if os.fstat(capture.fileno()).st_size > 65536:
+        raise RuntimeError('oversized TAP result')
+    tap = os.pread(capture.fileno(), 65537, 0).decode('utf-8')
+attack = re.findall(r'^(not ok|ok) 1 - test_attack_has_no_effect$', tap, re.M)
+benign = re.findall(r'^(not ok|ok) 2 - test_benign_input_still_works$', tap, re.M)
+valid = (len(attack) == 1 and benign == ['ok'] and
+         re.findall(r'^1\.\.([0-9]+)$', tap, re.M) == ['2'] and
+         '# tests 2\n' in tap and '# skipped 0\n' in tap)
+tap_red = (valid and attack == ['not ok'] and test.returncode == 1 and
+           "code: 'ERR_ASSERTION'" in tap and
+           'the input still has the effect Vettalon reproduced' in tap and
+           '# pass 1\n' in tap and '# fail 1\n' in tap)
+tap_green = valid and attack == ['ok'] and test.returncode == 0
+if not (tap_red or tap_green):
+    raise RuntimeError('emitted test did not confirm red or green')
+states = []
+for index, program in enumerate(PHASES):
+    scope = {'FIXTURE': FIXTURE, 'JS_CHILD': JS_CHILD}
+    exec('import sys, os, traceback, subprocess, json, stat, signal, ctypes\n' + bytes.fromhex(program).decode('utf-8'), scope)
+    scope['reap']()
+    fields = scope['fields']
+    if any(flag in fields for flag in ('error=true', 'timeout=true', 'missing=true')):
+        state = 'error'
+    elif index == 0:
+        state = 'fail' if scope['ok'] else 'pass'
+    else:
+        state = 'pass' if not scope['ok'] and 'raised=true' not in fields and 'functional=false' not in fields else 'fail'
+    states.append(state)
+scope['reap']()
+if not tap_red and states[0] == 'fail':
+    states[0] = 'error'
+if not tap_green and states[0] == 'pass':
+    states[0] = 'error'
+sys.stdout.write('\n__VTL_REGRESSION__ ' + MARKER + ' ran=2 skipped=0 attack=' + states[0] + ' benign=' + states[1] + '\n')
+sys.stdout.flush()
+"#;
 
 /// Program of the child process that runs the project test. It makes itself
 /// non-dumpable before loading `/workspace/sink.py`, so code the test starts
@@ -460,9 +809,9 @@ except Exception:
 /// - the host counts a verdict only with exit 0 and exactly one occurrence
 ///   of the marked prefix, at the start of a line.
 ///
-/// Not covered: a test that imports the target into its own process lets
-/// that code write the record, as it could already change the test's outcome
-/// directly.
+/// Not covered: a test that imports the target into its own process (a
+/// hand-written test given to `bisect`) lets that code write the record, as
+/// it could already change the test's outcome directly.
 pub(crate) fn red_runner() -> String {
     let child = RED_CHILD
         .replace("@ATTACK@", ATTACK_TEST)
@@ -495,6 +844,42 @@ fn marked_fields<'a>(exit: i64, output: &'a str, marker: &str) -> Result<&'a str
         .lines()
         .find_map(|line| line.trim_end().strip_prefix(expected.as_str()))
         .ok_or("invalid_regression_verdict")
+}
+
+/// One test's state in the red runner's verdict line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RedState {
+    Pass,
+    Fail,
+    Error,
+}
+
+/// [`parse_red_verdict`] keeping each test's exact state, so a caller can tell
+/// an assertion failure from an error (e.g. a missing function at an old commit).
+pub(crate) fn parse_red_states(
+    exit: i64,
+    output: &str,
+    marker: &str,
+) -> Result<(RedState, RedState), &'static str> {
+    let line = marked_fields(exit, output, marker)?;
+    let state = |value: &str| match value {
+        "pass" => Ok(RedState::Pass),
+        "fail" => Ok(RedState::Fail),
+        "error" => Ok(RedState::Error),
+        _ => Err("invalid_regression_verdict"),
+    };
+    match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["ran=2", "skipped=0", attack, benign] => {
+            let attack = attack
+                .strip_prefix("attack=")
+                .ok_or("invalid_regression_verdict")?;
+            let benign = benign
+                .strip_prefix("benign=")
+                .ok_or("invalid_regression_verdict")?;
+            Ok((state(attack)?, state(benign)?))
+        }
+        _ => Err("invalid_regression_verdict"),
+    }
 }
 
 /// Read the single marker-bound verdict of a run that exited 0. Anything
@@ -559,6 +944,459 @@ mod tests {
             .current_dir(repo.path())
             .output()
             .unwrap()
+    }
+
+    fn node_present() -> bool {
+        match Command::new("node").arg("--version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("SKIP generated Node regression tests: node is not on PATH");
+                false
+            }
+            result => {
+                assert!(result.unwrap().status.success(), "node --version failed");
+                true
+            }
+        }
+    }
+
+    fn run_node_generated(test: &str, target: &TargetCall, source: &str) -> Output {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join(&target.file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+        std::fs::write(repo.path().join("regression.test.mjs"), test).unwrap();
+        Command::new("node")
+            .args(["--test", "--test-reporter=tap", "regression.test.mjs"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn node_generated_tests_are_red_then_green_for_all_classes_and_module_formats() {
+        if !node_present() {
+            return;
+        }
+        let _guard = HOST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        let command = (
+            include_str!("../../tests/fixtures/node-e2e/cjs-command/app.cjs"),
+            include_str!("../../tests/fixtures/node-e2e/cjs-command/fixed/app.cjs"),
+        );
+        let cases = [
+            (
+                OracleClass::CommandInjection,
+                "app.cjs",
+                "run",
+                true,
+                command.0,
+                command.1,
+            ),
+            (
+                OracleClass::PathTraversal,
+                "app.mjs",
+                "default",
+                false,
+                "import fs from 'node:fs'; import path from 'node:path'; export default async function(x) { return fs.readFileSync(path.join(process.env.VTL_BASE, x), 'utf8'); }",
+                "import fs from 'node:fs'; import path from 'node:path'; export default async function(x) { if (x.includes('/')) throw Error('rejected'); return fs.readFileSync(path.join(process.env.VTL_BASE, x), 'utf8'); }",
+            ),
+            (
+                OracleClass::PathTraversal,
+                "app.mts",
+                "run",
+                false,
+                "import fs from 'node:fs'; import path from 'node:path'; export function run(x: string): string { return fs.readFileSync(path.join(process.env.VTL_BASE, x), 'utf8'); }",
+                "import fs from 'node:fs'; import path from 'node:path'; export function run(x: string): string { if (x.includes('/')) return ''; return fs.readFileSync(path.join(process.env.VTL_BASE, x), 'utf8'); }",
+            ),
+            (
+                OracleClass::Sqli,
+                "app.cjs",
+                "run",
+                false,
+                "const {DatabaseSync} = require('node:sqlite'); exports.run = x => { const db = new DatabaseSync(process.env.VTL_DB); try { return db.prepare(\"SELECT name FROM items WHERE name = '\" + x + \"'\").all(); } finally { db.close(); } };",
+                "const {DatabaseSync} = require('node:sqlite'); exports.run = x => { const db = new DatabaseSync(process.env.VTL_DB); try { return db.prepare('SELECT name FROM items WHERE name = ?').all(x); } finally { db.close(); } };",
+            ),
+        ];
+        for (class, file, function, callback, red, green) in cases {
+            let mut args = vec![TargetArgument::Payload];
+            if callback {
+                args.push(TargetArgument::Callback);
+            }
+            let target = TargetCall {
+                file: file.into(),
+                function: function.into(),
+                args,
+            };
+            let test = generate(&finding("abc123"), class, &target).unwrap();
+            let output = run_node_generated(&test, &target, red);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!output.status.success(), "{file}: {stdout}");
+            assert!(
+                stdout.contains("not ok 1 - test_attack_has_no_effect"),
+                "{file}: {stdout}"
+            );
+            assert!(
+                stdout.contains("ok 2 - test_benign_input_still_works"),
+                "{file}: {stdout}"
+            );
+            assert!(
+                stdout.contains("the input still has the effect Vettalon reproduced"),
+                "{file}: {stdout}"
+            );
+            let output = run_node_generated(&test, &target, green);
+            assert!(
+                output.status.success(),
+                "{file}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for broken in ["", "this is not valid javascript", "process.exit(0)"] {
+                let output = run_node_generated(&test, &target, broken);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(!output.status.success(), "{file}: {stdout}");
+                assert!(
+                    !stdout.contains("the input still has the effect Vettalon reproduced"),
+                    "{stdout}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_templates_precreate_private_output_and_reject_inode_replacement() {
+        if !node_present() || !python3_present() {
+            return;
+        }
+        let _guard = HOST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        let target = TargetCall {
+            file: "app.cjs".into(),
+            function: "run".into(),
+            args: vec![TargetArgument::Payload],
+        };
+        let test = generate(&finding("abc123"), OracleClass::CommandInjection, &target).unwrap();
+        let safe = "const fs = require('node:fs'); exports.run = x => { for (const p of ['/tmp/vtl_out', '/tmp/vtl_secret']) { const s = fs.lstatSync(p); if (!s.isFile() || (s.mode & 511) !== 384) throw Error('unsafe file'); } return x; };";
+        assert!(run_node_generated(&test, &target, safe).status.success());
+        let swap = "const fs = require('node:fs'); exports.run = x => { fs.writeFileSync('/tmp/vtl_out.swap', 'other'); fs.renameSync('/tmp/vtl_out.swap', '/tmp/vtl_out'); return x; };";
+        let output = run_node_generated(&test, &target, swap);
+        let kept = std::fs::read_to_string("/tmp/vtl_out").unwrap();
+        std::fs::remove_file("/tmp/vtl_out").unwrap();
+        assert_eq!(kept, "other");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("output file identity changed"));
+        assert!(!Path::new("/tmp/vtl_secret").exists());
+        let target = call("run", vec![TargetArgument::Payload]);
+        let test = generate(&finding("abc123"), OracleClass::CommandInjection, &target).unwrap();
+        let safe = "import os, stat\ndef run(x):\n    for p in ['/tmp/vtl_out', '/tmp/vtl_secret']:\n        s = os.lstat(p)\n        assert stat.S_ISREG(s.st_mode) and stat.S_IMODE(s.st_mode) == 0o600\n    return x\n";
+        assert!(run_generated(&test, safe).status.success());
+        let swap = "import os\ndef run(x):\n    with open('/tmp/vtl_out.swap', 'w') as f: f.write('other')\n    os.replace('/tmp/vtl_out.swap', '/tmp/vtl_out')\n    return x\n";
+        let output = run_generated(&test, swap);
+        let kept = std::fs::read_to_string("/tmp/vtl_out").unwrap();
+        std::fs::remove_file("/tmp/vtl_out").unwrap();
+        assert_eq!(kept, "other");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("output file identity changed"));
+        assert!(!Path::new("/tmp/vtl_secret").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_runtime_refuses_symlink_components_and_nonregular_targets() {
+        if !node_present() {
+            return;
+        }
+        let _guard = HOST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("app.cjs"), "exports.run = x => x;").unwrap();
+        std::fs::create_dir(repo.path().join("real")).unwrap();
+        std::fs::write(repo.path().join("real/app.cjs"), "exports.run = x => x;").unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("external")).unwrap();
+        std::os::unix::fs::symlink(repo.path().join("real"), repo.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink(
+            repo.path().join("real/app.cjs"),
+            repo.path().join("link.cjs"),
+        )
+        .unwrap();
+        std::fs::create_dir(repo.path().join("directory.cjs")).unwrap();
+        for file in [
+            "external/app.cjs",
+            "alias/app.cjs",
+            "link.cjs",
+            "directory.cjs",
+            "real/app.cjs/child.cjs",
+        ] {
+            let target = TargetCall {
+                file: file.into(),
+                function: "run".into(),
+                args: vec![TargetArgument::Payload],
+            };
+            let source =
+                generate(&finding("abc123"), OracleClass::CommandInjection, &target).unwrap();
+            std::fs::write(repo.path().join("regression.test.mjs"), source).unwrap();
+            let output = Command::new("node")
+                .args(["--test", "--test-reporter=tap", "regression.test.mjs"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{file}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("unsafe target path"),
+                "{file}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn node_report_strings_are_only_hex_data_and_hostile_identifiers_are_refused() {
+        let hostile = "` ${globalThis.pwned = true} '\"\n*/\u{2028}\u{2029}";
+        let mut target = TargetCall {
+            file: "quotes'\"`${pwned}.cjs".into(),
+            function: "$run".into(),
+            args: vec![
+                TargetArgument::Literal {
+                    value: serde_json::json!(hostile),
+                },
+                TargetArgument::Payload,
+            ],
+        };
+        let child = node_child(&target).unwrap();
+        assert!(!child.contains(hostile));
+        assert!(!child.contains(&target.file));
+        let plan_hex = child
+            .split("Buffer.from('")
+            .nth(1)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap();
+        let decoded: TargetCall = serde_json::from_slice(&hex::decode(plan_hex).unwrap()).unwrap();
+        assert_eq!(decoded, target);
+        let test = generate_node(
+            &finding("abc123"),
+            OracleClass::CommandInjection,
+            &target,
+            None,
+        )
+        .unwrap();
+        assert!(!test.contains(hostile));
+        assert!(!test.contains(&target.file));
+        assert!(test.contains(&hex::encode(&child)));
+        if node_present() {
+            let _guard = HOST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+            let source = format!(
+                "exports.$run = function(literal, payload) {{ if (literal !== {}) throw Error('literal changed'); return payload; }};",
+                serde_json::to_string(hostile).unwrap()
+            );
+            let output = run_node_generated(&test, &target, &source);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        for value in [
+            "`", "${pwned}", "'", "\"", "\n", "*/", "\u{2028}", "\u{2029}",
+        ] {
+            target.file = "app.cjs".into();
+            target.function = value.into();
+            assert_eq!(node_child(&target), Err("invalid_target_function"));
+            target.function = "run".into();
+            target.file = format!("hostile{value}.cjs");
+            match node_child(&target) {
+                Ok(child) => {
+                    assert!(!child.contains(&target.file));
+                    let test = generate(&finding("abc123"), OracleClass::CommandInjection, &target)
+                        .unwrap();
+                    assert!(test.contains(&hex::encode(child)));
+                }
+                Err(reason) => {
+                    assert!(matches!(value, "\n" | "\u{2028}" | "\u{2029}"));
+                    assert_eq!(reason, "unsafe_target_path");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn node_red_runner_runs_emitted_test_without_hooks_and_checks_parent_evidence() {
+        for class in [
+            OracleClass::CommandInjection,
+            OracleClass::PathTraversal,
+            OracleClass::Sqli,
+        ] {
+            let secrets = super::super::poc_oracle::OracleSecrets::fresh();
+            let runner = node_red_runner(class, &secrets, "// trusted child");
+            assert!(runner.contains("'--test', '--test-reporter=tap', '/workspace/sink.mjs'"));
+            for forbidden in ["--require", "vtl_hook", "VTL_EVENT_FD", "pass_fds"] {
+                assert!(!runner.contains(forbidden));
+            }
+            assert!(runner.starts_with(super::super::poc_oracle::NODE_RUNNER_SETUP));
+            assert!(!runner.contains(&secrets.marker));
+            let phases: Vec<String> = serde_json::from_str(
+                runner
+                    .lines()
+                    .find_map(|line| line.strip_prefix("PHASES = "))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(phases.len(), 2);
+            for phase in phases {
+                let phase = String::from_utf8(hex::decode(phase).unwrap()).unwrap();
+                assert!(!phase.lines().any(|line| line == "emit(fields)"));
+                for forbidden in ["--require", "vtl_hook", "VTL_EVENT_FD", "pass_fds"] {
+                    assert!(!phase.contains(forbidden));
+                }
+                assert!(phase.contains("stderr=subprocess.DEVNULL"));
+                assert!(phase.contains("child_env['VETTALON_REPO_ROOT'] = '/workspace/tree'"));
+                assert!(phase.contains("if not intact:"));
+                assert!(phase.contains("finally:\n            reap()"));
+            }
+        }
+    }
+
+    #[test]
+    fn node_emitted_red_check_runs_attack_and_benign_with_real_node() {
+        if !node_present() || !python3_present() {
+            return;
+        }
+        let _guard = HOST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        use std::io::Write;
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let tree = workspace.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let node = Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .unwrap();
+        assert!(node.status.success());
+        let node = String::from_utf8(node.stdout).unwrap().trim().to_string();
+        let target: TargetCall = serde_json::from_str(include_str!(
+            "../../tests/fixtures/node-e2e/cjs-command/target.json"
+        ))
+        .unwrap();
+        let child = node_child(&target)
+            .unwrap()
+            .replace("/workspace", workspace.to_str().unwrap());
+        std::fs::write(
+            workspace.join("sink.mjs"),
+            generate(&finding("abc123"), OracleClass::CommandInjection, &target).unwrap(),
+        )
+        .unwrap();
+        for (source, red) in [
+            (
+                include_str!("../../tests/fixtures/node-e2e/cjs-command/app.cjs"),
+                true,
+            ),
+            (
+                include_str!("../../tests/fixtures/node-e2e/cjs-command/fixed/app.cjs"),
+                false,
+            ),
+        ] {
+            std::fs::write(tree.join("app.cjs"), source).unwrap();
+            let secrets = super::super::poc_oracle::OracleSecrets::fresh();
+            let mut runner = node_red_runner(OracleClass::CommandInjection, &secrets, &child);
+            let old = runner
+                .lines()
+                .find_map(|line| line.strip_prefix("PHASES = "))
+                .unwrap()
+                .to_string();
+            let phases: Vec<String> = serde_json::from_str(&old).unwrap();
+            let phases: Vec<String> = phases
+                .into_iter()
+                .map(|phase| {
+                    let phase = String::from_utf8(hex::decode(phase).unwrap()).unwrap();
+                    // Host simulation only: never execute PID 1's kill(-1) on the host.
+                    // Keep real effect checks, standalone child bytes and input ordering.
+                    let start = phase.find("def reap():").unwrap();
+                    let end = phase.find("def read_result(path):").unwrap();
+                    let phase = format!(
+                        "{}def reap():\n    pass\n{}",
+                        &phase[..start],
+                        &phase[end..]
+                    )
+                    .replace("/workspace", workspace.to_str().unwrap())
+                    .replace(
+                        "'/usr/local/bin/node'",
+                        &serde_json::to_string(&node).unwrap(),
+                    );
+                    hex::encode(phase)
+                })
+                .collect();
+            runner = runner.replace(&old, &serde_json::to_string(&phases).unwrap()).replace(
+                "os.getpid() == 1 and libc.prctl(4, 0, 0, 0, 0) == 0 and libc.prctl(3, 0, 0, 0, 0) == 0", "True");
+            runner = runner
+                .replace("os.kill(-1, signal.SIGKILL)", "pass")
+                .replace("/workspace", workspace.to_str().unwrap())
+                .replace(
+                    "'/usr/local/bin/node'",
+                    &serde_json::to_string(&node).unwrap(),
+                );
+            let mut child = Command::new("python3")
+                .args(["-I", "-B", "-c", &runner])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    super::super::node::dispatch::runner_envelope(&secrets.marker, None).as_bytes(),
+                )
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for path in ["/tmp/vtl_secret", "/tmp/vtl_out"] {
+                let _ = std::fs::remove_file(path);
+            }
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                parse_red_verdict(0, &stdout, &secrets.marker),
+                Ok((red, true)),
+                "{stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_generated_child_resolves_relative_js_imports_to_ts() {
+        if !node_present() {
+            return;
+        }
+        let _guard = HOST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("app.mts"), "import { echo } from './helper.js'; export function run(x: string) { return echo(x); }").unwrap();
+        std::fs::write(
+            repo.path().join("helper.ts"),
+            "export function echo(x: string): string { return x; }",
+        )
+        .unwrap();
+        let target = TargetCall {
+            file: "app.mts".into(),
+            function: "run".into(),
+            args: vec![TargetArgument::Payload],
+        };
+        let test = generate(&finding("abc123"), OracleClass::CommandInjection, &target).unwrap();
+        std::fs::write(repo.path().join("regression.test.mjs"), test).unwrap();
+        let output = Command::new("node")
+            .args(["--test", "regression.test.mjs"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn outcome(output: &Output) -> String {
@@ -849,6 +1687,11 @@ mod tests {
                 Err("regression_test_execution_error"),
                 "{exit}"
             );
+            assert_eq!(
+                parse_red_states(exit, &real, "vtlmarker"),
+                Err("regression_test_execution_error"),
+                "{exit}"
+            );
         }
         // The R2-1 forgery: a line pushed into stdout without a trailing
         // newline, before the runner's own line. With or without the
@@ -857,6 +1700,11 @@ mod tests {
         for output in [format!("{forged}{real}"), swallowed] {
             assert_eq!(
                 parse_red_verdict(0, &output, "vtlmarker"),
+                Err("duplicate_regression_verdict"),
+                "{output:?}"
+            );
+            assert_eq!(
+                parse_red_states(0, &output, "vtlmarker"),
                 Err("duplicate_regression_verdict"),
                 "{output:?}"
             );
@@ -870,9 +1718,41 @@ mod tests {
         // A marked prefix elsewhere on a line still counts as a second one.
         let echoed = format!("noise {RED_PREFIX}vtlmarker\n{real}");
         assert_eq!(
-            parse_red_verdict(0, &echoed, "vtlmarker"),
+            parse_red_states(0, &echoed, "vtlmarker"),
             Err("duplicate_regression_verdict")
         );
+    }
+
+    #[test]
+    fn red_states_keep_errors_distinct_from_failures() {
+        let line = |rest: &str| format!("\n{RED_PREFIX}vtlmarker {rest}\n");
+        assert_eq!(
+            parse_red_states(
+                0,
+                &line("ran=2 skipped=0 attack=fail benign=pass"),
+                "vtlmarker"
+            ),
+            Ok((RedState::Fail, RedState::Pass))
+        );
+        assert_eq!(
+            parse_red_states(
+                0,
+                &line("ran=2 skipped=0 attack=error benign=fail"),
+                "vtlmarker"
+            ),
+            Ok((RedState::Error, RedState::Fail))
+        );
+        for bad in [
+            "ran=2 skipped=0 attack=bogus benign=pass",
+            "ran=2 skipped=0 benign=pass attack=fail",
+            "ran=1 skipped=0 attack=fail benign=pass",
+        ] {
+            assert_eq!(
+                parse_red_states(0, &line(bad), "vtlmarker"),
+                Err("invalid_regression_verdict"),
+                "{bad}"
+            );
+        }
     }
 
     fn position(haystack: &str, needle: &str) -> usize {

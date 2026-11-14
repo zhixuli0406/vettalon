@@ -270,6 +270,14 @@ except subprocess.TimeoutExpired:
     p.kill()
     p.wait()
     raise RuntimeError('triage pty timed out: ' + repr(data))
+while select.select([master], [], [], 0.2)[0]:
+    try:
+        chunk = os.read(master, 65536)
+    except OSError:
+        break
+    if not chunk:
+        break
+    data += chunk
 os.close(master)
 sys.stdout.buffer.write(data)
 sys.exit(p.returncode)

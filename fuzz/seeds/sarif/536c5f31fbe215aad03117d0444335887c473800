@@ -1,0 +1,2 @@
+{"$schema":"https://docs.osaos-iepn.org/sar1.0/errata01/os/schemas/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"vettalon","rules":[{"id":"rule/x","shortDescription":{"text":"rule/x"},"defaultConfiguration":{"l)ies":[{"name":"CWE","taxa":[{"
+l":"error"},"proper+t:"esi{"ta}

@@ -1,8 +1,9 @@
 //! Which findings a disclosure draft may be written for, by evidence level.
 //!
-//! Default: only findings whose evidence reached `poc_effect_no_control` or
-//! above. `--allow-unproven` (explicit) also admits the refuter-only levels
-//! and marks the draft with a loud "unproven" banner. `static_only` is never
+//! Default: only findings whose evidence reached `poc_differential` or
+//! above. `--allow-unproven` (explicit) also admits `poc_effect_no_control`
+//! and the refuter-only levels and marks the draft with a loud "unproven"
+//! banner. `static_only` is never
 //! drafted, and refuted / suppressed findings never are either.
 //!
 //! The level is the shared derivation [`Finding::evidence_level`]: a model
@@ -16,7 +17,7 @@ use crate::audit::evidence_level::EvidenceLevel;
 use crate::audit::schema::{Finding, FindingStatus};
 
 /// Lowest level drafted without `--allow-unproven`.
-pub const DEFAULT_MINIMUM: EvidenceLevel = EvidenceLevel::PocEffectNoControl;
+pub const DEFAULT_MINIMUM: EvidenceLevel = EvidenceLevel::PocDifferential;
 
 /// The outcome of the eligibility gate for one finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,8 +82,8 @@ pub fn draft_eligibility(f: &Finding, allow_unproven: bool) -> Result<Eligibilit
         });
     }
     Err(crate::tr!(
-        "證據等級 {} 未達預設門檻 poc_effect_no_control（需要由執行框架判定的 PoC 效果，或人工確認）。確定要為未證實的項目產生草稿，請明確加上 --allow-unproven；草稿會標示「未證實」。",
-        "evidence level {} is below the default threshold poc_effect_no_control (a harness-judged PoC effect, or a human confirmation). To draft an unproven finding anyway, pass --allow-unproven explicitly; the draft is marked UNPROVEN.",
+        "證據等級 {} 未達預設門檻 poc_differential（需要由執行框架判定、有通過的對照並在全新容器重跑的 PoC 效果，或人工確認）。確定要為未證實的項目產生草稿，請明確加上 --allow-unproven；草稿會標示「未證實」。",
+        "evidence level {} is below the default threshold poc_differential (a harness-judged PoC effect with a passing control and a fresh-container re-run, or a human confirmation). To draft an unproven finding anyway, pass --allow-unproven explicitly; the draft is marked UNPROVEN.",
         level.key()
     ))
 }
@@ -150,22 +151,35 @@ mod tests {
     }
 
     #[test]
-    fn harness_oracle_is_drafted_by_default() {
-        for (detail, want) in [
-            (ORACLE_NO_CONTROL, EvidenceLevel::PocEffectNoControl),
-            (ORACLE_DIFFERENTIAL, EvidenceLevel::PocDifferential),
-        ] {
-            let f = finding(
-                FindingStatus::NeedsHuman,
-                vec![
-                    ev(EvidenceKind::AdversarialReview, "plausible: ok"),
-                    ev(EvidenceKind::PocOracle, detail),
-                ],
-            );
-            let ok = draft_eligibility(&f, false).unwrap();
-            assert_eq!(ok.level, want, "{detail}");
-            assert!(!ok.unproven);
-        }
+    fn differential_oracle_is_drafted_by_default() {
+        let f = finding(
+            FindingStatus::NeedsHuman,
+            vec![
+                ev(EvidenceKind::AdversarialReview, "plausible: ok"),
+                ev(EvidenceKind::PocOracle, ORACLE_DIFFERENTIAL),
+            ],
+        );
+        let ok = draft_eligibility(&f, false).unwrap();
+        assert_eq!(ok.level, EvidenceLevel::PocDifferential);
+        assert!(!ok.unproven);
+    }
+
+    #[test]
+    fn effect_without_control_needs_allow_unproven() {
+        let f = finding(
+            FindingStatus::NeedsHuman,
+            vec![
+                ev(EvidenceKind::AdversarialReview, "plausible: ok"),
+                ev(EvidenceKind::PocOracle, ORACLE_NO_CONTROL),
+            ],
+        );
+        assert_eq!(f.evidence_level(), EvidenceLevel::PocEffectNoControl);
+        let err = draft_eligibility(&f, false).unwrap_err();
+        assert!(err.contains("--allow-unproven"), "{err}");
+        assert!(err.contains("poc_differential"), "{err}");
+        let ok = draft_eligibility(&f, true).unwrap();
+        assert_eq!(ok.level, EvidenceLevel::PocEffectNoControl);
+        assert!(ok.unproven);
     }
 
     #[test]

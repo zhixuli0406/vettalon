@@ -28,7 +28,8 @@ mod images;
 use images::missing_image_error;
 pub use images::{
     REGISTRY_PREFIX, SIGNER_IDENTITY_REGEXP, SIGNER_ISSUER, agents_base_image, agents_image,
-    build_images, build_joern_image, egress_image, joern_image, pull_images,
+    build_images, build_joern_image, build_poc_node_image, egress_image, joern_image,
+    poc_node_image, pull_images,
 };
 
 /// The prompt file and final-message file, as seen inside the container.

@@ -20,11 +20,12 @@
 
 pub mod cargo_audit;
 mod exec;
+pub(crate) use exec::{AttestationEnv, TrustedExecutable, run_attestation_subprocess};
 #[cfg(all(test, unix))]
 pub(crate) use exec::{GIT_SAFE_ENV, git_test_command_bare, git_version};
 pub use exec::{
     RunLimits as SubprocessLimits, RunOutcome as SubprocessOutcome,
-    run_capped as run_bounded_subprocess,
+    run_capped as run_bounded_subprocess, run_capped_bytes as run_bounded_subprocess_bytes,
 };
 /// Test fixtures that build Git repositories use the same environment.
 #[cfg(test)]

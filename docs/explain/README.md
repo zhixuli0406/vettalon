@@ -16,6 +16,7 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | --- | --- |
 | [adversarial_review](adversarial_review.md) | A note from the second model that tried to disprove the finding |
 | [ai_analysis](ai_analysis.md) | The finder model's explanation of why the code is vulnerable |
+| [bisect](bisect.md) | The first commit where a regression test fails |
 | [budget_cannot_fund_reserves](budget_cannot_fund_reserves.md) | The budget was too small to reserve room for verification |
 | [candidate](candidate.md) | The module review reported at least one finding |
 | [candidate_cap](candidate_cap.md) | The module was skipped because the run already had too many candidates |
@@ -30,10 +31,12 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | [engine_unavailable](engine_unavailable.md) | A model or tool the scan needed could not be used |
 | [evidence_funnel](evidence_funnel.md) | Evidence counts derived from the report |
 | [fix_check](fix_check.md) | The result of testing the finding's suggested fix |
+| [fix_check_cap_reached](fix_check_cap_reached.md) | The scan reached its cap on harness fix checks |
 | [fix_check_skipped](fix_check_skipped.md) | A step of the fix check could not run |
 | [fix_context_v1](fix_context_v1.md) | The exact files and settings a fix check or reproduction used |
 | [incomplete](incomplete.md) | Part of the requested work did not finish |
 | [injection_uncrosschecked](injection_uncrosschecked.md) | Text aimed at the AI reviewer was found and only one model family reviewed it |
+| [intake](intake.md) | One pasted vulnerability report checked as a single claim |
 | [interrupted](interrupted.md) | The run was recorded as interrupted |
 | [llm_failed](llm_failed.md) | The model call for this module failed |
 | [maintainer_confirmed](maintainer_confirmed.md) | A person confirmed this finding |
@@ -44,6 +47,7 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | [no_maintainer_confirmation](no_maintainer_confirmation.md) | No person has confirmed this finding |
 | [no_poc](no_poc.md) | No PoC was run for this finding |
 | [no_refuter](no_refuter.md) | No second model has given a verdict on this finding |
+| [node_exec](node_exec.md) | Execution proof for JavaScript and TypeScript targets in a Node sandbox |
 | [operator_decision](operator_decision.md) | A person's decision and the reason they gave |
 | [operator_review](operator_review.md) | A human reviewer recorded a decision on this finding |
 | [out_of_scope](out_of_scope.md) | The module was left out of the diff scan on purpose |
@@ -52,6 +56,7 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | [partial_by_design](partial_by_design.md) | The scan finished, but only on the part you asked for |
 | [partially_reviewed](partially_reviewed.md) | The model saw only part of this module |
 | [plausible](plausible.md) | The refuter tried to disprove the finding and could not |
+| [poc_budget_exhausted](poc_budget_exhausted.md) | The 20-run PoC counter was spent before every eligible PoC ran |
 | [poc_differential](poc_differential.md) | A sandbox test showed a real effect, and a control did not |
 | [poc_effect_no_control](poc_effect_no_control.md) | A sandbox test showed an effect, but the proof is incomplete |
 | [poc_generation_failed](poc_generation_failed.md) | The model did not produce a usable proof-of-concept |
@@ -74,6 +79,7 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | [reachability_unknown](reachability_unknown.md) | Nothing has shown that an attacker can actually reach this code |
 | [read_failed_or_outside_repository](read_failed_or_outside_repository.md) | A file could not be read safely |
 | [reasoning](reasoning.md) | The prefix of the finder model's explanation |
+| [receipt_signing](receipt_signing.md) | A receipt signed with your own cosign key |
 | [refute_basis](refute_basis.md) | The refuter's stated reason for closing a finding |
 | [refuted](refuted.md) | A refuter judged the claim false |
 | [refuter_consistent](refuter_consistent.md) | Three or more refuter runs all found the claim plausible |
@@ -82,8 +88,11 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | [refuter_run](refuter_run.md) | One of several refuter runs on this finding |
 | [refuter_score](refuter_score.md) | The refuter's own probability that the claim is real |
 | [refuter_survived](refuter_survived.md) | A refuter could not disprove the claim |
+| [replay_inconsistent](replay_inconsistent.md) | Repeated reproductions of a finding did not all agree |
+| [retest](retest.md) | An old report's differential PoCs re-run on a new revision |
 | [retrieval](retrieval.md) | Missing definitions were looked up and the refuter was asked again |
 | [reviewed_no_checks](reviewed_no_checks.md) | The model reviewed the module, reported nothing, and listed no checks |
+| [sarif_cwes](sarif_cwes.md) | The SARIF result named more than one CWE |
 | [scope_not_fully_reviewed](scope_not_fully_reviewed.md) | Some of the code you asked about was not fully reviewed |
 | [scope_note](scope_note.md) | A note from Vettalon about where a finding sits in the scan scope |
 | [severity_capped](severity_capped.md) | The finder's severity was lowered to match its own impact rating |
@@ -95,6 +104,7 @@ SARIF result properties include `vettalon.explain_uri`, an object mapping each c
 | [tier_disagreement](tier_disagreement.md) | The finder and refuter disagree on how hard the attack is |
 | [time_budget](time_budget.md) | The module ran out of time |
 | [time_budget_exhausted](time_budget_exhausted.md) | The scan hit its time limit with work left over |
+| [trust_policy](trust_policy.md) | A model refutation was not allowed to close this finding |
 | [units_failed](units_failed.md) | Some pieces of the scan produced no usable result |
 | [unreadable](unreadable.md) | The module had no text the model could be sent |
 | [unresolved](unresolved.md) | The refuter could not decide, so the finding stays open |

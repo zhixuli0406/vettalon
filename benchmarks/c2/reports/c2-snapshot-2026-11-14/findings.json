@@ -1,0 +1,975 @@
+{
+ "columns": [
+  "scanner",
+  "ruleId",
+  "file",
+  "line",
+  "cwe",
+  "status",
+  "votes"
+ ],
+ "rows": [
+  [
+   "opengrep",
+   "rules.python.lang.best-practice.arbitrary-sleep",
+   "src/werkzeug/debug/__init__.py",
+   472,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.best-practice.open-never-closed",
+   "src/werkzeug/datastructures/file_storage.py",
+   129,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.correctness.common-mistakes.identical-is-comparison",
+   "src/werkzeug/serving.py",
+   267,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.correctness.return-in-init",
+   "src/werkzeug/datastructures/accept.py",
+   59,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wrappers/response.py",
+   323,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   573,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.security.audit.dangerous-subprocess-use-audit",
+   "src/werkzeug/_reloader.py",
+   275,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.security.audit.exec-detected",
+   "src/werkzeug/routing/rules.py",
+   736,
+   "CWE-95",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.security.audit.httpsconnection-detected",
+   "src/werkzeug/middleware/http_proxy.py",
+   151,
+   "CWE-295",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.security.insecure-hash-algorithm-sha1",
+   "src/werkzeug/debug/__init__.py",
+   45,
+   "CWE-327",
+   "maintained",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.best-practice.open-never-closed",
+   "src/werkzeug/utils.py",
+   473,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.correctness.return-in-init",
+   "src/werkzeug/middleware/shared_data.py",
+   140,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/debug/tbtools.py",
+   276,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/sansio/response.py",
+   758,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.security.audit.exec-detected",
+   "src/werkzeug/debug/console.py",
+   177,
+   "CWE-95",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.security.insecure-hash-algorithm-sha1",
+   "src/werkzeug/http.py",
+   1077,
+   "CWE-327",
+   "maintained",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.best-practice.open-never-closed",
+   "src/werkzeug/datastructures/file_storage.py",
+   196,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.correctness.return-in-init",
+   "src/werkzeug/datastructures/auth.py",
+   179,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/local.py",
+   325,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   535,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.security.insecure-hash-algorithm-sha1",
+   "src/werkzeug/debug/__init__.py",
+   196,
+   "CWE-327",
+   "maintained",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/routing/rules.py",
+   477,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   538,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/middleware/shared_data.py",
+   140,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   571,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wrappers/request.py",
+   614,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/sansio/response.py",
+   749,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wsgi.py",
+   531,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   572,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wrappers/response.py",
+   191,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/sansio/response.py",
+   748,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wsgi.py",
+   589,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   575,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wrappers/response.py",
+   614,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   543,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/local.py",
+   305,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   560,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wrappers/response.py",
+   510,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/local.py",
+   555,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wsgi.py",
+   596,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.return-not-in-function",
+   "src/werkzeug/sansio/response.py",
+   757,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/routing/rules.py",
+   478,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/debug/__init__.py",
+   522,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/debug/tbtools.py",
+   438,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wrappers/response.py",
+   194,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "opengrep",
+   "rules.python.lang.maintainability.is-function-without-parentheses",
+   "src/werkzeug/wrappers/response.py",
+   349,
+   "",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B101",
+   "src/werkzeug/serving.py",
+   306,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B102",
+   "src/werkzeug/routing/rules.py",
+   736,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B104",
+   "src/werkzeug/serving.py",
+   855,
+   "CWE-605",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B110",
+   "src/werkzeug/test.py",
+   667,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B311",
+   "src/werkzeug/test.py",
+   70,
+   "CWE-330",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B324",
+   "src/werkzeug/debug/__init__.py",
+   196,
+   "CWE-327",
+   "maintained",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "bandit",
+   "B404",
+   "src/werkzeug/_reloader.py",
+   5,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B603",
+   "src/werkzeug/_reloader.py",
+   275,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B607",
+   "src/werkzeug/debug/__init__.py",
+   91,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B101",
+   "src/werkzeug/routing/map.py",
+   729,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B102",
+   "src/werkzeug/debug/console.py",
+   177,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B104",
+   "src/werkzeug/serving.py",
+   852,
+   "CWE-605",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B110",
+   "src/werkzeug/test.py",
+   650,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B324",
+   "src/werkzeug/http.py",
+   1077,
+   "CWE-327",
+   "maintained",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "bandit",
+   "B404",
+   "src/werkzeug/debug/__init__.py",
+   88,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B603",
+   "src/werkzeug/debug/__init__.py",
+   91,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B101",
+   "src/werkzeug/_internal.py",
+   39,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B110",
+   "src/werkzeug/datastructures/file_storage.py",
+   142,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B324",
+   "src/werkzeug/debug/__init__.py",
+   45,
+   "CWE-327",
+   "maintained",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 3
+   }
+  ],
+  [
+   "bandit",
+   "B404",
+   "src/werkzeug/debug/__init__.py",
+   89,
+   "CWE-78",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B101",
+   "src/werkzeug/datastructures/range.py",
+   178,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B110",
+   "src/werkzeug/serving.py",
+   391,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B101",
+   "src/werkzeug/routing/rules.py",
+   700,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B110",
+   "src/werkzeug/middleware/lint.py",
+   223,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B101",
+   "src/werkzeug/routing/map.py",
+   784,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B110",
+   "src/werkzeug/debug/repr.py",
+   260,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B101",
+   "src/werkzeug/serving.py",
+   266,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ],
+  [
+   "bandit",
+   "B101",
+   "src/werkzeug/serving.py",
+   265,
+   "CWE-703",
+   "refuted",
+   {
+    "no_verdict": 0,
+    "plausible": 0,
+    "refuted": 1
+   }
+  ]
+ ]
+}

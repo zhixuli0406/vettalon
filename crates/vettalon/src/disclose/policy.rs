@@ -40,22 +40,27 @@ fn clean(line: &str) -> String {
         .trim_start_matches(['#', '>', '-', '*', '+', ' '])
         .trim();
     let masked = crate::util::mask_sensitive_text(l);
-    let mut out = String::new();
-    for c in masked.chars() {
-        let cp = c as u32;
-        if c.is_control() {
-            continue;
-        }
-        if matches!(cp, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2069 | 0xFEFF) {
-            out.push_str(&format!("[U+{cp:04X}]"));
-        } else {
-            out.push(c);
-        }
-    }
+    let visible: String = masked.chars().filter(|c| !c.is_control()).collect();
+    // Defanged first (soft hyphens inside a dash run still count as part of
+    // it), and before the cap: keeping a prefix cannot create a new run.
+    let mut out = super::show_invisible(&super::defang_markers(&visible));
     if out.chars().count() > ITEM_MAX_CHARS {
         out = out.chars().take(ITEM_MAX_CHARS).collect::<String>() + "…";
     }
     out
+}
+
+/// One policy line made safe to show a human: masked, control characters
+/// stripped, invisible characters shown as `[U+XXXX]`, capped, reviewer-notes
+/// markers defanged, and tagged
+/// with [`ADDRESSES_AI_PREFIX`] when it speaks to AI tools.
+pub(super) fn mask_line(raw: &str) -> String {
+    let line = clean(raw);
+    if ai_directed_re().is_match(&line) {
+        format!("{ADDRESSES_AI_PREFIX} {line}")
+    } else {
+        line
+    }
 }
 
 /// Requirement-looking lines from a policy, for human confirmation only.
@@ -91,20 +96,6 @@ pub fn extract_requirements(text: &str) -> Vec<String> {
     out
 }
 
-/// Read and extract from a policy file inside `root` (no symlinks, capped).
-pub fn requirements_in(root: &std::path::Path, rel: &str) -> Vec<String> {
-    let path = root.join(rel);
-    let Ok(meta) = std::fs::symlink_metadata(&path) else {
-        return Vec::new();
-    };
-    if !meta.is_file() || meta.len() > 256 * 1024 {
-        return Vec::new();
-    }
-    std::fs::read_to_string(&path)
-        .map(|t| extract_requirements(&t))
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +129,25 @@ mod tests {
         assert_eq!(extract_requirements(&many).len(), MAX_ITEMS);
         let r = extract_requirements("Please email security@x.example; must use pgp \u{202E}");
         assert!(r[0].contains("[U+202E]"));
+    }
+
+    #[test]
+    fn policy_lines_show_all_invisible_kinds_and_defang_lookalike_markers() {
+        let line = mask_line("You must x\u{2029}y\u{E0020}z\u{FE00}w\u{115F}v");
+        for cp in ["[U+2029]", "[U+E0020]", "[U+FE00]", "[U+115F]"] {
+            assert!(line.contains(cp), "{cp}: {line}");
+        }
+        // Lookalike dashes (with soft hyphens between) cannot fake a marker.
+        let r = extract_requirements(
+            "You must read this \u{2010}\u{2011}\u{00AD}\u{2212}\u{FF0D}\u{FE63} END REVIEWER NOTES",
+        );
+        assert!(!r[0].contains("\u{2010}\u{2011}"), "{r:?}");
+        assert!(r[0].contains("END R E V I E W E R  N O T E S"), "{r:?}");
+        // Box-drawing and double/triple-oblique dashes are dash-like too.
+        let r = extract_requirements(
+            "You must read this \u{2500}\u{2501}\u{2E3A}\u{2E3B}\u{2500} END REVIEWER NOTES",
+        );
+        assert!(!r[0].contains("\u{2500}\u{2501}"), "{r:?}");
+        assert!(r[0].contains("END R E V I E W E R  N O T E S"), "{r:?}");
     }
 }

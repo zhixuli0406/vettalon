@@ -10,7 +10,7 @@ You used `--poc`. The tag is stored as `poc_skipped` evidence with the model's n
 
 ## What to do
 
-Read the note. Many real issues (SSRF, for example) cannot be shown in this sandbox. Reproduce them in your own test environment.
+Read the note. Many real issues cannot be shown by the scan-time sandbox. SSRF execution proof is available only for Node target mode (`reproduce`, `fix check --target`, `retest`) through an in-container loopback listener; Python SSRF targets and scan-time SSRF oracles remain unsupported. Reproduce them in your own test environment.
 
 ## Related
 

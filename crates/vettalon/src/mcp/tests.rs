@@ -273,8 +273,13 @@ impl Executor for FakeExecutor {
         target: &TargetCall,
         _image: &str,
         emit: bool,
+        replays: u32,
     ) -> TargetPocWithTest {
-        self.calls.push(format!("reproduce:{emit}"));
+        self.calls.push(if replays == 1 {
+            format!("reproduce:{emit}")
+        } else {
+            format!("reproduce:{emit}:{replays}")
+        });
         TargetPocWithTest {
             receipt: serde_json::from_value(json!({"version":1,"outcome":"effect_observed","phases":[],"target_file":target.file,"target_function":target.function,"target_plan_sha256":null,"target_file_sha256":null,"source_sha256":null,"exclusions":null,"adapter_sha256":null,"image_id":null,"reason":null})).unwrap(),
             test_source: emit.then(|| crate::audit::regression_test::generate(finding, crate::audit::poc_oracle::classify(finding).unwrap(), target).unwrap()),
@@ -292,6 +297,8 @@ impl Executor for FakeExecutor {
         assert_eq!(command, Some("python3 -m unittest"));
         self.calls.push("fix".into());
         FixCheckRun {
+            runtime: None,
+            reach_summary: None,
             check: audit::fix_check::FixCheck::not_run(diff, 1, "sandbox_unavailable"),
             note: None,
             binding: None,
@@ -328,6 +335,9 @@ fn mcp_fake_execution_writes_only_state_and_preserves_source_and_report() {
             )
             .unwrap();
         assert_eq!(value["outcome"], "effect_observed");
+        // The fake returns a version-1 receipt: read as one requested replay.
+        assert_eq!(value["replays"]["requested"], 1);
+        assert_eq!(value["replays"]["observed"], 1);
         if emit {
             let test = value["test"].as_str().unwrap();
             assert!(!test.contains("AKIAIOSFODNN7EXAMPLE"));
@@ -425,6 +435,43 @@ fn mcp_fake_execution_writes_only_state_and_preserves_source_and_report() {
         .unwrap();
     let updated = audit::load_report_for_delivery(updated).unwrap();
     assert_eq!(updated.findings[0].status, report.findings[0].status);
+}
+
+#[test]
+fn mcp_reproduce_replays_are_optional_and_bounded() {
+    let schema = tools::schemas()
+        .into_iter()
+        .find(|s| s["name"] == "vettalon_reproduce")
+        .unwrap();
+    let replays = &schema["inputSchema"]["properties"]["replays"];
+    assert_eq!(replays["type"], "integer");
+    assert_eq!(replays["minimum"], 1);
+    assert_eq!(replays["maximum"], 20);
+    assert_eq!(replays["default"], 1);
+    assert!(
+        !schema["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("replays"))
+    );
+    let target = json!({"file":"a.py","function":"run","args":[{"kind":"payload"}]});
+    let args = |replays: Value| json!({"finding":"f1","target":target,"replays":replays});
+    for ok in [1, 3, 20] {
+        tools::validate_args("vettalon_reproduce", &args(json!(ok))).unwrap();
+    }
+    for refused in [json!(0), json!(21), json!(-1), json!(2.5), json!("3")] {
+        assert!(
+            tools::validate_args("vettalon_reproduce", &args(refused.clone())).is_err(),
+            "{refused}"
+        );
+    }
+    assert!(
+        tools::validate_args(
+            "vettalon_check_fix",
+            &json!({"finding":"f1","target":target,"diff":"","replays":2})
+        )
+        .is_err()
+    );
 }
 
 #[test]

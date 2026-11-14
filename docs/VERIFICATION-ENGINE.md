@@ -1,8 +1,8 @@
 # Verification Engine：可重播證據與工程護城河基礎
 
-本文件描述尚未發版的 verification engine。它把來源綁定的 Python Target PoC 編譯成 language-neutral Verification IR（VIR），從執行事實衍生判決，保存可重播的反例與 sealed evaluation lineage，並產生保留完整分母的工程 scorecard。
+本文件描述尚未發版的 verification engine。它把來源綁定的 Python 與 JavaScript／TypeScript（Node）Target PoC 編譯成 language-neutral Verification IR（VIR），從執行事實衍生判決，保存可重播的反例與 sealed evaluation lineage，並產生保留完整分母的工程 scorecard。
 
-這是工程護城河的第一個可運作閉環，不代表護城河已經成立。現在只支援 Python 的 command injection、path traversal 與 SQL injection 三類 target；正式成立仍需跨語言、第二個獨立執行後端、prospective hidden batch、跨 host／版本重播，以及事前門檻達標。
+這是工程護城河的第一個可運作閉環，不代表護城河已經成立。現在支援 Python 與 JavaScript／TypeScript（Node）的 command injection、path traversal 與 SQL injection 三類 target；正式成立仍需第四種以上的 effect、第二個獨立執行後端、prospective hidden batch、跨 host／版本重播，以及事前門檻達標。
 
 ## 資料流與信任邊界
 
@@ -40,6 +40,26 @@ Target 子程序不接收 marker，stdout／stderr 只作 diagnostic。VIR 的 h
 - `vettalon.engineering-measurement/1`：每個 effect × language × framework 的事前登錄資料列；unsupported 與 inconclusive 都保留在分母。
 
 所有 identity 都由嚴格驗證後的內容計算。未知 capture、未確認 cleanup、tampering、非零 exit、required control 缺漏／失敗，或 unsupported／diverged replay 一律得到 `inconclusive`。
+
+### Node runtime（JavaScript／TypeScript）
+
+Target 檔案的副檔名決定語言：`.py` 是 Python，`.js`／`.cjs`／`.mjs` 是 JavaScript，`.ts`／`.cts`／`.mts` 是 TypeScript，VIR 的 `subject.language` 與副檔名不符時拒絕。Node target 的 VIR binding 多一個 `runtime`（`node_version`、`lockfile_sha256`、`lockfile_summary_sha256`、`deps_sha256`、`fixture_sha256`），harness 版本是 `vettalon-node-oracle-v1`，harness digest 另外雜湊 preload hook 與三個 driver shim 的位元組。Python 的 binding 不帶 `runtime`，`identity_sha256`、harness 版本與 effect／controls／capabilities 都沒有變。Fixture 只以 digest 進入 binding，值不會寫進任何收據或 event。
+
+`reproduce` 的 Node 收據是 `TargetPocReceipt` version 3：多 `runtime`、`harness_sha256`，每個 phase 多 `reached`、`reach_source: "in_process_hook"`、`reach_sha256`、遮罩後的 `reach` 摘要與 `executable`；`image_id` 是 Node image 的不可變 ID。Python 收據維持 version 2，位元組不變。簽署前與附進揭露草稿前，每份收據都依 runtime 從 phases 重新推導 outcome，不一致即拒絕。
+
+Reach 由 target 同一個 Node 行程裡的 hook 記錄，target 程式可以偽造或壓掉，因此只能讓結果降級：effect 仍由 PID 1 的 Python runner 依 canary 證據判定，`effect_absent` 另外要求 hook 回報到達 sink。`pg`／`mysql2` 只記 reach，一律 `inconclusive`（`sql_dialect_not_executable`）。依賴只在一個有網路、不跑 install script 的容器安裝一次，所有執行階段都是 `--network=none`。使用方式與限制見 [`docs/explain/node_exec.md`](explain/node_exec.md)。
+
+### SSRF in Node target mode
+
+CWE-918 uses effect id `loopback_http_request`, effect kind `network_egress`
+(`EffectKind::NetworkEgress`), and adds `loopback_network`
+(`Capability::LoopbackNetwork`) to the existing capabilities. The protected runner
+observes an HTTP request line or TLS ClientHello at its in-container listener;
+external networking remains disabled. SSRF also binds the bytes of
+`vtl_hook_net.cjs`. Reach remains an untrusted diagnostic. The benign control is a
+recognized network error in the target's error/cause chain, not a successful
+public HTTP response. Python SSRF targets, scan-time SSRF oracles and SSRF
+`--emit-test` remain unsupported. See [Node execution](explain/node_exec.md).
 
 ## CLI
 
@@ -112,11 +132,11 @@ Payload 本身不寫進共用 registry；registry 只保存 digest 與授權 met
 
 ## 驗收邊界
 
-目前可驗收的是 schema、fail-closed derivation、三類 Python Target PoC round-trip、semantic replay comparison、counterexample promotion、holdout contamination 與 denominator-preserving scorecard。以下仍是後續 gate：
+目前可驗收的是 schema、fail-closed derivation、三類 Python 與 Node（JavaScript／TypeScript）Target PoC round-trip、semantic replay comparison、counterexample promotion、holdout contamination 與 denominator-preserving scorecard。以下仍是後續 gate：
 
 - 30 個 marker／`/proc`／symlink／rename／timeout／cancel／late-create／cleanup fault-injection cases全部 fail closed。
 - 第二個獨立 backend 與兩台 host 的 paired replay。
-- JavaScript／TypeScript frontend 與至少四種 effect。
+- Four effect classes are implemented for Node targets, including SSRF; live fixture verification remains a reviewer task. Python still has three classes, and scan-time SSRF oracles remain unsupported.
 - 事前凍結的 prospective batches；unsupported／inconclusive 不得排除。
 - 新 verifier 工時與 manual trusted LOC 相較 Day 30 中位數各下降至少 50%。
 - Same-backend replay 至少 95%、跨版本至少 90%、共同子集跨 backend semantic agreement 至少 99%。

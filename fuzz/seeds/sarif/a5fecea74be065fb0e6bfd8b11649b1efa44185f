@@ -1,0 +1,1 @@
+{"$schema":"https://json.schemastore.org/arif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep OSS","rules":[{"id":"python.lang.se\uri.audit.dange[rous-sysσσσσσσσσσσσus system call"},ssage":έ‹xt":"Found user input in os.syss","message":{"texte":"ok"},"locastionssagee":[]l":},{"r

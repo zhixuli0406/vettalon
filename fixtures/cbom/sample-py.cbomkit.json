@@ -1,0 +1,185 @@
+{
+  "bomFormat" : "CycloneDX",
+  "specVersion" : "1.6",
+  "serialNumber" : "urn:uuid:dbdd54ee-0494-4023-bdec-3f293d86269a",
+  "version" : 1,
+  "metadata" : {
+    "timestamp" : "2026-11-09T08:40:56Z",
+    "tools" : {
+      "services" : [
+        {
+          "provider" : {
+            "name" : "PQCA"
+          },
+          "name" : "CBOMkit"
+        }
+      ]
+    }
+  },
+  "components" : [
+    {
+      "type" : "cryptographic-asset",
+      "bom-ref" : "f89b6dff-6b9e-4566-ad8e-5a3efd2effb8",
+      "name" : "AES-256-GCM",
+      "evidence" : {
+        "occurrences" : [
+          {
+            "location" : "ws/app/keys.py",
+            "line" : 17,
+            "offset" : 10,
+            "additionalContext" : "generate_key"
+          }
+        ]
+      },
+      "cryptoProperties" : {
+        "assetType" : "algorithm",
+        "algorithmProperties" : {
+          "primitive" : "ae",
+          "parameterSetIdentifier" : "256",
+          "mode" : "gcm",
+          "cryptoFunctions" : [
+            "encrypt",
+            "keygen"
+          ]
+        },
+        "oid" : "2.16.840.1.101.3.4.1.46"
+      }
+    },
+    {
+      "type" : "cryptographic-asset",
+      "bom-ref" : "2a817308-48c0-4f88-97de-41c419395e0a",
+      "name" : "private-key@2a817308-48c0-4f88-97de-41c419395e0a",
+      "evidence" : {
+        "occurrences" : [
+          {
+            "location" : "ws/app/keys.py",
+            "line" : 13,
+            "offset" : 11,
+            "additionalContext" : "generate_private_key"
+          }
+        ]
+      },
+      "cryptoProperties" : {
+        "assetType" : "related-crypto-material",
+        "relatedCryptoMaterialProperties" : {
+          "type" : "private-key"
+        }
+      }
+    },
+    {
+      "type" : "cryptographic-asset",
+      "bom-ref" : "6385bfb6-e991-451a-88df-a2b56c228e29",
+      "name" : "secret-key@6385bfb6-e991-451a-88df-a2b56c228e29",
+      "evidence" : {
+        "occurrences" : [
+          {
+            "location" : "ws/app/keys.py",
+            "line" : 17,
+            "offset" : 10,
+            "additionalContext" : "generate_key"
+          }
+        ]
+      },
+      "cryptoProperties" : {
+        "assetType" : "related-crypto-material",
+        "relatedCryptoMaterialProperties" : {
+          "type" : "secret-key"
+        }
+      }
+    },
+    {
+      "type" : "cryptographic-asset",
+      "bom-ref" : "1b9d0591-468e-454d-b797-6521249a5eeb",
+      "name" : "RSA-2048",
+      "evidence" : {
+        "occurrences" : [
+          {
+            "location" : "ws/app/keys.py",
+            "line" : 8,
+            "offset" : 11,
+            "additionalContext" : "generate_private_key"
+          }
+        ]
+      },
+      "cryptoProperties" : {
+        "assetType" : "algorithm",
+        "algorithmProperties" : {
+          "primitive" : "pke",
+          "parameterSetIdentifier" : "2048",
+          "cryptoFunctions" : [
+            "keygen"
+          ]
+        },
+        "oid" : "1.2.840.113549.1.1.1"
+      }
+    },
+    {
+      "type" : "cryptographic-asset",
+      "bom-ref" : "c20c7e7b-68da-4237-a7ca-bfd9a0229209",
+      "name" : "private-key@c20c7e7b-68da-4237-a7ca-bfd9a0229209",
+      "evidence" : {
+        "occurrences" : [
+          {
+            "location" : "ws/app/keys.py",
+            "line" : 8,
+            "offset" : 11,
+            "additionalContext" : "generate_private_key"
+          }
+        ]
+      },
+      "cryptoProperties" : {
+        "assetType" : "related-crypto-material",
+        "relatedCryptoMaterialProperties" : {
+          "type" : "private-key",
+          "size" : 2048
+        }
+      }
+    },
+    {
+      "type" : "cryptographic-asset",
+      "bom-ref" : "f8b02d71-8e2d-4752-bb82-0c8081dc7997",
+      "name" : "EC-secp256r1",
+      "evidence" : {
+        "occurrences" : [
+          {
+            "location" : "ws/app/keys.py",
+            "line" : 13,
+            "offset" : 11,
+            "additionalContext" : "generate_private_key"
+          }
+        ]
+      },
+      "cryptoProperties" : {
+        "assetType" : "algorithm",
+        "algorithmProperties" : {
+          "primitive" : "pke",
+          "curve" : "secp256r1",
+          "cryptoFunctions" : [
+            "keygen"
+          ]
+        },
+        "oid" : "1.2.840.10045.2.1"
+      }
+    }
+  ],
+  "dependencies" : [
+    {
+      "ref" : "6385bfb6-e991-451a-88df-a2b56c228e29",
+      "dependsOn" : [
+        "f89b6dff-6b9e-4566-ad8e-5a3efd2effb8"
+      ]
+    },
+    {
+      "ref" : "2a817308-48c0-4f88-97de-41c419395e0a",
+      "dependsOn" : [
+        "f8b02d71-8e2d-4752-bb82-0c8081dc7997"
+      ]
+    },
+    {
+      "ref" : "c20c7e7b-68da-4237-a7ca-bfd9a0229209",
+      "dependsOn" : [
+        "1b9d0591-468e-454d-b797-6521249a5eeb"
+      ]
+    }
+  ]
+}

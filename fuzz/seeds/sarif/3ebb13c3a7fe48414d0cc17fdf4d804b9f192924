@@ -1,0 +1,15 @@
+{"$schema":"arif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool"
+
+
+
+
+
+
+
+
+
+
+
+
+
+:{"driver":{"name":"vettalon","rules":[{"id":"rule/x","shortDescription":{"text":"rule/x"},"defaultConfiguration":{"level":"error"},"properties":{"tags":["security","external/cwe/cwe-327","external/cwe/cwe-079"],"vettalon.severity":"high"}}],"supportedTaxonomies":[{"name":"CWE","index":0}]}},"taxonomies":[{"name":"CWE","taxa":[{"id":"327"}]}],"results":[{"ruleId":"rule/x","level":"erro'","message":{"text":"weak cipher"},"locations":[{"p":"refuted: x"}],"properties":{"vettalon.status":"refuted"}}]}]}

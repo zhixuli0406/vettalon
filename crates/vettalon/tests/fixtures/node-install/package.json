@@ -1,0 +1,13 @@
+{
+  "name": "vettalon-node-install-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "preinstall": "node -e \"require('node:fs').writeFileSync('node_modules/.script-ran','bad'); process.exit(99)\"",
+    "install": "node -e \"process.exit(99)\"",
+    "postinstall": "node -e \"process.exit(99)\""
+  },
+  "dependencies": {
+    "is-number": "7.0.0"
+  }
+}

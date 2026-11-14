@@ -24,6 +24,11 @@ pub(super) fn validate_options(opts: &ScanOptions, mode: ProfileMode) -> Result<
 }
 
 fn read_report(path: &Path) -> Result<AuditReport, &'static str> {
+    read_report_with_sha256(path).map(|(report, _)| report)
+}
+
+/// [`read_report`] plus the SHA-256 of the exact bytes parsed.
+fn read_report_with_sha256(path: &Path) -> Result<(AuditReport, String), &'static str> {
     let meta = std::fs::symlink_metadata(path).map_err(|_| "unreadable report")?;
     if !meta.is_file() || meta.len() > MAX_REPORT_BYTES {
         return Err("report is not a regular file or exceeds size cap");
@@ -47,14 +52,13 @@ fn read_report(path: &Path) -> Result<AuditReport, &'static str> {
     if raw.len() as u64 > MAX_REPORT_BYTES {
         return Err("report exceeds size cap");
     }
-    serde_json::from_slice(&raw).map_err(|_| "cannot parse report")
+    let report = serde_json::from_slice(&raw).map_err(|_| "cannot parse report")?;
+    Ok((report, super::schema::sha256_hex(&raw)))
 }
 
-fn eligible(
-    report: &AuditReport,
-    mode: ProfileMode,
-    classes: AttackClassMode,
-) -> Result<Option<&str>, &'static str> {
+/// Schema, validator and commit checks every trusted base must pass,
+/// independent of the profile and attack classes it was scanned with.
+fn eligible_base(report: &AuditReport) -> Result<Option<&str>, &'static str> {
     if !is_supported_schema_version(report.schema_version)
         || !super::validator::validate_report(report).is_empty()
     {
@@ -62,11 +66,25 @@ fn eligible(
     }
     let commit = report.repo_commit.as_deref();
     // A saved report must never introduce revision syntax or Git options.
-    if commit.is_none_or(|commit| {
-        ![40, 64].contains(&commit.len()) || !commit.bytes().all(|b| b.is_ascii_hexdigit())
-    }) {
+    if !is_full_hex_oid(commit) {
         return Err("repo_commit is not a full hex OID");
     }
+    Ok(commit)
+}
+
+/// True for a full 40- or 64-character hex object id.
+pub(crate) fn is_full_hex_oid(commit: Option<&str>) -> bool {
+    commit.is_some_and(|commit| {
+        [40, 64].contains(&commit.len()) && commit.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
+fn eligible(
+    report: &AuditReport,
+    mode: ProfileMode,
+    classes: AttackClassMode,
+) -> Result<Option<&str>, &'static str> {
+    let commit = eligible_base(report)?;
     if report.profile.mode != mode {
         return Err("profile differs");
     }
@@ -102,6 +120,96 @@ pub(super) fn skip_intake_safe(ignored: Result<usize, String>) -> bool {
     matches!(ignored, Ok(0))
 }
 
+/// Saved report file names under `home/reports`, newest first. `Err(None)`
+/// when the directory is unavailable; `Err(Some(reason))` when the bounded
+/// enumeration cap is exceeded.
+fn saved_report_names(home: &Path) -> Result<Vec<String>, Option<&'static str>> {
+    let entries = std::fs::read_dir(home.join("reports")).map_err(|_| None)?;
+    let mut names = Vec::new();
+    // Bound directory enumeration as well as parsing and Git ancestry checks.
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_REPORT_FILES {
+            return Err(Some("report file count cap exceeded"));
+        }
+        if let Ok(entry) = entry
+            && let Some(name) = entry.file_name().to_str()
+            && name.ends_with(".json")
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort_by(|a, b| {
+        super::report::saved_report_sort_key(b).cmp(&super::report::saved_report_sort_key(a))
+    });
+    Ok(names)
+}
+
+/// A baseline report chosen by the `--since-last` trust rules.
+pub(crate) struct Baseline {
+    pub path: std::path::PathBuf,
+    pub report: AuditReport,
+    /// SHA-256 of the exact saved bytes (before any in-memory migration).
+    pub sha256: String,
+}
+
+/// The newest saved report `--since-last` would trust as a base for `root`
+/// (same enumeration cap, size cap, trust-policy migration, validator and
+/// commit checks, clean and complete run, commit an ancestor of HEAD), but
+/// without the profile / attack-class match: `retest` re-runs recorded
+/// findings, it does not merge scan coverage. `root` must be canonical.
+pub(crate) async fn select_baseline(home: &Path, root: &Path) -> Result<Baseline, String> {
+    let names = saved_report_names(home).map_err(|reason| {
+        format!(
+            "no baseline report: {}",
+            reason.unwrap_or("no saved reports directory")
+        )
+    })?;
+    for name in names {
+        let path = home.join("reports").join(&name);
+        let (mut report, sha256) = match read_report_with_sha256(&path) {
+            Ok(value) => value,
+            Err(reason) => {
+                eprintln!("[vettalon] retest: skipping base {name}: {reason}");
+                continue;
+            }
+        };
+        if report.repo != root.to_string_lossy() {
+            continue;
+        }
+        super::trust_policy::migrate_capped_refutations(&mut report);
+        let commit = match eligible_base(&report) {
+            Ok(Some(commit)) => commit.to_owned(),
+            Ok(None) => continue,
+            Err(reason) => {
+                eprintln!("[vettalon] retest: skipping base {name}: {reason}");
+                continue;
+            }
+        };
+        let completed = report.run_status == RunStatus::Complete
+            || (report.run_status == RunStatus::PartialByDesign && report.since_last.is_some());
+        if report.repo_tree_clean != Some(true) || !completed {
+            eprintln!("[vettalon] retest: skipping base {name}: dirty or unfinished report");
+            continue;
+        }
+        match diff_scope::compute(root, &commit).await {
+            Ok(selection) if selection.scope.merge_base == selection.scope.base_oid => {
+                return Ok(Baseline {
+                    path,
+                    report,
+                    sha256,
+                });
+            }
+            _ => eprintln!(
+                "[vettalon] retest: skipping base {name}: commit is not an ancestor of HEAD or Git state unavailable"
+            ),
+        }
+    }
+    Err(NO_BASELINE.into())
+}
+
+const NO_BASELINE: &str =
+    "no baseline report for this repository passed the --since-last trust rules; pass --report";
+
 pub(super) async fn select(
     home: &Path,
     root: &Path,
@@ -130,28 +238,18 @@ pub(super) async fn select(
             return None;
         }
     }
-    let entries = std::fs::read_dir(home.join("reports")).ok()?;
-    let mut names = Vec::new();
-    // Bound directory enumeration as well as parsing and Git ancestry checks.
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_REPORT_FILES {
-            eprintln!("[vettalon] --since-last: skipping base: report file count cap exceeded");
+    let names = match saved_report_names(home) {
+        Ok(names) => names,
+        Err(Some(reason)) => {
+            eprintln!("[vettalon] --since-last: skipping base: {reason}");
             return None;
         }
-        if let Ok(entry) = entry
-            && let Some(name) = entry.file_name().to_str()
-            && name.ends_with(".json")
-        {
-            names.push(name.to_owned());
-        }
-    }
-    names.sort_by(|a, b| {
-        super::report::saved_report_sort_key(b).cmp(&super::report::saved_report_sort_key(a))
-    });
+        Err(None) => return None,
+    };
     let mut supplements = Vec::new();
     for name in names {
         let result = read_report(&home.join("reports").join(&name));
-        let report = match result {
+        let mut report = match result {
             Ok(report) => report,
             Err(reason) => {
                 eprintln!("[vettalon] --since-last: skipping base: {reason}");
@@ -160,6 +258,19 @@ pub(super) async fn select(
         };
         if report.repo != root.to_string_lossy() {
             continue;
+        }
+        // A report saved before the per-CWE trust policy: reopen its
+        // model-only refutations of capped CWEs, then `eligible` validates
+        // strictly.
+        let migrated = super::trust_policy::migrate_capped_refutations(&mut report);
+        if migrated > 0 {
+            eprintln!(
+                "[vettalon] --since-last: {}",
+                super::trust_policy::migration_note(
+                    &crate::tr!("基準報告", "base report"),
+                    migrated
+                )
+            );
         }
         let commit = match eligible(&report, mode, classes) {
             Ok(commit) => commit,
@@ -407,6 +518,46 @@ mod tests {
             "open",
             vec![],
         )
+    }
+
+    /// N1: a pre-policy baseline with a model-only CWE-614 refutation is
+    /// rejected by the strict check until it is migrated, then eligible.
+    #[test]
+    fn pre_policy_baseline_is_eligible_once_migrated() {
+        use super::super::schema::{EvidenceItem, EvidenceKind, GatePolicy, Summary};
+        let mut report: AuditReport = serde_json::from_value(serde_json::json!({
+            "schema_version": 3,
+            "repo": "/repo",
+            "started_at": "2026-10-01T00:00:00Z",
+            "profile": {"mode":"deep", "intake":null},
+            "findings": [], "engines_run": [], "engines_missing": [],
+            "summary": {"total_findings":0,"by_severity":{"critical":0,"high":0,"medium":0,"low":0,"info":0},"engines_run_count":0,"engines_missing_count":0},
+            "run_status":"complete"
+        }))
+        .unwrap();
+        report.repo_commit = Some("a".repeat(40));
+        let mut f = finding("a.rs");
+        f.status = FindingStatus::Refuted;
+        f.cwe = Some("CWE-614".into());
+        f.evidence.push(EvidenceItem {
+            kind: EvidenceKind::AdversarialReview,
+            source: "verifier".into(),
+            detail: "refuted: cookie is not sensitive".into(),
+            recorded_at: "2026-10-01T00:00:00Z".into(),
+        });
+        report.findings.push(f);
+        report.summary = Summary::from_findings(&report.findings, 0, 0, GatePolicy::default(), &[]);
+        let classes = AttackClassMode::default();
+        assert_eq!(
+            eligible(&report, ProfileMode::Deep, classes),
+            Err("report validation failed")
+        );
+        assert_eq!(
+            super::super::trust_policy::migrate_capped_refutations(&mut report),
+            1
+        );
+        assert_eq!(report.findings[0].status, FindingStatus::NeedsHuman);
+        assert!(eligible(&report, ProfileMode::Deep, classes).is_ok());
     }
 
     #[test]

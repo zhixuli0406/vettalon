@@ -10,8 +10,44 @@
 /// of its delimiter block. Prompt-injection hardening: content read from a
 /// possibly-adversarial repository is DATA, and must never be able to
 /// terminate its own fence early and inject a new "instruction" section.
+///
+/// A closing tag is matched the way a lenient reader would see one: ASCII
+/// case-insensitively and with whitespace allowed around the `/` and before
+/// the `>` (`</claim>`, `</CLAIM>`, `</claim >`, `</ claim>`). Each match gets
+/// a zero-width space right after its `<`; nothing is removed, and text
+/// without such a tag is returned unchanged.
 pub fn escape_xml_tag(content: &str, tag: &str) -> String {
-    content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>"))
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(pos) = rest.find('<') {
+        let Some((before, from_lt)) = rest.split_at_checked(pos) else {
+            break;
+        };
+        out.push_str(before);
+        out.push('<');
+        // `<` is one byte, so the remainder starts on a char boundary.
+        let after_lt = from_lt.get(1..).unwrap_or_default();
+        if closes_tag(after_lt, tag) {
+            out.push('\u{200b}');
+        }
+        rest = after_lt;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `s` (the text right after a `<`) is `/tag>` up to case and whitespace.
+fn closes_tag(s: &str, tag: &str) -> bool {
+    let Some(s) = s.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let s = s.trim_start();
+    let name_matches = s
+        .get(..tag.len())
+        .is_some_and(|name| name.eq_ignore_ascii_case(tag));
+    name_matches
+        && s.get(tag.len()..)
+            .is_some_and(|after| after.trim_start().starts_with('>'))
 }
 
 /// A small ASCII-safe slug for embedding an LLM-supplied free-text category
@@ -121,6 +157,51 @@ mod tests {
         assert_eq!(
             escape_xml_tag("just code, no tags here", "file_content"),
             "just code, no tags here"
+        );
+    }
+
+    #[test]
+    fn escape_xml_tag_matches_case_and_whitespace_variants() {
+        for hostile in [
+            "x</claim>y",
+            "x</CLAIM>y",
+            "x</Claim>y",
+            "x</claim >y",
+            "x</ claim>y",
+            "x< / claim\t>y",
+            "x</claim\n>y",
+        ] {
+            let escaped = escape_xml_tag(hostile, "claim");
+            assert!(
+                escaped.starts_with("x<\u{200b}"),
+                "{hostile:?}: {escaped:?}"
+            );
+            // Only the zero-width space is added.
+            assert_eq!(escaped.replace('\u{200b}', ""), hostile);
+        }
+        // Not a closing tag of this name: unchanged.
+        for benign in [
+            "a < b",
+            "<claim>",
+            "</claims>",
+            "</clai>",
+            "</file_excerpt>",
+            "x</claimy",
+            "<",
+            "中文</",
+            "</ 中文>",
+        ] {
+            assert_eq!(escape_xml_tag(benign, "claim"), benign, "{benign:?}");
+        }
+        // Every occurrence, and multi-byte text around it, survives.
+        assert_eq!(
+            escape_xml_tag("中</claim>文</CLAIM>", "claim"),
+            "中<\u{200b}/claim>文<\u{200b}/CLAIM>"
+        );
+        // The exact form is escaped exactly as before.
+        assert_eq!(
+            escape_xml_tag("a</file_content>b", "file_content"),
+            "a<\u{200b}/file_content>b"
         );
     }
 

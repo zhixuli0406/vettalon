@@ -42,6 +42,9 @@ pub const DEFAULT_FINDER_PARSE_RETRIES: usize = ai_audit::AI_AUDIT_PARSE_RETRIES
 mod ai_audit;
 mod assign;
 pub mod attack_classes;
+pub mod bisect;
+pub mod cbom;
+pub mod cbom_check;
 mod comment_strip;
 pub mod completeness;
 mod coverage;
@@ -64,12 +67,23 @@ pub mod funnel;
 pub mod gate;
 pub(crate) mod injection;
 mod intake;
+mod java_crypto;
+mod java_crypto_bc;
+mod java_lex;
+mod java_parse;
+mod java_usage;
 mod jev;
 mod llm_util;
+/// Node/npm execution-proof input validators (lockfile, `--fixture`).
+pub mod node;
 mod poc;
 pub(crate) mod poc_oracle;
+pub(crate) mod receipt_fields;
 pub mod regression_test;
+pub mod retest;
+pub mod retest_package;
 pub mod target_poc;
+pub mod variants;
 pub mod verification;
 pub mod verification_context;
 pub use poc::attach_proof_evidence;
@@ -77,13 +91,17 @@ mod precheck;
 pub mod prescreen;
 mod prior_run;
 mod prompts;
+pub mod py_usage;
 pub mod rank_snapshot;
 pub(crate) mod report;
 mod report_evidence;
 mod report_verdict;
 pub mod sarif;
+pub mod sarif_input;
 mod scanners;
 mod since_last;
+mod src_io;
+pub(crate) use scanners::{AttestationEnv, TrustedExecutable, run_attestation_subprocess};
 /// Bounded subprocess capture and owned-process cleanup, shared with local renderers.
 /// Unix owns a private process group with an unreaped leader; this does not contain
 /// processes that escape via setsid. Windows uses a kill-on-close Job Object, whose
@@ -93,6 +111,7 @@ mod since_last;
 pub use scanners::{SubprocessLimits, SubprocessOutcome, run_bounded_subprocess};
 pub mod schema;
 pub mod triage;
+pub mod trust_policy;
 mod validator;
 pub mod verify_only;
 
@@ -103,10 +122,13 @@ pub mod verify_only;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing {
-    pub use super::adversarial::{VerifierReply, centered_window, parse_verdict};
+    pub use super::adversarial::{VerifierReply, centered_window, claim_text, parse_verdict};
     pub use super::ai_audit::{RawCandidate, parse_ai_candidates};
-    pub use super::llm_util::{extract_context_window, numbered_context_window};
+    pub use super::cbom::parse_cbom;
+    pub use super::java_usage::java_usage_one;
+    pub use super::llm_util::{escape_xml_tag, extract_context_window, numbered_context_window};
     pub use super::precheck::{LineOracle, check_candidate, check_file_and_line};
+    pub use super::verify_only::{VerifyInput, check_json_depth};
 }
 
 use std::collections::HashSet;
@@ -686,7 +708,7 @@ pub async fn run_scan_with_progress(
 
     let refuter_cap_hit = std::sync::atomic::AtomicBool::new(false);
     let mut poc_cap_hit = false;
-    let mut poc_budget_skipped = false;
+    let mut poc_stops = PocStepStops::default();
     if profile_mode == ProfileMode::Deep && (ai_ran || findings.iter().any(prior_run::is_carried)) {
         if findings.iter().any(review_eligible) {
             progress.phase(Phase::Review, "cross-family verifiers reviewing candidates");
@@ -722,7 +744,7 @@ pub async fn run_scan_with_progress(
                 .role_caps
                 .poc
                 .is_some_and(|c| scan_deadline.is_none_or(|s| poc_start + c < s));
-            poc_budget_skipped = poc_step(
+            poc_stops = poc_step(
                 &repo_root,
                 &mut findings,
                 opts,
@@ -732,7 +754,8 @@ pub async fn run_scan_with_progress(
                 progress,
             )
             .await;
-            poc_cap_hit = poc_budget_skipped && poc_cap_binds;
+            // `poc_cap_hit` is the --poc-budget clock, not the 20-run counter.
+            poc_cap_hit = poc_stops.time && poc_cap_binds;
         }
     }
     let refuter_cap_hit = refuter_cap_hit.into_inner();
@@ -824,20 +847,20 @@ pub async fn run_scan_with_progress(
                 .any(|a| a.timed_out || a.reason.as_deref() == Some(coverage::DEFER_TIME_BUDGET))
     });
     if incomplete_reason.is_none() {
-        // A PoC the budget never started is requested work left undone.
-        incomplete_reason = if time_budget_hit || poc_budget_skipped {
-            Some(IncompleteReason::TimeBudgetExhausted)
-        } else if refuter_cap_hit {
-            Some(IncompleteReason::CriticBudgetExhausted)
-        } else if !refusal_events.is_empty() {
-            Some(IncompleteReason::ModelRefused)
-        } else if unverified || units_failed || scanner_failed {
-            Some(IncompleteReason::UnitsFailed)
-        } else if schema::CoverageSummary::from_coverage(&coverage).partial {
-            Some(IncompleteReason::ScopeNotFullyReviewed)
-        } else {
-            None
-        };
+        // Time before the run counter, then the fix-check cap, then other gaps.
+        incomplete_reason = incomplete_from_poc(time_budget_hit, poc_stops).or_else(|| {
+            if refuter_cap_hit {
+                Some(IncompleteReason::CriticBudgetExhausted)
+            } else if !refusal_events.is_empty() {
+                Some(IncompleteReason::ModelRefused)
+            } else if unverified || units_failed || scanner_failed {
+                Some(IncompleteReason::UnitsFailed)
+            } else if schema::CoverageSummary::from_coverage(&coverage).partial {
+                Some(IncompleteReason::ScopeNotFullyReviewed)
+            } else {
+                None
+            }
+        });
     }
 
     if since_last_drift
@@ -1945,6 +1968,7 @@ async fn review_step(
                         answered,
                         call_failed,
                         refused,
+                        ..
                     } => {
                         answered_once |= answered;
                         if call_failed {
@@ -1973,12 +1997,50 @@ async fn review_step(
     slots.into_iter().flatten().collect()
 }
 
+/// Why the PoC step left work undone. `time` is a deadline (`--time-budget`
+/// or `--poc-budget`) or a fix check that stopped for `time_budget_exhausted`.
+/// `breaker` is the 20-run PoC counter. `fix_cap` is
+/// [`fix_check::MAX_FIX_CHECKS_PER_SCAN`]. A fix check uses its own container
+/// budget and does not draw that counter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PocStepStops {
+    time: bool,
+    breaker: bool,
+    fix_cap: bool,
+}
+
+fn incomplete_from_poc(time_budget_hit: bool, stops: PocStepStops) -> Option<IncompleteReason> {
+    if time_budget_hit || stops.time {
+        Some(IncompleteReason::TimeBudgetExhausted)
+    } else if stops.breaker {
+        Some(IncompleteReason::PocBudgetExhausted)
+    } else if stops.fix_cap {
+        Some(IncompleteReason::FixCheckCapReached)
+    } else {
+        None
+    }
+}
+
+fn apply_fix_stop(stops: &mut PocStepStops, finding: &Finding, marked: bool) {
+    if !marked {
+        return;
+    }
+    match finding
+        .fix_check()
+        .as_ref()
+        .and_then(|summary| summary.reason.as_deref())
+    {
+        Some(fix_check::TIME_BUDGET_EXHAUSTED) => stops.time = true,
+        Some(fix_check::POC_BUDGET_EXHAUSTED) => stops.breaker = true,
+        _ => {}
+    }
+}
+
 /// Step 3d: PoC generation, by a PoC-role model of another family than the
 /// finder when possible. `maybe_run_poc` applies the eligibility gate.
-/// Returns true when the time budget (`--time-budget` or `--poc-budget`)
-/// left an eligible finding without a PoC. After `deadline` (the earlier of `--time-budget`
-/// and `--poc-budget`) no new PoC starts; each eligible finding left out gets
-/// a `poc_skipped` record. A PoC already running finishes.
+/// After `deadline` (the earlier of `--time-budget` and `--poc-budget`) no new
+/// PoC starts; each eligible finding left out gets a `poc_skipped` record. A
+/// PoC already running finishes. Each harness fix check gets its own budget.
 async fn poc_step(
     repo_root: &Path,
     findings: &mut [Finding],
@@ -1987,7 +2049,7 @@ async fn poc_step(
     refusals: &RefusalLog,
     trace: &TraceLog,
     progress: &dyn Progress,
-) -> bool {
+) -> PocStepStops {
     if opts.poc_models.is_empty() {
         eprintln!(
             "[vettalon] {}",
@@ -1996,12 +2058,15 @@ async fn poc_step(
                 "note: no poc model configured, skipping PoCs."
             )
         );
-        return false;
+        return PocStepStops::default();
     }
     let total = findings.len() as u32;
-    // P0-2: one run-wide PoC execution budget shared across every finding.
+    // P0-2: one run-wide PoC execution budget for PoCs only. Fix checks below
+    // use `scan_fix_budget` so they cannot starve this counter.
     let budget = poc::PocBudget::with_image(poc::POC_MAX_RUNS, &opts.poc_image);
-    let mut skipped = false;
+    let idle_fix_budget = poc::PocBudget::with_image(0, &opts.poc_image);
+    let mut stops = PocStepStops::default();
+    let mut fix_gate = fix_check::FixCheckScanGate::default();
     for (nth, f) in findings.iter_mut().enumerate() {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             let why = if opts.role_caps.poc.is_some() {
@@ -2009,8 +2074,8 @@ async fn poc_step(
             } else {
                 "time budget ran out (--time-budget)"
             };
-            skipped |= poc::skip_for_budget(f, opts.poc, why);
-            skipped |= fix_check::skip_for_budget(f, opts.poc);
+            stops.time |= poc::skip_for_budget(f, opts.poc, why);
+            stops.time |= fix_check::skip_for_budget(f, opts.poc);
             continue;
         }
         let pick = finder_of(f, opts)
@@ -2034,7 +2099,7 @@ async fn poc_step(
         );
         let caller = StepCaller::new(opts.poc_models[pick].clone(), "poc", refusals.clone())
             .with_trace(trace.clone());
-        poc::maybe_run_poc(repo_root, f, &caller, opts.poc, &budget).await;
+        stops.breaker |= poc::maybe_run_poc(repo_root, f, &caller, opts.poc, &budget).await;
         if caller.usage_limited() {
             poc::push_skip(
                 f,
@@ -2043,21 +2108,44 @@ async fn poc_step(
             );
             continue;
         }
-        // O19: the fix check shares the PoC role's time budget; the PoC above
-        // may have used it up.
+        // The fix check shares this step's deadline. The PoC above may have
+        // used it up. It does not share the 20-run counter.
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            skipped |= fix_check::skip_for_budget(f, opts.poc);
+            stops.time |= fix_check::skip_for_budget(f, opts.poc);
             continue;
         }
-        fix_check::maybe_check_fix(
-            repo_root,
-            f,
-            &caller,
-            opts.poc,
-            opts.fix_test_command.as_deref(),
-            &budget,
-        )
-        .await;
+        if let Some(class) =
+            poc_oracle::classify(f).filter(|_| fix_check::harness_fix_would_start(f, opts.poc))
+        {
+            if fix_gate.allow() {
+                let dedicated = fix_check::scan_fix_budget(class, &opts.poc_image);
+                let marked = fix_check::maybe_check_fix(
+                    repo_root,
+                    f,
+                    &caller,
+                    opts.poc,
+                    opts.fix_test_command.as_deref(),
+                    &dedicated,
+                    deadline,
+                )
+                .await;
+                apply_fix_stop(&mut stops, f, marked);
+            } else if fix_check::record_fix_check_cap(f, opts.poc) {
+                stops.fix_cap = true;
+            }
+        } else {
+            let marked = fix_check::maybe_check_fix(
+                repo_root,
+                f,
+                &caller,
+                opts.poc,
+                opts.fix_test_command.as_deref(),
+                &idle_fix_budget,
+                deadline,
+            )
+            .await;
+            apply_fix_stop(&mut stops, f, marked);
+        }
         if caller.usage_limited() {
             poc::push_skip(
                 f,
@@ -2066,7 +2154,7 @@ async fn poc_step(
             );
         }
     }
-    skipped
+    stops
 }
 
 /// `vettalon validate <report.json>`: run the report validator on a
@@ -2087,8 +2175,10 @@ pub fn validate_fix_diff(diff: &str) -> Result<(), &'static str> {
 }
 
 /// Read a saved report to build a deliverable from: size-capped,
-/// schema-checked and validator-clean. An inconsistent report is refused —
-/// a client deliverable must not be built on one.
+/// schema-checked, migrated ([`trust_policy::migrate_capped_refutations`],
+/// one stderr note when it changed anything) and validator-clean. An
+/// inconsistent report is refused — a client deliverable must not be built
+/// on one.
 pub fn load_report_for_delivery(path: &Path) -> Result<AuditReport, String> {
     load_report_for_delivery_with_sha256(path).map(|(report, _)| report)
 }
@@ -2117,12 +2207,29 @@ pub(crate) fn load_report_for_delivery_with_sha256(
     if raw.len() as u64 > MAX_BYTES {
         return Err("report file too large".into());
     }
-    let report: AuditReport = serde_json::from_slice(&raw).map_err(|e| {
+    let report = parse_report_for_delivery(&raw)?;
+    Ok((report, schema::sha256_hex(&raw)))
+}
+
+/// Parse and validate report bytes the caller already read (and bounded).
+/// Same rules as [`load_report_for_delivery_with_sha256`].
+pub(crate) fn parse_report_for_delivery(raw: &[u8]) -> Result<AuditReport, String> {
+    let mut report: AuditReport = serde_json::from_slice(raw).map_err(|e| {
         crate::tr!(
             "不是有效的 vettalon 報告：{e}",
             "not a valid vettalon report: {e}"
         )
     })?;
+    // A report saved before the per-CWE trust policy: its model-only
+    // refutations of capped CWEs are reopened before the strict check. The
+    // returned hash stays the hash of the file as read.
+    let migrated = trust_policy::migrate_capped_refutations(&mut report);
+    if migrated > 0 {
+        eprintln!(
+            "[vettalon] {}",
+            trust_policy::migration_note(&crate::tr!("已存報告", "saved report"), migrated)
+        );
+    }
     let errors = validation_errors(&report);
     if !errors.is_empty() {
         let head: Vec<&str> = errors.iter().take(5).map(String::as_str).collect();
@@ -2133,7 +2240,7 @@ pub(crate) fn load_report_for_delivery_with_sha256(
             head.join(crate::lang::pick("；", "; "))
         ));
     }
-    Ok((report, schema::sha256_hex(&raw)))
+    Ok(report)
 }
 
 pub async fn cmd_validate(report_path: &Path) -> i32 {
@@ -3892,6 +3999,49 @@ mod tests {
         assert_eq!(b["refuter_cap_secs"], 0);
         assert_eq!(b["refuter_cap_hit"], true);
         assert_eq!(b["finder_cap_hit"], false);
+    }
+
+    #[test]
+    fn incomplete_from_poc_prefers_time_then_the_run_cap_then_the_fix_cap() {
+        let none = PocStepStops::default();
+        assert_eq!(incomplete_from_poc(false, none), None);
+        assert_eq!(
+            incomplete_from_poc(true, none),
+            Some(IncompleteReason::TimeBudgetExhausted)
+        );
+        assert_eq!(
+            incomplete_from_poc(
+                false,
+                PocStepStops {
+                    time: false,
+                    breaker: true,
+                    fix_cap: true,
+                }
+            ),
+            Some(IncompleteReason::PocBudgetExhausted)
+        );
+        assert_eq!(
+            incomplete_from_poc(
+                true,
+                PocStepStops {
+                    time: true,
+                    breaker: true,
+                    fix_cap: true,
+                }
+            ),
+            Some(IncompleteReason::TimeBudgetExhausted)
+        );
+        assert_eq!(
+            incomplete_from_poc(
+                false,
+                PocStepStops {
+                    time: false,
+                    breaker: false,
+                    fix_cap: true,
+                }
+            ),
+            Some(IncompleteReason::FixCheckCapReached)
+        );
     }
 
     #[tokio::test]

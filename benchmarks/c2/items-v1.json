@@ -1,0 +1,628 @@
+{
+  "items": [
+    {
+      "cwe": "CWE-94",
+      "id": "sastbench-000011",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-345",
+      "id": "sastbench-000028",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-000043",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-000076",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-532",
+      "id": "sastbench-000091",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-20",
+      "id": "sastbench-000104",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-78",
+      "id": "sastbench-000212",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-95",
+      "id": "sastbench-000237",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-522",
+      "id": "sastbench-000249",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-89",
+      "id": "sastbench-000252",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-22",
+      "id": "sastbench-000261",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-502",
+      "id": "sastbench-000267",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-915",
+      "id": "sastbench-000272",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-134",
+      "id": "sastbench-000278",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-352",
+      "id": "sastbench-000283",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-353",
+      "id": "sastbench-000284",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-1333",
+      "id": "sastbench-000296",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-345",
+      "id": "sastbench-000301",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-000308",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-200",
+      "id": "sastbench-000317",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-000346",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-000441",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-89",
+      "id": "sastbench-000442",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-000517",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-89",
+      "id": "sastbench-000556",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-89",
+      "id": "sastbench-000690",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-89",
+      "id": "sastbench-000747",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-000765",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-697",
+      "id": "sastbench-000783",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-116",
+      "id": "sastbench-000828",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-918",
+      "id": "sastbench-000844",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-918",
+      "id": "sastbench-000864",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-319",
+      "id": "sastbench-000891",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-470",
+      "id": "sastbench-000895",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-1021",
+      "id": "sastbench-000925",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-319",
+      "id": "sastbench-000942",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-327",
+      "id": "sastbench-001000",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-001007",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-1287",
+      "id": "sastbench-001011",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-78",
+      "id": "sastbench-001029",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-755",
+      "id": "sastbench-001048",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-287",
+      "id": "sastbench-001078",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-532",
+      "id": "sastbench-001079",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-611",
+      "id": "sastbench-001081",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-119",
+      "id": "sastbench-001097",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-134",
+      "id": "sastbench-001123",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-918",
+      "id": "sastbench-001151",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-22",
+      "id": "sastbench-001186",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-939",
+      "id": "sastbench-001225",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-61",
+      "id": "sastbench-001235",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-1004",
+      "id": "sastbench-001237",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-200",
+      "id": "sastbench-001267",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-250",
+      "id": "sastbench-001295",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-613",
+      "id": "sastbench-001331",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-001333",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-20",
+      "id": "sastbench-001366",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-345",
+      "id": "sastbench-001373",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-200",
+      "id": "sastbench-001392",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-681",
+      "id": "sastbench-001403",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-001420",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-78",
+      "id": "sastbench-001436",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-502",
+      "id": "sastbench-001451",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-601",
+      "id": "sastbench-001515",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-94",
+      "id": "sastbench-001520",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-405",
+      "id": "sastbench-001528",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-328",
+      "id": "sastbench-001532",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-116",
+      "id": "sastbench-001555",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-001570",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-22",
+      "id": "sastbench-001581",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-319",
+      "id": "sastbench-001653",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-502",
+      "id": "sastbench-001722",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-290",
+      "id": "sastbench-001730",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-1333",
+      "id": "sastbench-001740",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-345",
+      "id": "sastbench-001747",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-384",
+      "id": "sastbench-001749",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-1025",
+      "id": "sastbench-001819",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-94",
+      "id": "sastbench-001842",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-352",
+      "id": "sastbench-001858",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-20",
+      "id": "sastbench-001886",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-285",
+      "id": "sastbench-001899",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-665",
+      "id": "sastbench-001904",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-470",
+      "id": "sastbench-001935",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-22",
+      "id": "sastbench-001957",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-98",
+      "id": "sastbench-001984",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-863",
+      "id": "sastbench-002001",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-770",
+      "id": "sastbench-002016",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-285",
+      "id": "sastbench-002024",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-345",
+      "id": "sastbench-002029",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-352",
+      "id": "sastbench-002046",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-639",
+      "id": "sastbench-002049",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-770",
+      "id": "sastbench-002050",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-002114",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-918",
+      "id": "sastbench-002131",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-829",
+      "id": "sastbench-002138",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-319",
+      "id": "sastbench-002182",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-319",
+      "id": "sastbench-002197",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-327",
+      "id": "sastbench-002245",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-776",
+      "id": "sastbench-002272",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-22",
+      "id": "sastbench-002297",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-93",
+      "id": "sastbench-002348",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-755",
+      "id": "sastbench-002362",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-330",
+      "id": "sastbench-002377",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-400",
+      "id": "sastbench-002421",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-89",
+      "id": "sastbench-002430",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-732",
+      "id": "sastbench-002440",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-78",
+      "id": "sastbench-002441",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-706",
+      "id": "sastbench-002513",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-502",
+      "id": "sastbench-002521",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-190",
+      "id": "sastbench-002548",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-79",
+      "id": "sastbench-002576",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-862",
+      "id": "sastbench-002577",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-200",
+      "id": "sastbench-002595",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-78",
+      "id": "sastbench-002599",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-203",
+      "id": "sastbench-002614",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-200",
+      "id": "sastbench-002632",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-787",
+      "id": "sastbench-002639",
+      "set": "injected_known_true"
+    },
+    {
+      "cwe": "CWE-119",
+      "id": "sastbench-002652",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-601",
+      "id": "sastbench-002699",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-78",
+      "id": "sastbench-002701",
+      "set": "representative"
+    },
+    {
+      "cwe": "CWE-22",
+      "id": "sastbench-002734",
+      "set": "injected_known_true"
+    }
+  ],
+  "schema": "vettalon.c2-items/1",
+  "seed": "c2-s-2026-11",
+  "sources": [
+    {
+      "path": "benchmarks/sastbench/representative-100-v1.json",
+      "sha256": "f8077c46d6d3abd82f8c3e7dd71e26d7fe9061ba4bb32a1ee8851bbb84ca48fd"
+    },
+    {
+      "path": "benchmarks/sastbench/tp-labels-2026-10-22.json",
+      "sha256": "d5f01e2ffc607cb0f4576e2e0538a87ff97e54a50ece86e52ad23f662109ccad"
+    },
+    {
+      "path": "benchmarks/sastbench/power-split-2026-10-22.json",
+      "sha256": "039169dd0ee421572a1f3bed78efe9a05c9cb95a35dd7dd6ede1bef5ce9e712c"
+    },
+    {
+      "path": "benchmarks/sastbench/strata.py",
+      "sha256": "d22847eb68a66353f387dbedcfcc80af281ebfb81021ef8f9705364d21ed38c3"
+    },
+    {
+      "path": "sastbench-v0.1-original.json",
+      "sha256": "57c765633bdefc2130d3725dd9648bc49b85456e4dd733c55f49d44d883c9487"
+    }
+  ]
+}

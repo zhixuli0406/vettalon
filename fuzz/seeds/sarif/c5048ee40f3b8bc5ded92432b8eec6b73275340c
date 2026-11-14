@@ -1,0 +1,13 @@
+
+
+
+
+
+
+
+
+
+
+
+
+{"vs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-:injection","shorts":{"tags":["security",{"s":[{"location":{"physicalLocation":{"arttLccoiafation":{"index":{"tags":["security",{"s":[{"location":{"physicalLocation":{"arpifactLocation":{"index":{"tags":["security",{"s":[{"location":{"physicalLocation":{"artifactLocation":{"index":0},"region":{"startLine":1}}}},{"location":["physicalLocatio0},"region":{"startLine0},"region":{"startLine":1}}}},{"lo"physicalLocation":{"artifactLocation"{"ve:{"rfile:s

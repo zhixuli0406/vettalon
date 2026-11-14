@@ -2,7 +2,7 @@
 
 ## What it means
 
-A time cap ran out: `--time-budget` for the whole deep audit, `--finder-budget` for the finders, or `--poc-budget` for sandbox tests. Modules were deferred, a model call timed out, or PoCs never started. Findings found so far stay in the report.
+A time cap ran out: `--time-budget` for the whole deep audit, `--finder-budget` for the finders, or `--poc-budget` for sandbox tests. Modules were deferred, a model call timed out, or PoCs never started. A fix check that stops because this deadline passed uses the same reason and marks the scan incomplete. The 20-run PoC counter is not this reason; that case is [poc_budget_exhausted](poc_budget_exhausted.md). A scan that stopped later harness fix checks is [fix_check_cap_reached](fix_check_cap_reached.md). Findings found so far stay in the report.
 
 ## Why you see it
 
@@ -14,4 +14,4 @@ Check `coverage` for deferred modules and findings with `no_poc`. Raise the cap 
 
 ## Related
 
-[time_budget](time_budget.md), [incomplete](incomplete.md), [no_poc](no_poc.md).
+[time_budget](time_budget.md), [incomplete](incomplete.md), [no_poc](no_poc.md), [poc_budget_exhausted](poc_budget_exhausted.md), [fix_check_cap_reached](fix_check_cap_reached.md).

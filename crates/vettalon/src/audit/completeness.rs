@@ -93,6 +93,8 @@ fn reason_code(reason: IncompleteReason) -> (&'static str, RepairAction) {
         R::ModelRefused => ("model_refused", A::ManualReview),
         R::UnitsFailed => ("units_failed", A::Inspect),
         R::InjectionUncrosschecked => ("injection_uncrosschecked", A::Models),
+        R::PocBudgetExhausted => ("poc_budget_exhausted", A::ConfigureScan),
+        R::FixCheckCapReached => ("fix_check_cap_reached", A::ConfigureScan),
     }
 }
 
@@ -334,6 +336,20 @@ mod tests {
             "../../../../fixtures/coverage/samples/complete.json"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn poc_run_cap_and_fix_check_cap_are_distinct_scan_reasons() {
+        let mut report = report();
+        report.run_status = RunStatus::Incomplete;
+        report.incomplete_reason = Some(IncompleteReason::PocBudgetExhausted);
+        let diagnosis = diagnose(&report);
+        assert_eq!(diagnosis.issues[0].code, "poc_budget_exhausted");
+        assert_eq!(diagnosis.issues[0].action, RepairAction::ConfigureScan);
+        report.incomplete_reason = Some(IncompleteReason::FixCheckCapReached);
+        let diagnosis = diagnose(&report);
+        assert_eq!(diagnosis.issues[0].code, "fix_check_cap_reached");
+        assert_eq!(diagnosis.issues[0].action, RepairAction::ConfigureScan);
     }
 
     #[test]

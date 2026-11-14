@@ -119,8 +119,23 @@ pub fn parse(diff: &str) -> Result<Vec<FilePatch>, &'static str> {
                 (Some(o), Some(n)) if o == n => (n, false),
                 (Some(_), Some(_)) => return Err("rename_or_copy"),
             };
-            if patches.iter().any(|p| p.path == path) {
+            // Both checks fold case: on a case-insensitive file system
+            // (macOS, Windows) `a.py` and `A.py` are one file, and `X.py`
+            // and `x.py/y.py` collide just like `x.py` and `x.py/y.py`.
+            let folded = fold_path_case(&path);
+            let others: Vec<String> = patches.iter().map(|p| fold_path_case(&p.path)).collect();
+            if others.contains(&folded) {
                 return Err("malformed_diff");
+            }
+            // One path a file, the other inside it as a directory (`x.py`
+            // and `x.py/y.py`): no tree holds both, so the diff cannot apply.
+            // Refused here as content, never left to fail while the fixed
+            // copy is written (a host-side `tree_copy_failed`).
+            if others
+                .iter()
+                .any(|other| is_dir_prefix(other, &folded) || is_dir_prefix(&folded, other))
+            {
+                return Err("diff_does_not_apply");
             }
             i += 2;
             let mut hunks = Vec::new();
@@ -150,6 +165,45 @@ pub fn parse(diff: &str) -> Result<Vec<FilePatch>, &'static str> {
         return Err("not_a_unified_diff");
     }
     Ok(patches)
+}
+
+/// The key under which two paths name one file on a case-insensitive or
+/// normalizing file system (macOS, Windows): `path` NFC-normalized (so
+/// `é` and `e` + U+0301 agree), every character lowercased, uppercased, then
+/// lowercased again per character (so the result does not depend on
+/// context), and NFC again because case mapping can leave a base letter and
+/// a combining mark that now compose (`ǰ` → `J` + U+030C → `ǰ`).
+///
+/// The first lowercasing makes the round trip stable for capital sharp s
+/// `ẞ` (U+1E9E): upper-then-lower alone would give `ẞ` → `ẞ` → `ß` but
+/// `ß` → `SS` → `ss`, so `straẞe` and `straße` would get different keys;
+/// lowercase first gives `ẞ` → `ß` → `SS` → `ss` for both.
+///
+/// Uppercasing then folds the characters that lowercasing alone keeps
+/// apart but Unicode case folding (and APFS/NTFS) treat as one: final sigma
+/// `ς` and `σ` (both `Σ`), long s `ſ` and `s`, micro sign `µ` and `μ`, the
+/// Greek symbol variants `ϐ ϑ ϕ ϖ ϰ ϱ ϵ`, `ẛ`, U+1FBE and U+0345 (`ι`), and
+/// the Cyrillic variants U+1C80–U+1C88. Full mappings also fold `ß` to
+/// `ss`, which can only refuse a diff some file system would accept (a
+/// false positive, never a missed collision). Still an approximation: no
+/// file system's exact folding table is used.
+fn fold_path_case(path: &SafeRepoPath) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    path.as_str()
+        .nfc()
+        .flat_map(char::to_lowercase)
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .nfc()
+        .collect()
+}
+
+/// Whether `inner` lies under `outer` taken as a directory (`outer` is a
+/// whole-component prefix of `inner`).
+fn is_dir_prefix(outer: &str, inner: &str) -> bool {
+    inner
+        .strip_prefix(outer)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Extended git headers this checker refuses.
@@ -383,7 +437,26 @@ pub struct SourceSnapshot {
     pub exclusions: SnapshotExclusions,
 }
 
+/// Source-copy policy. Existing callers retain the Python policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SnapshotMode {
+    #[default]
+    Python,
+    #[allow(dead_code)] // Node callers arrive in D8/D9.
+    Node,
+}
+
 pub fn snapshot(repo_root: &Path) -> Result<SourceSnapshot, &'static str> {
+    snapshot_with_mode(repo_root, SnapshotMode::default())
+}
+
+/// Node copies omit dependency directories at every depth (case-insensitive
+/// to protect macOS/Windows mountpoints) and reserve an empty top-level mount.
+/// A regular file at that mountpoint is refused as `tree_copy_failed`.
+pub fn snapshot_with_mode(
+    repo_root: &Path,
+    mode: SnapshotMode,
+) -> Result<SourceSnapshot, &'static str> {
     let root = std::fs::canonicalize(repo_root).map_err(|_| "tree_copy_failed")?;
     let dir = tempfile::Builder::new()
         .prefix("vettalon-source-")
@@ -391,7 +464,8 @@ pub fn snapshot(repo_root: &Path) -> Result<SourceSnapshot, &'static str> {
         .map_err(|_| "tree_copy_failed")?;
     let path = dir.path().join("source");
     let mut stats = CopyStats::default();
-    copy_dir(&root, &path, &mut stats)?;
+    copy_dir(&root, &path, &mut stats, mode)?;
+    dependency_mountpoint(&path, mode)?;
     Ok(SourceSnapshot {
         _dir: dir,
         path,
@@ -413,6 +487,26 @@ struct CopyStats {
 /// copies leave out `.git`, symlinks, special files and secret files
 /// ([`crate::util::is_secret_file`]). `Err` is a refusal token.
 pub fn prepare(repo_root: &Path, patches: &[FilePatch]) -> Result<TreeCopies, &'static str> {
+    prepare_with_mode(repo_root, patches, SnapshotMode::default())
+}
+
+/// Prepare both sides with the same source-copy policy.
+pub fn prepare_with_mode(
+    repo_root: &Path,
+    patches: &[FilePatch],
+    mode: SnapshotMode,
+) -> Result<TreeCopies, &'static str> {
+    // Patches must never populate the reserved dependency mountpoint.
+    if mode == SnapshotMode::Node
+        && patches.iter().any(|p| {
+            p.path
+                .as_str()
+                .split('/')
+                .any(|part| part.eq_ignore_ascii_case("node_modules"))
+        })
+    {
+        return Err("diff_changes_dependencies");
+    }
     let root = std::fs::canonicalize(repo_root).map_err(|_| "tree_copy_failed")?;
     check_paths(&root, patches)?;
     let dir = tempfile::Builder::new()
@@ -422,10 +516,12 @@ pub fn prepare(repo_root: &Path, patches: &[FilePatch]) -> Result<TreeCopies, &'
     let original = dir.path().join("original");
     let fixed = dir.path().join("fixed");
     let mut stats = CopyStats::default();
-    copy_dir(&root, &original, &mut stats)?;
+    copy_dir(&root, &original, &mut stats, mode)?;
+    dependency_mountpoint(&original, mode)?;
     // Copy the copy, so both sides hold the same bytes even if the user's
     // tree changes meanwhile.
-    copy_dir(&original, &fixed, &mut CopyStats::default())?;
+    copy_dir(&original, &fixed, &mut CopyStats::default(), mode)?;
+    dependency_mountpoint(&fixed, mode)?;
     for p in patches {
         let target = p.path.join_under(&fixed);
         let before = if p.create {
@@ -499,7 +595,21 @@ fn create_dirs(root: &Path, dir: &Path) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn copy_dir(src: &Path, dst: &Path, stats: &mut CopyStats) -> Result<(), &'static str> {
+fn dependency_mountpoint(root: &Path, mode: SnapshotMode) -> Result<(), &'static str> {
+    if mode == SnapshotMode::Node {
+        let path = root.join("node_modules");
+        std::fs::create_dir(&path).map_err(|_| "tree_copy_failed")?;
+        set_mode(&path, 0o755);
+    }
+    Ok(())
+}
+
+fn copy_dir(
+    src: &Path,
+    dst: &Path,
+    stats: &mut CopyStats,
+    mode: SnapshotMode,
+) -> Result<(), &'static str> {
     const FAIL: &str = "tree_copy_failed";
     // Re-check right before listing: a directory swapped for a symlink after
     // its parent was listed is never followed. (A narrower race remains; the
@@ -517,12 +627,20 @@ fn copy_dir(src: &Path, dst: &Path, stats: &mut CopyStats) -> Result<(), &'stati
     set_mode(dst, 0o755);
     for entry in std::fs::read_dir(src).map_err(|_| FAIL)? {
         let entry = entry.map_err(|_| FAIL)?;
+        let name = entry.file_name();
+        let ty = entry.file_type().map_err(|_| FAIL)?;
+        // Excluded dependency subtrees do not consume the source entry cap.
+        if mode == SnapshotMode::Node
+            && ty.is_dir()
+            && name.to_string_lossy().eq_ignore_ascii_case("node_modules")
+        {
+            stats.exclusions.node_modules += 1;
+            continue;
+        }
         stats.entries += 1;
         if stats.entries > 40_000 {
             return Err("tree_too_large");
         }
-        let name = entry.file_name();
-        let ty = entry.file_type().map_err(|_| FAIL)?;
         let (from, to) = (entry.path(), dst.join(&name));
         if ty.is_symlink() {
             stats.exclusions.symlinks += 1;
@@ -533,7 +651,7 @@ fn copy_dir(src: &Path, dst: &Path, stats: &mut CopyStats) -> Result<(), &'stati
                 stats.exclusions.git_directories += 1;
                 continue;
             }
-            copy_dir(&from, &to, stats)?;
+            copy_dir(&from, &to, stats, mode)?;
         } else if ty.is_file() {
             if crate::util::is_secret_file(&name.to_string_lossy()) {
                 stats.exclusions.secret_files += 1;
@@ -638,6 +756,128 @@ mod tests {
         let p = parse(d).unwrap();
         assert!(p[0].create);
         assert_eq!(apply_hunks("", &p[0].hunks).unwrap(), "a\nb\n");
+    }
+
+    /// A file and a path inside it as a directory (`x.py`, `x.py/y.py`) can
+    /// never both exist: a content refusal at parse time, in either order,
+    /// never a copy failure (an environment blocker) while the fixed copy is
+    /// written. Duplicate paths stay refused too.
+    #[test]
+    fn refuses_a_path_nested_under_another_patched_file() {
+        let create = |path: &str| format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+x\n");
+        let modify = |path: &str| format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-x\n+y\n");
+        for (first, second) in [
+            (create("x.py"), create("x.py/y.py")),
+            (create("x.py/y.py"), create("x.py")),
+            (modify("pkg/x.py"), create("pkg/x.py/deep/y.py")),
+            (create("pkg/x.py/deep/y.py"), modify("pkg/x.py")),
+        ] {
+            let d = format!("{first}{second}");
+            assert_eq!(parse(&d).map(|_| ()), Err("diff_does_not_apply"), "{d}");
+        }
+        // Only whole components count: siblings sharing a name prefix pass.
+        for (first, second) in [
+            (create("x.py"), create("x.pyc/y.py")),
+            (create("x"), create("xy/z.py")),
+            (create("pkg/a.py"), create("pkg/b.py")),
+        ] {
+            let d = format!("{first}{second}");
+            assert_eq!(parse(&d).map(|p| p.len()), Ok(2), "{d}");
+        }
+        let dup = format!("{}{}", modify("x.py"), modify("x.py"));
+        assert_eq!(parse(&dup).map(|_| ()), Err("malformed_diff"));
+        // Case folds, as on macOS and Windows file systems.
+        for (first, second) in [
+            (create("X.py"), create("x.py/y.py")),
+            (create("x.py/y.py"), create("X.PY")),
+            (modify("Pkg/x.py"), create("pkg/X.py/deep/y.py")),
+            (create("ÄB/x.py"), create("äb")),
+        ] {
+            let d = format!("{first}{second}");
+            assert_eq!(parse(&d).map(|_| ()), Err("diff_does_not_apply"), "{d}");
+        }
+        for (first, second) in [
+            (modify("a.py"), modify("A.py")),
+            (create("src/App.py"), modify("SRC/app.PY")),
+            (create("Äb.py"), create("äb.py")),
+        ] {
+            let d = format!("{first}{second}");
+            assert_eq!(parse(&d).map(|_| ()), Err("malformed_diff"), "{d}");
+        }
+        let d = format!("{}{}", create("X.py"), create("x.pyc/y.py"));
+        assert_eq!(parse(&d).map(|p| p.len()), Ok(2), "{d}");
+        // Unicode normalization and final sigma fold too.
+        for (first, second) in [
+            (create("Café.txt"), create("Cafe\u{301}.txt")),
+            (create("cafe\u{301}.txt"), modify("CAFÉ.txt")),
+            (create("ΟΔΟΣ"), create("οδος")),
+            (create("οδος"), create("οδοσ")),
+            (create("ΟΔΟΣ.md"), create("οδοσ.md")),
+        ] {
+            let d = format!("{first}{second}");
+            assert_eq!(parse(&d).map(|_| ()), Err("malformed_diff"), "{d}");
+        }
+        for (first, second) in [
+            (create("Cafe\u{301}"), create("café/x.txt")),
+            (create("οδος/x.txt"), create("ΟΔΟΣ")),
+        ] {
+            let d = format!("{first}{second}");
+            assert_eq!(parse(&d).map(|_| ()), Err("diff_does_not_apply"), "{d}");
+        }
+        // A content refusal: no environment or harness blocker.
+        assert_eq!(
+            super::super::fix_check::blocker_for_reason("diff_does_not_apply"),
+            super::super::fix_check::Blocker::None
+        );
+    }
+
+    /// Characters that lowercasing alone keeps apart but Unicode case
+    /// folding (and APFS/NTFS) treat as one letter collide too.
+    #[test]
+    fn path_case_folding_covers_special_case_folds() {
+        let create = |path: &str| format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+x\n");
+        let modify = |path: &str| format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-x\n+y\n");
+        for (first, second) in [
+            // Long s, micro sign.
+            (create("src/a.py"), create("\u{017F}rc/a.py")),
+            (modify("src/a.py"), modify("\u{017F}rc/a.py")),
+            (create("\u{00B5}/x"), create("\u{03BC}/x")),
+            // Greek symbol variants: beta, theta, phi, pi, kappa, rho,
+            // epsilon.
+            (create("\u{03D0}.txt"), create("\u{03B2}.txt")),
+            (create("\u{03D1}.txt"), create("\u{0398}.txt")),
+            (create("\u{03D5}.txt"), create("\u{03C6}.txt")),
+            (create("\u{03D6}.txt"), create("\u{03C0}.txt")),
+            (create("\u{03F0}.txt"), create("\u{039A}.txt")),
+            (create("\u{03F1}.txt"), create("\u{03C1}.txt")),
+            (create("\u{03F5}.txt"), create("\u{0395}.txt")),
+            // Long s with dot above, Greek prosgegrammeni and iota
+            // subscript, Cyrillic rounded ve.
+            (create("\u{1E9B}"), create("\u{1E61}")),
+            (create("\u{1FBE}"), create("\u{03B9}")),
+            (create("\u{0345}x"), create("\u{0399}x")),
+            (create("\u{1C80}"), create("\u{0432}")),
+            // ß folds to ss (a false positive at worst).
+            (create("stra\u{00DF}e"), create("STRASSE")),
+            // Capital sharp s is the same name as ß and ss.
+            (create("stra\u{1E9E}e"), create("stra\u{00DF}e")),
+            (create("stra\u{1E9E}e"), create("strasse")),
+        ] {
+            let d = format!("{first}{second}");
+            assert_eq!(parse(&d).map(|_| ()), Err("malformed_diff"), "{d}");
+        }
+        for (first, second) in [
+            (create("\u{017F}rc"), create("src/a.py")),
+            (create("src/a.py"), create("\u{017F}RC")),
+            (create("\u{00B5}"), create("\u{039C}/x")),
+            (create("\u{1E9E}/x"), create("\u{00DF}")),
+        ] {
+            let d = format!("{first}{second}");
+            assert_eq!(parse(&d).map(|_| ()), Err("diff_does_not_apply"), "{d}");
+        }
+        // Distinct letters still pass.
+        let d = format!("{}{}", create("src/a.py"), create("arc/a.py"));
+        assert_eq!(parse(&d).map(|p| p.len()), Ok(2), "{d}");
     }
 
     #[test]
@@ -757,6 +997,100 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(ok.fixed.join("real/x.py")).unwrap(),
             "y\n"
+        );
+    }
+
+    #[test]
+    fn node_snapshot_skips_nested_dependencies_and_reserves_mountpoint() {
+        let source = tree(&[
+            ("app.js", "hello\n"),
+            ("node_modules/pkg/index.js", "dependency"),
+            ("nested/node_modules/pkg/index.js", "nested dependency"),
+        ]);
+        let copy = snapshot_with_mode(source.path(), SnapshotMode::Node).unwrap();
+        assert_eq!(copy.exclusions.node_modules, 2);
+        assert!(copy.path.join("node_modules").is_dir());
+        assert_eq!(
+            std::fs::read_dir(copy.path.join("node_modules"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!copy.path.join("nested/node_modules").exists());
+        let before = super::super::verification_context::snapshot_digest(&copy.path).unwrap();
+        std::fs::write(source.path().join("node_modules/pkg/index.js"), "changed").unwrap();
+        assert_eq!(
+            before,
+            super::super::verification_context::snapshot_digest(&copy.path).unwrap()
+        );
+        let again = snapshot_with_mode(source.path(), SnapshotMode::Node).unwrap();
+        assert_eq!(
+            before,
+            super::super::verification_context::snapshot_digest(&again.path).unwrap()
+        );
+        let copies = prepare_with_mode(source.path(), &[], SnapshotMode::Node).unwrap();
+        assert_eq!(copies.exclusions.node_modules, 2);
+        for path in [&copies.original, &copies.fixed] {
+            assert_eq!(
+                before,
+                super::super::verification_context::snapshot_digest(path).unwrap()
+            );
+        }
+        let patches =
+            parse("--- /dev/null\n+++ b/node_modules/new.js\n@@ -0,0 +1 @@\n+x\n").unwrap();
+        assert_eq!(
+            prepare_with_mode(source.path(), &patches, SnapshotMode::Node).err(),
+            Some("diff_changes_dependencies")
+        );
+    }
+
+    #[test]
+    fn node_snapshot_without_dependencies_has_stable_empty_mountpoint() {
+        let source = tree(&[("app.js", "hello\n")]);
+        let copy = snapshot_with_mode(source.path(), SnapshotMode::Node).unwrap();
+        assert_eq!(copy.exclusions.node_modules, 0);
+        assert!(copy.path.join("node_modules").is_dir());
+        let before = super::super::verification_context::snapshot_digest(&copy.path).unwrap();
+        assert_eq!(before.entries, 2);
+        assert_eq!(
+            before,
+            super::super::verification_context::snapshot_digest(&copy.path).unwrap()
+        );
+    }
+
+    #[test]
+    fn python_snapshot_keeps_legacy_bytes_and_dependency_sources() {
+        let source = tree(&[("app.py", "print(1)\n")]);
+        set_mode(&source.path().join("app.py"), 0o644);
+        let copy = snapshot(source.path()).unwrap();
+        assert_eq!(
+            std::fs::read(copy.path.join("app.py")).unwrap(),
+            b"print(1)\n"
+        );
+        assert!(!copy.path.join("node_modules").exists());
+        assert_eq!(
+            super::super::verification_context::snapshot_digest(&copy.path)
+                .unwrap()
+                .sha256,
+            "9065ade483bb587acda9a2649465973ed8294b7271509113286dc2326f5ec6d3"
+        );
+        assert_eq!(
+            serde_json::to_string(&copy.exclusions).unwrap(),
+            r#"{"git_directories":0,"symlinks":0,"secret_files":0,"special_files":0}"#
+        );
+        std::fs::create_dir_all(source.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(source.path().join("node_modules/pkg/index.js"), "kept").unwrap();
+        let copy = snapshot(source.path()).unwrap();
+        assert_eq!(
+            std::fs::read(copy.path.join("node_modules/pkg/index.js")).unwrap(),
+            b"kept"
+        );
+        assert_eq!(copy.exclusions.node_modules, 0);
+        let copies = prepare(source.path(), &[]).unwrap();
+        let explicit = prepare_with_mode(source.path(), &[], SnapshotMode::Python).unwrap();
+        assert_eq!(
+            super::super::verification_context::snapshot_digest(&copies.fixed).unwrap(),
+            super::super::verification_context::snapshot_digest(&explicit.fixed).unwrap()
         );
     }
 

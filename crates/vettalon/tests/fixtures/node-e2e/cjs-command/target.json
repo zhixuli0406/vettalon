@@ -1,0 +1,12 @@
+{
+  "file": "app.cjs",
+  "function": "run",
+  "args": [
+    {
+      "kind": "payload"
+    },
+    {
+      "kind": "callback"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+package com.ex;
+
+import java.security.MessageDigest;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        MessageDigest sha = MessageDigest.getInstance("SHA-256");
+        MessageDigest md5 = MessageDigest.getInstance("MD5");
+        // TODO: drop MD5 once clients upgrade
+        System.out.println(sha.getDigestLength() + md5.getDigestLength());
+    }
+}

@@ -1,0 +1,13 @@
+package com.ex;
+
+import javax.crypto.Cipher;
+
+public class Main {
+    static final String ALG = "AES";
+    static final String MODE = "GCM";
+
+    public static void main(String[] args) throws Exception {
+        Cipher c = Cipher.getInstance(ALG + "/" + MODE + "/NoPadding");
+        System.out.println(c.getAlgorithm());
+    }
+}

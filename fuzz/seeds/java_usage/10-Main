@@ -1,0 +1,13 @@
+package com.ex;
+
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
+        g.initialize(2048);
+        KeyPair kp = g.generateKeyPair();
+        System.out.println(kp.getPublic().getAlgorithm());
+    }
+}

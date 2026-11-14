@@ -46,6 +46,18 @@ pub enum Language {
     Wasm,
 }
 
+impl Language {
+    /// The supported target language is determined by the source extension.
+    pub fn for_target_file(file: &str) -> Option<Self> {
+        match file.rsplit_once('.').map(|(_, extension)| extension) {
+            Some("py") => Some(Self::Python),
+            Some("js" | "cjs" | "mjs") => Some(Self::JavaScript),
+            Some("ts" | "cts" | "mts") => Some(Self::TypeScript),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectKind {
@@ -103,9 +115,43 @@ pub struct ControlSpec {
     pub required: bool,
 }
 
+/// Host-recorded Node execution inputs; fixture values never enter a binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeIdentity {
+    pub node_version: String,
+    pub lockfile_sha256: Option<String>,
+    pub lockfile_summary_sha256: Option<String>,
+    pub deps_sha256: Option<String>,
+    pub fixture_sha256: Option<String>,
+}
+
+impl RuntimeIdentity {
+    pub fn valid(&self) -> bool {
+        !self.node_version.is_empty()
+            && self.node_version.len() <= 128
+            && self
+                .node_version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+            && [
+                &self.lockfile_sha256,
+                &self.lockfile_summary_sha256,
+                &self.deps_sha256,
+                &self.fixture_sha256,
+            ]
+            .iter()
+            .all(|digest| digest.as_deref().is_none_or(is_sha256))
+            && self.lockfile_sha256.is_some() == self.lockfile_summary_sha256.is_some()
+            && (self.deps_sha256.is_none() || self.lockfile_sha256.is_some())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindingManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeIdentity>,
     pub finding_id: String,
     pub source_sha256: String,
     pub target_file_sha256: String,
@@ -153,6 +199,16 @@ impl VerificationIr {
         .any(|value| !is_sha256(value))
         {
             return Err(ContractError::InvalidDigest);
+        }
+        if self
+            .binding
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.valid())
+            || Language::for_target_file(&self.subject.file) != Some(self.subject.language)
+            || (self.subject.language == Language::Python) != self.binding.runtime.is_none()
+        {
+            return Err(ContractError::BindingMismatch);
         }
         if self.controls.is_empty() || self.controls.len() > MAX_CONTROLS {
             return Err(ContractError::TooManyControls);
@@ -728,6 +784,7 @@ mod tests {
             }],
             capabilities: vec![Capability::ReadPreparedTree, Capability::WriteEphemeralTemp],
             binding: BindingManifest {
+                runtime: None,
                 finding_id: "finding-1".into(),
                 source_sha256: hash('a'),
                 target_file_sha256: hash('b'),
@@ -735,6 +792,47 @@ mod tests {
                 harness_sha256: hash('d'),
                 policy_version: "verification-policy-v1".into(),
             },
+        }
+    }
+
+    #[test]
+    fn ir_rejects_every_extension_language_runtime_mismatch() {
+        let runtime = RuntimeIdentity {
+            node_version: "v26.0.0".into(),
+            lockfile_sha256: Some(hash('a')),
+            lockfile_summary_sha256: Some(hash('b')),
+            deps_sha256: None,
+            fixture_sha256: None,
+        };
+        for (file, expected) in [
+            ("app.py", Language::Python),
+            ("app.js", Language::JavaScript),
+            ("app.cjs", Language::JavaScript),
+            ("app.mjs", Language::JavaScript),
+            ("app.ts", Language::TypeScript),
+            ("app.cts", Language::TypeScript),
+            ("app.mts", Language::TypeScript),
+        ] {
+            for language in [
+                Language::Python,
+                Language::JavaScript,
+                Language::TypeScript,
+                Language::Native,
+            ] {
+                for has_runtime in [false, true] {
+                    let mut ir = sample_ir();
+                    ir.subject.file = file.into();
+                    ir.subject.language = language;
+                    ir.binding.runtime = has_runtime.then(|| runtime.clone());
+                    let decoded: VerificationIr =
+                        serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+                    assert_eq!(
+                        decoded.validate().is_ok(),
+                        language == expected && has_runtime == (expected != Language::Python),
+                        "{file} {language:?} {has_runtime}"
+                    );
+                }
+            }
         }
     }
 
