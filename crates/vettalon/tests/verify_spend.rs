@@ -406,7 +406,9 @@ fn a_missing_or_empty_api_key_is_refused_before_any_call() {
         assert_eq!(mock.requests().len(), 0, "key={key:?}");
         assert!(!fx.out_path().exists(), "key={key:?}");
         let err = stderr(&o);
-        assert!(err.contains(KEY_VAR), "{err}");
+        assert!(err.contains("api_key_env"), "{err}");
+        assert!(err.contains("not set or empty"), "{err}");
+        assert!(!err.contains(KEY_VAR), "{err}");
     }
 }
 
@@ -422,7 +424,9 @@ fn a_non_utf8_api_key_is_refused_before_any_call() {
     assert_eq!(mock.requests().len(), 0);
     assert!(!fx.out_path().exists());
     let err = stderr(&o);
-    assert!(err.contains(KEY_VAR), "{err}");
+    assert!(err.contains("api_key_env"), "{err}");
+    assert!(err.contains("not set or empty"), "{err}");
+    assert!(!err.contains(KEY_VAR), "{err}");
     assert!(!err.contains("sk-"), "key value leaked: {err}");
 }
 

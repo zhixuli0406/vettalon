@@ -464,13 +464,13 @@ pub fn check_spend_ready(verifier: &ModelHandle, guard: &SpendGuard) -> Result<(
         })?;
     // Without a key every call would fail after its reservation and be
     // charged the worst case. This must match how the HTTP caller reads the
-    // key (`std::env::var`, so a non-UTF-8 value counts as unusable). The
-    // value is never printed.
+    // key (`std::env::var`, so a non-UTF-8 value counts as unusable).
+    // Neither the value nor the variable name is ever printed.
     if let Some(var) = &info.api_key_env
         && std::env::var(var).map_or(true, |v| v.is_empty())
     {
         return Err(format!(
-            "--spend-cap-usd: environment variable {var} (api_key_env of verifier {:?}) is not set or empty",
+            "--spend-cap-usd: the API key environment variable (api_key_env) of verifier {:?} is not set or empty",
             verifier.id
         ));
     }
@@ -1773,7 +1773,7 @@ mod tests {
         let g = guard(1.0);
         assert!(check_spend_ready(&metered_handle(vec![]), &g).is_ok());
         let e = check_spend_ready(&handle("g", "google", vec![]), &g).unwrap_err();
-        assert!(e.contains("not metered"), "{e}");
+        assert!(e.contains("not metered"), "expected not-metered error");
         // Metered but unpriced: a table without model "m".
         let table = crate::llm::spend::PriceTable::parse(
             br#"{"schema":"vettalon.prices/1","retrieved":"2026-01-01","source":["t"],
@@ -1782,7 +1782,7 @@ mod tests {
         .unwrap();
         let other = SpendGuard::new(1.0, table).unwrap();
         let e = check_spend_ready(&metered_handle(vec![]), &other).unwrap_err();
-        assert!(e.contains("no price"), "{e}");
+        assert!(e.contains("no price"), "expected no-price error");
     }
 
     /// Even if the early check were skipped, a non-metered caller under a
@@ -1867,7 +1867,7 @@ mod tests {
     }
 
     /// L6: a guard with a verifier whose key variable is unset is refused
-    /// before any call; the message names the variable, never a value.
+    /// before any call; the message names neither variable nor value.
     #[test]
     fn spend_guard_needs_the_api_key_variable_set() {
         let g = guard(1.0);
@@ -1878,7 +1878,10 @@ mod tests {
             caller: Arc::new(MeteredReplies(Mutex::new(vec![]), Some(var.into()))),
         };
         let e = check_spend_ready(&h, &g).unwrap_err();
-        assert!(e.contains(var) && e.contains("not set or empty"), "{e}");
+        assert!(
+            e.contains("not set or empty") && e.contains("api_key_env") && !e.contains(var),
+            "spend-ready error must not name the key variable"
+        );
         // No key variable configured (e.g. local server): fine.
         assert!(check_spend_ready(&metered_handle(vec![]), &g).is_ok());
     }
