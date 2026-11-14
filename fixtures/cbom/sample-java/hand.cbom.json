@@ -1,0 +1,75 @@
+{
+  "bomFormat" : "CycloneDX",
+  "specVersion" : "1.6",
+  "serialNumber" : "urn:uuid:5c1f0a52-3d7e-4b1a-9a53-0e8d2f6b7c14",
+  "version" : 1,
+  "metadata" : {
+    "timestamp" : "2026-11-12T08:00:00Z",
+    "tools" : {
+      "services" : [
+        {
+          "provider" : {
+            "name" : "PQCA"
+          },
+          "name" : "CBOMkit"
+        }
+      ]
+    }
+  },
+  "components" : [
+    {
+      "type" : "cryptographic-asset",
+      "bom-ref" : "a1c0e3b4-7d52-4f6a-8e19-3b5d7c9f1a20",
+      "name" : "AES-GCM",
+      "evidence" : {
+        "occurrences" : [
+          {
+            "location" : "ws/src/main/java/com/ex/Crypto.java",
+            "line" : 7,
+            "offset" : 19,
+            "additionalContext" : "Cipher.getInstance"
+          }
+        ]
+      },
+      "cryptoProperties" : {
+        "assetType" : "algorithm",
+        "algorithmProperties" : {
+          "primitive" : "ae",
+          "mode" : "gcm",
+          "padding" : "pkcs5",
+          "cryptoFunctions" : [
+            "encrypt",
+            "decrypt"
+          ]
+        },
+        "oid" : "2.16.840.1.101.3.4.1"
+      }
+    },
+    {
+      "type" : "cryptographic-asset",
+      "bom-ref" : "b7e2d9f1-4a63-4c8b-9d05-6e1f3a8c2b47",
+      "name" : "MD5",
+      "evidence" : {
+        "occurrences" : [
+          {
+            "location" : "ws/src/main/java/com/ex/Unused.java",
+            "line" : 7,
+            "offset" : 27,
+            "additionalContext" : "MessageDigest.getInstance"
+          }
+        ]
+      },
+      "cryptoProperties" : {
+        "assetType" : "algorithm",
+        "algorithmProperties" : {
+          "primitive" : "hash",
+          "cryptoFunctions" : [
+            "digest"
+          ]
+        },
+        "oid" : "1.2.840.113549.2.5"
+      }
+    }
+  ],
+  "dependencies" : []
+}

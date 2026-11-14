@@ -1428,6 +1428,7 @@ fn project_meta_for(dep: &DependencyHunt) -> crate::disclose::ProjectMeta {
         security_policy: None,
         security_emails: dep.upstream.security_emails.clone(),
         policy_requirements: dep.upstream.policy_requirements.clone(),
+        scope_docs: Vec::new(),
     }
 }
 
@@ -1468,7 +1469,10 @@ async fn hunt_extras(
     today: chrono::NaiveDate,
 ) -> crate::disclose::FindingExtras {
     let dedupe = match dedupe {
-        Some(src) => crate::disclose::dedupe::check(src, meta, &f.file, today).await,
+        Some(src) => {
+            let cwe = crate::disclose::finding_cwe(f);
+            crate::disclose::dedupe::check(src, meta, &f.file, cwe.as_deref(), today).await
+        }
         None => crate::disclose::DedupeReport::not_requested(),
     };
     crate::disclose::FindingExtras {

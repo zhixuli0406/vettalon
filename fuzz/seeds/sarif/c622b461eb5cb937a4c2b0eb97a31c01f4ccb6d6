@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"entensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-injection","shortDescription":{"text":"SQL query built fr query depends on a user-provided value."},"ta)a":[{"id":"89","toolComponent":{"index":0e":{"text":"This SQL q}

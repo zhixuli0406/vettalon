@@ -7,7 +7,9 @@
 //! caps. Direct model-generated scripts are streamed over stdin and never
 //! written to a host scratch directory or bind-mounted into the container.
 //! Harness-authored multi-file checks use fresh temporary copies mounted
-//! read-only; the user's original tree is never mounted directly.
+//! read-only; the user's original tree is never mounted directly. The sole
+//! networked exception installs validated npm inputs without running scripts;
+//! only its private dependency output is writable.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -21,6 +23,15 @@ use tokio::sync::{Mutex, OnceCell};
 /// automatically (pulling needs the network); the operator runs
 /// `docker pull` once.
 pub const DEFAULT_POC_IMAGE: &str = "python:3.12-slim";
+/// Locally built Node image for JS/TS execution proof. Never pulled
+/// automatically; run `vettalon poc-node build` before use.
+pub fn default_node_poc_image() -> &'static str {
+    crate::llm::container::poc_node_image()
+}
+/// Start of the error a container run returns when it hit the host-side
+/// hard timeout (and was killed). Callers match on it to tell a hanging
+/// target from a backend failure.
+pub const EXECUTION_TIMEOUT_PREFIX: &str = "container execution exceeded the ";
 
 /// Label on every PoC container, used to clean up leftovers.
 const POC_LABEL: &str = "vettalon.poc=1";
@@ -56,6 +67,112 @@ const DOCKER_CALL_LIMIT: Duration = Duration::from_secs(30);
 const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 const METADATA_CAP_BYTES: usize = 16 * 1024;
 const CLIENT_REAP_LIMIT: Duration = Duration::from_secs(1);
+
+const NODE_INSTALL_LIMIT: Duration = Duration::from_secs(300);
+const NODE_INSTALL_FAILED: &str = "node_deps_install_failed";
+const NODE_DEPS_MOUNT: &str = "/workspace/tree/node_modules";
+const NODE_INSTALL_ENV: &[&str] = &[
+    "PATH=/usr/local/bin:/usr/bin:/bin",
+    "HOME=/tmp",
+    "npm_config_userconfig=/tmp/npmrc-user",
+    "npm_config_globalconfig=/tmp/npmrc-global",
+    "npm_config_registry=https://registry.npmjs.org/",
+    "npm_config_cache=/tmp/npm-cache",
+    "npm_config_ignore_scripts=true",
+    "npm_config_audit=false",
+    "npm_config_fund=false",
+    "npm_config_update_notifier=false",
+];
+// Only trusted harness commands run while networking is enabled. Install on
+// bounded tmpfs first; the host remains authoritative when importing output.
+const NODE_INSTALL_TOO_LARGE_EXIT: i64 = 86;
+const NODE_INSTALL_TMPFS_BYTES: u64 = crate::audit::node::deps::MAX_BYTES + 64 * 1024 * 1024;
+const NODE_INSTALL_TMPFS_INODES: u32 = crate::audit::node::deps::MAX_ENTRIES + 1_000;
+
+/// Only Node install inputs use this in-memory transport. Private manifests
+/// never enter host scratch or mounts (uid 65534 cannot read host 0600 binds).
+fn node_install_input(package_json: &[u8], lockfile: &[u8]) -> Result<String, &'static str> {
+    let manifest = std::str::from_utf8(package_json).map_err(|_| NODE_INSTALL_FAILED)?;
+    let lock = std::str::from_utf8(lockfile).map_err(|_| NODE_INSTALL_FAILED)?;
+    Ok(format!(
+        "{}\n{}{}\n{}",
+        manifest.len(),
+        manifest,
+        lock.len(),
+        lock
+    ))
+}
+
+// Run as uid 65534 on private /work tmpfs, under umask 077. Read both frames
+// and EOF before writing anything; fixed names and O_EXCL prevent substitution.
+const NODE_INSTALL_STAGE: &str = r#"import os, sys
+os.umask(0o077)
+os.chmod(".", 0o700)
+def frame(cap):
+    header = sys.stdin.buffer.readline(12)
+    if not header.endswith(b"\n") or not header[:-1].isdigit():
+        raise ValueError("invalid install envelope")
+    size = int(header)
+    if size > cap:
+        raise ValueError("invalid install envelope")
+    data = sys.stdin.buffer.read(size)
+    if len(data) != size:
+        raise ValueError("invalid install envelope")
+    return data
+try:
+    manifest = frame(1048576)
+    lock = frame(33554432)
+    if sys.stdin.buffer.read(1):
+        raise ValueError("trailing input")
+    for name, data in (("package.json", manifest), ("package-lock.json", lock)):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+except Exception:
+    sys.exit(1)
+"#;
+
+fn node_install_command() -> String {
+    use crate::audit::node::deps::{MAX_BYTES, MAX_ENTRIES, MAX_FILES};
+    // Count constant markers rather than filenames (which may contain newlines).
+    // Check each producer before consuming its output; /work includes inputs and
+    // directory metadata, so this pre-check is conservative relative to the host.
+    format!(
+        concat!(
+            "umask 077; : > /tmp/npmrc-user; : > /tmp/npmrc-global; ",
+            "python3 -I -B -c '{stage}' && cd /work && ",
+            "npm ci --ignore-scripts --no-audit --no-fund --bin-links=false --prefer-online; ",
+            "status=$?; [ \"$status\" -eq 0 ] || exit \"$status\"; ",
+            "find /work -xdev -printf '.' > /tmp/install-entries || exit 1; ",
+            "entries=$(wc -c < /tmp/install-entries) || exit 1; ",
+            "find /work -xdev -type f -printf '.' > /tmp/install-files || exit 1; ",
+            "files=$(wc -c < /tmp/install-files) || exit 1; ",
+            "du -sbl /work > /tmp/install-bytes || exit 1; ",
+            "read -r bytes path < /tmp/install-bytes || exit 1; ",
+            "[ \"$entries\" -le {} ] && [ \"$files\" -le {} ] && ",
+            "[ \"$bytes\" -le {} ] || exit {}; ",
+            "cp -RP /work/node_modules /deps/ && ",
+            "find /deps -mindepth 1 -type d -exec chmod 0777 {{}} + && ",
+            "find /deps -mindepth 1 -type f -exec chmod 0644 {{}} + || exit 1"
+        ),
+        MAX_ENTRIES,
+        MAX_FILES,
+        MAX_BYTES,
+        NODE_INSTALL_TOO_LARGE_EXIT,
+        stage = NODE_INSTALL_STAGE,
+    )
+}
+
+/// Keep the private, normalized dependency tree alive across all offline
+/// phases. No target path or mutable caller-owned install output is retained.
+#[derive(Debug)]
+#[allow(dead_code)] // D9 consumes the installation result.
+pub(crate) struct InstalledDependencies {
+    _dir: tempfile::TempDir,
+    pub path: std::path::PathBuf,
+    pub digest: crate::audit::node::deps::DependencyDigest,
+    pub lockfile: crate::audit::node::lockfile::LockfileSummary,
+}
 
 #[derive(Debug, Clone)]
 pub struct DockerSandbox {
@@ -223,6 +340,175 @@ impl DockerSandbox {
         self.build_run_args(name, mounts, workdir, false, Pid1::Timeout, cmd)
     }
 
+    /// Pure argv builder for the sole networked container. Validated manifest
+    /// bytes arrive on stdin; `output` is a fresh private directory.
+    pub(crate) fn install_run_args(
+        &self,
+        name: &str,
+        output: &Path,
+    ) -> Result<Vec<String>, &'static str> {
+        if !output.is_absolute() || output.to_str().is_none_or(|s| s.contains([',', '\0'])) {
+            return Err(NODE_INSTALL_FAILED);
+        }
+        let mut args: Vec<String> = [
+            "run",
+            "--rm",
+            "--interactive",
+            "--name",
+            name,
+            "--label",
+            POC_LABEL,
+            "--label",
+            &format!("{POC_OWNER_KEY}={}", std::process::id()),
+            "--pull=never",
+            "--network=bridge",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=256m",
+            "--tmpfs",
+            &format!(
+                "/work:rw,nosuid,nodev,noexec,size={NODE_INSTALL_TMPFS_BYTES},nr_inodes={NODE_INSTALL_TMPFS_INODES},mode=0700,uid=65534,gid=65534"
+            ),
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--user",
+            "65534:65534",
+            "--pids-limit=128",
+            "--memory=1792m",
+            "--memory-swap=1792m",
+            "--cpus=2",
+            "--ulimit",
+            "nofile=256:256",
+            "--ulimit",
+            "fsize=67108864:67108864",
+            "--workdir",
+            "/work",
+            "--init=false",
+            // Bypass image entrypoints and discard image-provided env too.
+            "--entrypoint",
+            "/usr/bin/env",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for env in NODE_INSTALL_ENV {
+            args.extend(["--env".into(), (*env).into()]);
+        }
+        args.extend([
+            "--mount".into(),
+            format!("type=bind,source={},target=/deps", output.display()),
+            self.image.clone(),
+            "-i".into(),
+        ]);
+        args.extend(NODE_INSTALL_ENV.iter().map(|s| (*s).into()));
+        args.extend(
+            [
+                "timeout",
+                "-s",
+                "KILL",
+                "300",
+                "/bin/sh",
+                "-c",
+                &node_install_command(),
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        Ok(args)
+    }
+
+    /// Validate the exact bytes being staged, install once, then import and
+    /// digest the stopped container's output. A caller-supplied summary alone
+    /// cannot authorize network fetches. Shrinkwrap bytes may be passed as the
+    /// lockfile; the private input always uses the name `package-lock.json`.
+    /// No dependencies returns `None` without invoking Docker. All npm/runner
+    /// failures are environment blockers, never an observed target verdict.
+    #[allow(dead_code)] // CLI orchestration is D9.
+    pub(crate) async fn run_install(
+        &self,
+        package_json: &[u8],
+        lockfile: &[u8],
+    ) -> Result<Option<InstalledDependencies>, &'static str> {
+        use crate::audit::node::{deps, lockfile::validate_install_inputs};
+        let summary =
+            validate_install_inputs(package_json, lockfile).map_err(|_| "node_lockfile_refused")?;
+        // npm ci may resolve missing manifest edges before reporting an
+        // out-of-sync lock. Require matching root maps before enabling network.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(package_json).map_err(|_| "node_lockfile_refused")?;
+        let locked: serde_json::Value =
+            serde_json::from_slice(lockfile).map_err(|_| "node_lockfile_refused")?;
+        for key in [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+            "peerDependenciesMeta",
+        ] {
+            let empty = serde_json::json!({});
+            if manifest.get(key).unwrap_or(&empty)
+                != locked["packages"][""].get(key).unwrap_or(&empty)
+            {
+                return Err("node_lockfile_refused");
+            }
+        }
+        if !summary.needs_install() {
+            return Ok(None);
+        }
+        let input = node_install_input(package_json, lockfile)?;
+        let output = tempfile::Builder::new()
+            .prefix("vettalon-node-install-")
+            .tempdir()
+            .map_err(|_| NODE_INSTALL_FAILED)?;
+        let output_path = output.path().join("deps");
+        std::fs::create_dir(&output_path).map_err(|_| NODE_INSTALL_FAILED)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| NODE_INSTALL_FAILED)?;
+            std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o733))
+                .map_err(|_| NODE_INSTALL_FAILED)?;
+        }
+        let name = format!("vettalon-poc-{}", uuid::Uuid::new_v4().simple());
+        let args = self.install_run_args(&name, &output_path)?;
+        // Preserve the output scratch and any caller's cleanup hold if
+        // cancellation hands removal to the existing container guard.
+        let prior = CLEANUP_HOLD.try_with(Clone::clone).ok();
+        let hold: CleanupHold = std::sync::Arc::new((output, prior));
+        let (code, _) = with_cleanup_hold(
+            hold.clone(),
+            self.run_container(&name, &args, Some(&input), NODE_INSTALL_LIMIT),
+        )
+        .await
+        .map_err(|_| NODE_INSTALL_FAILED)?;
+        if code == NODE_INSTALL_TOO_LARGE_EXIT {
+            return Err("node_deps_too_large");
+        }
+        if code != 0 {
+            return Err(NODE_INSTALL_FAILED);
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("vettalon-node-deps-")
+            .tempdir()
+            .map_err(|_| NODE_INSTALL_FAILED)?;
+        let path = dir.path().join("node_modules");
+        let digest =
+            deps::copy_and_digest(&output_path.join("node_modules"), &path).map_err(|reason| {
+                if reason == "node_deps_too_large" {
+                    reason
+                } else {
+                    NODE_INSTALL_FAILED
+                }
+            })?;
+        Ok(Some(InstalledDependencies {
+            _dir: dir,
+            path,
+            digest,
+            lockfile: summary,
+        }))
+    }
+
     fn build_run_args(
         &self,
         name: &str,
@@ -371,6 +657,35 @@ impl DockerSandbox {
         .await
     }
 
+    /// Node offline phase: the prepared tree already has an empty, stable
+    /// `node_modules` mountpoint. All three mounts remain read-only; deps are
+    /// shared from one installation for every replay and both fix-check trees.
+    #[allow(dead_code)] // CLI orchestration is D9.
+    pub(crate) async fn run_workspace_with_tree_and_deps(
+        &self,
+        files: &[(&str, &str)],
+        tree: &Path,
+        deps: &Path,
+        cmd: &[String],
+        input: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(i64, String), String> {
+        let scratch = write_scratch(files, true)?;
+        self.run_mounted(
+            &[
+                (scratch.path(), "/workspace"),
+                (tree, "/workspace/tree"),
+                (deps, NODE_DEPS_MOUNT),
+            ],
+            "/tmp",
+            Pid1::Command,
+            cmd,
+            input,
+            timeout,
+        )
+        .await
+    }
+
     /// O19: run `cmd` with a prepared directory (a temporary copy of the
     /// scanned tree) mounted read-only at `/workspace` as the working
     /// directory. Same isolation, same timeout: only `/tmp` is writable.
@@ -478,7 +793,7 @@ impl DockerSandbox {
                 let _ = child.start_kill();
                 let _ = tokio::time::timeout(CLIENT_REAP_LIMIT, child.wait()).await;
                 Err(format!(
-                    "container execution exceeded the {}ms hard timeout",
+                    "{EXECUTION_TIMEOUT_PREFIX}{}ms hard timeout",
                     timeout.as_millis()
                 ))
             }
@@ -690,6 +1005,26 @@ fn script_command(language: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// A value an operation keeps alive until every container it started has
+/// finished its removal, including removal that a cancelled run hands to a
+/// background thread. See [`with_cleanup_hold`].
+pub type CleanupHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+tokio::task_local! {
+    static CLEANUP_HOLD: CleanupHold;
+}
+
+/// Run `future` so that every container it starts keeps a clone of `hold`
+/// until that container's removal has returned, also when `future` is dropped
+/// mid-run (for example a client disconnect) and the removal continues on a
+/// background thread. Whatever `hold` guards (such as a concurrency slot) is
+/// therefore released only after the last such removal ends, so a
+/// cancel-and-retry loop cannot keep several containers alive at once.
+/// Containers started from tasks spawned inside `future` are not covered.
+pub async fn with_cleanup_hold<F: std::future::Future>(hold: CleanupHold, future: F) -> F::Output {
+    CLEANUP_HOLD.scope(hold, future).await
+}
+
 /// Removes a PoC container when dropped while still armed, i.e. when the run
 /// that owns it was cancelled before the container exited. `Drop` cannot
 /// await, so a detached thread performs bounded removal and confirmation.
@@ -698,6 +1033,9 @@ struct ContainerGuard {
     docker_bin: String,
     name: String,
     armed: bool,
+    /// The [`with_cleanup_hold`] value in scope when the container was
+    /// started, kept until the container's removal has returned.
+    hold: Option<CleanupHold>,
 }
 
 impl ContainerGuard {
@@ -706,6 +1044,7 @@ impl ContainerGuard {
             docker_bin: docker_bin.to_string(),
             name: name.to_string(),
             armed: true,
+            hold: CLEANUP_HOLD.try_with(CleanupHold::clone).ok(),
         }
     }
 
@@ -721,6 +1060,9 @@ impl Drop for ContainerGuard {
         }
         let docker_bin = self.docker_bin.clone();
         let name = self.name.clone();
+        // Moved into the thread: the operation's hold (e.g. a request slot)
+        // stays taken until the removal below has returned.
+        let hold = self.hold.take();
         // No successful execution receipt is returned on cancellation. This
         // bounded cleanup is best effort and reports its independent failure.
         let spawned = std::thread::Builder::new()
@@ -736,6 +1078,7 @@ impl Drop for ContainerGuard {
                 if let Err(error) = result {
                     eprintln!("sandbox cancellation cleanup unconfirmed: {error}");
                 }
+                drop(hold);
             });
         if spawned.is_err() {
             eprintln!("sandbox cancellation cleanup could not start");
@@ -743,12 +1086,19 @@ impl Drop for ContainerGuard {
     }
 }
 
-/// `docker run` exits 125 when docker itself fails; 126/127 are also what a
-/// script's own shell returns for "not executable" / "command not found",
-/// so those count as docker's only when docker's own error text is present.
+/// `docker run` exits 125 when docker itself fails, and 126/127 when the
+/// container command cannot be run. The container's own command can exit
+/// with any of these codes too (`os._exit(125)`, a shell's "not executable"
+/// / "command not found"), so each counts as docker's only when docker's own
+/// error text is present; otherwise it is the target's ordinary exit.
 fn is_docker_failure(code: i32, output: &str) -> bool {
     match code {
-        125 => true,
+        125 => {
+            output.trim_start().starts_with("docker:")
+                || output.contains("Error response from daemon")
+                || output.contains("OCI runtime")
+                || output.contains("'docker run --help'")
+        }
         126 | 127 => {
             output.contains("OCI runtime")
                 || output.contains("docker: Error response from daemon")
@@ -809,6 +1159,22 @@ async fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("sandbox_node_tests.rs");
+
+    #[test]
+    fn default_node_poc_image_is_versioned_local_tag() {
+        let image = default_node_poc_image();
+        assert_eq!(image, crate::llm::container::poc_node_image());
+        let tag = image.strip_prefix("vettalon-poc-node:").unwrap();
+        assert_eq!(tag.len(), 12);
+        assert!(
+            tag.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert!(!image.contains('/'));
+        assert!(!image.ends_with(":latest"));
+    }
 
     #[cfg(unix)]
     struct FakeDocker {
@@ -1471,8 +1837,32 @@ ghi789 notapid
     }
 
     #[test]
+    fn exit_125_is_docker_failure_only_with_docker_error_text() {
+        for docker_error in [
+            "docker: Error response from daemon: No such image: sha256:aa.\n",
+            "\ndocker: invalid reference format.\nSee 'docker run --help'.\n",
+            "Error response from daemon: conflict: name already in use\n",
+            "docker: failed to create task: OCI runtime create failed\n",
+            "unknown flag: --bogus\nSee 'docker run --help'.\n",
+        ] {
+            assert!(is_docker_failure(125, docker_error), "{docker_error:?}");
+        }
+    }
+
+    #[test]
+    fn exit_125_without_docker_error_text_is_the_targets_own_exit() {
+        // A target that calls os._exit(125) is an ordinary non-zero exit,
+        // not an unavailable environment.
+        assert!(!is_docker_failure(125, ""));
+        assert!(!is_docker_failure(125, "__VTL_ORACLE__ m effect=false\n"));
+        assert!(!is_docker_failure(
+            125,
+            "Traceback (most recent call last):\n"
+        ));
+    }
+
+    #[test]
     fn script_exit_127_is_the_scripts_own_result() {
-        assert!(is_docker_failure(125, ""));
         assert!(!is_docker_failure(127, "bash: curl: command not found"));
         assert!(is_docker_failure(
             127,
@@ -1598,5 +1988,55 @@ for line in open('/proc/self/status'):
             "{calls}"
         );
         assert!(!calls.contains("finished"));
+    }
+
+    /// A cancelled run's hold is released only after its container removal
+    /// has returned, not when the run's future is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_container_keeps_the_cleanup_hold_until_removal_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        let fake = dir.path().join("docker");
+        // `rm` blocks until the gate file exists; `ps` reports absence.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\nrm) while [ ! -f '{}' ]; do sleep 0.02; done ;;\nesac\n",
+                gate.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = fake.display().to_string();
+
+        let hold: CleanupHold = std::sync::Arc::new(());
+        let weak = std::sync::Arc::downgrade(&hold);
+        with_cleanup_hold(hold, async {
+            // Dropped while armed, as when the request future is cancelled.
+            drop(ContainerGuard::new(&bin, "cancelled"));
+        })
+        .await;
+        // Without a scope, a guard carries no hold.
+        let mut unscoped = ContainerGuard::new(&bin, "unscoped");
+        assert!(unscoped.hold.is_none());
+        unscoped.disarm();
+        drop(unscoped);
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            weak.upgrade().is_some(),
+            "hold released while removal is still running"
+        );
+        std::fs::write(&gate, "").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while weak.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hold never released after removal returned"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

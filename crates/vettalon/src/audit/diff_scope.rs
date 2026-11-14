@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use super::ai_audit::ModuleTarget;
-use super::scanners::{SubprocessLimits, run_bounded_subprocess};
+#[cfg(test)]
+use super::scanners::run_bounded_subprocess;
+use super::scanners::{SubprocessLimits, run_bounded_subprocess_bytes};
 use super::schema::{DiffScope, DiffScopeMode, EvidenceItem, EvidenceKind, Finding, FindingKind};
 
 /// Conservative revision syntax. Validate before even checking Git metadata.
@@ -232,7 +234,12 @@ fn parse_paths(output: &str) -> (BTreeSet<String>, usize) {
     (paths, invalid)
 }
 
-async fn git_read(git: &str, git_dir: &Path, root: &Path, args: &[&str]) -> Result<String, String> {
+pub(super) async fn git_read(
+    git: &str,
+    git_dir: &Path,
+    root: &Path,
+    args: &[&str],
+) -> Result<String, String> {
     git_read_capped(git, git_dir, root, args, 4 * 1024 * 1024).await
 }
 
@@ -243,19 +250,45 @@ async fn git_read_capped(
     args: &[&str],
     max_output_bytes: usize,
 ) -> Result<String, String> {
-    let dir = format!("--git-dir={}", git_dir.display());
-    let mut command = vec!["--no-pager", "--no-replace-objects", dir.as_str()];
-    command.extend_from_slice(args);
-    let out = run_bounded_subprocess(
+    git_read_with(
         git,
-        &command,
+        git_dir,
         root,
+        args,
         &SubprocessLimits {
             timeout: std::time::Duration::from_secs(30),
             max_output_bytes,
         },
     )
-    .await;
+    .await
+}
+
+/// [`git_read`] with caller-chosen limits.
+pub(super) async fn git_read_with(
+    git: &str,
+    git_dir: &Path,
+    root: &Path,
+    args: &[&str],
+    limits: &SubprocessLimits,
+) -> Result<String, String> {
+    let out = git_read_bytes_with(git, git_dir, root, args, limits, None).await?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// [`git_read_with`] returning stdout as raw bytes (binary-safe). `stdin`,
+/// when given, is a written and rewound file read by Git as its stdin.
+pub(super) async fn git_read_bytes_with(
+    git: &str,
+    git_dir: &Path,
+    root: &Path,
+    args: &[&str],
+    limits: &SubprocessLimits,
+    stdin: Option<std::fs::File>,
+) -> Result<Vec<u8>, String> {
+    let dir = format!("--git-dir={}", git_dir.display());
+    let mut command = vec!["--no-pager", "--no-replace-objects", dir.as_str()];
+    command.extend_from_slice(args);
+    let out = run_bounded_subprocess_bytes(git, &command, root, limits, stdin).await;
     if out.exit_code != Some(0)
         || out.timed_out
         || out.stdout_truncated
@@ -281,6 +314,14 @@ fn parse_changed_paths(output: &str) -> Result<BTreeSet<String>, String> {
         ));
     }
     Ok(paths)
+}
+
+/// Even an empty file or dangling symlink must not silently alter ancestry.
+pub(super) fn refuse_grafts(git_dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(git_dir.join("info/grafts")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("Git info/grafts exists or cannot be inspected".into()),
+    }
 }
 
 /// Name-only diff flags shared by every scope read. `dirty` still reports a
@@ -335,7 +376,7 @@ async fn read_index(
     parse_index(&git_read_capped(git, git_dir, root, &args, INDEX_LISTING_CAP).await?)
 }
 
-fn parse_oid(output: &str) -> Result<String, String> {
+pub(super) fn parse_oid(output: &str) -> Result<String, String> {
     let oid = output.trim();
     if ![40, 64].contains(&oid.len()) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("Git returned an invalid commit OID".into());
@@ -346,21 +387,11 @@ fn parse_oid(output: &str) -> Result<String, String> {
 /// Bound ignored-file enumeration before applying intake's shared path predicate.
 /// Errors and count overflow are conservative presence, never an empty list.
 pub(super) async fn ignored_intake_count(root: &Path) -> Result<usize, String> {
-    let (git, git_dir) = super::intake::prepare_readonly_git(root).await?;
-    ignored_intake_count_with(&git, &git_dir, root).await
-}
-
-/// [`ignored_intake_count`] after metadata validation; tests call it directly
-/// to prove the read stays safe even when validation is bypassed.
-pub(super) async fn ignored_intake_count_with(
-    git: &str,
-    git_dir: &Path,
-    root: &Path,
-) -> Result<usize, String> {
     const MAX_IGNORED_FILES: usize = 10_000;
+    let (git, git_dir) = super::intake::prepare_readonly_git(root).await?;
     let output = git_read(
-        git,
-        git_dir,
+        &git,
+        &git_dir,
         root,
         &[
             "ls-files",
@@ -487,13 +518,7 @@ pub(super) async fn compute_with(
 ) -> Result<DiffSelection, String> {
     validate_ref(base)?;
     let (git, git_dir) = (git.to_owned(), git_dir.to_owned());
-    // Even an empty file or dangling symlink must not silently alter ancestry.
-    match std::fs::symlink_metadata(git_dir.join("info/grafts")) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        _ => {
-            return Err("diff scope refused: Git info/grafts exists or cannot be inspected".into());
-        }
-    }
+    refuse_grafts(&git_dir).map_err(|reason| format!("diff scope refused: {reason}"))?;
     let head = parse_oid(
         &git_read(
             &git,
@@ -587,8 +612,33 @@ pub(super) async fn compute_with(
     })
 }
 
+/// Regular-file entries (modes 100644 and 100755) of an index listing that
+/// [`parse_index`] accepts. Symlinks (120000) and gitlinks (160000) are left
+/// out: a tracked symlink can point at an ignored file or at `.git`.
+fn regular_index_files(output: &str) -> Result<std::collections::HashSet<String>, String> {
+    parse_index(output)?;
+    Ok(output
+        .split_terminator('\0')
+        .filter_map(|entry| entry.split_once('\t'))
+        .filter(|(meta, _)| meta.starts_with("100644 ") || meta.starts_with("100755 "))
+        .map(|(_, path)| path.to_owned())
+        .collect())
+}
+
+/// Every regular file tracked in the index (`ls-files --stage -z`), read
+/// once through the same validated read-only Git runner as diff scope.
+/// Gitlinks and symlinks are left out (see [`regular_index_files`]).
+/// Any Git or metadata failure is an error; callers fail closed.
+pub(crate) async fn tracked_files(
+    root: &Path,
+) -> Result<std::collections::HashSet<String>, String> {
+    let (git, git_dir) = super::intake::prepare_readonly_git(root).await?;
+    let args = ["ls-files", "--stage", "-z", "--"];
+    regular_index_files(&git_read_capped(&git, &git_dir, root, &args, INDEX_LISTING_CAP).await?)
+}
+
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Fixture setup also uses the bounded, sanitized subprocess runner.
@@ -701,6 +751,10 @@ pub(super) mod tests {
             "gpg.program",
             "diff.external",
             "core.fsmonitor",
+            "core.excludesFile",
+            "core.attributesFile",
+            "diff.orderFile",
+            "mailmap.file",
         ] {
             git(root, &["config", key, "/tmp/must-not-run"]).await;
             assert!(
@@ -745,6 +799,19 @@ pub(super) mod tests {
             tracked,
             BTreeSet::from(["a/\u{fffd}.c".into(), "x\ny".into()])
         );
+    }
+
+    #[test]
+    fn tracked_files_keep_only_regular_file_modes() {
+        let oid = "0".repeat(40);
+        let listing = format!(
+            "100644 {oid} 0\ta.rs\0100755 {oid} 0\trun.sh\0120000 {oid} 0\tlink\0160000 {oid} 0\tvendor/nested\0"
+        );
+        assert_eq!(
+            regular_index_files(&listing).unwrap(),
+            std::collections::HashSet::from(["a.rs".to_string(), "run.sh".to_string()])
+        );
+        assert!(regular_index_files(&format!("100644 {oid} 0\t../x\0")).is_err());
     }
 
     /// Names reserved on Windows are legal tracked files elsewhere; listing
@@ -1015,6 +1082,106 @@ pub(super) mod tests {
             marker.exists(),
             "fixture did not reproduce the fsmonitor hook"
         );
+    }
+
+    /// Path-valued keys Git opens during plain reads (`log`, `diff`,
+    /// `ls-files`); each is refused by validation and overridden.
+    pub const READ_TIME_PATH_KEYS: [&str; 4] = [
+        "mailmap.file",
+        "diff.orderFile",
+        "core.excludesFile",
+        "core.attributesFile",
+    ];
+
+    /// How long a read with a FIFO-valued key may take before it counts as
+    /// blocked.
+    #[cfg(unix)]
+    pub const FIFO_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A committed repository at `<temp>/repo` with a modified, an
+    /// untracked and an ignored file, whose `.git/config` sets `key` to a
+    /// FIFO at `<temp>/fifo` (written with `git config`, which never opens
+    /// the value). Returns the temp dir guard, the root and Git; `None`
+    /// without Git, or with Git older than 2.31, which ignores the
+    /// command-scoped overrides.
+    #[cfg(unix)]
+    pub async fn repo_with_fifo_config(
+        key: &str,
+    ) -> Option<(tempfile::TempDir, std::path::PathBuf, String)> {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let binary = crate::audit::scanners::git_for_security_test(&root)?;
+        if crate::audit::scanners::git_version(&binary).is_none_or(|v| v < (2, 31)) {
+            return None; // GIT_CONFIG_COUNT needs Git 2.31+.
+        }
+        git(&root, &["init", "-q"]).await;
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        commit(&root).await;
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
+        let fifo = temp.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates a node.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        git(&root, &["config", key, fifo.to_str().unwrap()]).await;
+        Some((temp, root, binary))
+    }
+
+    /// Even with config validation bypassed, no scope read opens a FIFO
+    /// named by `core.excludesFile` (`ls-files --exclude-standard`),
+    /// `core.attributesFile` or `diff.orderFile` (`diff`), or
+    /// `mailmap.file`: the runner's command-scoped overrides point them at
+    /// the null device. Cancelling a read kills its process group, so a
+    /// regression fails after 5 s instead of hanging.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scope_reads_never_open_fifo_path_keys_when_validation_is_bypassed() {
+        for key in READ_TIME_PATH_KEYS {
+            let Some((_temp, root, binary)) = repo_with_fifo_config(key).await else {
+                return;
+            };
+            let git_dir = root.join(".git");
+            let refused = super::super::intake::prepare_readonly_git(&root).await;
+            assert!(refused.is_err(), "{key} must be refused by validation");
+
+            let state = repo_state_with(&binary, &git_dir, &root);
+            let state = tokio::time::timeout(FIFO_READ_BOUND, state)
+                .await
+                .unwrap_or_else(|_| panic!("{key}: repo_state blocked on a FIFO"))
+                .unwrap_or_else(|error| panic!("{key}: {error}"));
+            assert_eq!(state.clean, Some(false), "{key}");
+
+            let selection = compute_with(&binary, &git_dir, &root, "HEAD");
+            let selection = tokio::time::timeout(FIFO_READ_BOUND, selection)
+                .await
+                .unwrap_or_else(|_| panic!("{key}: diff scope blocked on a FIFO"))
+                .unwrap_or_else(|error| panic!("{key}: {error}"));
+            assert_eq!(
+                selection.changed,
+                BTreeSet::from(["a.txt".into(), "new.txt".into(), ".gitignore".into()]),
+                "{key}"
+            );
+
+            let args = [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+            ];
+            let ignored = git_read(&binary, &git_dir, &root, &args);
+            let ignored = tokio::time::timeout(FIFO_READ_BOUND, ignored)
+                .await
+                .unwrap_or_else(|_| panic!("{key}: ls-files blocked on a FIFO"))
+                .unwrap_or_else(|error| panic!("{key}: {error}"));
+            assert_eq!(ignored, "ignored.txt\0", "{key}");
+        }
     }
 
     fn selection(paths: &[&str]) -> DiffSelection {

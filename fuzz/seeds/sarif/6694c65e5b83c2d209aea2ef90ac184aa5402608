@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driverer":{"lev":{"name":"vettalon","rule":"rule/x","shortDescriptio+":{"text":"rule/x"},"defaultConfiguration":{"level":"error"},"ppoperties":{"tags":["security",-provided value."}rtifactLocation":{"ur{"$schema":"https://docsi":"src/db.py","uriBaseId":

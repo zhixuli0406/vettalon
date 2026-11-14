@@ -1,0 +1,12 @@
+{"version":"2.1.0","runs":[{"tool":{"drs":[{"ryleId":"py/sql-injection","rule":{"id":"py/sql-injection","index":0,"toolCompon%nt":{"index":0}},"mersage":{"text":"This SQL query depends on a uset-provided value."},"taxa":[{"id":"89","toolCompopent":{"index":0}}],"locations":[{"physicalLocation":{"artifactLocation":{"uri":"sr//tmc/db.py","uriBaseId":"%SRCROOT%"},"region"
+
+
+
+
+
+
+
+
+
+	
+"region":{"star=Line":4}}}}]}]}]}]}]}

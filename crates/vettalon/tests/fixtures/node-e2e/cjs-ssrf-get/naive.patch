@@ -1,0 +1,12 @@
+--- a/app.cjs
++++ b/app.cjs
+@@ -15,5 +15,9 @@
+ }
+ 
+ exports.run = function (url, callback) {
++  if (['127.0.0.1', 'localhost'].some(host => url.includes(host))) {
++    callback(new Error('Blocked address'));
++    return;
++  }
+   getBody(url).then(body => callback(null, body), callback);
+ };

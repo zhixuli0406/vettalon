@@ -63,6 +63,10 @@ pub fn apply(
     let reason =
         crate::util::mask_sensitive_text(crate::util::truncate_bytes(reason, REASON_MAX_BYTES));
     let mut next = report.clone();
+    // A report saved before the per-CWE trust policy must not block a
+    // decision on another finding: reopen its model-only refutations of
+    // capped CWEs first (a no-op on a current report).
+    super::trust_policy::migrate_capped_refutations(&mut next);
     let f = next
         .findings
         .iter_mut()
@@ -304,6 +308,40 @@ mod tests {
             r.findings
                 .iter()
                 .all(|f| f.status == FindingStatus::Suppressed)
+        );
+        assert!(crate::audit::validation_errors(&r).is_empty());
+    }
+
+    /// N1: a decision on one finding of a pre-policy report (another finding
+    /// holds a model-only CWE-327 refutation) succeeds; that finding is
+    /// reopened at needs_human.
+    #[test]
+    fn decision_on_a_pre_policy_report_migrates_the_capped_refutation() {
+        let mut r = report();
+        let mut g = r.findings[0].clone();
+        g.id = "f2".into();
+        g.status = FindingStatus::Refuted;
+        g.cwe = Some("CWE-327".into());
+        g.evidence.push(EvidenceItem {
+            kind: EvidenceKind::AdversarialReview,
+            source: "verifier".into(),
+            detail: "refuted: test-only key".into(),
+            recorded_at: "2026-10-01T00:00:00Z".into(),
+        });
+        r.findings.push(g);
+        r.summary = Summary::from_findings(&r.findings, 0, 0, GatePolicy::default(), &[]);
+        assert!(
+            !crate::audit::validation_errors(&r).is_empty(),
+            "pre-policy"
+        );
+        apply(&mut r, "f1", Decision::Suppressed, "接受風險").unwrap();
+        assert_eq!(r.findings[0].status, FindingStatus::Suppressed);
+        assert_eq!(r.findings[1].status, FindingStatus::NeedsHuman);
+        assert!(
+            r.findings[1]
+                .evidence
+                .iter()
+                .any(|e| e.detail == "trust_policy: llm_refute_capped CWE-327")
         );
         assert!(crate::audit::validation_errors(&r).is_empty());
     }

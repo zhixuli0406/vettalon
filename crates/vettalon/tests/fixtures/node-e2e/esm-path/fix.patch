@@ -1,0 +1,11 @@
+--- a/app.mjs
++++ b/app.mjs
+@@ -2,5 +2,7 @@
+ import path from 'node:path';
+ export function run(x) {
+   const base = process.env.VTL_BASE;
+-  return fs.readFileSync(path.join(base, x), 'utf8');
++  const resolved = path.resolve(base, x);
++  if (!resolved.startsWith(base + path.sep)) return '';
++  return fs.readFileSync(resolved, 'utf8');
+ }

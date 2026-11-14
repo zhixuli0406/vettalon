@@ -27,6 +27,7 @@ pub trait Executor {
         target: &TargetCall,
         image: &str,
         emit: bool,
+        replays: u32,
     ) -> TargetPocWithTest;
     fn check_fix(
         &mut self,
@@ -55,19 +56,11 @@ impl Executor for DockerExecutor {
         target: &TargetCall,
         image: &str,
         emit: bool,
+        replays: u32,
     ) -> TargetPocWithTest {
-        if emit {
-            self.0.block_on(audit::target_poc::run_target_poc_with_test(
-                repo, finding, target, image,
-            ))
-        } else {
-            TargetPocWithTest {
-                receipt: self.0.block_on(audit::target_poc::run_target_poc(
-                    repo, finding, target, image,
-                )),
-                test_source: None,
-            }
-        }
+        self.0.block_on(audit::target_poc::run_target_poc_replayed(
+            repo, finding, target, image, replays, emit,
+        ))
     }
     fn check_fix(
         &mut self,
@@ -79,7 +72,7 @@ impl Executor for DockerExecutor {
         image: &str,
     ) -> FixCheckRun {
         self.0.block_on(audit::fix_check::run_target_fix(
-            repo, finding, target, diff, command, image,
+            repo, finding, target, diff, command, image, None,
         ))
     }
 }
@@ -186,10 +179,15 @@ impl<E: Executor> LocalBackend<E> {
             "vettalon_reproduce" | "vettalon_check_fix" => {
                 let target = bound_target(&finding, args)?;
                 if name == "vettalon_reproduce" {
+                    // validate_args already enforced 1..=MAX_REPLAYS.
+                    let replays = args["replays"].as_u64().unwrap_or(1);
+                    let replays = u32::try_from(replays).map_err(|_| "invalid replays")?;
+                    audit::target_poc::validate_replays(replays)?;
                     self.reproduce_tool(
                         &finding,
                         &target,
                         args["emit_test"].as_bool().unwrap_or(false),
+                        replays,
                     )
                 } else {
                     self.check_fix_tool(
@@ -208,15 +206,18 @@ impl<E: Executor> LocalBackend<E> {
         finding: &Finding,
         target: &TargetCall,
         emit: bool,
+        replays: u32,
     ) -> Result<Value, String> {
-        let result = self
-            .executor
-            .reproduce(&self.repo, finding, target, &self.image, emit);
+        let result =
+            self.executor
+                .reproduce(&self.repo, finding, target, &self.image, emit, replays);
         prune_outputs(&self.state_dir, "reproduce")?;
         write_new_remediation_output(&self.output("reproduce"), &result.receipt)
             .map_err(|_| "cannot save reproduction receipt")?;
+        let summary = result.receipt.replay_summary();
+        let replays = json!({"requested":summary.requested,"completed":summary.completed,"observed":summary.observed,"absent":summary.absent,"inconclusive":summary.inconclusive});
         Ok(
-            json!({"outcome":result.receipt.outcome,"phases":result.receipt.phases,"test":result.test_source,"receipt":result.receipt,"status_unchanged":true}),
+            json!({"outcome":result.receipt.outcome,"phases":result.receipt.phases,"replays":replays,"test":result.test_source,"receipt":result.receipt,"status_unchanged":true}),
         )
     }
     fn check_fix_tool(
@@ -264,7 +265,7 @@ impl<E: Executor> LocalBackend<E> {
         )
         .map_err(|_| "cannot save fix-check outputs")?;
         Ok(
-            json!({"touched_paths":touched_paths,"outcome":run.outcome(),"phases":{"regression":run.check.regression,"tests":run.check.tests},"receipt":run,"nothing_applied":true,"notice_applied":"Nothing was applied to the repository. Finding status is unchanged."}),
+            json!({"touched_paths":touched_paths,"outcome":run.outcome(),"phases":{"original":run.check.original,"variants":run.check.variants,"benign":run.check.benign,"tests":run.check.tests,"regression":run.check.regression(),"blocker":run.blocker()},"receipt":run,"nothing_applied":true,"notice_applied":"Nothing was applied to the repository. Finding status is unchanged. A blocker means the environment or harness could not be built, not that the fix failed."}),
         )
     }
 }

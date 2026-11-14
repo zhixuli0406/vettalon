@@ -5,7 +5,7 @@
 //! `1` when refused.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Serialize;
 
@@ -373,15 +373,21 @@ fn fail(msg: &str) -> i32 {
     2
 }
 
-fn emit(text: &str, out: Option<&Path>) -> i32 {
+fn emit(text: &str, out: Option<crate::remediation::NewOutput>) -> i32 {
     match out {
-        Some(p) => match crate::remediation::write_new_text_output(p, text) {
-            Ok(()) => {
-                eprintln!("[vettalon] {}", tr!("已寫入 {}", "wrote {}", p.display()));
-                0
+        Some(p) => {
+            let path = p.path().to_path_buf();
+            match p.write_text(text) {
+                Ok(()) => {
+                    eprintln!(
+                        "[vettalon] {}",
+                        tr!("已寫入 {}", "wrote {}", path.display())
+                    );
+                    0
+                }
+                Err(e) => fail(&e),
             }
-            Err(e) => fail(&e),
-        },
+        }
         None => {
             print!("{text}");
             0
@@ -394,11 +400,15 @@ pub async fn cmd_audit(opts: AuditOptions) -> i32 {
     if opts.max_file_bytes == 0 {
         return fail("--max-file-bytes must be at least 1");
     }
-    if let Some(p) = &opts.out
-        && let Err(e) = crate::remediation::preflight_new_output(p)
+    let output = match opts
+        .out
+        .as_deref()
+        .map(crate::remediation::preflight_new_output)
+        .transpose()
     {
-        return fail(&e);
-    }
+        Ok(output) => output,
+        Err(e) => return fail(&e),
+    };
     let store = match open_store(&opts.selection).and_then(|dir| pins::load(&dir)) {
         Ok(s) => s,
         Err(e) => return fail(&e),
@@ -416,7 +426,7 @@ pub async fn cmd_audit(opts: AuditOptions) -> i32 {
     };
     // The report is printed or written first; the exit code then reflects
     // the gate and, unless --allow-incomplete, completeness.
-    match emit(&text, opts.out.as_deref()) {
+    match emit(&text, output) {
         0 => report.exit_code(opts.fail_on, opts.allow_incomplete),
         code => code,
     }

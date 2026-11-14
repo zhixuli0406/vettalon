@@ -212,11 +212,18 @@ pub enum EvidenceKind {
     /// O19: the result of checking the finding's `suggested_fix`. `detail` is
     /// the fixed machine format parsed by
     /// [`super::fix_check::FixCheck::parse`] (and written by its
-    /// `to_detail`): `fix_check: outcome=<o> regression=<r> tests=<r>
-    /// inputs=<k>/<n> diff_sha256=<hex> reason=<token|none>`. The outcome
-    /// must equal the one derived from `regression` and `tests`, and the
-    /// result only applies to the diff whose SHA-256 it names; anything else
-    /// is ignored. Never sets a status.
+    /// `to_detail`), policy v4: `fix_check: outcome=<o> original=<r>
+    /// variants=<r> benign=<r> tests=<r> inputs=<k>/<n> decoding=<b>/<a>/<t>
+    /// diff_sha256=<hex> reason=<token|none> blocker=<environment|harness|none>`
+    /// and, when a generated set ran, `variant_set_sha256=<hex>
+    /// variant_generator_version=<token>`. `outcome` must equal
+    /// [`super::fix_check::decide`] of the four verdicts and decoding counts,
+    /// and `blocker` must follow from the outcome and reason. A pass with
+    /// `b < a` is `fix_check_partial`, not `fix_verified`. Pre-v4 details
+    /// (`outcome= regression= tests= inputs= [decoding=] diff_sha256= reason=`
+    /// plus the optional identity tokens) still parse but never count as
+    /// positive. The result only applies to the diff whose SHA-256 it names;
+    /// anything else is ignored. Never sets a status.
     FixCheck,
     /// O10: one refuter run read the code with its comments, the others
     /// without, and the verdict flipped. `detail` is

@@ -14,7 +14,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15717/badge)](https://www.bestpractices.dev/projects/15717)
 
-Vettalon 替安全 finding 提供獨立的第二意見，來源可以是它自己的掃描，也可以是別的工具：多家 AI 模型分工審查，再由另一家模型試著推翻每一個發現；留下來的每一筆都帶著證據等級、還缺的證明與最強反證。沒做完的就標成沒做完，最後由人判定。
+Vettalon 替安全 finding 提供第二意見，並留下可以重跑的紀錄，來源可以是它自己的掃描，也可以是別的工具：多家 AI 模型分工審查，再由另一家模型試著推翻每一個發現；留下來的每一筆都帶著證據等級、還缺的證明與最強反證。沒做完的就標成沒做完，最後由人判定。換一家廠商的模型來覆核，只是多一個不同的審查者，兩個模型仍可能犯同樣的錯；能實際執行的 finding，以執行結果為準。`refuted` 只是模型的判斷，不能當成誤報的證明：C2 校準實測（SastBench 120 題，Anthropic、OpenAI、xAI 三家 verifier）中，每家都推翻了一半以上的真漏洞，59 個真漏洞有 28 個被三家一致推翻。見 [C2 結果](benchmarks/c2/reports/README.md)。
 
 ![Vettalon demo](docs/assets/demo.gif)
 
@@ -31,12 +31,12 @@ Vettalon 替安全 finding 提供獨立的第二意見，來源可以是它自�
 | 形式 | 在你的 coding agent 裡執行的 skill | 獨立的 CLI 與 GitHub Action（Pro 另有桌面版） |
 | 誰來反駁 finding | 同一個 coding agent 另開的 sub-agent | 設定兩家以上時由另一家廠商的模型反駁，加上不用 LLM 的位置檢查 |
 | 依賴套件 | 對被審 repo 套用供應鏈類攻擊檢查 | `hunt` 下載並審查依賴的正式發布原始碼 |
-| 執行程式碼 | 只在你自備的 OS 沙箱內執行目標程式碼，否則只做原始碼審查 | 自行建立 Docker 沙箱（需先安裝 Docker）；`vettalon reproduce` 可執行真實的 Python 程式碼，僅限命令注入、路徑穿越與 SQL 注入 |
+| 執行程式碼 | 只在你自備的 OS 沙箱內執行目標程式碼，否則只做原始碼審查 | 自行建立 Docker 沙箱（需先安裝 Docker）；`vettalon reproduce` 可執行真實的 Python、JavaScript 與 TypeScript 程式碼，僅限命令注入、路徑穿越與 SQL 注入 |
 | 攻擊類別 | 一個核心攻擊類別檔加 10 個領域檔，由 agent 判斷要套哪些 | 8 類，依固定字串規則替每個模組挑選，需手動開啟（`--attack-classes auto`） |
 | 覆蓋紀錄 | 每個單元一筆檢查帳本，由 agent 執行 Node 腳本驗證 | 每個模組保存 finder 列出的檢查；一筆都沒有的記為 `reviewed_no_checks`，不算 `covered` |
 | 輸出 | `findings.json` 與 Markdown 報告 | JSON 報告與 SARIF（可接 code scanning） |
 
-兩者可以搭配：其他工具的 finding 可以寫成 `vettalon.claims/1` 檔交給 `vettalon verify`，取得你設定的另一家廠商的第二意見。
+兩者可以搭配：其他工具的 finding 可以用 SARIF 2.1.0 或 `vettalon.claims/1` 檔交給 `vettalon verify`，取得你設定的另一家廠商的第二意見。
 
 ## 證據漏斗與模型用量上限
 
@@ -53,7 +53,7 @@ $ vettalon scan fixtures/demo-app --profile deep --poc --finders claude --verifi
 AI 深度審計／對抗式覆核／PoC（deep profile）：
   AI 候選：2　已證偽：0（其中前置檢查證偽 0）　待人工覆核：2　PoC 已執行：2
   模組覆蓋：共 4　已審 4（無候選 2、有候選 2）　延後 0　失敗 0
-  覆核獨立性：全部跨家族覆核（找洞：claude；覆核：codex）
+  覆核模型組成：全部跨家族覆核（找洞：claude；覆核：codex）
 結論：未達 --fail-on 門檻（high），視為通過。
 ```
 
@@ -79,6 +79,15 @@ vettalon models --probe      # 確認找得到哪些模型、能不能連上
 docker pull python:3.12-slim  # 只有要用 --poc 才需要
 ```
 
+**建置 Node PoC 映像檔**
+
+只有 JS／TS 執行證明需要 Node PoC 映像檔。0.8 由使用者透過下列指令建置執行檔內嵌的 Dockerfile，尚未發布到 GHCR；一般掃描與 Python PoC 不需要這個映像檔。
+
+```bash
+vettalon poc-node build
+vettalon poc-node image  # vettalon-poc-node:<12 hex digits of the context SHA-256>
+```
+
 也可以直接下載預先建置的執行檔（macOS arm64／x64、Linux x64／arm64）：到 [Releases](https://github.com/zhixuli0406/vettalon/releases) 下載對應平台的 `vettalon-<平台>.tar.gz`，用同名的 `.sha256` 核對，或用 cosign 驗證簽章（`.sig`、`.pem`）。
 
 同一批發佈的執行檔也放在 npm 上，不想裝 Rust 的話可以直接 `npm install -g vettalon`（macOS arm64／x64、Linux x64／arm64）。
@@ -93,6 +102,8 @@ steps:
   - uses: actions/checkout@v7
   - uses: zhixuli0406/vettalon-action@v1
 ```
+
+actions/checkout 預設保存的憑證會通過 Git metadata 檢查。若工作流程不需要 push，仍建議在 checkout 步驟設定 `persist-credentials: false`。
 
 在 Claude Code 裡掃描，可以裝 skills-only plugin（0.2.0，需另行安裝上面的 CLI）：`/plugin install vettalon --marketplace zhixuli0406/vettalon`，說明見 [integrations/claude-code](integrations/claude-code/README.md)。
 
@@ -154,7 +165,7 @@ vettalon scan . --profile deep --poc --time-budget 1800 --finder-budget 1200 --r
 # High 以上的發現預設跑 3 次獨立反駁覆核，必須全部一致；--refuter-runs 1 改回只跑一次（便宜但較弱），上限 5
 vettalon scan . --profile deep --refuter-runs 1
 
-# 記錄每次模型呼叫的追蹤（JSON Lines：步驟、模型、位元組數、延遲、結果，不含內文；失敗的呼叫另附遮罩後最多 200 位元組的錯誤訊息）
+# 記錄每次模型呼叫的追蹤（JSON Lines：步驟、模型、位元組數、延遲、結果，不含內文；失敗的呼叫另附遮罩後最多 200 位元組的錯誤訊息；HTTP 呼叫另記供應商回報的 token 數）
 vettalon scan . --profile deep --trace trace.jsonl
 
 # 不做 reflector 重問：finder 回覆違反 JSON 合約時直接記為解析失敗，不再追問一次
@@ -162,9 +173,16 @@ vettalon scan . --profile deep --trace trace.jsonl
 vettalon scan . --profile deep --finder-parse-retries 0
 
 # 只覆核既有的發現，不呼叫 finder：存下來的報告裡的 AI 候選（例如沒有 verifier 的掃描），
-# 或其他工具產生的 vettalon.claims/1 檔
-#（{"schema": "vettalon.claims/1", "claims": [{"id", "file", "line", "title", "cwe"?, "severity"?, "locations"?: [...]}]}）
+# 其他工具產生的 vettalon.claims/1 檔
+#（{"schema": "vettalon.claims/1", "claims": [{"id", "file", "line", "title", "cwe"?, "severity"?, "locations"?: [...]}]}），
+# 或 SARIF 2.1.0（Semgrep、CodeQL 等，見「verify 讀 SARIF」）
 vettalon verify . --input report.json --verifier grok --out verified.json --trace verify.jsonl
+vettalon verify . --input semgrep.sarif --verifier grok --out verified.json
+# 每次預設最多覆核 200 筆（每筆最多花 --refuter-runs 次呼叫），超過就在呼叫模型前報錯。
+# 要更多請明確調高，並在 30 分鐘後不再開始新的發現：
+vettalon verify . --input codeql.sarif --verifier grok --out verified.json --max-claims 1000 --time-budget 1800
+# 依牌價在模型花費超過 5 美元前停下（只支援 HTTP verifier，見「verify 讀 SARIF」）
+vettalon verify . --input semgrep.sarif --verifier my-http-model --out verified.json --spend-cap-usd 5 --price-table prices.json
 
 # 選擇記錄每次 finder 的來源快照及本機組裝提示 SHA-256 收據，寫入 report.json
 vettalon scan . --profile deep --source-receipts --report report.json
@@ -268,6 +286,8 @@ vettalon toolchain audit --format sarif --out toolchain.sarif --fail-on medium
 
 指令、掃描位置、規則（TC001–TC013、MC001–MC006、PN001–PN003）與報告格式見 [docs/TOOLCHAIN-AUDIT.md](docs/TOOLCHAIN-AUDIT.md)（英文）。
 
+離線（隔離網路）部署：[docs/OFFLINE-DEPLOYMENT.md](docs/OFFLINE-DEPLOYMENT.md)（英文）。
+
 ### 漏洞提交草稿
 
 `vettalon disclose` 依本機 repo 資訊（git remote、SECURITY.md、套件設定）建議管道並產生未核准的本機草稿。格式用 `--format ghsa | minimal | kernel | email`（預設依管道；TWCERT/CC 與 HITCON ZeroDay 維持原表單）。每份草稿都遵守這些規則：
@@ -275,13 +295,15 @@ vettalon toolchain audit --format sarif --out toolchain.sarif --fail-on medium
 - 上游儲存庫：`origin` remote 在 github.com 就用它；沒有的話（直接解開的 crates.io `.crate`、PyPI sdist、npm tarball 都沒有 `.git`）改讀 `Cargo.toml`、`package.json`、`pyproject.toml`、`setup.cfg`、`PKG-INFO` 或 `go.mod` 裡的儲存庫網址。中繼資料當資料看，只採用格式正確的 `github.com/<owner>/<repo>`，審閱備註會寫出來自哪個檔案的哪個欄位。其他主機只記錄，不提供 GitHub 安全公告管道。
 - 語言：`ghsa`、`minimal`、`kernel`、`email` 草稿全文英文，CWE 修補建議也是；只有 TWCERT/CC 與 HITCON ZeroDay 表單用 zh-TW。
 
-- 證據門檻：預設只為有執行框架判定 PoC、或已人工確認的項目產生草稿。`--allow-unproven` 也會為只過了覆核的項目產生，並在開頭標示「未證實」。只有掃描器命中的項目一律不產生。
+- 證據門檻：預設只為證據等級 `poc_differential` 以上（執行框架判定有效果、有通過的對照、並在全新容器重跑）、或已人工確認的項目產生草稿。`--allow-unproven` 也會為 `poc_effect_no_control`（開頭說明 PoC 缺少通過的對照或重跑）與只過了覆核的項目產生，並在開頭標示「未證實」。只有掃描器命中的項目一律不產生。
 - AI 使用聲明：工具與版本、哪些模型負責發現、覆核與寫 PoC，以及人工審閱者化名與審閱日期（`--reviewer`／`--review-date`，或設定檔 `[disclosure] reviewer`）。沒有審閱者就不產生，化名會公開。
-- 嚴重度不由工具自填，除非是人工設定的；模型建議另記在審閱備註供日後對照。
+- 嚴重度不由工具自填，除非是人工設定的（以一個詞填入）；模型建議另記在審閱備註供日後對照。草稿不帶任何 CVSS 向量或分數。
+- 草稿是純文字，上限 8,000 字元（在行界截斷，附截斷說明與清單警告）。Details 段寫出 commit、檔案與行號，查不到 commit 就寫「commit unknown」。`--receipt <FILE>` 引用 `vettalon reproduce` 的收據（檔名、SHA-256、outcome；須對應 finding 的檔案且為 `effect_observed`），`--receipt-bundle <FILE>` 再加上套件檔名、SHA-256 與 `vettalon receipt verify` 指令文字。這裡不驗簽。
 - `--no-patch` 拿掉修補建議段落，給不收工具寫的修補的專案用。`--format kernel` 依 Linux 核心流程：AI 輔助發現視為公開，不要公開重現程式。
 - `--check-duplicates` 在送出前查 OSV 與上游 GitHub repo（近 90 天動到該檔案的 commit、未結的 issue／PR）；沒加這個旗標，每項都寫「未檢查」。除此之外不連網。
 - 同一專案一次只能有一份未獲回覆的草稿（本機紀錄在 `~/.vettalon`）；`--force-throttle <理由>` 可覆寫，`vettalon disclose-ledger close <專案>` 解除。
-- 目標專案的 SECURITY.md 一律當資料：列出需要你確認的要求，裡面的指示不會被照做。
+- 目標專案的 SECURITY.md 一律當資料：列出需要你確認的要求，裡面的指示不會被照做。SECURITY.md 與 `THREAT_MODEL.md` 類檔案另會掃「範圍外」段落；與 finding 相符（CWE、攻擊類別、路徑）的行會以範圍提示出現在審閱備註與封包的 `scope_check`。這個提示不改變證據門檻，也不改草稿。
+- 加上 `--check-duplicates` 時，每筆 OSV 公告在本機分類為 `same_cwe`、`same_file` 或 `package_only`（最多顯示 20 筆，同 CWE 與同檔案的排前面）。
 
 送出前須留下獨立人工覆核、對應目標與來源識別的沙盒重現紀錄，核對維護者／管道現行政策，再取得明確核准。可產生草稿不代表上述條件已成立。日期僅供協調檢查；保留的 90／60 天計算不是已核實的平台政策，也不授權公開。公開須另行核准，vettalon 不會替你送出任何東西。
 
@@ -312,6 +334,41 @@ vettalon toolchain audit --format sarif --out toolchain.sarif --fail-on medium
 `vettalon` 不用 `3`，Vettalon Pro 的 CLI 用它表示「需要授權」。只有部分 AI 引擎無法使用時，整次標為未完成（`engine_unavailable`），終端會寫出幾個引擎沒跑，結束碼照門檻結果。quick 掃描不會出現 4。
 
 `vettalon verify` 只要輸出檔寫出就是 `0`，覆核模型連不上也一樣（看輸出的 `incomplete` 與 `unverified`）；沒辦法執行（輸入檔有誤、模型清單沒有這個 verifier、輸出檔寫不出來）時是 `2`。
+
+### `verify` 讀 SARIF
+
+`vettalon verify` 也讀 SARIF 2.1.0，Semgrep（`--sarif`）、CodeQL、OpenAI Codex Security 匯出、anthropics/claude-code-security-review 或 vettalon 自己的 `--sarif` 產生的告警，不用轉成 claims 檔就能交給你的 verifier：
+
+```bash
+semgrep scan --config auto --sarif -o semgrep.sarif
+vettalon verify . --input semgrep.sarif --verifier grok --out verified.json
+```
+
+每筆結果變成一個 claim，id 是 `sarif-<run>-<result>`（列在 `claim_ids`），在呼叫模型之前跟 claims 檔走同一套位置檢查：路徑必須是安全的 repo 相對路徑、檔案讀得到、行號存在。標題取 `message.text`，沒有就取規則的 short description，再沒有就取 `ruleId`，一律整理成一行：控制字元、換行與 U+2028／U+2029 換成空白，沒有任何可見字元的標題（例如只有零寬空白）改用下一個來源。嚴重度依序取 CodeQL 的 `security-severity`（9 以上 critical、7 以上 high、4 以上 medium、其餘 low）、SARIF 的 `level`（error 為 high、warning 為 medium、note 為 low）。`vettalon.*` 結果屬性（`vettalon.severity`、`vettalon.cwe`）只在該 run 的 `tool.driver.name` 恰好是 `vettalon`，也就是 vettalon 自己的 `--sarif` 時才讀，其他工具的 log 一律忽略。結果提到的 CWE 全部收集：結果的 `taxa`、結果標籤、`external/cwe/cwe-089`、`CWE-89: …` 這類規則標籤、gosec 規則指向 CWE 分類的 `relationships`，以及 Snyk Code 規則的 `properties.cwe`。發現的 `cwe` 取第一個；但其中只要有下面信任政策名單上的 CWE，就改用那一個。有多個時，全部列在一行 `sarif_cwes:` 證據。其他位置與 code flow 步驟成為追蹤位置，最多 10 個。
+
+SARIF 一律當不可信輸入處理。以下上限超過都是錯誤：每個輸入檔 32 MiB（所有 `verify` 輸入都適用）、`{`／`[` 巢狀 64 層、32 個 run、5,000 筆結果；每個 run 最多 64 個 tool extension、64 個 taxonomy、每個工具元件 10,000 條規則、50,000 個 artifact、64 個 `originalUriBaseIds`；每筆結果最多 32 個 taxa、16 個 suppression；每條規則最多 64 個 relationship；每個標籤清單 256 項；整份 log 最多保留 500,000 個陣列項目。log 直接讀進這裡列出的欄位，其他欄位（包括 `relatedLocations`）一律略過、不保留。每筆結果只讀前 16 個 `locations`、2 個 `codeFlows`、每個 flow 2 個 `threadFlows`、每個 thread flow 32 個步驟，其餘計入 `sarif_dropped_locations`。只讀 SARIF 2.1.0。相對 URI 解碼後當 repo 相對路徑；`file:` URI 必須指向交給 `verify` 的 repo 裡面；`uriBaseId` 只透過 `originalUriBaseIds` 裡指向這個 repo 內部的 `file:` URI 解析，其他基準（例如 CI runner 上的 `%SRCROOT%`）一律把 URI 當 repo 相對路徑。log 裡的路徑只跟給定的 repo 路徑及其標準形式比對，絕不到磁碟上查找，所以 log 沒辦法讓 `verify` 碰到 repo 以外的路徑（例如 `/net/<host>` 自動掛載）。`file:` URI 只按 Unix 路徑對應；Windows 上請用相對 URI。含 `..` 的路徑、沒有 `file:` 的絕對路徑、`http:` 等其他 scheme、NUL、反斜線、query 與 fragment，該位置一律拒絕。
+
+`kind` 為 `pass`、`notApplicable`、`informational` 的結果，以及在 SARIF 裡已被壓制的結果會略過（`inSource` 壓制的原因記為 `suppressed_in_source`）。檔案、行號、規則 id 與 CWE 都跟前面某筆相同的結果，以原因 `duplicate` 略過，`duplicate_of` 指向實際覆核的那筆（`sarif_duplicates` 計數），同一個告警重複幾千次也只覆核一次。沒有可用位置或標題的結果也會略過，並把這次執行標為 `incomplete`。每筆略過的結果連同原因列在 `sarif_skipped`（`sarif_unreviewable` 是其中無法覆核的筆數），已覆核結果被捨棄的位置列在 `sarif_dropped_locations`，stderr 另印一行摘要。超過 2,000 位元組的標題在字元邊界截斷，列在 `title_truncated`。這些欄位只在 SARIF 輸入時出現，報告與 claims 檔的 `vettalon.verify/1` 輸出不變。`vettalon joern check` 仍然只接受 claims 檔。
+
+成本上限適用於所有 `verify` 輸入。`--max-claims N`（預設 200）是一次最多覆核的發現數：報告的候選、claims，或 SARIF 扣掉略過與重複後的結果。超過就在呼叫任何模型之前報錯（結束碼 2），訊息會寫出筆數與這個旗標。加上 `--time-budget SECS` 時，預算用完後不再開始新的發現，剩下的維持未覆核的 `candidate` 並附 `verify_error:` 註記，計入 `time_budget_skipped` 與 `unverified`，整次標為 `incomplete`。
+
+`--spend-cap-usd USD` 搭配 `--price-table PATH`（`vettalon.prices/1` JSON：以 API model id 為鍵，每百萬 token 的美元牌價）會在模型花費即將超過上限前停下。每次呼叫先預留最壞情況（輸入以提示位元組數加 256 token 計，輸出以 `max_output_tokens_worst` 計（未設時用 `max_tokens`），價目表的選填 `max_billed_output_tokens` 較大時用它），回覆後依供應商回報的 `usage` 結算。沒有 usage、逾時、5xx、408／409／499 照最壞情況計；400／401／403／404／413／422／429 且沒有 usage 則退回預留。某次呼叫的計費超過預留時整次停止，所以可能超出上限一次。只接受 HTTP verifier 後端，模型要有價目，`api_key_env` 也要已設定，否則在任何呼叫前以結束碼 2 結束。`verify.json` 會帶 `spend`（`cap_usd`、`spent_usd`、`calls_charged_worst_case`、`exceeded_cap`、`over_reservation_calls`）。這只是預算輔助，帳單以供應商為準，請同時在供應商那邊設定花費上限。`--refuter-runs-all-severities` 是評測用選項，讓 `--refuter-runs` 套用到每個發現，不只 High 與 Critical。
+
+### 漏洞回報收件（`vettalon intake`）
+
+`vettalon intake` 讀一份貼上的漏洞回報（Markdown 或純文字，UTF-8，最多 256 KiB，`-` 讀 stdin），轉成單筆 `vettalon.claims/1` claim，用跟 `verify` 一樣的方式交給你的 verifier，再印出最多 12 行的分流摘要：
+
+```bash
+vettalon intake . --input report.md --out intake.json --verifier <id>
+# 只檢查位置、寫出 claim，不呼叫模型
+vettalon intake . --input report.md --out intake.json --claims-only --claims-out claims.json
+```
+
+抽取用固定規則，不經過模型。回報全文不會進 prompt，refuter 只拿到 CWE、通過檢查的 `file:line` 和中性標題（或你給的 `--title`）。回報裡的位置必須是 git index 追蹤中的一般檔案；`.git` 路徑、秘密檔、超過 4 MiB 的檔案、FIFO 和其他 repo 的 GitHub 網址都會被拒絕。在 linked git worktree 或讀不到 index 時，回報裡的位置全部拒絕（`tracked_check: git_unavailable`），請用 `--location FILE:LINE` 自己指定。`intake.json`（`vettalon.intake/1`）只存回報的 SHA-256，不存全文，另有遮罩後最多 300 字的 `report_summary`。`--target TARGET.json --receipt-out R.json` 用你自己寫的 TargetCall 重現（限 Python 的命令注入、路徑穿越、SQL 注入），回報附的 PoC 從不執行。`--check-duplicates` 另做唯讀的 OSV 與 GitHub 查詢。不會送出或提交任何東西。結束碼：0 跑完（不論判決）、1 沒有通過檢查的位置或 `incomplete`、2 輸入被拒或發生錯誤。`refuted` 不代表回報是假的，`effect_absent` 或 `inconclusive` 不代表不可利用，`possibly_out_of_scope` 只是提示，查無重複也不代表是新漏洞。說明見 [`docs/explain/intake.md`](../docs/explain/intake.md)（英文）。
+
+### 依 CWE 的信任政策
+
+CWE-327（有缺陷或高風險的加密演算法）、CWE-328（弱雜湊）、CWE-501（信任邊界違反）、CWE-614（敏感 cookie 未設 `Secure`）這幾類，單靠模型推翻不能把發現關掉。`scan` 與 `verify` 都會把這類發現留在 `needs_human`，附上證據行 `trust_policy: llm_refute_capped CWE-<n>`、請人核對推翻理由的 blocker，終端摘要也會多一行；refuter 的票仍記為 `refuted`。它跟其他 `needs_human` 發現一樣計算（見 `--fail-on-needs-human`）。名單依據 Sifting the Noise（ISSTA 2026，arXiv 2601.22952）的逐 CWE 量測：LLM agent 誤殺真告警的比例在 CWE-327 為 77.17%、CWE-328 為 84.50%、CWE-501 為 77.11%、CWE-614 為 50%，CWE-78 只有 2.38%。確定性的結果不變：預檢沒過或原始碼讀不到，仍是未覆核的 `candidate`。沿用先前報告也照同一規則：這幾類 CWE 先前的 `refuted`，只有在是人工判定或預檢沒過而關掉時才沿用（發現會多一行 `trust_policy: carried_refutation CWE-<n>`）；只靠模型推翻的不會沿用，發現會重新覆核。報告驗證器也會拒絕只有模型 `refuted:` 一行就結案的這類發現。這個政策之前存下的報告，在讀取後再使用的地方（先前報告沿用、`--since-last` 基準、交付／MCP／修補指令）會先把這類發現改回 `needs_human`、加上 `llm_refute_capped` 證據行，再做嚴格驗證，stderr 有一行寫出筆數；檔案本身不會改寫，`vettalon validate` 仍會標出來。這個政策讓模型推翻無法讓這幾類 CWE 結案，但不驗證報告真偽：人工判定、預檢與沿用的標記都是一般欄位，改得動 JSON 的人就寫得出來。說明見 `vettalon explain trust_policy`。
 
 ### 保守模式
 
@@ -410,6 +467,7 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 - CLI 模型也吃 `max_tokens`：回覆超過 `max_tokens` × 4 位元組就算錯誤，不會截斷後拿來用；`claude` 另外在每次請求帶上限（`CLAUDE_CODE_MAX_OUTPUT_TOKENS`）。其他 CLI 看不到的推理 token 不受限。
 - `preset = "agy"` 必須設 `allow_agent_tools = true`。只有 Gemini 模型會自動帶 `google` 家族；agy 也提供其他廠商的模型（例如 `gpt-oss-120b-medium`），這時要自己填 `family`。
 - `api_key_env` 只接受 `_API_KEY`、`_KEY`、`_TOKEN` 結尾的名稱，`AWS_*` 不接受。
+- 每個 HTTP 模型可設 `token_limit_param = "max_tokens"`（預設）或 `"max_completion_tokens"`、`omit_temperature = true|false`（預設 false），以及選填的 `reasoning_effort = "low"|"medium"|"high"`。選填整數 `max_output_tokens_worst >= max_tokens` 用於費用預留及輸出超限檢查（含推理 token），不改變請求上限。見[設定細節](../docs/OFFLINE-DEPLOYMENT.md)。
 - 自訂 CLI 的 `program` 必須是絕對路徑。
 
 ## 安全邊界
@@ -460,7 +518,7 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 
    容器裡只有 Python 標準函式庫和 bash，repo 本身不在容器內，所以 PoC 要用標準函式庫重現有漏洞的寫法。沙箱起不來就跳過，絕不在本機執行。PoC 跑通也不會自動把發現標成 confirmed。
 
-   指令注入（CWE-78/77）、路徑穿越／讀檔（CWE-22/73）、SQL 注入（CWE-89）這三類改由 harness 判定，不看 PoC 自己印的結論。harness 每次開容器都產一組一次性秘密，看的是真實副作用：注入的 shell 複製了秘密檔、`../` 讀到允許目錄外的檔、`UNION` 撈出秘密那一列。PoC 只印「成功」沒有用，漏洞得真的被打穿。執行前先跑零 LLM 的靜態檢查，PoC 若寫死秘密、自己寫出效果檔、根本沒呼叫真正的 sink、或去讀 harness 原始碼，直接拒絕。接著用良性輸入跑一次對照（產品路徑沒有上游修補可比），再換新秘密開新容器重跑。結果記成 `poc_oracle` 證據（`effect`／`control`／`rerun`／`nonce_bound`／`rejected`），旁邊另存一份已遮罩的執行紀錄。攻擊時有效果、對照時沒有、重跑也重現，才算差分（`poc_differential`）。SSRF（CWE-918）做不了，因為沙箱沒有網路，也起不了 loopback listener；其他類別同樣沒有可行的 oracle，都維持上面的獨立模式示範。兩條路的狀態都停在 `needs_human`。
+   指令注入（CWE-78/77）、路徑穿越／讀檔（CWE-22/73）、SQL 注入（CWE-89）這三類改由 harness 判定，不看 PoC 自己印的結論。harness 每次開容器都產一組一次性秘密，看的是真實副作用：注入的 shell 複製了秘密檔、`../` 讀到允許目錄外的檔、`UNION` 撈出秘密那一列。PoC 只印「成功」沒有用，漏洞得真的被打穿。執行前先跑零 LLM 的靜態檢查，PoC 若寫死秘密、自己寫出效果檔、根本沒呼叫真正的 sink、或去讀 harness 原始碼，直接拒絕。接著用良性輸入跑一次對照（產品路徑沒有上游修補可比），再換新秘密開新容器重跑。結果記成 `poc_oracle` 證據（`effect`／`control`／`rerun`／`nonce_bound`／`rejected`），旁邊另存一份已遮罩的執行紀錄。攻擊時有效果、對照時沒有、重跑也重現，才算差分（`poc_differential`）。SSRF（CWE-918）在 Node target mode 已有容器內 loopback listener oracle（`reproduce`、`fix check --target`、`retest`），對外網路仍停用。Python target、掃描當下的 SSRF 與其他未支援類別維持上面的獨立模式示範。兩條路的狀態都停在 `needs_human`。
 
 **拒答不轉送。** 模型拒絕審查時，只有那個模組記成「未審」，同一個模型分到的其他模組照常進行。拒答會列在 `ensemble.refusals`，整次執行標成 `incomplete`（`model_refused`），不會悄悄改丟給別的模型。覆蓋缺口要攤開給你看，換不換模型由你決定。
 
@@ -469,11 +527,11 @@ api_key_env = "DEEPSEEK_API_KEY"   # 金鑰只放在環境變數，設定檔不�
 - 有模組的呼叫失敗，或回覆不符合格式
 - 有候選沒拿到覆核結論（每次覆核都有回覆、只是結論不一致，不算這種情況：`verify_uncertain` 讓發現維持 `candidate`，但整次執行不因此標成 incomplete）
 
-覆核獨立性只計算真正給出判定的覆核，呼叫失敗或拒答都不算。同一個 verifier 第一次就連不上時，同組其餘的候選會直接標成未覆核，不會每一筆都等滿逾時。
+覆核模型組成只計算真正給出判定的覆核，呼叫失敗或拒答都不算。同一個 verifier 第一次就連不上時，同組其餘的候選會直接標成未覆核，不會每一筆都等滿逾時。
 
 **AI 不會自動宣告「確認」。** AI 能做到的最高狀態是 `needs_human`，`confirmed` 只能由人來標。
 
-**用實際原始碼重現與檢查修補。** 已有 validator-clean 的 `report.json` 時，可把一次呼叫寫成封閉 JSON；目前只接受 `.py` 內同步、top-level 的函式，`args` 恰好一個 `payload`，其餘參數只能是有界 JSON literal：
+**用實際原始碼重現與檢查修補。** 已有 validator-clean 的 `report.json` 時，可把一次呼叫寫成封閉 JSON；目標可以是 `.py` 內同步、top-level 的函式，或 `.js`、`.cjs`、`.mjs`、`.ts`、`.cts`、`.mts` 匯出的函式（見下方「JavaScript／TypeScript 目標」），`args` 恰好一個 `payload`，其餘參數只能是有界 JSON literal：
 
 ```json
 {"file":"app.py","function":"read_file","args":[{"kind":"payload"}]}
@@ -490,13 +548,65 @@ vettalon fix check . --report report.json --finding FINDING_ID \
 
 兩個命令都核對 report 的 repo、finding、目標檔與原始碼 hash，只在 prepared copy／新容器執行；不改 live tree，也不自動改 finding status。`reproduce` 是三階段來源綁定收據；`fix check` 另把 exact diff 與相鄰的 check/context evidence 寫進 `--report-out`，更新後報告會再跑 validator。receipt 與 report-out 必須是不存在的新檔，父路徑不能含 symlink；這避免一般覆寫與 link 攻擊，但檢查未以 dirfd 錨定，不能宣稱消除所有並行 rename 競態。`fix_verified` 只描述收據綁定的 prepared snapshot、image 與測試設定，不代表今天的工作樹仍相同，也不會把漏洞改成 `confirmed`。
 
-`reproduce` 觀察到效果時，也可以留下一支測試。加上 `--emit-test tests/test_vettalon_FINDING.py`，Vettalon 會寫出一個獨立的 Python `unittest` 檔，不依賴 Vettalon。它用的輸入和效果判定與 harness 相同，而且要先在沙箱裡對這份原始碼失敗過才會寫出。效果還在時攻擊測試失敗，這個輸入不再有效果後通過；另一支測試確認良性輸入仍然正常，所以把函式刪掉過不了。在 repo 根目錄用 `python3 -m unittest` 執行，它會建立並清除 `/tmp/vtl_*`，需要 POSIX 環境。固定的 `/tmp` 路徑可能讓同一使用者的並行程序互相干擾，請依序執行這些測試。測試變綠只涵蓋這一個輸入，不代表漏洞已經消失，finding 狀態也不會改變。沒有觀察到效果，或測試沒有失敗時，不會寫檔，指令以非 0 結束，原因記在 receipt 的 `regression_test`。
+**JavaScript／TypeScript 目標。** `reproduce`、`fix check --target` 與 `retest` 也能在本機 Node 沙箱跑 `.js`、`.cjs`、`.mjs`、`.ts`、`.cts`、`.mts` 目標（ESM 或 CommonJS；TypeScript 只靠 Node 內建的型別剝除），三階段流程、結果、判決與 blocker 都和 Python 相同。先用 `vettalon poc-node build` 建置映像檔（見安裝段），它不會自動拉取，缺少時記 `node_runtime_unavailable`。依賴只從指向 `registry.npmjs.org` 且驗證過的 npm lockfile 安裝，每個指令在唯一有網路的容器以 `npm ci --ignore-scripts` 裝一次，之後每個執行階段都不連網。`--fixture auth.json`（必須在 repo 外）把 env 值交給受測程式，收據只存它的 digest。`pg` 與 `mysql2` 只記錄查詢、不執行，所以一律 `inconclusive`（`sql_dialect_not_executable`）。Node 收據是 version 3，Python 收據不變。到達哪個 sink 由受測程式自己行程內的 hook 記錄，那段程式可以偽造它，所以它只能讓結果降級。支援範圍、拒絕原因與結果不能說明的事見 [`docs/explain/node_exec.md`](docs/explain/node_exec.md)。
 
-`reproduce` 收據另可攜帶 language-neutral VerificationEvent：VIR 綁定來源、target、plan、實際 runner／adapter harness 與 policy；ExecutionEnvelope 記 capture、cleanup、tamper、effect、controls 與 replay grade；stored verdict 每次讀回都會重新推導。可用 `vettalon verification validate` 驗證 event、`verification compare` 比較兩次 execution envelope、`verification registry` 管理反例與 sealed holdout lineage、`verification scorecard` 重算包含 unsupported／inconclusive 分母的工程量尺。反例升格需要至少兩份不同 fresh challenge 的一致完整事件；holdout 污染沿 parent lineage 傳遞，registry 也會核對內容位址。完整格式、命令與限制見 [`docs/VERIFICATION-ENGINE.md`](../docs/VERIFICATION-ENGINE.md)。目前只支援 Python 的 command／path／SQL target 與 Docker reference backend，不代表跨語言或工程護城河已成立。
+`reproduce --replays N`（1–20，預設 1）會把完整的三階段流程跑 N 次，每次都用新容器與新 nonce，所以一次最多用 60 個容器（加 `--emit-test` 為 61 個）。收據（version 2）只有在每次重播都觀察到效果時才是 `effect_observed`，每次都沒有效果時才是 `effect_absent`；結果有混合就是 `inconclusive`，原因 `replay_inconsistent`；某次重播因其他原因 inconclusive 時沿用那個原因。沙箱失敗會停止剩下的重播。收據的 `replays` 列出每一次執行，指令會印出 `replays k/N observed`。N 次重播結果一致，能提高「這個效果在這個版本上可重現」的信心；它不證明可被利用，沒觀察到效果也不證明程式安全。`--emit-test` 的紅燈檢查仍只跑一次，在所有重播之後，而且只在每次重播都觀察到效果時才跑。version 1 收據仍以一次重播讀取。
+
+`vettalon retest` 用來確認舊版本上證實過的發現，在目前版本是否仍可重現：
+
+```bash
+vettalon retest . --targets plans.json --out retest.json \
+  [--report old-report.json] [--replays N] [--max-findings M] [--deadline SECONDS]
+```
+
+`plans.json` 是「finding id（完整）→ TargetCall」的 JSON 物件，TargetCall 格式與 `reproduce --target` 相同。只有 `poc_differential` 且有計畫的發現會依報告順序重跑，最多 `--max-findings` 筆（1–20，預設 20）；其餘列為 `not_reproducible_before` 或 `retest_cap_reached`，不執行。沒給 `--report` 時，舊報告是 `scan --since-last` 規則信任的最新已存報告；找不到就拒絕。repo 必須是舊報告的 repo。每筆發現會重新綁定到該檔案目前的位元組（`old_file_sha256`、`new_file_sha256`、`rebound`）；檔案刪除或函式移除記 `target_missing`。其他狀態是 `still_observed`、`not_observed`、`inconclusive`、`environment_unavailable`，都附 reproduce 收據。`--targets` 必填；計畫指向無法重跑的發現（不在報告中、沒有差分 PoC、檔案不同、oracle 類別不支援）時整次拒絕。`--replays` × `--max-findings` × 3 不得超過 120 個容器。`--deadline`（1–86400 秒，預設 3600）在每筆發現與每次重播前檢查，被截停的記 `retest_cap_reached`，原因 `deadline_exceeded`。目標卡到容器硬逾時記 `inconclusive`，原因 `target_timeout`。結束碼依序比對：有 `still_observed` 為 1；有 `inconclusive` 或 `environment_unavailable`，或執行被拒為 2；什麼都沒跑，或有 `target_missing`、`retest_cap_reached` 為 3；至少跑了一筆且跑過的全是 `not_observed` 才是 0。舊報告不會被修改，發現狀態也不變。`not_observed` 只表示「這個版本、這組輸入沒有觀察到效果」，不代表已修好或安全。見 `vettalon explain retest`。
+
+**簽署收據。** 用你自己的 [cosign](https://github.com/sigstore/cosign) v3 金鑰，可以簽署 `reproduce` 或 `fix check` 收據，或 `retest` 報告，之後離線驗證：
+
+```bash
+cosign generate-key-pair    # 會要求輸入密碼；產生 cosign.key 與 cosign.pub
+vettalon receipt sign reproduce-receipt.json --key cosign.key
+vettalon receipt verify reproduce-receipt.json --key cosign.pub \
+  --bundle reproduce-receipt.json.sigstore.json
+```
+
+收據（以 SHA-256）成為 in-toto Statement v1 的 subject，bundle 寫在收據旁邊（0600，不覆寫既有檔）。簽章有效只表示這把金鑰的持有者為這份收據背書、之後沒有被改動；不代表結論正確，也不代表產生收據的環境可信。只有在驗證者信任這把公鑰（向簽署者以可信管道另外取得）時，簽章才有意義。沒有可信時間戳：用日後外洩的金鑰做出的簽章，與先前真正的簽章無法區分。
+
+`--key` 必須是本機金鑰檔；遠端、KMS 與 token 參照（`https://`、`env://`、`pkcs11:`、`awskms://` 等）在執行 cosign 前就被拒絕。使用本機金鑰檔時，簽署與驗證已用 cosign v3.1.3 在封鎖網路下（proxy 指向無人監聽的埠、HOME 與 TUF 快取為空）實測，不需要網路；因為 Vettalon 拒絕遠端／KMS 金鑰，就 Vettalon 這端而言這點由設計成立。不使用公開透明日誌，需要 cosign v3。由 Vettalon 執行時 cosign 無法提示輸入密碼，加密金鑰請設定 `COSIGN_PASSWORD`。結束碼：0 已簽署或已驗證、1 驗證失敗、2 拒絕（輸入錯誤、金鑰缺少或無效、cosign 不存在或版本不符）。說明見 `vettalon explain receipt_signing`。
+
+可選用 ML-DSA-65 混合簽章：簽署加上 `--pq-key`，驗證同時指定 `--pq-pub` 與 `--pq-sig`，兩層都通過才算驗證成功；需要 OpenSSL 3.5 以上、未滿 5。cosign／OpenSSL 與上層路徑須由 root 或自己擁有，且群組與其他使用者不可寫入（root 擁有的 sticky 上層目錄除外）；Homebrew 預設路徑會被拒絕，請複製到私人目錄並設定 `VETTALON_COSIGN`／`VETTALON_OPENSSL`。詳見 [收據簽章說明](../docs/explain/receipt_signing.md)（`vettalon explain receipt_signing`）。
+
+**複測交付封包。** `vettalon receipt package` 將重新驗證過的 `retest` 報告、`reproduce` 與 `fix check` 收據整理成目錄或 zip，附上繁中／英文 Markdown 紀錄、證據索引及 SHA-256 manifest；任一輸入不合規則就拒絕整包。`vettalon receipt verify-package <dir|zip>` 重新檢查檔案集合、雜湊與收據，並重繪紀錄比對位元組；`vettalon receipt engagement-template` 產生委託資料 TOML 範本，空白欄位保留為未記錄。這是工具重跑紀錄，不是人工滲透複測；PCI DSS v4.0.1 11.4.4 與共契的欄位對照不構成合規聲明，且尚未核對標準原文。付費的 Vettalon Pro 另可把通過驗證的封包產成 DOCX／PDF。見 `vettalon explain retest_package`。
+
+```sh
+vettalon receipt engagement-template --lang zh-TW > engagement.toml
+vettalon receipt package --retest retest.json --reproduce reproduce.json \
+  --fix-check fix.json --report old-report.json --include-report \
+  --targets plans.json --engagement engagement.toml --lang both --out delivery
+vettalon receipt verify-package delivery
+```
+
+`reproduce` 觀察到效果時，也可以留下一支測試。加上 `--emit-test tests/test_vettalon_FINDING.py`，Vettalon 會寫出一個獨立的 Python `unittest` 檔，不依賴 Vettalon。它用的輸入和效果判定與 harness 相同，而且要先在沙箱裡對這份原始碼失敗過才會寫出。效果還在時攻擊測試失敗，這個輸入不再有效果後通過；另一支測試確認良性輸入仍然正常，所以把函式刪掉過不了。在 repo 根目錄用 `python3 -m unittest` 執行（Node 目標寫出的是 `node:test` 模組，例如 `--emit-test tests/vettalon-FINDING.test.mjs`，用 `node --test` 執行；它的紅燈檢查同時要求完整檔案的 `node --test` 結果與受保護父程序獨立確認的 canary 證據，兩者皆使用真實驅動程式，不載入 hook 或 shim），它會建立並清除 `/tmp/vtl_*`，需要 POSIX 環境。固定的 `/tmp` 路徑可能讓同一使用者的並行程序互相干擾，請依序執行這些測試。測試變綠只涵蓋這一個輸入，不代表漏洞已經消失，finding 狀態也不會改變。沒有觀察到效果，或測試沒有失敗時，不會寫檔，指令以非 0 結束，原因記在 receipt 的 `regression_test`。
+
+**找出測試從哪個 commit 開始失敗。** `vettalon bisect` 在較早的 first-parent commit 上執行這支回歸測試，回報它第一個失敗的 commit：
+
+```bash
+vettalon bisect . --report report.json --finding FINDING_ID \
+  --test tests/test_vettalon_FINDING.py [--good v1.0] [--bad HEAD] \
+  [--max-steps 20] --out bisect-receipt.json
+```
+
+你的 repo 只會被讀取：每個 commit 的樹用 `git ls-tree` 列出、以 `git cat-file` 讀原始 blob 寫到新的私有暫存目錄，不做 checkout，不套用任何 attributes（含 repo 自己的 `.gitattributes`）或 filter，符號連結與子模組略過。每個受測 commit 在一個與 `reproduce` 相同的沙箱容器中執行；`--max-steps`（1 到 40，預設 20）限制執行次數，含最多兩次一致性檢查，沙箱另外拒絕超過 `--max-steps` + 3 個容器。finding 的檔案在某個 commit 不存在時，視為「尚未出現」。結果是這支測試第一個失敗的 commit，不一定是漏洞被引入的地方；receipt 的 `non_monotonic` 標出失敗後又通過的歷史。結束碼：0 找到（`introduced_in`、`present_since_oldest`），1 測試在 `--bad` 沒有失敗，2 無法判定、達步數上限、範圍為空或輸入被拒。說明見 [`docs/explain/bisect.md`](../docs/explain/bisect.md)。
+
+`reproduce` 收據另可攜帶 language-neutral VerificationEvent：VIR 綁定來源、target、plan、實際 runner／adapter harness 與 policy；ExecutionEnvelope 記 capture、cleanup、tamper、effect、controls 與 replay grade；stored verdict 每次讀回都會重新推導。可用 `vettalon verification validate` 驗證 event、`verification compare` 比較兩次 execution envelope、`verification registry` 管理反例與 sealed holdout lineage、`verification scorecard` 重算包含 unsupported／inconclusive 分母的工程量尺。反例升格需要至少兩份不同 fresh challenge 的一致完整事件；holdout 污染沿 parent lineage 傳遞，registry 也會核對內容位址。完整格式、命令與限制見 [`docs/VERIFICATION-ENGINE.md`](../docs/VERIFICATION-ENGINE.md)。目前只支援 Python 與 Node 的 command／path／SQL target 與 Docker reference backend，不代表跨語言或工程護城河已成立。
 
 **證據等級。** JSON 報告與 SARIF 的每筆發現都帶 `evidence_level`，由弱到強是 `static_only`、`refuter_survived`、`refuter_consistent`、`poc_effect_no_control`、`poc_differential`、`maintainer_confirmed`（只有人能給）。旁邊的 `proof_gaps` 列出還缺什麼（`no_refuter`、`refuter_inconsistent`、`no_poc`、`poc_not_harness_judged`、`no_control`、`no_fresh_rerun`、`reachability_unknown`、`no_maintainer_confirmation`），`strongest_counterevidence` 引用最不利的推翻理由或失敗的對照組，已遮罩、上限 300 位元組。三者都在寫報告時從證據鏈算出來，模型設定不了，報告檔裡存的值讀回時一律忽略，舊報告則依它本來有的證據推導。有 `verify_error` 時最高只到 `static_only`，有 `verify_uncertain` 時最高只到 `refuter_survived`。沙箱的 pattern PoC 不會提高等級，只有 harness 判定的 oracle 紀錄（`poc_oracle`）可以。
 
-**修補建議。** 發現可以帶 `suggested_fix`（unified diff，上限 64 KB，讀報告時超過就拒絕）。報告不會因為有這段 diff 就當它驗證過：凡是帶修補建議的發現，JSON 報告都有衍生欄位 `fix_check`，SARIF 有 `vettalon.fix_check`，其中 `outcome` 只有 `fix_verified`、`fix_check_partial`、`fix_rejected`、`fix_unverified` 四種。加了 `--poc` 時，對會跑 PoC 的同一批發現，vettalon 把掃描的目錄複製兩份到暫存目錄，只把 diff 套到其中一份，你的檔案只讀不寫。diff 碰到目錄外的路徑、二進位檔、符號連結、`.git` 或秘密檔，或是改名、刪檔、改權限，都在執行任何東西之前拒絕。檢查 A 在同一次執行裡，用 harness 對該類別的每個 fixture 輸入，分別在原始副本與修補副本跑上面的 oracle：原始副本要仍有效果，修補副本要沒有，而且 harness 的良性輸入在修補副本上要照常運作（不拋例外，讀檔與 SQL 類別還要拿到預期結果），只是把程式改壞的修補會被否決。連接 harness 與專案程式的 adapter 由模型撰寫，只能 import 並呼叫專案程式（自己執行危險操作、讀專案檔、檢視已 import 的模組、執行期組程式碼的 adapter 會被靜態檢查擋下），兩份副本用同一個 adapter，所以目前只適用可以 import 的 Python 程式。檢查 B 只在你明確設定測試指令時才跑（`--fix-test-command "python3 -m pytest -q"`，或設定檔 `[fix_check]` 的 `test_command`），vettalon 不會自己猜。它沿用 PoC 沙箱的限制（無網路、120 秒、目錄唯讀、只有 `/tmp` 可寫），先跑原始副本再跑修補副本；原始副本的測試就失敗時，B 記為無法判定。修補檢查和 PoC 共用時間預算（`--poc-budget`／`--time-budget`），預算用完而沒檢查到的修補記為 `fix_unverified`，`reason` 為 `time_budget_exhausted`。結果只看 A 和 B：兩者都通過才是 `fix_verified`；A 通過但沒設定測試指令是 `fix_check_partial`；修補副本仍有效果或測試失敗是 `fix_rejected`；其他情況（被拒絕、沒有沙箱、原始副本已重現不出效果、類別沒有 harness、從沒檢查過）都是 `fix_unverified`，並附 `reason`。結果存成固定格式的 `fix_check` 證據，綁定 diff 的 SHA-256，之後改了 diff，標籤就回到 `fix_unverified`。
+**修補建議。** 發現可以帶 `suggested_fix`（unified diff，上限 64 KB，讀報告時超過就拒絕）。報告不會因為有這段 diff 就當它驗證過：凡是帶修補建議的發現，JSON 報告都有衍生欄位 `fix_check`，SARIF 有 `vettalon.fix_check`，其中 `outcome` 只有 `fix_verified`、`fix_check_partial`、`fix_rejected`、`fix_unverified` 四種。加了 `--poc` 時，對會跑 PoC 的同一批發現，vettalon 把掃描的目錄複製兩份到暫存目錄，只把 diff 套到其中一份，你的檔案只讀不寫。diff 碰到目錄外的路徑、二進位檔、符號連結、`.git` 或秘密檔，或是改名、刪檔、改權限，都在執行任何東西之前拒絕。攻擊面的檢查在同一次執行裡，用 harness 對該類別變體集的每個計分輸入，分別在原始副本與修補副本跑上面的 oracle，回報三個判決（`original`、`variants`、`benign`，各為 `pass`、`fail`、`inconclusive` 或 `not_run`），三個都會跑到最後。`original`：基礎輸入在原始副本要有效果，在修補副本要沒有。`variants`：其餘每個計分變體在修補副本都要被擋下。`benign`：harness 的良性輸入在兩份副本上都要照常運作（不拋例外，讀檔與 SQL 類別還要拿到預期結果），只是把程式改壞的修補會被否決。連接 harness 與專案程式的 adapter 由模型撰寫，只能 import 並呼叫專案程式（自己執行危險操作、讀專案檔、檢視已 import 的模組、執行期組程式碼的 adapter 會被靜態檢查擋下），兩份副本用同一個 adapter，所以目前只適用可以 import 的 Python 程式。檢查 B 只在你明確設定測試指令時才跑（`--fix-test-command "python3 -m pytest -q"`，或設定檔 `[fix_check]` 的 `test_command`），vettalon 不會自己猜。它沿用 PoC 沙箱的限制（無網路、120 秒、目錄唯讀、只有 `/tmp` 可寫），先跑原始副本再跑修補副本；原始副本的測試就失敗時，B 記為無法判定。修補檢查和 PoC 共用時間預算（`--poc-budget`／`--time-budget`），預算用完而沒檢查到的修補記為 `fix_unverified`，`reason` 為 `time_budget_exhausted`。否決仍只看三個判決和 B。全部通過，而且每個適用的解碼變體都被擋下，才是 `fix_verified`；三個判決通過，但沒設定測試指令，或適用的解碼變體仍有效果，是 `fix_check_partial`；修補副本仍有效果或測試失敗是 `fix_rejected`；其他情況（被拒絕、沒有沙箱、原始副本已重現不出效果、類別沒有 harness、從沒檢查過）都是 `fix_unverified`，並附 `reason`。reason 屬於建置失敗時，另有 `blocker` 說明是哪一種：`environment`（報告寫「環境無法重建」）或 `harness`（報告寫「harness 無法建置」）；它不是修補未通過的判決。結果存成固定格式的 `fix_check` 證據，綁定 diff 的 SHA-256，之後改了 diff，標籤就回到 `fix_unverified`。
+
+detail 共 12 段：`fix_check: outcome= original= variants= benign= tests= inputs=k/n decoding=b/a/t diff_sha256= reason= blocker= variant_set_sha256= variant_generator_version=`，政策為 `vettalon-fix-check-v4`。JSON 摘要仍保留由三個判決推導的 `regression` 欄位。舊的 6、7、9 段 detail（單一 `regression=`）解析為舊格式，不算已驗證，請重跑修補檢查。失敗的修補會跑完每一條輸入，不再停在第一個沒被擋下的輸入，所以容器次數較多。
+
+這項檢查會跑一組固定變體（`variants/1`），涵蓋命令注入、路徑穿越與 SQL 注入，只由弱點類別決定，沒有亂數，也不呼叫模型。基礎輸入排第一。每個計分輸入都要在原始副本觀察到效果，在修補副本觀察不到。需要解碼的輸入（路徑類的百分比編碼 `../`）會執行，detail 記 `decoding=<blocked>/<applicable>/<total>`。只有原始副本出現效果才算 applicable；blocked 是 applicable 且修補副本沒有效果。原始副本也沒有效果的（例如 `%2e%2e/` 打在不會解碼的 `os.path.join`）不算 blocked。`original`、`variants`、`benign` 都通過且 `decoding_blocked` 小於 `decoding_applicable` 時，結果最高是 `fix_check_partial`，reason 為 `decoding_variant_not_blocked`，不會因此變成 `fix_rejected`。原始副本沒有效果的解碼變體只作紀錄。收據的 `variant_set` 帶 `generator_version`、`sha256`、`total`、`ids_not_blocked`（每一個沒被擋下的計分 id，依變體集順序）、`decoding_ids_not_blocked` 與 `decoding_ids_not_applicable`。選到變體集時，detail 另有 `variant_set_sha256` 與 `variant_generator_version`。沒有這兩個欄位的舊 detail 仍可解析。`--poc` 掃描裡每個修補檢查自帶容器預算（跟單獨的 `fix check` 同一算法），不佔 20 次 PoC 執行上限。一次掃描最多啟動 5 次 harness 修補檢查；超過的記 `fix_unverified`，reason 為 `fix_check_cap_reached`，掃描的 `incomplete_reason` 也是這個。20 次上限用完是 `incomplete_reason` `poc_budget_exhausted`，不是時間預算。呼叫端若傳入不夠整次檢查的預算，開始前略過，finding 的 reason 仍是 `poc_budget_exhausted`。掃描截止時間在下一個輸入開始前到了，檢查停在 `time_budget_exhausted`，掃描也標未完成。人類可讀報告只在 `decoding_total` 大於 0 時顯示解碼計數；reason `decoding_variant_not_blocked` 只有三個判決都通過且 blocked 小於 applicable 才解析，報告上的特別標籤只給 `fix_check_partial`。沒有 `decoding=` 的舊 detail 仍解析成 0/0/0。通過只表示在這個 revision、這組輸入與變體上沒有觀察到效果，不證明修補完整。`vettalon reproduce` 與掃描時的 PoC 仍只用基礎那一條輸入。
 
 報告格式定義在 [`crates/vettalon/src/audit/schema.rs`](crates/vettalon/src/audit/schema.rs)，寫檔前一律先跑 validator。SARIF 2.1.0 輸出可以直接上傳到 GitHub code scanning，被證偽的發現會標成 suppressed，不會刪掉；result 的 properties 另帶該發現對應的 CAPEC 攻擊模式（`vettalon.capec`）、依前置條件推導的可利用性分級（`vettalon.exploitability`：direct／conditional／hard_to_reach，取 finder 與 verifier 中摩擦較高者；verifier 有給自己的前置條件時另帶 `vettalon.exploitability_finder`／`vettalon.exploitability_refuter`，兩者不同時帶 `vettalon.tier_disagreement: true`）、結論隨註解翻轉時的 `vettalon.comment_sensitivity: true`，以及證據等級與缺口（`vettalon.evidence_level`、`vettalon.proof_gaps`、`vettalon.strongest_counterevidence`）。有 CWE 對應的發現，報告會多一段攻擊情境與 CAPEC 參考連結。
 
@@ -506,7 +616,7 @@ SARIF 裡 GitHub 用的 `security-severity`，只有在同一條 rule 的每筆�
 
 `--cyclonedx` 會把相依套件公告類發現寫成 CycloneDX 1.6 VDR/VEX：受影響套件（Package URL）、公告、CVE 參照、來源給的 CVSS 評分、vettalon 的定性評分（不帶數字）、CWE，以及只依紀錄證據決定的 `analysis.state`。操作者確認過是 `exploitable`，操作者判定誤報是 `false_positive`，其他情況都是 `in_triage`。`not_affected` 一律不輸出，因為它需要操作者提供 VEX 理由，而 vettalon 目前還沒有收這項資料。程式碼類發現仍放在 SARIF。
 
-`--trace` 會另寫一份逐次模型呼叫的 JSON Lines（只記步驟、模型、位元組數、延遲、結果，不含內文）。
+`--trace` 會另寫一份逐次模型呼叫的 JSON Lines（只記步驟、模型、位元組數、延遲、結果，不含內文）。成功或被拒答的呼叫另記 `usage`（`provider` 或 `missing`）；HTTP 呼叫再記供應商回報的 token 數與 `http_status`，開了 `--spend-cap-usd` 時還有實際計費的 `cost_micro_usd`。
 
 ## 已知限制
 

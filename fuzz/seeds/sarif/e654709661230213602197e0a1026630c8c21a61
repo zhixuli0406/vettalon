@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-injection","shortDescription":{"text":"SQL ueqry built from user-controlled sources"},,,¨[{"locations"∆§Ñ›ìêú£tion":{"physicalLocation"::"WEB"},"region":{"startLine":4}}}}]}]}]}]}]}

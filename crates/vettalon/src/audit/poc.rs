@@ -85,9 +85,8 @@ impl PocBudget {
         self.max
     }
 
-    /// Live remaining slots (used by tests to prove non-executing paths spend
-    /// no budget).
-    #[cfg(test)]
+    /// Live remaining slots. A fix check reads this before it starts so a
+    /// shared scan budget cannot be exhausted halfway through.
     pub fn remaining(&self) -> usize {
         self.remaining.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -308,23 +307,24 @@ pub(crate) fn skip_for_budget(finding: &mut Finding, poc_flag: bool, why: &str) 
 /// Attempt a PoC for one finding, mutating its evidence in place. A pure
 /// no-op (zero evidence added, zero LLM/sandbox cost) unless ALL of:
 /// `poc_flag`, `severity >= High`, `status == NeedsHuman`, and it originated
-/// from ai_audit.
+/// from ai_audit. Returns true only when the run-wide execution counter
+/// refused a sandbox run.
 pub async fn maybe_run_poc<C: LlmCaller>(
     repo_root: &Path,
     finding: &mut Finding,
     caller: &C,
     poc_flag: bool,
     budget: &PocBudget,
-) {
+) -> bool {
     if !poc_eligible(finding, poc_flag) {
-        return;
+        return false;
     }
 
     let excerpt = match read_excerpt(repo_root, finding) {
         Ok(e) => e,
         Err(reason) => {
             push_evidence(finding, EvidenceKind::PocSkipped, "poc_skipped", &reason);
-            return;
+            return false;
         }
     };
 
@@ -333,8 +333,7 @@ pub async fn maybe_run_poc<C: LlmCaller>(
     // of the printed-conclusion transcript. Unsupported classes fall through to
     // the standalone pattern-demonstration path below.
     if let Some(class) = super::poc_oracle::classify(finding) {
-        super::poc_oracle::run_for_finding(finding, caller, &excerpt, class, budget).await;
-        return;
+        return super::poc_oracle::run_for_finding(finding, caller, &excerpt, class, budget).await;
     }
 
     let prompt = build_poc_prompt(finding, &excerpt);
@@ -347,7 +346,7 @@ pub async fn maybe_run_poc<C: LlmCaller>(
                 "poc_generation_failed",
                 &format!("llm call failed: {e}"),
             );
-            return;
+            return false;
         }
     };
     let (language, script, note) = match parse_poc_response(&raw) {
@@ -359,7 +358,7 @@ pub async fn maybe_run_poc<C: LlmCaller>(
                 "poc_generation_failed",
                 &format!("unparseable llm response: {e}"),
             );
-            return;
+            return false;
         }
     };
     if language == "none" || script.trim().is_empty() {
@@ -369,7 +368,7 @@ pub async fn maybe_run_poc<C: LlmCaller>(
             "poc_not_demonstrable",
             &note,
         );
-        return;
+        return false;
     }
     if language != "python" && language != "bash" {
         push_evidence(
@@ -378,7 +377,7 @@ pub async fn maybe_run_poc<C: LlmCaller>(
             "poc_generation_failed",
             &format!("unsupported language {language:?} (expected python or bash)"),
         );
-        return;
+        return false;
     }
 
     // P0-2 circuit breaker: a genuine sandbox execution is about to happen —
@@ -394,7 +393,7 @@ pub async fn maybe_run_poc<C: LlmCaller>(
                 budget.max()
             ),
         );
-        return;
+        return true;
     }
 
     match execute_in_sandbox(&script, &language, budget).await {
@@ -433,6 +432,7 @@ pub async fn maybe_run_poc<C: LlmCaller>(
             );
         }
     }
+    false
 }
 
 /// The fresh, numbered excerpt around the finding's line, for a PoC or a
@@ -1401,7 +1401,10 @@ mod tests {
         let caller =
             StubCaller(r#"{"language":"python","script":"print('x')","note":"n"}"#.to_string());
         let budget = PocBudget::new(0);
-        maybe_run_poc(dir.path(), &mut f, &caller, true, &budget).await;
+        assert!(
+            maybe_run_poc(dir.path(), &mut f, &caller, true, &budget).await,
+            "the run-count breaker must signal the scan"
+        );
         assert_eq!(f.evidence.len(), 1);
         assert_eq!(f.evidence[0].kind, EvidenceKind::PocSkipped);
         assert!(
@@ -1425,7 +1428,10 @@ mod tests {
             r#"{"language":"none","script":"","note":"needs a live server"}"#.to_string(),
         );
         let budget = PocBudget::new(1);
-        maybe_run_poc(dir.path(), &mut f, &caller, true, &budget).await;
+        assert!(
+            !maybe_run_poc(dir.path(), &mut f, &caller, true, &budget).await,
+            "a non-executing path is not the run-count breaker"
+        );
         assert_eq!(f.evidence[0].kind, EvidenceKind::PocSkipped);
         assert!(f.evidence[0].detail.contains("poc_not_demonstrable"));
         assert_eq!(

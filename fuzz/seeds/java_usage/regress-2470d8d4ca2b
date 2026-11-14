@@ -1,0 +1,9 @@
+package com.ex;
+
+import javax.crypto.Cipher;
+
+public class Sealer {
+  static void seal() throws Exception {
+        Cipher.getInstance("AES/CBC/PKCS3@adding");
+    }
+}

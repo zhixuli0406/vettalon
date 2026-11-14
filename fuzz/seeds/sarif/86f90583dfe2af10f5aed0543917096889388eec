@@ -1,0 +1,1 @@
+{"version":"3.1.0","runs":[{"tool":{"driver":{"name":"CodeQL","r}les":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-injection","shortDescription":{"text":"SQL query built from user"},="properties":{"tag}]}]}]}]            }

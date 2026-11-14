@@ -1,0 +1,23 @@
+
+
+
+
+
+
+
+
+
+
+
+
+{"vs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-:injection","shorts":{"tags":["security",{"s":[{"location":{"physicalLocation":{"artifactLocation":{"index":0},"region":{"startLine":1}}}},{"location":{"physicalLocation":{"artifactLocation":{"uri":"file://localhost/etc/pad"wss},"re$schema":"httpng.security":"Dangerous syste
+
+
+
+
+
+
+
+
+
+m 

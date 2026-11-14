@@ -1,0 +1,23 @@
+
+
+
+
+
+
+
+
+
+
+
+
+{"vs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-:injection","shorts":{"tags":["",{"s":[{"location":{"physicocation":{"artifactLocation":{"index":5},"region":{"startLine":1}}}},{"location":["physicalLocation":{"art(ocation":{"uri":"file://us syste
+
+
+
+
+
+
+
+
+
+m 

@@ -1,0 +1,153 @@
+{
+ "caveats": [
+  "Refuted is a model judgement, not ground truth.",
+  "Execution-confirmed: not measured (verify runs no PoC)."
+ ],
+ "commit": "6604c3b8784ecc7cf5ac0b7412d916989b4c7d45",
+ "error_reasons": {},
+ "not_run": {},
+ "overall": {
+  "error": {
+   "k": 0,
+   "n": 74,
+   "wilson95": [
+    0.0,
+    0.0493
+   ]
+  },
+  "maintained": {
+   "k": 6,
+   "n": 74,
+   "wilson95": [
+    0.0377,
+    0.1658
+   ]
+  },
+  "n": 74,
+  "refuted": {
+   "k": 68,
+   "n": 74,
+   "wilson95": [
+    0.8342,
+    0.9623
+   ]
+  },
+  "uncertain": {
+   "k": 0,
+   "n": 74,
+   "wilson95": [
+    0.0,
+    0.0493
+   ]
+  },
+  "zero_call": {
+   "k": 0,
+   "n": 74,
+   "wilson95": [
+    0.0,
+    0.0493
+   ]
+  }
+ },
+ "overlap": {
+  "cwe_unknown": {
+   "in_two_or_more": 0,
+   "keys_total": 38,
+   "pairs": {}
+  },
+  "in_two_or_more": 4,
+  "keys_total": 30,
+  "pairs": {
+   "bandit+opengrep": 4
+  }
+ },
+ "scanners": {
+  "bandit": {
+   "error": {
+    "k": 0,
+    "n": 28,
+    "wilson95": [
+     0.0,
+     0.1206
+    ]
+   },
+   "maintained": {
+    "k": 3,
+    "n": 28,
+    "wilson95": [
+     0.0371,
+     0.272
+    ]
+   },
+   "n": 28,
+   "refuted": {
+    "k": 25,
+    "n": 28,
+    "wilson95": [
+     0.728,
+     0.9629
+    ]
+   },
+   "uncertain": {
+    "k": 0,
+    "n": 28,
+    "wilson95": [
+     0.0,
+     0.1206
+    ]
+   },
+   "zero_call": {
+    "k": 0,
+    "n": 28,
+    "wilson95": [
+     0.0,
+     0.1206
+    ]
+   }
+  },
+  "opengrep": {
+   "error": {
+    "k": 0,
+    "n": 46,
+    "wilson95": [
+     0.0,
+     0.0771
+    ]
+   },
+   "maintained": {
+    "k": 3,
+    "n": 46,
+    "wilson95": [
+     0.0224,
+     0.175
+    ]
+   },
+   "n": 46,
+   "refuted": {
+    "k": 43,
+    "n": 46,
+    "wilson95": [
+     0.825,
+     0.9776
+    ]
+   },
+   "uncertain": {
+    "k": 0,
+    "n": 46,
+    "wilson95": [
+     0.0,
+     0.0771
+    ]
+   },
+   "zero_call": {
+    "k": 0,
+    "n": 46,
+    "wilson95": [
+     0.0,
+     0.0771
+    ]
+   }
+  }
+ },
+ "schema": "vettalon.c2-snapshot-summary/1"
+}

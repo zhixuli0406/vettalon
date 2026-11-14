@@ -9,14 +9,23 @@ use sha2::{Digest, Sha256};
 use super::schema::sha256_hex;
 
 pub const CONTEXT_PREFIX: &str = "fix_context_v1:";
-pub const POLICY_VERSION: &str = "vettalon-fix-check-v2";
+/// Current decide() rule: three attack verdicts (original, variants, benign)
+/// plus tests, and a derived blocker. The earlier policies in
+/// [`PREVIOUS_POLICY_VERSIONS`] still parse and are not current.
+pub const POLICY_VERSION: &str = "vettalon-fix-check-v4";
 /// Current harness. Every version in [`PREVIOUS_HARNESS_VERSIONS`] still
 /// parses and is not current, so such a receipt is not bound
 /// (`fix_unverified`). v3: the per-run marker reaches the runner on stdin
 /// only and the runner is non-dumpable (v1/v2 runners kept it in the mounted
 /// `runner.py`, readable by checked code).
+/// The variant set that ran is not a field here: it is in the fix-check detail,
+/// and `check_sha256` is the hash of that detail.
+pub use vettalon_contract::verification::RuntimeIdentity;
+pub const NODE_HARNESS_VERSION: &str = "vettalon-node-oracle-v1";
 pub const HARNESS_VERSION: &str = "vettalon-three-class-oracle-v3";
-/// Older harnesses: still read, never `complete()`.
+/// v3 bundled the attack checks into one `regression` result; v2 predates
+/// the variant set. Both read, neither is ever `complete()`.
+const PREVIOUS_POLICY_VERSIONS: &[&str] = &["vettalon-fix-check-v3", "vettalon-fix-check-v2"];
 const PREVIOUS_HARNESS_VERSIONS: &[&str] = &[
     "vettalon-three-class-oracle-v1",
     "vettalon-three-class-oracle-v2",
@@ -44,6 +53,13 @@ pub struct SnapshotExclusions {
     pub symlinks: u64,
     pub secret_files: u64,
     pub special_files: u64,
+    /// Dependency directories omitted in Node mode; absent in Python receipts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub node_modules: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Digest of the prepared tree's sorted directory/file entries, exact file
@@ -214,6 +230,8 @@ pub fn source_file_digest(root: &Path, file: &str) -> Result<String, &'static st
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeIdentity>,
     pub version: u32,
     pub source_scope: String,
     pub check_sha256: String,
@@ -255,9 +273,16 @@ impl VerificationContext {
     }
 
     pub fn complete(&self) -> bool {
-        // An older harness still reads but never binds a positive result.
         self.valid()
-            && self.harness_version == HARNESS_VERSION
+            && self.policy_version == POLICY_VERSION
+            && match &self.runtime {
+                None => self.harness_version == HARNESS_VERSION,
+                Some(runtime) => {
+                    self.harness_version == NODE_HARNESS_VERSION
+                        && runtime.lockfile_sha256.is_some()
+                        && runtime.lockfile_summary_sha256.is_some()
+                }
+            }
             && self.finding_file_sha256.as_deref() == Some(self.target_file_sha256.as_str())
             && self.image_identity.is_some()
     }
@@ -272,8 +297,22 @@ impl VerificationContext {
         };
         self.version == 1
             && self.source_scope == SOURCE_SCOPE
-            && self.policy_version == POLICY_VERSION
+            && (self.policy_version == POLICY_VERSION
+                || PREVIOUS_POLICY_VERSIONS.contains(&self.policy_version.as_str()))
+            && self.runtime.as_ref().is_none_or(RuntimeIdentity::valid)
+            && match super::target_poc::Runtime::for_file(&self.target_file) {
+                Ok(super::target_poc::Runtime::Python) => {
+                    self.runtime.is_none()
+                        && (self.harness_version == HARNESS_VERSION
+                            || PREVIOUS_HARNESS_VERSIONS.contains(&self.harness_version.as_str()))
+                }
+                Ok(super::target_poc::Runtime::Node) => {
+                    self.runtime.is_some() && self.harness_version == NODE_HARNESS_VERSION
+                }
+                Err(_) => false,
+            }
             && (self.harness_version == HARNESS_VERSION
+                || self.harness_version == NODE_HARNESS_VERSION
                 || PREVIOUS_HARNESS_VERSIONS.contains(&self.harness_version.as_str()))
             && self.target_file.len() <= 4096
             && vettalon_contract::safe_path::SafeRepoPath::parse(&self.target_file).is_ok()
@@ -328,6 +367,7 @@ mod tests {
             bytes: 1,
         };
         VerificationContext {
+            runtime: None,
             version: 1,
             source_scope: SOURCE_SCOPE.into(),
             check_sha256: hash.clone(),
@@ -350,9 +390,109 @@ mod tests {
     }
 
     #[test]
+    fn python_receipt_identity_and_exclusion_bytes_are_unchanged() {
+        let python = context(POLICY_VERSION, HARNESS_VERSION);
+        // Golden identity over the complete pre-D4 serialized Python context.
+        assert_eq!(
+            python.identity_sha256(),
+            "864912000fc8febbc4bdc5939f939112e005496d756159fdd0f2c02764c208d3"
+        );
+        let legacy = r#"{"git_directories":0,"symlinks":0,"secret_files":0,"special_files":0}"#;
+        let exclusions: SnapshotExclusions = serde_json::from_str(legacy).unwrap();
+        assert_eq!(exclusions.node_modules, 0);
+        assert_eq!(serde_json::to_string(&exclusions).unwrap(), legacy);
+        let mut node = python.clone();
+        node.exclusions.node_modules = 2;
+        assert!(node.to_detail().contains("\"node_modules\":2"));
+        assert_eq!(VerificationContext::parse(&node.to_detail()).unwrap(), node);
+        assert_ne!(node.identity_sha256(), python.identity_sha256());
+    }
+
+    #[test]
+    fn node_context_requires_its_harness_and_binds_every_runtime_input() {
+        let mut node = context(POLICY_VERSION, NODE_HARNESS_VERSION);
+        node.target_file = "app.js".into();
+        assert!(!node.complete());
+        node.runtime = Some(RuntimeIdentity {
+            node_version: "v22.15.0".into(),
+            lockfile_sha256: Some("a".repeat(64)),
+            lockfile_summary_sha256: Some("b".repeat(64)),
+            deps_sha256: Some("c".repeat(64)),
+            fixture_sha256: Some("d".repeat(64)),
+        });
+        assert!(node.complete());
+        assert_eq!(
+            VerificationContext::parse(&node.to_detail()),
+            Some(node.clone())
+        );
+        for field in 0..5 {
+            let mut changed = node.clone();
+            let runtime = changed.runtime.as_mut().unwrap();
+            match field {
+                0 => runtime.node_version = "v22.16.0".into(),
+                1 => runtime.lockfile_sha256 = Some("e".repeat(64)),
+                2 => runtime.lockfile_summary_sha256 = Some("e".repeat(64)),
+                3 => runtime.deps_sha256 = Some("e".repeat(64)),
+                _ => runtime.fixture_sha256 = Some("e".repeat(64)),
+            }
+            assert_ne!(changed.identity_sha256(), node.identity_sha256());
+        }
+        node.harness_version = HARNESS_VERSION.into();
+        assert!(!node.complete());
+        node.runtime.as_mut().unwrap().deps_sha256 = Some("invalid".into());
+        assert!(VerificationContext::parse(&node.to_detail()).is_none());
+    }
+
+    #[test]
+    fn context_rechecks_extension_runtime_and_harness_after_deserialization() {
+        let runtime = RuntimeIdentity {
+            node_version: "v26.0.0".into(),
+            lockfile_sha256: Some("a".repeat(64)),
+            lockfile_summary_sha256: Some("b".repeat(64)),
+            deps_sha256: None,
+            fixture_sha256: None,
+        };
+        for file in [
+            "app.py", "app.js", "app.cjs", "app.mjs", "app.ts", "app.cts", "app.mts",
+        ] {
+            for has_runtime in [false, true] {
+                for harness in [HARNESS_VERSION, NODE_HARNESS_VERSION] {
+                    let mut binding = context(POLICY_VERSION, harness);
+                    binding.target_file = file.into();
+                    binding.runtime = has_runtime.then(|| runtime.clone());
+                    let expected = has_runtime != file.ends_with(".py")
+                        && (harness == NODE_HARNESS_VERSION) == has_runtime;
+                    let decoded: VerificationContext =
+                        serde_json::from_str(&serde_json::to_string(&binding).unwrap()).unwrap();
+                    assert_eq!(
+                        decoded.complete(),
+                        expected,
+                        "{file} {has_runtime} {harness}"
+                    );
+                    assert_eq!(
+                        VerificationContext::parse(&binding.to_detail()).is_some(),
+                        expected
+                    );
+                }
+            }
+        }
+        let mut binding = context(POLICY_VERSION, NODE_HARNESS_VERSION);
+        binding.target_file = "app.js".into();
+        binding.runtime = Some(runtime);
+        assert!(binding.complete());
+        binding.runtime.as_mut().unwrap().lockfile_sha256 = None;
+        binding.runtime.as_mut().unwrap().lockfile_summary_sha256 = None;
+        assert!(!binding.complete());
+    }
+
+    #[test]
     fn old_verification_context_keeps_the_previous_harness_and_is_not_complete() {
-        assert_eq!(POLICY_VERSION, "vettalon-fix-check-v2");
+        assert_eq!(POLICY_VERSION, "vettalon-fix-check-v4");
         assert_eq!(HARNESS_VERSION, "vettalon-three-class-oracle-v3");
+        assert_eq!(
+            PREVIOUS_POLICY_VERSIONS,
+            ["vettalon-fix-check-v3", "vettalon-fix-check-v2"]
+        );
         assert_eq!(
             PREVIOUS_HARNESS_VERSIONS,
             [
@@ -360,19 +500,29 @@ mod tests {
                 "vettalon-three-class-oracle-v2"
             ]
         );
-        // An older harness reads but is never complete.
+        // An older harness reads with any known policy but is never complete.
         for previous in PREVIOUS_HARNESS_VERSIONS {
-            let old = context(POLICY_VERSION, previous);
+            for policy in PREVIOUS_POLICY_VERSIONS.iter().chain([&POLICY_VERSION]) {
+                let old = context(policy, previous);
+                let parsed = VerificationContext::parse(&old.to_detail()).unwrap();
+                assert_eq!(parsed.policy_version, *policy);
+                assert_eq!(parsed.harness_version, *previous);
+                assert_ne!(parsed.harness_version, HARNESS_VERSION);
+                assert!(!parsed.complete(), "{previous} {policy}");
+            }
+        }
+        // An older policy on the current harness reads but is not complete.
+        for policy in PREVIOUS_POLICY_VERSIONS {
+            let old = context(policy, HARNESS_VERSION);
             let parsed = VerificationContext::parse(&old.to_detail()).unwrap();
-            assert_eq!(parsed.harness_version, *previous);
-            assert_ne!(parsed.harness_version, HARNESS_VERSION);
-            assert!(!parsed.complete(), "{previous}");
+            assert_eq!(parsed.policy_version, *policy);
+            assert!(!parsed.complete(), "{policy}");
         }
         let unknown = context(POLICY_VERSION, "vettalon-three-class-oracle-v0");
         assert!(VerificationContext::parse(&unknown.to_detail()).is_none());
         let unknown = context("vettalon-fix-check-v9", HARNESS_VERSION);
         assert!(VerificationContext::parse(&unknown.to_detail()).is_none());
-        let old = context(POLICY_VERSION, PREVIOUS_HARNESS_VERSIONS[0]);
+        let old = context(PREVIOUS_POLICY_VERSIONS[1], PREVIOUS_HARNESS_VERSIONS[0]);
         let current = context(POLICY_VERSION, HARNESS_VERSION);
         assert!(
             VerificationContext::parse(&current.to_detail())

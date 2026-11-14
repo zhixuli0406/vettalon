@@ -13,22 +13,30 @@ use serde::{Deserialize, Serialize};
 
 /// Normalize a CWE reference to `CWE-<n>`.
 ///
-/// Accepts `CWE-89`, `cwe-89`, `CWE 89`, `89`, and the semgrep registry form
-/// `CWE-89: Improper Neutralization of …`. Rejects anything else, including
-/// id 0 and over-long numbers.
+/// Accepts `CWE-89`, `cwe-89`, `CWE 89`, `CWE:89`, `89`, zero-padded ids
+/// (`CWE-000089`), and the semgrep registry form `CWE-89: Improper
+/// Neutralization of …`. Rejects anything else, including id 0 (`CWE-0`,
+/// `CWE-000`), more than 5 significant digits and non-ASCII separators.
 pub fn normalize(raw: &str) -> Option<String> {
     let s = raw.trim();
-    let rest = match s.get(..3) {
-        Some(p) if p.eq_ignore_ascii_case("cwe") => s[3..].trim_start_matches(['-', ' ', '_']),
+    let rest = match (s.get(..3), s.get(3..)) {
+        (Some(p), Some(tail)) if p.eq_ignore_ascii_case("cwe") => {
+            tail.trim_start_matches(['-', ' ', '_', ':'])
+        }
         _ => s,
     };
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() || digits.len() > 5 {
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let (digits, after) = rest.split_at_checked(digits_end)?;
+    // Leading zeros are padding (`cwe-079`, `CWE-000327`); the length cap
+    // applies to the significant digits only.
+    let significant = digits.trim_start_matches('0');
+    if digits.is_empty() || significant.is_empty() || significant.len() > 5 {
         return None;
     }
     // After the number only a separator (or nothing) may follow: `89abc`
     // is not CWE-89.
-    let after = &rest[digits.len()..];
     if after
         .chars()
         .next()
@@ -36,8 +44,39 @@ pub fn normalize(raw: &str) -> Option<String> {
     {
         return None;
     }
-    let n: u32 = digits.parse().ok()?;
+    let n: u32 = significant.parse().ok()?;
     (n > 0).then(|| format!("CWE-{n}"))
+}
+
+/// GitHub's SARIF tag prefix (`external/cwe/cwe-079`), see [`sarif_tag`].
+const SARIF_TAG_PREFIX: &str = "external/cwe/";
+
+/// [`normalize`], plus GitHub's SARIF tag form `external/cwe/cwe-079`
+/// (prefix matched case-insensitively at the start only).
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    match s.get(..SARIF_TAG_PREFIX.len()) {
+        Some(p) if p.eq_ignore_ascii_case(SARIF_TAG_PREFIX) => {
+            normalize(s.get(SARIF_TAG_PREFIX.len()..)?)
+        }
+        _ => normalize(s),
+    }
+}
+
+/// A free-form tag that names a CWE explicitly: it must start with `CWE`
+/// (`CWE-79`, `cwe-79: …`) or with `external/cwe/`. A bare number tag
+/// (`"2021"`, `"89"`) is never read as an id.
+pub fn tag_cwe(tag: &str) -> Option<String> {
+    let t = tag.trim();
+    let marked = |prefix: &str| {
+        t.get(..prefix.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+    };
+    if marked("cwe") || marked(SARIF_TAG_PREFIX) {
+        normalize_tag(t)
+    } else {
+        None
+    }
 }
 
 /// First CWE in a semgrep rule's `metadata.cwe` (a string or a list).
@@ -295,6 +334,41 @@ mod tests {
     }
 
     #[test]
+    fn zero_padding_and_colon_separators_are_read_whole() {
+        for (raw, want) in [
+            ("CWE-000327", "CWE-327"),
+            ("cwe-0000079", "CWE-79"),
+            ("000327", "CWE-327"),
+            ("CWE:327", "CWE-327"),
+            ("cwe: 327", "CWE-327"),
+            ("CWE:0614: Sensitive Cookie", "CWE-614"),
+            ("CWE-0000012345", "CWE-12345"),
+        ] {
+            assert_eq!(normalize(raw).as_deref(), Some(want), "{raw:?}");
+        }
+        // Padding never merges digits into another id, and zero is no id.
+        assert_eq!(normalize("CWE-3270").as_deref(), Some("CWE-3270"));
+        assert_eq!(normalize("CWE-0003270").as_deref(), Some("CWE-3270"));
+        for bad in [
+            "CWE-0",
+            "CWE-000",
+            "0000",
+            "CWE:0",
+            "CWE-0000123456",
+            "CWE\u{2011}327",
+            "CWE\u{2013}327",
+            "CWE-０327",
+        ] {
+            assert!(normalize(bad).is_none(), "{bad:?}");
+        }
+        assert_eq!(
+            normalize_tag("external/cwe/cwe-000327").as_deref(),
+            Some("CWE-327")
+        );
+        assert_eq!(tag_cwe("CWE:614").as_deref(), Some("CWE-614"));
+    }
+
+    #[test]
     fn semgrep_metadata_string_or_list() {
         let list = serde_json::json!({"cwe": ["CWE-95: Eval injection", "CWE-94"]});
         assert_eq!(from_semgrep_metadata(&list).as_deref(), Some("CWE-95"));
@@ -381,6 +455,38 @@ mod tests {
             (Some("CWE-79".into()), None)
         );
         assert_eq!(prefer_specific(None, "sql_injection"), (None, None));
+    }
+
+    #[test]
+    fn normalize_tag_reads_the_github_sarif_form_and_plain_shapes() {
+        assert_eq!(
+            normalize_tag("external/cwe/cwe-079").as_deref(),
+            Some("CWE-79")
+        );
+        assert_eq!(
+            normalize_tag("External/CWE/CWE-1321").as_deref(),
+            Some("CWE-1321")
+        );
+        assert_eq!(normalize_tag("CWE-89: SQLi").as_deref(), Some("CWE-89"));
+        for bad in [
+            "external/cwe/",
+            "external/cwe/cwe-79x",
+            "x/external/cwe/cwe-79",
+            "external/owasp/a03",
+            "security",
+        ] {
+            assert!(normalize_tag(bad).is_none(), "{bad:?}");
+        }
+        assert_eq!(tag_cwe("CWE-89: SQLi").as_deref(), Some("CWE-89"));
+        assert_eq!(tag_cwe("external/cwe/cwe-079").as_deref(), Some("CWE-79"));
+        for unmarked in ["89", "2021", "security", "OWASP-A03", "a CWE-79"] {
+            assert!(tag_cwe(unmarked).is_none(), "{unmarked:?}");
+        }
+        // Round trip with the exporter's tag.
+        assert_eq!(
+            normalize_tag(&sarif_tag("CWE-614").unwrap()).as_deref(),
+            Some("CWE-614")
+        );
     }
 
     #[test]

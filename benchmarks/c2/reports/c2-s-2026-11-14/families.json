@@ -1,0 +1,5 @@
+{
+ "claude-sonnet-5-5": "anthropic",
+ "gpt-6.1-sol": "openai",
+ "grok-4.7": "xai"
+}

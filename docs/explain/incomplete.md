@@ -2,7 +2,7 @@
 
 ## What it means
 
-`run_status: incomplete` means the scan left something undone. The `incomplete_reason` field names the highest-priority cause, such as a time budget, an unavailable model or a model refusal. Findings found so far stay in the report. An incomplete run can still exit 0, so do not read a passing exit code as a clean result.
+`run_status: incomplete` means the scan left something undone. The `incomplete_reason` field names the highest-priority cause, such as a time budget, the 20-run PoC counter, the per-scan fix-check cap, an unavailable model or a model refusal. Findings found so far stay in the report. An incomplete run can still exit 0, so do not read a passing exit code as a clean result.
 
 ## Why you see it
 
@@ -14,4 +14,4 @@ Read `incomplete_reason`, then run `vettalon explain <reason>`. Check `coverage`
 
 ## Related
 
-[scope_not_fully_reviewed](scope_not_fully_reviewed.md), [units_failed](units_failed.md), [time_budget_exhausted](time_budget_exhausted.md).
+[scope_not_fully_reviewed](scope_not_fully_reviewed.md), [units_failed](units_failed.md), [time_budget_exhausted](time_budget_exhausted.md), [poc_budget_exhausted](poc_budget_exhausted.md), [fix_check_cap_reached](fix_check_cap_reached.md).

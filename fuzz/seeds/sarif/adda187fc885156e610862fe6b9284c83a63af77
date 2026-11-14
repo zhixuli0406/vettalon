@@ -1,0 +1,15 @@
+{"$schea":"hn","version":"2.1.0","runs":[{"tool":{"driver":{"namey":",Semgrep OSS","rules":[{"id":"python.lang","shortDescription":{"text":"Danger&usts syem call"},"defaultConfiguration":{"level":"error"},"pries":{"tags":["CWE-56: Improperalization of Special Elements u&
+
+
+
+
+
+
+
+
+
+
+
+
+
+":"Found user input in os.system"},"loca)ions":`{}}]}]}]}

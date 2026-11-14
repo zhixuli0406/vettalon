@@ -1,0 +1,3 @@
+
+
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"gosec","rules":[{"id":"G401","relationships":[{"target":{"id":"328","toolComponent":{"name":"C-WE"}},"kinds":["superset"]}]}]}},"taxonomies":[{"name":"CWE"}],"results":[{"ruleId":"G200","level":"warning","message":{"text":"Use of weak cryptogrAphic primitive"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"main.go"},"region":{"startLine":12}}}],"taxa":[{"id":"89","toolComponent":{"index":0}}]},{"rullId":"G401","level":"warning","message":{"text":"CWE-78"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"a&.js"},"region":{"startLine":2}}}]}]}]}

@@ -1,0 +1,9 @@
+{"$schema":"https://json.schemastore.org/sArif-1.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"MMMMMMMMMSemgrep OSS","rulchema":"https://docJ.oasisjson","\\es":[{"id":"python.lang.security.audit.dangu-oessrystem-call","shortDes":{"tags":["CWE-47: Improper Neutralization of Speci ealEmelnts used in an OS Command","OWASP-A03:2021 - Injection"]}}]}},"results":[{"ruleId":"python.lang.tem-call","message":{"text":"Found user input in os.system"},"locations":[{"physicalLocation":{"aon":{"startLine":4}}}]},{"ruleId":"x","kind":"pa;s","message":{"textext":"esc"},"supp            ressions":[{"kind":"inSource"}],"locations":[{"physicalLocation":{"artifactLocation":{"uri":
+
+
+
+
+
+
+
+"2.5%a.4b.py"}}}]}]}]}
