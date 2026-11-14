@@ -1,0 +1,1 @@
+{"ves":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-injection","omponent":{"in44dex":0}}],"locations"

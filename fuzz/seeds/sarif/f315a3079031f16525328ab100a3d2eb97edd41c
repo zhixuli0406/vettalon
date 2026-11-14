@@ -1,0 +1,1 @@
+{"$schema":"https://docs.oasis-open.org/sarif/sarif/v2.1rif-schema-2.1.0.sson","version":"2.1.0","ruks":[{"tool":{"driver":{"name":"vettalon","rules":[{"id":"rule/x","shortDescription":{"t!!!!!tags":["security","external/cwe/cwe-327",																																										erties":{"vettal,n.status":"refuted"}}]}]}

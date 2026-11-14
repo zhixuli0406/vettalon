@@ -871,6 +871,12 @@ mod tests {
         let p = props(&f);
         assert_eq!(p["vettalon.fix_check"]["outcome"], "fix_unverified");
         assert_eq!(p["vettalon.fix_check"]["reason"], "not_checked");
+        // The three verdicts and the blocker are serialized, with the derived
+        // `regression` kept for older consumers.
+        for key in ["original", "variants", "benign", "regression", "tests"] {
+            assert_eq!(p["vettalon.fix_check"][key], "not_run", "{key}");
+        }
+        assert_eq!(p["vettalon.fix_check"]["blocker"], "none");
     }
 
     #[test]

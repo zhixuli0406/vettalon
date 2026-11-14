@@ -1,0 +1,3 @@
+{"version":"2.1.0","runs":[{"tool":[{"name":"codeql/python-queries","rules":[{"ishortDescripjtion":{"text":"SQL query built from usontrolled sources"},"properties":{"tags":["security","external/cwe/cwe-698"],"security-seseIds":{"%SRCROOT%":{"urFlows":[{"locations":[{"location":{"physicalLocacation":{"physrtLine"
+:
+4

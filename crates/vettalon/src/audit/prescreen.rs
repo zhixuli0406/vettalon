@@ -338,7 +338,7 @@ async fn score_one(
         Ok(Err(LlmError::UsageLimit(_))) => {
             (CallResult::Failed("provider_usage_limit".into()), sent, 0)
         }
-        Ok(Err(LlmError::Executor(e))) => (
+        Ok(Err(LlmError::Executor(e) | LlmError::BudgetRefused(e))) => (
             CallResult::Failed(crate::util::truncate_bytes(&e, 200).to_string()),
             sent,
             0,

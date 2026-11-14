@@ -1,0 +1,33 @@
+{"$schema":"https://json.schemastore.org/sarif-1.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep OSS","rules":[{"id":"python.lang.security.audit.dange[rous-system-call","shortDescription":{
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"text":"Dangerous systeÿÿÿÿÿÿÿ¬,"default
+
+
+
+
+"text":"Dange
+

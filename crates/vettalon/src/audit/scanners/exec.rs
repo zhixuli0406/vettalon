@@ -7,6 +7,10 @@
 //! exit-code and JSON contract together, retaining partial findings while
 //! recording errors; parseable or empty output alone never proves success.
 
+#[path = "exec_trust.rs"]
+mod trust;
+pub(crate) use trust::TrustedExecutable;
+
 use std::path::Path;
 #[cfg(not(windows))]
 use std::process::Stdio;
@@ -35,21 +39,23 @@ const GIT_NULL_CONFIG: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 /// including the ones Git starts inside nested repositories, so it hardens
 /// metadata that intake never validated. Older Git ignores it; the
 /// repository config is still validated and transports stay blocked.
+///
+/// The path-valued settings Git opens during plain reads point at the null
+/// device: a repository value naming a FIFO would block `log`, `diff` or
+/// `ls-files`, and on Windows a `//host/share` path would reach an SMB
+/// server. This also stops Git from reading the user's own
+/// `$XDG_CONFIG_HOME/git/{ignore,attributes}` defaults during a scan.
 pub(crate) const GIT_CONFIG_OVERRIDES: &[(&str, &str)] = &[
     ("core.fsmonitor", "false"),
     ("core.hooksPath", GIT_NULL_CONFIG),
     ("diff.ignoreSubmodules", "dirty"),
     ("submodule.recurse", "false"),
     ("log.showSignature", "false"),
-    // Paths Git opens during read-only commands (`log`, `diff`, `ls-files`).
-    // A repository value could name a FIFO (hangs the scan) or, on Windows,
-    // a `//host/share/…` path (leaks NTLM credentials). The null device
-    // reads as an empty file for each of them.
     ("core.excludesFile", GIT_NULL_CONFIG),
     ("core.attributesFile", GIT_NULL_CONFIG),
     ("mailmap.file", GIT_NULL_CONFIG),
-    ("diff.orderFile", GIT_NULL_CONFIG),
     ("log.mailmap", "false"),
+    ("diff.orderFile", GIT_NULL_CONFIG),
 ];
 
 /// Set on every bounded subprocess (scanners included: some invoke Git
@@ -106,6 +112,35 @@ fn apply_git_env(cmd: &mut tokio::process::Command) {
         }
     }
     cmd.envs(git_safe_env_pairs());
+}
+
+/// Attestation tools never inherit loader variables or unrelated secrets.
+/// Passwords are forwarded only for private-key operations. OpenSSL's empty
+/// OPENSSL_CONF disables system configuration; cosign uses a private HOME.
+#[derive(Clone, Copy)]
+pub(crate) enum AttestationEnv<'a> {
+    Cosign { private_key: bool, home: &'a Path },
+    Openssl { private_key: bool },
+}
+
+pub(crate) fn apply_attestation_env(cmd: &mut tokio::process::Command, env: AttestationEnv<'_>) {
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    let (private_key, password_name) = match env {
+        AttestationEnv::Cosign { private_key, home } => {
+            cmd.env("HOME", home);
+            (private_key, "COSIGN_PASSWORD")
+        }
+        AttestationEnv::Openssl { private_key } => {
+            cmd.env("OPENSSL_CONF", "");
+            (private_key, "VETTALON_PQ_KEY_PASSWORD")
+        }
+    };
+    if private_key && let Some(password) = std::env::var_os(password_name) {
+        cmd.env(password_name, password);
+    }
 }
 
 /// A direct Git command for test fixtures with every inherited `GIT_*`
@@ -187,10 +222,24 @@ pub struct RunOutcome {
     pub cleanup_error: Option<String>,
 }
 
-impl RunOutcome {
+/// [`RunOutcome`] with stdout kept as raw bytes (binary-safe), returned by
+/// [`run_capped_bytes`].
+#[derive(Debug, Clone)]
+pub struct RunBytesOutcome {
+    pub stdout: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_tail: String,
+    pub exit_code: Option<i32>,
+    pub duration: Duration,
+    pub timed_out: bool,
+    pub spawn_error: Option<String>,
+    pub cleanup_error: Option<String>,
+}
+
+impl RunBytesOutcome {
     fn spawn_failed(err: String, duration: Duration) -> Self {
-        RunOutcome {
-            stdout: String::new(),
+        RunBytesOutcome {
+            stdout: Vec::new(),
             stdout_truncated: false,
             stderr_tail: String::new(),
             exit_code: None,
@@ -198,6 +247,20 @@ impl RunOutcome {
             timed_out: false,
             spawn_error: Some(err),
             cleanup_error: None,
+        }
+    }
+
+    /// Decode stdout lossily, as [`run_capped`] reports it.
+    pub fn into_text(self) -> RunOutcome {
+        RunOutcome {
+            stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+            stdout_truncated: self.stdout_truncated,
+            stderr_tail: self.stderr_tail,
+            exit_code: self.exit_code,
+            duration: self.duration,
+            timed_out: self.timed_out,
+            spawn_error: self.spawn_error,
+            cleanup_error: self.cleanup_error,
         }
     }
 }
@@ -447,13 +510,60 @@ pub async fn run_capped(
     cwd: &Path,
     limits: &RunLimits,
 ) -> RunOutcome {
+    run_capped_bytes(program, args, cwd, limits, None)
+        .await
+        .into_text()
+}
+
+/// [`run_capped`] with stdout returned as raw bytes. `stdin`, when given, is
+/// an already written and rewound file connected directly as the child's
+/// stdin (no concurrent writer, so a child that stops reading cannot block
+/// the caller); otherwise stdin is null. Same ownership, timeout and cap.
+pub async fn run_capped_bytes(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    limits: &RunLimits,
+    stdin: Option<std::fs::File>,
+) -> RunBytesOutcome {
+    run_with_policy(program, args, cwd, limits, stdin, None).await
+}
+
+/// Revalidate the canonical executable and its saved identity immediately before
+/// spawn. Existing scanner callers retain their environment and stdin behavior.
+pub(crate) async fn run_attestation_subprocess(
+    program: &TrustedExecutable,
+    args: &[&str],
+    cwd: &Path,
+    limits: &RunLimits,
+    env: AttestationEnv<'_>,
+) -> RunBytesOutcome {
+    run_with_policy(
+        program.path(),
+        args,
+        cwd,
+        limits,
+        None,
+        Some((program, env)),
+    )
+    .await
+}
+
+async fn run_with_policy(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    limits: &RunLimits,
+    stdin: Option<std::fs::File>,
+    policy: Option<(&TrustedExecutable, AttestationEnv<'_>)>,
+) -> RunBytesOutcome {
     #[cfg(windows)]
     {
-        windows::run_capped(program, args, cwd, limits).await
+        windows::run_capped_bytes(program, args, cwd, limits, stdin, policy).await
     }
     #[cfg(not(windows))]
     {
-        run_capped_direct(program, args, cwd, limits).await
+        run_capped_direct(program, args, cwd, limits, stdin, policy).await
     }
 }
 
@@ -463,12 +573,14 @@ async fn run_capped_direct(
     args: &[&str],
     cwd: &Path,
     limits: &RunLimits,
-) -> RunOutcome {
+    stdin: Option<std::fs::File>,
+    policy: Option<(&TrustedExecutable, AttestationEnv<'_>)>,
+) -> RunBytesOutcome {
     let start = Instant::now();
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin.map_or_else(Stdio::null, Stdio::from))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Unix cleanup must verify ownership before signalling. In particular,
@@ -476,14 +588,22 @@ async fn run_capped_direct(
         .kill_on_drop(cfg!(not(unix)));
     cmd.env("PATH", crate::util::trusted_path_for_scan(cwd));
     apply_git_env(&mut cmd);
+    if let Some((_, env)) = policy {
+        apply_attestation_env(&mut cmd, env);
+    }
 
     #[cfg(unix)]
     cmd.process_group(0);
     // Non-Unix retains the existing direct-child path. Tree enforcement there
     // is explicitly pending a Job Object implementation and live acceptance.
+    if let Some((tool, _)) = policy
+        && let Err(error) = tool.recheck()
+    {
+        return RunBytesOutcome::spawn_failed(error, start.elapsed());
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return RunOutcome::spawn_failed(e.to_string(), start.elapsed()),
+        Err(e) => return RunBytesOutcome::spawn_failed(e.to_string(), start.elapsed()),
     };
 
     // Declared after child, so cancellation/early returns drop the group guard
@@ -491,12 +611,12 @@ async fn run_capped_direct(
     #[cfg(unix)]
     let mut group = match OwnedGroup::new(&child) {
         Ok(group) => group,
-        Err(error) => return RunOutcome::spawn_failed(error.to_string(), start.elapsed()),
+        Err(error) => return RunBytesOutcome::spawn_failed(error.to_string(), start.elapsed()),
     };
     let mut stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            return RunOutcome::spawn_failed(
+            return RunBytesOutcome::spawn_failed(
                 "child had no stdout pipe".to_string(),
                 start.elapsed(),
             );
@@ -505,7 +625,7 @@ async fn run_capped_direct(
     let mut stderr = match child.stderr.take() {
         Some(s) => s,
         None => {
-            return RunOutcome::spawn_failed(
+            return RunBytesOutcome::spawn_failed(
                 "child had no stderr pipe".to_string(),
                 start.elapsed(),
             );
@@ -595,8 +715,8 @@ async fn run_capped_direct(
     };
     let stdout_truncated = stdout_buf.len() > max;
     stdout_buf.truncate(max);
-    RunOutcome {
-        stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+    RunBytesOutcome {
+        stdout: stdout_buf,
         stdout_truncated,
         stderr_tail: String::from_utf8_lossy(&stderr_buf).into_owned(),
         exit_code: status.and_then(|s| s.code()),
@@ -909,6 +1029,20 @@ mod tests {
             let pair = (name.to_owned(), value.to_owned());
             assert!(expected.contains(&pair), "{pair:?}");
         }
+        // Path-valued settings Git opens during reads go to the null device.
+        for key in [
+            "core.hooksPath",
+            "core.excludesFile",
+            "core.attributesFile",
+            "mailmap.file",
+            "diff.orderFile",
+        ] {
+            assert!(
+                GIT_CONFIG_OVERRIDES.contains(&(key, GIT_NULL_CONFIG)),
+                "{key}"
+            );
+        }
+        assert!(GIT_CONFIG_OVERRIDES.contains(&("log.mailmap", "false")));
     }
 
     #[tokio::test]

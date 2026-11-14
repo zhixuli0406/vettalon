@@ -1,0 +1,1 @@
+{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep OSS","runjection"]}}]}},"results":[{"ruleId":"python.lang.security.audit.dangerotyusss-em-call","message":{"text":"Found user anput in os.system"},"locations":[{"physicalLocation":{"artifactLocaysicalLocation":{"artifactLocation":{"uri":"../a%46b.py"}}}]}]}]}

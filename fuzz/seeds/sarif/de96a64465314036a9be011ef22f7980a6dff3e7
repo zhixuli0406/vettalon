@@ -1,0 +1,1 @@
+{"$schema":"https://docs.oasis-open.org/sarif/sarif/ema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"vettalon","ru]les":[{"id":"rule/x","shortDescription":{"text":"rule/x"},"defaultConfiguration":{"level":"eeeeeeeeeeem-call","messagttalon.severity":"high"}}],"supportedTaxonomies":[{"name":"CWE","%ndex":0}]}},                 

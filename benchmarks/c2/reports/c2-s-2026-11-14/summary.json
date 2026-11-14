@@ -1,0 +1,23 @@
+{
+ "calls": 1100,
+ "cost_usd": 23.330076,
+ "date": "2026-11-14",
+ "excluded_rows": {},
+ "items": 120,
+ "ledger_spent_usd": 28.649908,
+ "rows": 360,
+ "rows_exported": 360,
+ "schema": "vettalon.c2-export/1",
+ "status_by_judge": {
+  "claude-sonnet-5-5": {
+   "ok": 120
+  },
+  "gpt-6.1-sol": {
+   "ok": 120
+  },
+  "grok-4.7": {
+   "ok": 120
+  }
+ },
+ "zero_llm_rows": 0
+}

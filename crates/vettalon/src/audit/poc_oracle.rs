@@ -38,13 +38,14 @@
 //! - command injection (CWE-78/77): injected shell copies a secret file;
 //! - path traversal / file read (CWE-22/73): `../` escapes an allowed root and
 //!   returns a secret file's content;
-//! - SQL injection (CWE-89): a `UNION`/tautology payload surfaces a secret row.
+//! - SQL injection (CWE-89): a `UNION`/tautology payload surfaces a secret row;
+//! - SSRF (CWE-918), Node target mode only: an HTTP request line or TLS
+//!   ClientHello reaches the protected runner's in-container loopback listener.
+//!   External networking remains disabled. Python targets and scan-time SSRF
+//!   oracles stay unsupported; [`classify_target`] enables the Node path.
 //!
 //! **Unsupported** (stay `PocTranscript` / `needs_human`, no oracle):
-//! - SSRF (CWE-918): would need an in-sandbox listener on loopback, but the
-//!   sandbox runs `--network=none` with `--cap-drop=ALL`, so the loopback
-//!   interface cannot be brought up and no external network may be enabled —
-//!   so no oracle is possible here without weakening isolation.
+//! - SSRF at scan time and for Python targets;
 //! - every other class (XSS, deserialization, code injection, …): no feasible
 //!   in-sandbox effect oracle, so [`classify`] returns `None` and the caller
 //!   keeps the existing transcript path.
@@ -75,6 +76,7 @@ pub enum OracleClass {
     CommandInjection,
     PathTraversal,
     Sqli,
+    Ssrf,
 }
 
 impl OracleClass {
@@ -83,6 +85,7 @@ impl OracleClass {
             OracleClass::CommandInjection => "command injection",
             OracleClass::PathTraversal => "path traversal / file read",
             OracleClass::Sqli => "SQL injection",
+            OracleClass::Ssrf => "server-side request forgery",
         }
     }
 }
@@ -106,11 +109,60 @@ pub fn classify(finding: &Finding) -> Option<OracleClass> {
         "CWE-78" | "CWE-77" => OracleClass::CommandInjection,
         "CWE-22" | "CWE-73" => OracleClass::PathTraversal,
         "CWE-89" => OracleClass::Sqli,
-        // SSRF (CWE-918), XSS (CWE-79), deserialization (CWE-502), code
+        // Scan-time SSRF (CWE-918), XSS (CWE-79), deserialization (CWE-502), code
         // injection (CWE-94/95) and everything else have no feasible oracle in
         // a `--network=none`, no-capabilities sandbox → keep the transcript path.
         _ => return None,
     })
+}
+
+/// Target-mode classification. SSRF requires the protected Node listener;
+/// scan-time classification remains unchanged.
+pub fn classify_target(
+    finding: &Finding,
+    runtime: super::target_poc::Runtime,
+) -> Option<OracleClass> {
+    classify(finding).or_else(|| {
+        if runtime != super::target_poc::Runtime::Node {
+            return None;
+        }
+        let id = finding
+            .cwe
+            .as_deref()
+            .and_then(super::cwe::normalize)
+            .or_else(|| {
+                let kind = finding
+                    .rule_id
+                    .strip_prefix("ai-audit/")
+                    .unwrap_or(&finding.rule_id);
+                crate::kb::for_kind(kind).map(|entry| entry.id.clone())
+            })?;
+        (id == "CWE-918").then_some(OracleClass::Ssrf)
+    })
+}
+
+/// Target-mode classification when only the finding's file identifies the runtime.
+pub(crate) fn classify_finding_target(finding: &Finding) -> Option<OracleClass> {
+    super::target_poc::Runtime::for_file(&finding.file)
+        .ok()
+        .and_then(|runtime| classify_target(finding, runtime))
+}
+
+/// Classes usable for target receipts in the selected runtime.
+pub(crate) fn oracle_classes(runtime: super::target_poc::Runtime) -> &'static [OracleClass] {
+    match runtime {
+        super::target_poc::Runtime::Python => &[
+            OracleClass::CommandInjection,
+            OracleClass::PathTraversal,
+            OracleClass::Sqli,
+        ],
+        super::target_poc::Runtime::Node => &[
+            OracleClass::CommandInjection,
+            OracleClass::PathTraversal,
+            OracleClass::Sqli,
+            OracleClass::Ssrf,
+        ],
+    }
 }
 
 /// A target or rerun phase's one-time secrets. Distinct prefixes guarantee
@@ -232,13 +284,14 @@ fn oracle_runner_output(code: i64, output: String) -> Result<String, String> {
 /// Entry point from [`super::poc::maybe_run_poc`] for a supported class. Owns
 /// the model call, the anti-cheat gate, Docker detection and evidence
 /// emission. Mutates the finding's evidence in place; never changes status.
+/// Returns true only when the run-wide execution counter refused a run.
 pub async fn run_for_finding<C: LlmCaller>(
     finding: &mut Finding,
     caller: &C,
     excerpt: &str,
     class: OracleClass,
     budget: &PocBudget,
-) {
+) -> bool {
     let prompt = build_oracle_prompt(finding, class, excerpt);
     let raw = match caller.complete(&prompt).await {
         Ok(r) => r,
@@ -248,7 +301,7 @@ pub async fn run_for_finding<C: LlmCaller>(
                 "poc_generation_failed",
                 &format!("oracle llm call failed: {e}"),
             );
-            return;
+            return false;
         }
     };
     let (language, sink, note) = match parse_poc_response(&raw) {
@@ -259,12 +312,12 @@ pub async fn run_for_finding<C: LlmCaller>(
                 "poc_generation_failed",
                 &format!("unparseable oracle response: {e}"),
             );
-            return;
+            return false;
         }
     };
     if language == "none" || sink.trim().is_empty() {
         push_skip(finding, "poc_not_demonstrable", &note);
-        return;
+        return false;
     }
     if language != "python" {
         // Oracle sinks are python-only (the runner imports `sink.run`).
@@ -273,7 +326,7 @@ pub async fn run_for_finding<C: LlmCaller>(
             "poc_not_demonstrable",
             &format!("oracle requires a python sink, got {language:?}"),
         );
-        return;
+        return false;
     }
 
     // Docker detection is cheap and non-executing; an anti-cheat rejection is
@@ -287,13 +340,20 @@ pub async fn run_for_finding<C: LlmCaller>(
             } else {
                 push_skip(finding, "poc_skipped", &format!("sandbox unavailable: {e}"));
             }
-            return;
+            return false;
         }
     };
     let sandbox = DockerOracleSandbox { sb, budget };
     match run_oracle(class, &sink, &sandbox).await {
-        Ok(run) => record_run(finding, class, &sink, &run),
-        Err(e) => push_skip(finding, "poc_skipped", &e),
+        Ok(run) => {
+            record_run(finding, class, &sink, &run);
+            false
+        }
+        Err(e) => {
+            let breaker = e.contains("run-wide PoC execution budget");
+            push_skip(finding, "poc_skipped", &e);
+            breaker
+        }
     }
 }
 
@@ -404,13 +464,15 @@ fn contains_secret(sink: &str, s: &OracleSecrets) -> bool {
 }
 
 /// Parse the harness verdict line bound to `marker`. `None` if absent,
-/// malformed or present more than once (no verdict). Sink output never
-/// reaches the runner's stdout directly, and a line that does get there by
-/// another route (for example `/proc/<pid>/fd/1`) sits next to the runner's
-/// own line, so a second `effect=` for the marker means a forgery attempt.
-/// Same rule as `target_poc::parse_verdict`.
+/// malformed, or if more than one line carries the marker, whatever fields
+/// the extra line holds (no verdict). Sink output never reaches the runner's
+/// stdout directly, and a line that does get there by another route (for
+/// example `/proc/<pid>/fd/1`) sits next to the runner's own line, so a
+/// second marked line means a forgery attempt. Same rule as
+/// `target_poc::parse_verdict`.
 pub fn parse_effect(output: &str, marker: &str) -> Option<bool> {
     let mut effect = None;
+    let mut marked = 0usize;
     for line in output.lines() {
         let line = line.trim();
         let Some(rest) = line.strip_prefix("__VTL_ORACLE__ ") else {
@@ -419,6 +481,10 @@ pub fn parse_effect(output: &str, marker: &str) -> Option<bool> {
         let mut parts = rest.split_whitespace();
         if parts.next() != Some(marker) {
             continue;
+        }
+        marked += 1;
+        if marked > 1 {
+            return None;
         }
         for p in parts {
             if let Some(v) = p.strip_prefix("effect=") {
@@ -441,11 +507,15 @@ pub fn parse_effect(output: &str, marker: &str) -> Option<bool> {
 /// Over-blocking is acceptable: an honest sink for these classes needs none of
 /// the banned constructs.
 pub fn anti_cheat_static(class: OracleClass, src: &str) -> Option<String> {
+    if class == OracleClass::Ssrf {
+        return Some("unsupported_oracle_class".into());
+    }
     let low = src.to_ascii_lowercase();
     if let Some(reason) = anti_cheat_common(&low, src) {
         return Some(reason);
     }
     match class {
+        OracleClass::Ssrf => return Some("unsupported_oracle_class".into()),
         // A shell/sql sink needs no file handle at all; any open() is a forgery route.
         OracleClass::CommandInjection | OracleClass::Sqli => {
             if low.contains("open(") {
@@ -470,6 +540,7 @@ pub fn anti_cheat_static(class: OracleClass, src: &str) -> Option<String> {
         }
         OracleClass::PathTraversal => low.contains("open("),
         OracleClass::Sqli => low.contains("execute("),
+        OracleClass::Ssrf => false,
     };
     if !sink_called {
         return Some("missing_sink_call".to_string());
@@ -644,22 +715,24 @@ fn open_has_write_mode(low: &str) -> bool {
 /// is the HARNESS — it is not subject to the anti-cheat checks.
 fn build_runner(class: OracleClass, s: &OracleSecrets, phase: Phase) -> String {
     let payload = match phase {
-        // The oracle path uses the first fixture input; every class currently
-        // has exactly one (see `fixture_inputs`).
+        // Scan-time PoC and reproduce use only the base input. Fix check runs
+        // `variants::variant_set`, whose first input is this same string.
         Phase::Malicious => fixture_inputs(class)[0],
         Phase::Benign => benign_input(class),
     };
     runner_source(class, s, payload, RunnerKind::Scan)
 }
 
-/// The harness's attacking fixture inputs for a class. The fix check (O19)
-/// requires every one of them to be blocked; the oracle path runs the first.
-/// Each class has exactly one today.
+/// The base attacking fixture for a class. Scan-time PoC, `vettalon reproduce`
+/// and `--emit-test` run this string only. Fix check runs
+/// [`super::variants::variant_set`], whose first input is this one, then the
+/// other scoring inputs and the decoding inputs.
 pub(super) fn fixture_inputs(class: OracleClass) -> &'static [&'static str] {
     match class {
         OracleClass::CommandInjection => &["vtlbenign; cat /tmp/vtl_secret > /tmp/vtl_out"],
         OracleClass::PathTraversal => &["../vtl_secret"],
         OracleClass::Sqli => &["' UNION SELECT token FROM vtl_secret --"],
+        OracleClass::Ssrf => &["http://127.0.0.1/vtl_ssrf"],
     }
 }
 
@@ -669,6 +742,7 @@ pub(super) fn benign_input(class: OracleClass) -> &'static str {
         OracleClass::CommandInjection => "vtlbenign",
         OracleClass::PathTraversal => "safe.txt",
         OracleClass::Sqli => "apple",
+        OracleClass::Ssrf => "https://example.com/vtl_benign",
     }
 }
 
@@ -698,6 +772,76 @@ pub(super) fn target_runner(class: OracleClass, secrets: &OracleSecrets, payload
     runner_source(class, secrets, payload, RunnerKind::Target)
 }
 
+/// Independent canary corroboration for the emitted Node test. Reuse the
+/// parent's evidence checks, but execute the standalone child with real drivers.
+/// This is never sufficient to certify red without the emitted test's TAP result.
+pub(super) fn node_regression_runner(
+    class: OracleClass,
+    secrets: &OracleSecrets,
+    payload: &str,
+) -> String {
+    if class == OracleClass::Ssrf {
+        return format!(
+            "{NODE_RUNNER_SETUP}{RUNNER_REPORTING}{RUNNER_UNSUPPORTED}reap()\nemit(fields)\n"
+        );
+    }
+    let invoke = RUNNER_INVOKE
+        .replace(
+            "[sys.executable, '-I', '-B'] + CHILD + [payload_hex, result_path]",
+            "['/usr/local/bin/node', '--input-type=module', '-e', JS_CHILD, 'vettalon-child', payload_hex, result_path]",
+        )
+        .replace(
+            "    for key in ('VTL_BASE', 'VTL_DB'):",
+            "    child_env.update(FIXTURE.get('env', {}))\n    child_env['VETTALON_REPO_ROOT'] = '/workspace/tree'\n    for key in ('VTL_BASE', 'VTL_DB'):",
+        );
+    let mut runner = target_runner(class, secrets, payload)
+        .replacen(RUNNER_SETUP, NODE_RUNNER_SETUP, 1)
+        .replace("CHILD = ['/workspace/sink.py']\n", "")
+        .replace(RUNNER_INVOKE, &invoke);
+    if class == OracleClass::Sqli {
+        runner = runner.replacen(
+            "con = sqlite3.connect(DB)\n",
+            "con = sqlite3.connect(DB)\nif FIXTURE.get('sql_setup'):\n    con.executescript(FIXTURE['sql_setup'])\n",
+            1,
+        );
+    }
+    runner
+}
+
+/// The host's selected SQL dialect, never inferred from hook events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // D8/D9 supply the plan's driver selection.
+pub(crate) enum NodeSqlDriver {
+    Sqlite3,
+    Pg,
+    Mysql2,
+}
+
+#[allow(dead_code)] // D9 dispatches Node execution.
+pub(crate) fn node_target_runner(
+    class: OracleClass,
+    secrets: &OracleSecrets,
+    payload: &str,
+    _driver: Option<NodeSqlDriver>,
+) -> String {
+    // Executability is enforced by the host's plan_driver gate.
+    runner_source(class, secrets, payload, RunnerKind::NodeTarget)
+}
+
+/// Ordered malicious, benign and replay runners, shared with receipt hashing.
+pub(crate) fn node_target_runners(
+    class: OracleClass,
+    secrets: &OracleSecrets,
+    driver: Option<NodeSqlDriver>,
+) -> [String; 3] {
+    [
+        fixture_inputs(class)[0],
+        benign_input(class),
+        fixture_inputs(class)[0],
+    ]
+    .map(|payload| node_target_runner(class, secrets, payload, driver))
+}
+
 /// Which harness a runner is generated for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunnerKind {
@@ -709,6 +853,8 @@ enum RunnerKind {
     /// Typed target adapter: `sink.py` is a script taking
     /// `<payload_hex> <result_path>`.
     Target,
+    /// Node adapter; executable is a host-side plan decision.
+    NodeTarget,
 }
 
 /// The fixed program the sink child runs for a `run()`-module sink (scan
@@ -816,14 +962,59 @@ def setup():
 MARKER = setup()
 "#;
 
+/// Node alone consumes a bounded, length-prefixed stdin envelope. Protect the
+/// parent before reading secrets; never put them in argv, os.environ or files.
+pub(super) const NODE_RUNNER_SETUP: &str = r#"import sys, os, traceback, subprocess, json, stat, signal, ctypes
+HARD_LIMIT_SECS = 110
+def hard_stop(signum, frame):
+    os._exit(128 + signum)
+def read_frame(cap):
+    header = sys.stdin.buffer.readline(12)
+    if not header.endswith(b'\n') or not header[:-1].isdigit():
+        raise ValueError('invalid envelope')
+    size = int(header)
+    if size > cap:
+        raise ValueError('invalid envelope')
+    data = sys.stdin.buffer.read(size)
+    if len(data) != size:
+        raise ValueError('invalid envelope')
+    return data
+def setup():
+    try:
+        for signum in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(signum, hard_stop)
+        signal.alarm(HARD_LIMIT_SECS)
+        libc = ctypes.CDLL(None, use_errno=True)
+        if not (os.getpid() == 1 and libc.prctl(4, 0, 0, 0, 0) == 0 and libc.prctl(3, 0, 0, 0, 0) == 0):
+            raise ValueError('unprotected runner')
+        marker = read_frame(64).decode('ascii')
+        if not (marker.startswith('vtlm') and 8 <= len(marker) <= 64 and marker.isalnum()):
+            raise ValueError('invalid marker')
+        raw = read_frame(65536)
+        if sys.stdin.buffer.read(1):
+            raise ValueError('trailing input')
+        fixture = json.loads(raw.decode('utf-8')) if raw else {}
+        if not isinstance(fixture, dict):
+            raise ValueError('invalid fixture')
+        # Canonical fixture bytes have already passed the host's closed schema
+        # and environment allow policy. They stay in protected parent memory.
+        return marker, fixture
+    except Exception:
+        sys.stderr.write('vettalon harness: invalid Node envelope or unprotected runner; no verdict\n')
+        sys.stderr.flush()
+        os._exit(3)
+MARKER, FIXTURE = setup()
+"#;
+
 /// Verdict reporting and helpers shared by every runner. All fields go out
 /// in ONE `emit` call at the very end (one short write), and `emit` starts
 /// the line with a newline, so bytes another process pushed into the same
 /// stdout pipe without a trailing newline cannot swallow the line's prefix.
 /// `failed()` records a harness-side failure (`error=true` in the fix and
 /// typed runners); `STATE['raised']` records a Python exception reported by
-/// the sink child.
-const RUNNER_REPORTING: &str = r#"STATE = {'error': False, 'raised': False}
+/// the sink child; `STATE['timeout']` records that the sink child hit its
+/// 30 s limit (`timeout=true`, always with `error=true`).
+const RUNNER_REPORTING: &str = r#"STATE = {'error': False, 'raised': False, 'timeout': False}
 def emit(fields):
     sys.stdout.write('\n__VTL_ORACLE__ ' + MARKER + ' ' + ' '.join(fields) + '\n')
     sys.stdout.flush()
@@ -882,25 +1073,31 @@ def intact_file(path, expected):
         return False
     finally:
         os.close(fd)
-def file_ids(paths):
+def file_ids(paths, with_ctime=True):
     # Identity of each evidence path, recorded before the sink child starts
     # and compared after it is gone. A rename or replace changes the inode
     # or ctime, a chmod changes the mode and ctime, a write changes ctime;
-    # plain reads change none of them. None if a path is missing.
+    # plain reads change none of them. Without ctime only a rename, replace
+    # or a change of file type or mode still left in place shows. None if a
+    # path is missing.
     ids = []
     for path in paths:
         try:
             info = os.lstat(path)
         except OSError:
             return None
-        ids.append((info.st_dev, info.st_ino, info.st_mode, info.st_ctime_ns))
+        if with_ctime:
+            ids.append((info.st_dev, info.st_ino, info.st_mode, info.st_ctime_ns))
+        else:
+            ids.append((info.st_dev, info.st_ino, info.st_mode))
     return ids
 "#;
 
 /// Runs the sink in a child process (`CHILD` is the child's program) and
 /// returns its result string. A `{"raised": …}` record sets
 /// `STATE['raised']` and returns `''`; any other failure returns `''` after
-/// `failed()`. The child gets stdin/stdout/stderr on /dev/null, a fixed
+/// `failed()`, and a child that ran out of time also sets `STATE['timeout']`.
+/// The child gets stdin/stdout/stderr on /dev/null, a fixed
 /// minimal environment and 30 s; `reap()` then kills anything it left.
 const RUNNER_INVOKE: &str = r#"def invoke(payload):
     result_path = '/tmp/vtl_target_result'
@@ -936,6 +1133,10 @@ const RUNNER_INVOKE: &str = r#"def invoke(payload):
             sys.stderr.write('sink raised ' + ascii(record['raised'])[:100] + '\n')
             return ''
         raise RuntimeError('invalid target result')
+    except subprocess.TimeoutExpired:
+        STATE['timeout'] = True
+        failed()
+        return ''
     except Exception:
         failed()
         return ''
@@ -944,6 +1145,430 @@ const RUNNER_INVOKE: &str = r#"def invoke(payload):
             os.remove(result_path)
         except OSError:
             pass
+"#;
+
+/// In-process diagnostics are untrusted and can only restrict the effect rule.
+/// Empty, truncated or saturated logs cannot establish complete instrumentation.
+const RUNNER_REACH_NODE: &str = r#"REACHED = 'unknown'
+REACH = {'reach_source': 'in_process_hook', 'events_total': 0, 'first_match': None}
+MISSING = False
+def unique_object(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError('duplicate event key')
+        obj[key] = value
+    return obj
+def evaluate_reach(fd, payload):
+    unknown = ('unknown', {'reach_source': 'in_process_hook', 'events_total': 0, 'first_match': None})
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 0 or info.st_size > 65536:
+            return unknown
+        data = os.pread(fd, 65537, 0)
+        # A next event up to 4 KiB may have stopped the hook without a footer.
+        if not data or len(data) > 65536 - 4096 or not data.endswith(b'\n'):
+            return unknown
+        lines = data.splitlines(keepends=True)
+        if len(lines) >= 256:
+            return unknown
+        summary = {'reach_source': 'in_process_hook', 'events_total': len(lines), 'first_match': None}
+        process_apis = {'child_process.' + name for name in ('exec', 'execSync', 'execFile', 'execFileSync', 'spawn', 'spawnSync', 'fork')}
+        read_apis = {'fs.' + name for name in ('readFile', 'readFileSync', 'createReadStream', 'open', 'openSync', 'promises.readFile', 'promises.open')}
+        common = {'v', 'seq', 'class', 'api', 'truncated'}
+        for seq, line in enumerate(lines, 1):
+            if len(line) > 4096 or not line.endswith(b'\n'):
+                return unknown
+            event = json.loads(line.decode('utf-8'), object_pairs_hook=unique_object,
+                               parse_constant=lambda value: (_ for _ in ()).throw(ValueError('non-JSON number')))
+            if not isinstance(event, dict) or type(event.get('v')) is not int or event['v'] != 1:
+                return unknown
+            if type(event.get('seq')) is not int or event['seq'] != seq:
+                return unknown
+            if 'truncated' in event and event['truncated'] is not False:
+                return unknown
+            cls, api = event.get('class'), event.get('api')
+            if not isinstance(api, str):
+                return unknown
+            candidates = []
+            if cls == 'CWE-78':
+                if set(event) - common - {'file', 'argv', 'shell'} or api not in process_apis:
+                    return unknown
+                if not isinstance(event.get('file'), str) or not isinstance(event.get('argv'), list):
+                    return unknown
+                if not all(isinstance(arg, str) for arg in event['argv']) or type(event.get('shell')) not in (bool, str):
+                    return unknown
+                candidates = [('file', event['file'])] + [('argv', arg) for arg in event['argv']]
+            elif cls == 'CWE-22':
+                if set(event) - common - {'raw', 'path', 'inside_base'} or api not in read_apis:
+                    return unknown
+                if 'path' not in event or (event['path'] is not None and not isinstance(event['path'], str)) or type(event.get('inside_base')) is not bool:
+                    return unknown
+                candidates = [('path', event['path'])]
+            elif cls == 'CWE-89':
+                if set(event) - common - {'driver', 'query', 'params', 'executable', 'filename', 'requested_api'}:
+                    return unknown
+                if event.get('driver') not in ('sqlite3', 'pg', 'mysql2') or api not in ('Database', 'prepare', 'all', 'get', 'run', 'each', 'exec', 'query', 'execute', 'api_unsupported'):
+                    return unknown
+                if not isinstance(event.get('query'), str) or not isinstance(event.get('params'), list) or type(event.get('executable')) is not bool:
+                    return unknown
+                if not all(type(arg) in (str, int, float, bool, type(None)) for arg in event['params']):
+                    return unknown
+                if api not in ('Database', 'api_unsupported'):
+                    candidates = [('query', event['query'])] + [('params', arg) for arg in event['params'] if isinstance(arg, str)]
+            else:
+                return unknown
+            if cls != NODE_CLASS:
+                continue
+            for field, text in candidates:
+                matched = text == NODE_PROBE if cls == 'CWE-22' else isinstance(text, str) and NODE_PROBE in text
+                if matched and summary['first_match'] is None:
+                    # Bounded display only, never a claim that this event is authentic.
+                    first = {'api': api, 'field': field,
+                             'display': text.encode('utf-8', 'replace')[:256].decode('utf-8', 'ignore'),
+                             'payload_in_text': payload in event['query'] if cls == 'CWE-89' else None}
+                    summary['first_match'] = first
+        return ('true' if summary['first_match'] is not None else 'false', summary)
+    except Exception:
+        return unknown
+"#;
+
+/// Same protected parent and effect evidence as Python; only the child changes.
+const RUNNER_INVOKE_NODE: &str = r#"def invoke(payload):
+    global REACHED, REACH, MISSING
+    result_path = '/tmp/vtl_target_result'
+    event_path = '/tmp/vtl_events'
+    read_fd = write_fd = None
+    try:
+        try:
+            os.remove(result_path)
+        except FileNotFoundError:
+            pass
+        child_env = {'HOME': '/tmp', 'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8'}
+        child_env.update(FIXTURE.get('env', {}))
+        for key in ('VTL_BASE', 'VTL_DB'):
+            if key in os.environ:
+                child_env[key] = os.environ[key]
+        write_fd = os.open(event_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        read_fd = os.open(event_path, os.O_RDONLY | os.O_NOFOLLOW)
+        os.unlink(event_path)
+        child_env['VTL_EVENT_FD'] = str(write_fd)
+        payload_hex = json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('utf-8').hex()
+        try:
+            child = subprocess.run(
+                ['/usr/local/bin/node', '--require', '/workspace/vtl_hook.cjs', '--no-addons', '--max-old-space-size=320', '--disable-warning=ExperimentalWarning', '/workspace/sink.mjs', payload_hex, result_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=child_env,
+                pass_fds=(write_fd,),
+                timeout=30,
+                check=False,
+            )
+        finally:
+            reap()
+        if child.returncode != 0:
+            raise RuntimeError('sink child exited with code ' + str(child.returncode))
+        REACHED, REACH = evaluate_reach(read_fd, payload)
+        record = read_result(result_path)
+        if set(record) == {'result'} and isinstance(record['result'], str):
+            return record['result']
+        if set(record) == {'raised'} and isinstance(record['raised'], str):
+            STATE['raised'] = True
+            return ''
+        if record == {'missing': 'export'}:
+            MISSING = True
+            return ''
+        raise RuntimeError('invalid target result')
+    except subprocess.TimeoutExpired:
+        STATE['timeout'] = True
+        failed()
+        return ''
+    except Exception:
+        failed()
+        return ''
+    finally:
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                os.close(fd)
+        try:
+            os.remove(result_path)
+        except OSError:
+            pass
+"#;
+
+// Unsupported runner kinds fail without a marked verdict or a Rust panic.
+const RUNNER_UNSUPPORTED: &str = "import os, sys\nsys.stderr.write('vettalon harness: unsupported_oracle_class; no verdict\\n')\nsys.stderr.flush()\nos._exit(3)\n";
+
+/// SSRF-only event validation; existing reach templates remain immutable.
+const RUNNER_REACH_NODE_NET: &str = r#"REACHED = 'unknown'
+REACH = {'reach_source': 'in_process_hook', 'events_total': 0, 'first_match': None}
+MISSING = False
+def unique_object(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError('duplicate event key')
+        obj[key] = value
+    return obj
+def evaluate_reach(fd, payload):
+    unknown = ('unknown', {'reach_source': 'in_process_hook', 'events_total': 0, 'first_match': None})
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 0 or info.st_size > 65536:
+            return unknown
+        data = os.pread(fd, 65537, 0)
+        # A next event up to 4 KiB may have stopped the hook without a footer.
+        if not data or len(data) > 65536 - 4096 or not data.endswith(b'\n'):
+            return unknown
+        lines = data.splitlines(keepends=True)
+        if len(lines) >= 256:
+            return unknown
+        summary = {'reach_source': 'in_process_hook', 'events_total': len(lines), 'first_match': None}
+        net_apis = {'http.request', 'http.get', 'https.request', 'https.get', 'fetch'}
+        common = {'v', 'seq', 'class', 'api', 'truncated'}
+        for seq, line in enumerate(lines, 1):
+            if len(line) > 4096 or not line.endswith(b'\n'):
+                return unknown
+            event = json.loads(line.decode('utf-8'), object_pairs_hook=unique_object,
+                               parse_constant=lambda value: (_ for _ in ()).throw(ValueError('non-JSON number')))
+            if not isinstance(event, dict) or type(event.get('v')) is not int or event['v'] != 1:
+                return unknown
+            if type(event.get('seq')) is not int or event['seq'] != seq:
+                return unknown
+            if 'truncated' in event and event['truncated'] is not False:
+                return unknown
+            cls, api = event.get('class'), event.get('api')
+            if not isinstance(api, str):
+                return unknown
+            candidates = []
+            if cls != 'CWE-918' or api not in net_apis:
+                return unknown
+            if set(event) != common | {'url', 'href', 'method'} or event['truncated'] is not False:
+                return unknown
+            if not isinstance(event['url'], str) or len(event['url'].encode('utf-8')) > 2048:
+                return unknown
+            if event['href'] is not None and (not isinstance(event['href'], str) or len(event['href'].encode('utf-8')) > 2048):
+                return unknown
+            if event['method'] is not None and (not isinstance(event['method'], str) or len(event['method'].encode('utf-8')) > 16):
+                return unknown
+            candidates = [('url', event['url']), ('href', event['href'])]
+            if cls != NODE_CLASS:
+                continue
+            for field, text in candidates:
+                matched = isinstance(text, str) and NODE_PROBE in text
+                if matched and summary['first_match'] is None:
+                    # Bounded display only, never a claim that this event is authentic.
+                    first = {'api': api, 'field': field,
+                             'display': text.encode('utf-8', 'replace')[:256].decode('utf-8', 'ignore'),
+                             'payload_in_text': None}
+                    summary['first_match'] = first
+        return ('true' if summary['first_match'] is not None else 'false', summary)
+    except Exception:
+        return unknown
+"#;
+
+/// SSRF-only child channel with a separate unlinked network event file.
+const RUNNER_INVOKE_NODE_NET: &str = r#"import re
+BENIGN_ATTEMPT = {'ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL', 'EAI_NODATA', 'ENETUNREACH'}
+NET_FAILURE = BENIGN_ATTEMPT | {'EHOSTUNREACH', 'ECONNREFUSED', 'ECONNRESET', 'EADDRNOTAVAIL', 'ETIMEDOUT', 'EPIPE', 'EPROTO', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'}
+NET_CODE = None
+def invoke(payload):
+    global REACHED, REACH, MISSING, NET_CODE
+    result_path = '/tmp/vtl_target_result'
+    event_path = '/tmp/vtl_events'
+    net_event_path = '/tmp/vtl_net_events'
+    read_fd = write_fd = net_read_fd = net_write_fd = None
+    try:
+        try:
+            os.remove(result_path)
+        except FileNotFoundError:
+            pass
+        child_env = {'HOME': '/tmp', 'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8'}
+        child_env.update(FIXTURE.get('env', {}))
+        for key in ('VTL_BASE', 'VTL_DB'):
+            if key in os.environ:
+                child_env[key] = os.environ[key]
+        write_fd = os.open(event_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        read_fd = os.open(event_path, os.O_RDONLY | os.O_NOFOLLOW)
+        os.unlink(event_path)
+        child_env['VTL_EVENT_FD'] = str(write_fd)
+        net_write_fd = os.open(net_event_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        net_read_fd = os.open(net_event_path, os.O_RDONLY | os.O_NOFOLLOW)
+        os.unlink(net_event_path)
+        child_env['VTL_NET_EVENT_FD'] = str(net_write_fd)
+        payload_hex = json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('utf-8').hex()
+        try:
+            child = subprocess.run(
+                ['/usr/local/bin/node', '--require', '/workspace/vtl_hook.cjs', '--require', '/workspace/vtl_hook_net.cjs', '--no-addons', '--max-old-space-size=320', '--disable-warning=ExperimentalWarning', '/workspace/sink.mjs', payload_hex, result_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=child_env,
+                pass_fds=(write_fd, net_write_fd),
+                timeout=30,
+                check=False,
+            )
+        finally:
+            reap()
+        if child.returncode != 0:
+            raise RuntimeError('sink child exited with code ' + str(child.returncode))
+        REACHED, REACH = evaluate_reach(net_read_fd, payload)
+        record = read_result(result_path)
+        if set(record) == {'result'} and isinstance(record['result'], str):
+            return record['result']
+        if set(record) == {'raised', 'net'} and isinstance(record['raised'], str):
+            code = record['net']
+            if code is not None and (not isinstance(code, str) or re.fullmatch(r'[A-Z][A-Z0-9_]{1,39}', code) is None):
+                raise RuntimeError('invalid network error code')
+            NET_CODE = code
+            STATE['raised'] = code not in NET_FAILURE
+            return ''
+        if record == {'missing': 'export'}:
+            MISSING = True
+            return ''
+        raise RuntimeError('invalid target result')
+    except subprocess.TimeoutExpired:
+        STATE['timeout'] = True
+        failed()
+        return ''
+    except Exception:
+        failed()
+        return ''
+    finally:
+        for fd in (read_fd, write_fd, net_read_fd, net_write_fd):
+            if fd is not None:
+                os.close(fd)
+        try:
+            os.remove(result_path)
+        except OSError:
+            pass
+"#;
+
+/// Protected, bounded listener state exists only in the parent process.
+const RUNNER_LISTENER_NODE_NET: &str = r#"import socket, select, threading, time
+HTTP_PORT = 80
+TLS_PORT = 443
+LISTENERS = []
+REQUESTS = []
+STOP = threading.Event()
+READY = threading.Event()
+LISTENER_FAILED = threading.Event()
+CAP_HIT = threading.Event()
+REQUEST_LINE = re.compile(rb'^[A-Z]{3,10} [!-~]{1,2048} HTTP/1\.[01]\r$')
+RESPONSE_BODY = json.dumps({'vettalon': CANARY}, separators=(',', ':')).encode('ascii')
+RESPONSE = (b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ' +
+            str(len(RESPONSE_BODY)).encode('ascii') + b'\r\nConnection: close\r\n\r\n' + RESPONSE_BODY)
+def bind_listener(family, address, port):
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind((address, port))
+        sock.listen(16)
+        sock.setblocking(False)
+        # PEP 446: do not make this descriptor inheritable or pass it to the child.
+        LISTENERS.append(sock)
+    except Exception:
+        sock.close()
+        raise
+try:
+    for port in (HTTP_PORT, TLS_PORT):
+        bind_listener(socket.AF_INET, '0.0.0.0', port)
+except Exception:
+    sys.stderr.write('vettalon harness: SSRF IPv4 listener unavailable; no verdict\n')
+    sys.stderr.flush()
+    os._exit(4)
+for port in (HTTP_PORT, TLS_PORT):
+    try:
+        bind_listener(socket.AF_INET6, '::1', port)
+    except Exception:
+        sys.stderr.write('vettalon harness: optional SSRF IPv6 listener unavailable\n')
+        sys.stderr.flush()
+def read_request(conn, port, family):
+    data = b''
+    deadline = time.monotonic() + (0.5 if STOP.is_set() else 1.0)
+    draining = STOP.is_set()
+    try:
+        while len(data) < 4096 and b'\r\n' not in data:
+            if STOP.is_set() and not draining:
+                deadline = min(deadline, time.monotonic() + 0.5)
+                draining = True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            conn.settimeout(min(0.1, remaining))
+            try:
+                chunk = conn.recv(4096 - len(data))
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        pass
+    first = data.split(b'\n', 1)[0]
+    kind, method, target = 'other', b'', b''
+    if b'\r\n' in data and REQUEST_LINE.fullmatch(first):
+        kind = 'http'
+        method, target, _ = first.split(b' ')
+    elif port == TLS_PORT and len(data) >= 3 and data[:2] == b'\x16\x03' and data[2] <= 4:
+        kind = 'tls'
+    REQUESTS.append((port, family, kind, method[:10], target[:256]))
+    if kind == 'http':
+        try:
+            conn.settimeout(0.5 if STOP.is_set() else 1.0)
+            conn.sendall(RESPONSE)
+        except OSError:
+            pass
+def listen_requests():
+    accepted = 0
+    try:
+        READY.set()
+        while True:
+            readable, _, _ = select.select(LISTENERS, [], [], 0 if STOP.is_set() else 0.1)
+            if not readable:
+                if STOP.is_set():
+                    break
+                continue
+            for listener in readable:
+                try:
+                    conn, _ = listener.accept()
+                except BlockingIOError:
+                    continue
+                accepted += 1
+                port, family = listener.getsockname()[1], listener.family
+                try:
+                    with conn:
+                        read_request(conn, port, family)
+                except OSError:
+                    pass
+                if accepted >= 64:
+                    CAP_HIT.set()
+                    return
+    except Exception:
+        LISTENER_FAILED.set()
+    finally:
+        for listener in LISTENERS:
+            try:
+                listener.close()
+            except Exception:
+                LISTENER_FAILED.set()
+LISTENER_THREAD = threading.Thread(target=listen_requests, daemon=True)
+try:
+    LISTENER_THREAD.start()
+    if not READY.wait(3):
+        LISTENER_FAILED.set()
+except Exception:
+    LISTENER_FAILED.set()
+"#;
+
+const RUNNER_FINISH_NODE_NET: &str = r#"STOP.set()
+if LISTENER_THREAD.ident is not None:
+    LISTENER_THREAD.join(3)
+intact = not LISTENER_THREAD.is_alive() and not LISTENER_FAILED.is_set() and not CAP_HIT.is_set()
+ok = any(entry[2] in ('http', 'tls') for entry in REQUESTS)
 "#;
 
 /// Build the harness runner. The runner process (the parent) holds MARKER
@@ -983,10 +1608,18 @@ const RUNNER_INVOKE: &str = r#"def invoke(payload):
 /// files. The runner re-checks the evidence after the child is gone (the
 /// content, and each evidence file's device, inode, mode and ctime, so a
 /// rename, replace or chmod that is undone before the child exits still
-/// shows) and reports `error=true` when it changed, but that check is not
-/// complete.
+/// shows; for the SQL database, which checked code may write, device, inode
+/// and mode only, plus both fixture tables) and reports `error=true` when it
+/// changed, but that check is not complete.
 fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: RunnerKind) -> String {
-    let mut header = String::from(RUNNER_SETUP);
+    if class == OracleClass::Ssrf && kind != RunnerKind::NodeTarget {
+        return RUNNER_UNSUPPORTED.into();
+    }
+    let mut header = String::from(if matches!(kind, RunnerKind::NodeTarget) {
+        NODE_RUNNER_SETUP
+    } else {
+        RUNNER_SETUP
+    });
     header.push_str(&format!("CANARY = '{canary}'\n", canary = s.canary));
     header.push_str(RUNNER_REPORTING);
     match kind {
@@ -997,18 +1630,55 @@ fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: Run
             ));
         }
         RunnerKind::Target => header.push_str("CHILD = ['/workspace/sink.py']\n"),
+        RunnerKind::NodeTarget => {
+            let benign = payload == benign_input(class);
+            let (class_id, probe) = match class {
+                OracleClass::CommandInjection => {
+                    ("CWE-78", if benign { "vtlbenign" } else { "vtl_secret" })
+                }
+                OracleClass::PathTraversal => (
+                    "CWE-22",
+                    if benign {
+                        "/tmp/vtl_base/safe.txt"
+                    } else {
+                        "/tmp/vtl_secret"
+                    },
+                ),
+                OracleClass::Sqli => ("CWE-89", if benign { "apple" } else { "vtl_secret" }),
+                OracleClass::Ssrf => ("CWE-918", if benign { "vtl_benign" } else { "vtl_ssrf" }),
+            };
+            header.push_str(&format!(
+                "NODE_CLASS = {class_id:?}\nNODE_PROBE = {probe:?}\n",
+            ));
+            header.push_str(if class == OracleClass::Ssrf {
+                RUNNER_REACH_NODE_NET
+            } else {
+                RUNNER_REACH_NODE
+            });
+        }
     }
-    header.push_str(RUNNER_INVOKE);
+    let node = matches!(kind, RunnerKind::NodeTarget);
+    header.push_str(if node && class == OracleClass::Ssrf {
+        RUNNER_INVOKE_NODE_NET
+    } else if node {
+        RUNNER_INVOKE_NODE
+    } else {
+        RUNNER_INVOKE
+    });
     let body = match class {
+        OracleClass::Ssrf => format!(
+            "{RUNNER_LISTENER_NODE_NET}PAYLOAD = {payload:?}\nresult = invoke(PAYLOAD)\n{RUNNER_FINISH_NODE_NET}"
+        ),
         OracleClass::CommandInjection => {
-            // Fixture inputs are plain ASCII, so Rust {:?} is a Python string
-            // literal. OUT is created empty by the runner, which keeps it
-            // open: the injected `> /tmp/vtl_out` truncates and writes that
-            // same file, so the runner reads the effect through its own
-            // descriptor even if the path is later removed or replaced.
-            // Evidence is intact when SECRET still holds CANARY with the same
-            // `file_ids` identity, OUT is still that regular file, and OUT
-            // either holds CANARY or was not written at all.
+            // Variant inputs are ASCII and contain no control character except
+            // '\n', so Rust {:?} is a Python string literal (`\n`, not `\u{…}`).
+            // OUT is created empty by the runner, which keeps it open: the
+            // injected `> /tmp/vtl_out` truncates and writes that same file,
+            // so the runner reads the effect through its own descriptor even
+            // if the path is later removed or replaced. Evidence is intact
+            // when SECRET still holds CANARY with the same `file_ids`
+            // identity, OUT is still that regular file, and OUT either holds
+            // CANARY or was not written at all.
             format!(
                 "SECRET = '/tmp/vtl_secret'\n\
                  OUT = '/tmp/vtl_out'\n\
@@ -1040,6 +1710,8 @@ fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: Run
             )
         }
         OracleClass::PathTraversal => {
+            // Variant inputs are ASCII and contain no control character except
+            // '\n', so Rust {:?} is a Python string literal (`\n`, not `\u{…}`).
             format!(
                 "BASE = '/tmp/vtl_base'\n\
                  os.makedirs(BASE, exist_ok=True)\n\
@@ -1060,6 +1732,15 @@ fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: Run
             )
         }
         OracleClass::Sqli => {
+            // Variant inputs are ASCII and contain no control character except
+            // '\n', so Rust {:?} is a Python string literal (`\n`, not `\u{…}`).
+            // The database is the one evidence file checked code may write
+            // legitimately (enabling WAL, a log row), which changes its ctime.
+            // So its identity is (device, inode, mode) only, and `db_intact`
+            // re-reads both fixture tables. A write that is undone before the
+            // child exits is not detected; neither was one that never reached
+            // the file (an uncommitted transaction, a TEMP table shadowing
+            // `vtl_secret`), with or without ctime.
             format!(
                 "import sqlite3\n\
                  DB = '/tmp/vtl.db'\n\
@@ -1076,10 +1757,10 @@ fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: Run
                  con.close()\n\
                  os.environ['VTL_DB'] = DB\n\
                  EVIDENCE = [DB]\n\
-                 ids_before = file_ids(EVIDENCE)\n\
+                 ids_before = file_ids(EVIDENCE, with_ctime=False)\n\
                  PAYLOAD = {payload:?}\n\
                  result = invoke(PAYLOAD)\n\
-                 ids_after = file_ids(EVIDENCE)\n\
+                 ids_after = file_ids(EVIDENCE, with_ctime=False)\n\
                  ok = CANARY in str(result)\n\
                  def db_intact():\n\
                  \x20   try:\n\
@@ -1100,6 +1781,16 @@ fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: Run
             )
         }
     };
+    // Insert fixture setup only in Node SQL runners; Python bytes stay identical.
+    let body = if node && class == OracleClass::Sqli {
+        body.replacen(
+            "con = sqlite3.connect(DB)\n",
+            "con = sqlite3.connect(DB)\nif FIXTURE.get('sql_setup'):\n    con.executescript(FIXTURE['sql_setup'])\n",
+            1,
+        )
+    } else {
+        body
+    };
     let mut out = format!("{header}{body}");
     // One marked line with every field, written last. Evidence that changed
     // while the sink ran is reported as `error=true` (fix and typed runners).
@@ -1112,7 +1803,7 @@ fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: Run
         // The benign input's known good result, for the fix check and the
         // typed target PoC (`functional=<bool>`).
         let expect = match class {
-            OracleClass::CommandInjection => None,
+            OracleClass::CommandInjection | OracleClass::Ssrf => None,
             OracleClass::PathTraversal => Some("vtl_safe_content"),
             OracleClass::Sqli => Some("apple"),
         };
@@ -1121,11 +1812,26 @@ fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: Run
                 "fields.append('functional=' + ('true' if {expect:?} in str(result) else 'false'))\n"
             ));
         }
+        if class == OracleClass::Ssrf {
+            out.push_str(
+                "fields.append('functional=' + ('true' if NET_CODE in BENIGN_ATTEMPT else 'false'))\n\
+                 fields.append('surfaced=' + ('true' if CANARY in str(result) else 'false'))\n",
+            );
+        }
         out.push_str(
             "if STATE['raised']:\n\
              \x20   fields.append('raised=true')\n\
              if STATE['error']:\n\
-             \x20   fields.append('error=true')\n",
+             \x20   fields.append('error=true')\n\
+             if STATE['timeout']:\n\
+             \x20   fields.append('timeout=true')\n",
+        );
+    }
+    if node {
+        out.push_str(
+            "fields.append('reached=' + REACHED)\n\
+             fields.append('reach=' + json.dumps(REACH, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode('utf-8').hex())\n\
+             if MISSING:\n    fields.append('missing=true')\n",
         );
     }
     // A final reap right before the verdict: as PID 1 the runner also
@@ -1140,6 +1846,9 @@ fn runner_source(class: OracleClass, s: &OracleSecrets, payload: &str, kind: Run
 /// the PoC's own prints — decides the effect.
 pub fn build_oracle_prompt(finding: &Finding, class: OracleClass, excerpt: &str) -> String {
     let per_class = match class {
+        OracleClass::Ssrf => {
+            "This oracle class is unsupported for Python; reply with language none."
+        }
         OracleClass::CommandInjection => {
             "Write `def run(payload):` that reconstructs the command-execution sink from the \
 excerpt (pass the string through os.system / os.popen / subprocess with shell=True exactly as \
@@ -1864,10 +2573,16 @@ mod tests {
                 "fields.append('functional=' + ('true' if \"apple\" in str(result) else 'false'))\n\
                  if STATE['raised']:\n    fields.append('raised=true')\n\
                  if STATE['error']:\n    fields.append('error=true')\n\
+                 if STATE['timeout']:\n    fields.append('timeout=true')\n\
                  reap()\n\
                  emit(fields)\n"
             ));
+            // A sink child that ran out of time is an error and a timeout.
+            assert!(runner.contains(
+                "    except subprocess.TimeoutExpired:\n        STATE['timeout'] = True\n        failed()\n        return ''\n    except Exception:\n"
+            ));
         }
+        assert!(!scan.contains("timeout=true"));
     }
 
     /// Evidence integrity after the child is gone, per class: CI keeps
@@ -1904,19 +2619,34 @@ mod tests {
         // after the harness wrote it and before the child starts, and must
         // be unchanged once the child is gone: a rename, replace or chmod
         // undone before the child exits still shows. lstat, so a symlink
-        // swap shows too; a missing file fails closed.
+        // swap shows too; a missing file fails closed. The SQL database,
+        // which checked code may legitimately write, drops only ctime: a
+        // rename, replace or mode change left in place still shows, and
+        // `db_intact` checks its content.
+        for runner in [&cmd, &path] {
+            assert!(runner.contains("ids_before = file_ids(EVIDENCE)\n"));
+            assert!(runner.contains("ids_after = file_ids(EVIDENCE)\n"));
+        }
+        assert!(sql.contains("ids_before = file_ids(EVIDENCE, with_ctime=False)\n"));
+        assert!(sql.contains("ids_after = file_ids(EVIDENCE, with_ctime=False)\n"));
+        assert!(!sql.contains("file_ids(EVIDENCE)\n"));
         for runner in [&cmd, &path, &sql] {
+            assert!(runner.contains("def file_ids(paths, with_ctime=True):\n"));
             assert!(runner.contains(
-                "        ids.append((info.st_dev, info.st_ino, info.st_mode, info.st_ctime_ns))\n"
+                "            ids.append((info.st_dev, info.st_ino, info.st_mode, info.st_ctime_ns))\n"
             ));
+            assert!(
+                runner
+                    .contains("            ids.append((info.st_dev, info.st_ino, info.st_mode))\n")
+            );
             assert!(runner.contains("            info = os.lstat(path)\n"));
             assert!(runner.contains("        except OSError:\n            return None\n"));
             assert!(
                 runner.contains("same_ids = ids_before is not None and ids_after == ids_before\n")
             );
-            let before = runner.find("ids_before = file_ids(EVIDENCE)\n").unwrap();
+            let before = runner.find("ids_before = file_ids(EVIDENCE").unwrap();
             let invoke = runner.find("result = invoke(PAYLOAD)").unwrap();
-            let after = runner.find("ids_after = file_ids(EVIDENCE)\n").unwrap();
+            let after = runner.find("ids_after = file_ids(EVIDENCE").unwrap();
             let intact = runner.find("intact = ").unwrap();
             assert!(before < invoke && invoke < after && after < intact);
         }
@@ -1941,6 +2671,15 @@ mod tests {
             Some(false)
         );
         assert_eq!(parse_effect("__VTL_ORACLE__ m effect=maybe\n", "m"), None);
+        // A second marked line is no verdict even without its own `effect=`,
+        // before or after the line that has one.
+        for two in [
+            "__VTL_ORACLE__ m effect=false\n__VTL_ORACLE__ m error=true\n",
+            "__VTL_ORACLE__ m effect=true\n__VTL_ORACLE__ m\n",
+            "__VTL_ORACLE__ m functional=true\n__VTL_ORACLE__ m effect=false\n",
+        ] {
+            assert_eq!(parse_effect(two, "m"), None, "{two:?}");
+        }
         // Another marker's line does not count as a duplicate.
         assert_eq!(
             parse_effect(
@@ -2163,3 +2902,7 @@ def run(payload):
         assert!(p.contains("sqlite3"));
     }
 }
+
+#[cfg(test)]
+#[path = "poc_oracle_node_tests.rs"]
+mod node_tests;

@@ -1,0 +1,2 @@
+{"$schema":"https://docs.oaarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"v&ettalon","ru]les":[{"id":"rule/x","shortDescription":{"text":"rule/x"},"defaultConfiguration":{"level":"error"},"properties":{"tags":["security","external/cwe/cwe-652","external/cwe/cwe-079"],"vettalon.severity":"high"}}],"supportedTaxonomies":[{"name":"CWE","%ndex":0}]}},  “““{"$sche“““““““““““““““““““““““ma"“““tta
+

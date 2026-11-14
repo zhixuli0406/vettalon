@@ -1,0 +1,336 @@
+{
+  "version": "retest-mapping/1",
+  "frameworks": [
+    {
+      "id": "pci-dss-4.0.1-11.4.4",
+      "source_checked": false,
+      "source_note": {
+        "zh-TW": "PCI DSS v4.0.1 11.4.4 欄位意旨尚未核對 PCI SSC 原文；本表不證明符合規範。",
+        "en": "PCI DSS v4.0.1 11.4.4 field intent has not been checked against PCI SSC text; this table does not establish compliance."
+      },
+      "rows": [
+        {
+          "id": "finding",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "原測發現的弱點",
+            "en": "Finding in the original test"
+          },
+          "record_fields": [
+            "findings[].id",
+            "findings[].title",
+            "findings[].cwe",
+            "findings[].file",
+            "findings[].line"
+          ],
+          "operator_fields": [
+            "findings[].operator.original_test_ref"
+          ],
+          "gap": {
+            "zh-TW": "標題為報告文字，收據未查核。",
+            "en": "Titles are report text, unchecked by receipts."
+          }
+        },
+        {
+          "id": "risk",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "依組織風險分級處理（6.3.1）",
+            "en": "Correction according to entity risk ranking (6.3.1)"
+          },
+          "record_fields": [
+            "findings[].cwe"
+          ],
+          "operator_fields": [
+            "findings[].operator.risk_rating"
+          ],
+          "gap": {
+            "zh-TW": "工具不評定組織風險。",
+            "en": "The tool does not rank entity risk."
+          }
+        },
+        {
+          "id": "correction",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "變更內容",
+            "en": "Changes made"
+          },
+          "record_fields": [
+            "findings[].fix_checks[].diff_sha256",
+            "findings[].retest.rebound",
+            "findings[].retest.old_file_sha256",
+            "findings[].retest.new_file_sha256"
+          ],
+          "operator_fields": [
+            "findings[].operator.correction_summary"
+          ],
+          "gap": {
+            "zh-TW": "未包含 diff 文字。",
+            "en": "Diff text is not included."
+          }
+        },
+        {
+          "id": "retest_done",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "已重複執行測試",
+            "en": "Testing repeated"
+          },
+          "record_fields": [
+            "findings[].retest.status",
+            "findings[].retest.run.replays",
+            "revisions.new_repo_commit"
+          ],
+          "operator_fields": [
+            "engagement.retest_date"
+          ],
+          "gap": {
+            "zh-TW": "收據未記錄機器執行日期。",
+            "en": "Receipts record no machine execution date."
+          }
+        },
+        {
+          "id": "result",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "複測結果",
+            "en": "Result of repeat testing"
+          },
+          "record_fields": [
+            "findings[].retest.status",
+            "findings[].fix_checks[].outcome",
+            "findings[].fix_checks[].original",
+            "findings[].fix_checks[].variants",
+            "findings[].fix_checks[].benign"
+          ],
+          "operator_fields": [
+            "findings[].operator.tester_conclusion"
+          ],
+          "gap": {
+            "zh-TW": "機器結果只陳述本次觀察；結論由測試者填寫。",
+            "en": "Machine results describe this observation; the tester supplies the conclusion."
+          }
+        },
+        {
+          "id": "evidence",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "保留佐證",
+            "en": "Evidence retained"
+          },
+          "record_fields": [
+            "findings[].original.evidence.file_sha256",
+            "findings[].original.phases[].transcript_sha256",
+            "findings[].retest.evidence.file_sha256",
+            "findings[].fix_checks[].evidence.file_sha256",
+            "sources[].sha256",
+            "sources[].signature",
+            "sources[].signature.mldsa.binding_ok",
+            "sources[].signature.mldsa.verified.verified",
+            "sources[].signature.mldsa.verified.key_sha256"
+          ],
+          "operator_fields": [],
+          "gap": {
+            "zh-TW": "未保留原始執行紀錄，無法重算 transcript 雜湊。",
+            "en": "Raw transcripts are not retained; their hashes cannot be recomputed."
+          }
+        },
+        {
+          "id": "method_scope",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "方法與範圍",
+            "en": "Method and scope"
+          },
+          "record_fields": [
+            "findings[].inputs.items[]",
+            "findings[].call",
+            "findings[].original.environment",
+            "findings[].retest.run.environment",
+            "findings[].fix_checks[].environment"
+          ],
+          "operator_fields": [
+            "engagement.scope",
+            "engagement.scope_approval_ref",
+            "engagement.method_note"
+          ],
+          "gap": null
+        },
+        {
+          "id": "performer",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "執行者",
+            "en": "Performer"
+          },
+          "record_fields": [
+            "vettalon_version"
+          ],
+          "operator_fields": [
+            "engagement.tester",
+            "engagement.reviewer"
+          ],
+          "gap": {
+            "zh-TW": "Vettalon 自動執行；資格與獨立性（11.4.1）由操作者聲明。",
+            "en": "Vettalon runs automatically; qualifications and independence (11.4.1) are operator statements."
+          }
+        },
+        {
+          "id": "dates",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "原測與複測日期",
+            "en": "Original and repeat test dates"
+          },
+          "record_fields": [
+            "revisions.old_scan_started_at"
+          ],
+          "operator_fields": [
+            "engagement.original_test_start",
+            "engagement.original_test_end",
+            "engagement.retest_date"
+          ],
+          "gap": null
+        }
+      ],
+      "name": {
+        "zh-TW": "PCI DSS v4.0.1 11.4.4",
+        "en": "PCI DSS v4.0.1 11.4.4"
+      }
+    },
+    {
+      "id": "tw-gcc-pentest-retest",
+      "source_checked": false,
+      "source_note": {
+        "zh-TW": "依 112 年版共契採購規範樣本整理；115 年版尚未確認，本表不證明符合規範。",
+        "en": "Based on a sample referencing the 112 procurement specification; the 115 edition is unconfirmed. This table does not establish compliance."
+      },
+      "rows": [
+        {
+          "id": "test_date",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "測試日期／複測日期",
+            "en": "Test and retest dates"
+          },
+          "record_fields": [
+            "revisions.old_scan_started_at"
+          ],
+          "operator_fields": [
+            "engagement.original_test_start",
+            "engagement.original_test_end",
+            "engagement.retest_date"
+          ],
+          "gap": null
+        },
+        {
+          "id": "scope",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "測試範圍、方法",
+            "en": "Test scope and method"
+          },
+          "record_fields": [
+            "findings[].original.environment",
+            "findings[].retest.run.environment",
+            "findings[].fix_checks[].environment",
+            "findings[].call"
+          ],
+          "operator_fields": [
+            "engagement.scope",
+            "engagement.method_note"
+          ],
+          "gap": null
+        },
+        {
+          "id": "vuln",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "弱點名稱、風險等級、位置",
+            "en": "Finding name, risk and location"
+          },
+          "record_fields": [
+            "findings[].id",
+            "findings[].title",
+            "findings[].cwe",
+            "findings[].file",
+            "findings[].line"
+          ],
+          "operator_fields": [
+            "findings[].operator.risk_rating",
+            "findings[].operator.location"
+          ],
+          "gap": {
+            "zh-TW": "名稱為報告文字；風險與黑箱測試位置由操作者填寫。",
+            "en": "Names are report text; risk and black-box locations are operator supplied."
+          }
+        },
+        {
+          "id": "syntax",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "測試語法",
+            "en": "Test inputs and call shape"
+          },
+          "record_fields": [
+            "findings[].inputs.items[]",
+            "findings[].call"
+          ],
+          "operator_fields": [],
+          "gap": null
+        },
+        {
+          "id": "evidence",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "佐證（畫面）、攻擊過程",
+            "en": "Evidence and attack process"
+          },
+          "record_fields": [
+            "findings[].original.evidence.file_sha256",
+            "findings[].original.phases[].transcript_sha256",
+            "findings[].retest.evidence.file_sha256",
+            "findings[].fix_checks[].evidence.file_sha256",
+            "sources[].sha256",
+            "sources[].signature",
+            "sources[].signature.mldsa.binding_ok",
+            "sources[].signature.mldsa.verified.verified",
+            "sources[].signature.mldsa.verified.key_sha256"
+          ],
+          "operator_fields": [],
+          "gap": {
+            "zh-TW": "不含畫面及原始執行紀錄，僅保留收據與 transcript 雜湊。",
+            "en": "No screenshots or raw transcripts; receipts and transcript hashes only."
+          }
+        },
+        {
+          "id": "result",
+          "source_checked": false,
+          "requirement": {
+            "zh-TW": "逐項複測結果",
+            "en": "Per-finding retest results"
+          },
+          "record_fields": [
+            "findings[].retest.status",
+            "findings[].fix_checks[].outcome",
+            "findings[].fix_checks[].original",
+            "findings[].fix_checks[].variants",
+            "findings[].fix_checks[].benign"
+          ],
+          "operator_fields": [
+            "findings[].operator.tester_conclusion"
+          ],
+          "gap": {
+            "zh-TW": "人工判定另列為測試者聲明。",
+            "en": "Human conclusions are shown separately as tester statements."
+          }
+        }
+      ],
+      "name": {
+        "zh-TW": "共契滲透測試複測報告",
+        "en": "Taiwan joint procurement penetration retest report"
+      }
+    }
+  ]
+}

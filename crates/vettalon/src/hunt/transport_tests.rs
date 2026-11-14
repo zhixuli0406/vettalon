@@ -512,6 +512,10 @@ async fn bounded_live_public_hunt_transport() {
                 api_key_env: None,
                 max_tokens: 256,
                 temperature: 0.0,
+                token_limit_param: Default::default(),
+                omit_temperature: false,
+                reasoning_effort: None,
+                max_output_tokens_worst: None,
                 timeout: Duration::from_secs(15),
             },
             client: reqwest::Client::builder()

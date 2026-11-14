@@ -15,6 +15,7 @@ fn hash(byte: char) -> String {
 
 fn input() -> CompileInput {
     CompileInput {
+        runtime: None,
         finding_id: "finding-1".into(),
         file: "app.py".into(),
         line: Some(8),
@@ -434,4 +435,138 @@ fn scorecard_keeps_unsupported_inconclusive_and_tamper_denominators() {
     let card = build_scorecard(&[huge_a, huge_b]).unwrap();
     assert_eq!(card.median_verifier_engineering_minutes, Some(u64::MAX));
     assert_eq!(card.median_manual_trusted_loc, Some(u64::MAX));
+}
+
+#[test]
+fn python_ir_bytes_remain_identical() {
+    assert_eq!(
+        compile_ir(&input()).unwrap().identity_sha256().unwrap(),
+        "2c083e2e58867ccf7d8254418afa8b842ce39e6bd56ed218155bad82c2ee7b40"
+    );
+}
+
+#[test]
+fn d11a_pin_existing_ir_identities_for_python_and_node() {
+    use super::super::verification_context::RuntimeIdentity;
+    let runtime = RuntimeIdentity {
+        node_version: "v22.15.0".into(),
+        lockfile_sha256: Some(hash('1')),
+        lockfile_summary_sha256: Some(hash('2')),
+        deps_sha256: Some(hash('3')),
+        fixture_sha256: Some(hash('4')),
+    };
+    let cases = [
+        (
+            "CWE-78",
+            "09f5bc51096ba1b43adf0cf9eb5ab4561d7787a42debe6b786f0617fc6524245",
+            "4b33e5ea548abde92905b4c07d65abc18478e2134fa0ad023fa6746669da6402",
+        ),
+        (
+            "CWE-22",
+            "2c083e2e58867ccf7d8254418afa8b842ce39e6bd56ed218155bad82c2ee7b40",
+            "2ee692ce07c1e34f743f522216f4b8994249bb816279616996c277010b9ca42c",
+        ),
+        (
+            "CWE-89",
+            "8fa991ea54515d587bc1f1146ca69f511da41f699fa3d1998b66a67d77753d36",
+            "b0c2e38695f45e584511a36ee19c6425a4057ec5fb1414b44e438b4f5f911660",
+        ),
+    ];
+    for (cwe, py_expected, mjs_expected) in cases {
+        let mut py = input();
+        py.cwe = cwe.into();
+        // D11a pin: must not change when SSRF is added
+        let py_hash = compile_ir(&py).unwrap().identity_sha256().unwrap();
+        assert_eq!(py_hash, py_expected);
+        let mut mjs = py;
+        mjs.file = "app.mjs".into();
+        mjs.runtime = Some(runtime.clone());
+        // D11a pin: must not change when SSRF is added
+        let mjs_hash = compile_ir(&mjs).unwrap().identity_sha256().unwrap();
+        assert_eq!(mjs_hash, mjs_expected);
+    }
+}
+
+#[test]
+fn node_ir_binds_runtime_and_each_execution_digest() {
+    use super::super::verification_context::RuntimeIdentity;
+    let runtime = RuntimeIdentity {
+        node_version: "v22.15.0".into(),
+        lockfile_sha256: Some(hash('1')),
+        lockfile_summary_sha256: Some(hash('2')),
+        deps_sha256: Some(hash('3')),
+        fixture_sha256: Some(hash('4')),
+    };
+    for (extension, language) in [
+        ("js", Language::JavaScript),
+        ("mjs", Language::JavaScript),
+        ("cjs", Language::JavaScript),
+        ("ts", Language::TypeScript),
+        ("mts", Language::TypeScript),
+        ("cts", Language::TypeScript),
+    ] {
+        let mut node = input();
+        node.file = format!("app.{extension}");
+        assert_eq!(compile_ir(&node), Err("invalid_verification_runtime"));
+        node.runtime = Some(runtime.clone());
+        let original = compile_ir(&node).unwrap();
+        assert_eq!(original.subject.language, language);
+        assert_eq!(
+            original.capabilities,
+            compile_ir(&input()).unwrap().capabilities
+        );
+        for field in 0..5 {
+            let mut changed = node.clone();
+            let identity = changed.runtime.as_mut().unwrap();
+            match field {
+                0 => identity.node_version = "v22.16.0".into(),
+                1 => identity.lockfile_sha256 = Some(hash('5')),
+                2 => identity.lockfile_summary_sha256 = Some(hash('5')),
+                3 => identity.deps_sha256 = Some(hash('5')),
+                _ => identity.fixture_sha256 = Some(hash('5')),
+            }
+            assert_ne!(
+                original.identity_sha256().unwrap(),
+                compile_ir(&changed).unwrap().identity_sha256().unwrap()
+            );
+        }
+        node.runtime.as_mut().unwrap().fixture_sha256 = Some("invalid".into());
+        assert_eq!(compile_ir(&node), Err("invalid_verification_runtime"));
+    }
+    let mut python = input();
+    python.runtime = Some(runtime);
+    assert_eq!(compile_ir(&python), Err("invalid_verification_runtime"));
+}
+
+#[test]
+fn ssrf_ir_has_only_the_loopback_network_capability_extension() {
+    let mut ssrf = input();
+    ssrf.file = "app.mjs".into();
+    ssrf.cwe = "CWE-918".into();
+    ssrf.runtime = Some(super::super::verification_context::RuntimeIdentity {
+        node_version: "v22.15.0".into(),
+        lockfile_sha256: Some(hash('1')),
+        lockfile_summary_sha256: Some(hash('2')),
+        deps_sha256: Some(hash('3')),
+        fixture_sha256: None,
+    });
+    let ir = compile_ir(&ssrf).unwrap();
+    assert_eq!(ir.effect.kind, EffectKind::NetworkEgress);
+    assert_eq!(ir.effect.id, "loopback_http_request");
+    assert_eq!(
+        ir.capabilities,
+        vec![
+            Capability::ReadPreparedTree,
+            Capability::WriteEphemeralTemp,
+            Capability::SpawnBoundedProcess,
+            Capability::LoopbackNetwork,
+        ]
+    );
+    for cwe in ["CWE-77", "CWE-78", "CWE-22", "CWE-73", "CWE-89"] {
+        ssrf.cwe = cwe.into();
+        let existing = compile_ir(&ssrf).unwrap();
+        assert!(!existing.capabilities.contains(&Capability::LoopbackNetwork));
+        assert_eq!(existing.controls, ir.controls);
+        assert_eq!(existing.binding.policy_version, ir.binding.policy_version);
+    }
 }

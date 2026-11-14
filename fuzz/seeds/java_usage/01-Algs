@@ -1,0 +1,5 @@
+package com.ex;
+
+public final class Algs {
+    public static final String CIPHER = "AES/CBC/PKCS5Padding";
+}

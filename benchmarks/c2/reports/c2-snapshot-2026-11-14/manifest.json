@@ -1,0 +1,34 @@
+{
+ "commands": {
+  "bandit": "bandit -r src -f sarif -o bandit.sarif (run from the repository root; bandit[sarif]==1.9.4 from PyPI in a dedicated venv)",
+  "opengrep": "opengrep scan --config ../rules/python --sarif --output opengrep.sarif src (run from the repository root; rules dir = opengrep-rules f1d2b562b414783763fd02a6ed2736eaed622efa checked out beside it; binary opengrep_osx_arm64 v1.33.1, Sigstore-verified)"
+ },
+ "commit": "6604c3b8784ecc7cf5ac0b7412d916989b4c7d45",
+ "created": "2026-11-13T17:32:32Z",
+ "license": "BSD-3-Clause",
+ "repo_url": "https://github.com/pallets/werkzeug",
+ "scanners": [
+  {
+   "bytes": 553303,
+   "name": "opengrep",
+   "path": "opengrep.sarif",
+   "results": 46,
+   "rules": 375,
+   "sarif_sha256": "21c5a31274b1a9389011a44660ae601f3eee0309a03a5495e5501288fd1ff1fa",
+   "version": "1.33.1"
+  },
+  {
+   "bytes": 60123,
+   "name": "bandit",
+   "path": "bandit.sarif",
+   "results": 28,
+   "rules": 9,
+   "sarif_sha256": "b44fa3b8dcc35a6243418b82667918c53a794c32de98fb7dda4405c70a404970",
+   "version": "1.9.4"
+  }
+ ],
+ "schema": "vettalon.c2-snapshot/1",
+ "symlinks": 0,
+ "tree_entries": 291,
+ "tree_sha256": "f0764268599a18bb47d5ed449442f5b3a15c8134e9f3833eedd630aa26e332f4"
+}

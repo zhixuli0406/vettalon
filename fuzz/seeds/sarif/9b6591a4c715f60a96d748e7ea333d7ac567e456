@@ -1,0 +1,23 @@
+
+
+
+
+
+
+
+
+
+
+
+
+{"vs":[{"tool":{"driver":{"name":"CodeQL","rules":[]},"e"id":"py/sql-injection","shorts":{"actLocation":{"index":0},"region":{"startLine":1}}}},{"location":{"physicalLocation":{"artifactLocation":{"uri":"file://localhost/etc/passwd"},"re$schema":"httpng.security":"Dangerous syste
+1
+
+
+
+
+
+
+
+
+m 

@@ -1,0 +1,1 @@
+{"$schema":"https://docs.oasis-open.f-schema-2.1.0.json","version":[{"ruleId":"rule/x","level":"error","message":f-2.1.0.json","ver2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep OSS","rules":[{"id":"python.lang.security.audit.dan","messties":{"vettalon.status":"2efuted"}}]}]}

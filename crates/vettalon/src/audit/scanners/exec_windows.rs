@@ -9,7 +9,7 @@ use std::time::Instant;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, JobObject, KillOnDrop};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{RunLimits, RunOutcome};
+use super::{RunBytesOutcome, RunLimits};
 
 const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -45,21 +45,33 @@ impl Drop for OwnedJob {
     }
 }
 
-fn spawn_job(program: &str, args: &[&str], cwd: &Path) -> io::Result<OwnedJob> {
-    let mut command = CommandWrap::with_new(program, |command| {
+fn spawn_job_with_policy(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    stdin: Option<std::fs::File>,
+    policy: Option<(&super::TrustedExecutable, super::AttestationEnv<'_>)>,
+) -> io::Result<OwnedJob> {
+    let mut command = CommandWrap::with_new(program, move |command| {
         command
             .args(args)
             .current_dir(cwd)
-            .stdin(Stdio::null())
+            .stdin(stdin.map_or_else(Stdio::null, Stdio::from))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("PATH", crate::util::trusted_path_for_scan(cwd))
             .env("NoDefaultCurrentDirectoryInExePath", "1");
         super::apply_git_env(command);
+        if let Some((_, env)) = policy {
+            super::apply_attestation_env(command, env);
+        }
     });
     // KillOnDrop must be registered as a wrapper: JobObject queries it before
     // enabling JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. A raw Command flag is not enough.
     command.wrap(KillOnDrop).wrap(JobObject);
+    if let Some((tool, _)) = policy {
+        tool.recheck().map_err(io::Error::other)?;
+    }
     Ok(OwnedJob {
         child: command.spawn()?,
         cleanup_requested: false,
@@ -121,21 +133,23 @@ enum Stop {
     CaptureError(&'static str, io::Error),
 }
 
-pub(super) async fn run_capped(
+pub(super) async fn run_capped_bytes(
     program: &str,
     args: &[&str],
     cwd: &Path,
     limits: &RunLimits,
-) -> RunOutcome {
+    stdin: Option<std::fs::File>,
+    policy: Option<(&super::TrustedExecutable, super::AttestationEnv<'_>)>,
+) -> RunBytesOutcome {
     let start = Instant::now();
-    let job = match spawn_job(program, args, cwd) {
+    let job = match spawn_job_with_policy(program, args, cwd, stdin, policy) {
         Ok(job) => job,
-        Err(error) => return RunOutcome::spawn_failed(error.to_string(), start.elapsed()),
+        Err(error) => return RunBytesOutcome::spawn_failed(error.to_string(), start.elapsed()),
     };
     run_spawned(job, start, limits).await
 }
 
-async fn run_spawned(mut job: OwnedJob, start: Instant, limits: &RunLimits) -> RunOutcome {
+async fn run_spawned(mut job: OwnedJob, start: Instant, limits: &RunLimits) -> RunBytesOutcome {
     let Some(deadline) = tokio::time::Instant::from_std(start).checked_add(limits.timeout) else {
         return reject_spawned(job, "scanner timeout exceeds the clock range", start).await;
     };
@@ -234,8 +248,8 @@ async fn run_spawned(mut job: OwnedJob, start: Instant, limits: &RunLimits) -> R
     }
     let stdout_truncated = stdout_bytes.len() > limits.max_output_bytes;
     stdout_bytes.truncate(limits.max_output_bytes);
-    RunOutcome {
-        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+    RunBytesOutcome {
+        stdout: stdout_bytes,
         stdout_truncated,
         stderr_tail: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         exit_code,
@@ -246,8 +260,8 @@ async fn run_spawned(mut job: OwnedJob, start: Instant, limits: &RunLimits) -> R
     }
 }
 
-async fn reject_spawned(mut job: OwnedJob, reason: &str, start: Instant) -> RunOutcome {
-    let mut outcome = RunOutcome::spawn_failed(reason.into(), start.elapsed());
+async fn reject_spawned(mut job: OwnedJob, reason: &str, start: Instant) -> RunBytesOutcome {
+    let mut outcome = RunBytesOutcome::spawn_failed(reason.into(), start.elapsed());
     let mut errors = Vec::new();
     if let Err(error) = job.request_cleanup() {
         errors.push(format!("scanner job termination failed: {error}"));
@@ -265,6 +279,7 @@ async fn reject_spawned(mut job: OwnedJob, reason: &str, start: Instant) -> RunO
 
 #[cfg(test)]
 mod tests {
+    use super::super::{RunOutcome, run_capped};
     use super::*;
     use std::ffi::c_void;
     use std::io::Write;
@@ -613,6 +628,7 @@ mod tests {
                 },
             )
             .await
+            .into_text()
         });
         let child = descendant_handle(&dir.path().join("child.pid")).await;
         release(dir.path());

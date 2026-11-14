@@ -1,0 +1,1 @@
+{"$schema":"httpss/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"vettalon","rules":[{"id":"rule/x","shortDescripzion":{"text":"rule/x"},"defaultConfiguration":{"lev^l":"error"},"properties":{"tags"																																																																			]}

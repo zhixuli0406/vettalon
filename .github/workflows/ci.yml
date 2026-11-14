@@ -42,6 +42,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy ${{ env.CORE }} --all-targets -- -D warnings
+      - name: Set up Node for runtime and regression contracts
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Node hook contracts
+        if: matrix.os == 'ubuntu-24.04'
+        run: node --test assets/node/test/
       - run: cargo test ${{ env.CORE }}
       # The three Docker live tests (PoC sandbox flags, O2 oracle, O19 fix
       # check). No model calls, no secrets; the image is pinned by digest.
@@ -101,6 +108,24 @@ jobs:
           docker build --tag vettalon-agents-base:ci docker/agents-base
           docker build --build-arg BASE_IMAGE=vettalon-agents-base:ci --tag vettalon-agents:ci docker/agents
           docker build --tag vettalon-egress:ci docker/egress
+      - name: Build local Node PoC image
+        if: steps.changes.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # Match images.rs context_digest: length-prefixed name/body, SHA-256, 12 hex digits.
+          tag=$(python3 - <<'PYTAG'
+          import hashlib
+          from pathlib import Path
+          name = b"Dockerfile"
+          body = Path("docker/poc-node/Dockerfile").read_bytes()
+          digest = hashlib.sha256()
+          for value in (name, body):
+              digest.update(len(value).to_bytes(8, "little"))
+              digest.update(value)
+          print("vettalon-poc-node:" + digest.hexdigest()[:12])
+          PYTAG
+          )
+          docker build --tag "$tag" docker/poc-node
 
   trust:
     name: trust tools (no signing or publishing)

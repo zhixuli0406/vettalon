@@ -33,8 +33,9 @@ fn read_small(repo: &Path, path: &Path) -> Option<String> {
     {
         return None;
     }
-    // Regular files only: a FIFO (`.git/HEAD`, a ref, SECURITY.md, a
-    // manifest) would otherwise block `hunt`/`disclose` until killed.
+    // Never follows the resolved leaf and never blocks: a FIFO, socket,
+    // device or directory (e.g. a `.git/HEAD` or `SECURITY.md` FIFO) is
+    // refused like any unreadable file, and so is anything over the cap.
     let bytes = crate::util::read_regular_file(&resolved, META_MAX_BYTES).ok()?;
     String::from_utf8(bytes).ok()
 }
@@ -134,6 +135,21 @@ pub fn detect_project_as(repo: &Path, ecosystem: Option<&str>) -> ProjectMeta {
             // DATA only: listed for the human, never acted on.
             m.policy_requirements = super::policy::extract_requirements(&t);
             break;
+        }
+    }
+    // Scope hint: every policy / threat-model file that exists (same read
+    // limits as SECURITY.md). Reviewer-notes data only.
+    for rel in super::scope::SCOPE_FILES {
+        // `SECURITY.md` and `security.md` are one file on a case-insensitive
+        // filesystem: read it once.
+        if m.scope_docs
+            .iter()
+            .any(|d| d.file.eq_ignore_ascii_case(rel))
+        {
+            continue;
+        }
+        if let Some(t) = read_small(repo, &repo.join(rel)) {
+            m.scope_docs.push(super::scope::ScopeDoc::parse(rel, &t));
         }
     }
     read_manifest(repo, &mut m);
@@ -278,4 +294,62 @@ pub fn recommend(meta: &ProjectMeta) -> Vec<ChannelOption> {
         window_days: Channel::HitconZeroday.window_days(),
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates a node.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// A FIFO at any path `read_small` opens (`.git/HEAD`, a loose ref,
+    /// `packed-refs`, `SECURITY.md`, a manifest) is refused at once like an
+    /// unreadable file, instead of blocking hunt/disclose forever. The reads
+    /// run on a separate thread so a regression fails after 5 s.
+    #[cfg(unix)]
+    #[test]
+    fn read_small_never_blocks_on_a_fifo() {
+        const FIFOS: [&str; 5] = [
+            ".git/HEAD",
+            ".git/refs/heads/main",
+            ".git/packed-refs",
+            "SECURITY.md",
+            "package.json",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        std::fs::create_dir_all(repo.join(".git/refs/heads")).unwrap();
+        for rel in FIFOS {
+            mkfifo(&repo.join(rel));
+        }
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"fifo\"\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_repo = repo.clone();
+        std::thread::spawn(move || {
+            let reads: Vec<Option<String>> = FIFOS
+                .iter()
+                .map(|rel| read_small(&worker_repo, &worker_repo.join(rel)))
+                .collect();
+            let meta = detect_project(&worker_repo);
+            let _ = tx.send((reads, meta.commit, meta.security_policy, meta.name));
+        });
+        let (reads, commit, policy, name) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("read_small blocked on a FIFO");
+        for (rel, read) in FIFOS.iter().zip(&reads) {
+            assert!(read.is_none(), "{rel}: {read:?}");
+        }
+        assert_eq!(commit, None);
+        assert_eq!(policy, None);
+        // Regular files next to the FIFOs are still read.
+        assert_eq!(name.as_deref(), Some("fifo"));
+        assert!(read_small(&repo, &repo.join("Cargo.toml")).is_some());
+    }
 }

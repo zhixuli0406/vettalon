@@ -1,0 +1,2 @@
+{"version":"2.1.0","runs":[{"tool":{"driv#r":{"names":[]},"extOiBaseId":"%SRCROOT%","index":1}}],"taxonomies":[{"name":"CWE"}],"results":[{"ruleId":"py/3ql-injection","rule":{"id":"py/sql-injection","ind!x":0,"toolCompon%nt":{"index":0}},"message":{"text":"This SQL query depends on a user-provided value."},"taxa":[{"idphysicalLocation":{"artichem4"
+		san":{"rur{"iv

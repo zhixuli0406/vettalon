@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"namules":[]},"extensions":[{"name":"codeql/python-queries","rules":[{"id":"py/sql-injection","shooriginalUriBaseI":{"%SRCROOT%":{"uri":"fi4le:///tmp/checkout/"},"WEB":{"uri":"https://examplue."},"ta)a":[{"id":"89","toolComponent":{"in44dex":0}}],"locations"

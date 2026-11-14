@@ -11,12 +11,17 @@ use std::sync::LazyLock;
 use tokio::process::Command;
 
 use super::{docker, docker_bin};
+use crate::audit::{
+    AttestationEnv, SubprocessLimits, TrustedExecutable, run_attestation_subprocess,
+};
 
 const AGENTS_REPO: &str = "vettalon-agents";
 const AGENTS_BASE_REPO: &str = "vettalon-agents-base";
 const EGRESS_REPO: &str = "vettalon-egress";
 /// Experimental Joern image (`verify --joern-keep`). Built locally only.
 const JOERN_REPO: &str = "vettalon-joern";
+/// Local-only Node image for JS/TS execution proof.
+const POC_NODE_REPO: &str = "vettalon-poc-node";
 /// Hex digits of the build-context digest used as the image tag.
 const IMAGE_TAG_HEX_LEN: usize = 12;
 
@@ -36,6 +41,7 @@ const EGRESS_DOCKERFILE: &str = include_str!("../../../../../docker/egress/Docke
 const EGRESS_CONF: &str = include_str!("../../../../../docker/egress/tinyproxy.conf");
 const EGRESS_ALLOWLIST: &str = include_str!("../../../../../docker/egress/allowlist");
 const JOERN_DOCKERFILE: &str = include_str!("../../../../../docker/joern/Dockerfile");
+const POC_NODE_DOCKERFILE: &str = include_str!("../../../../../docker/poc-node/Dockerfile");
 
 macro_rules! base_license {
     ($rel:literal) => {
@@ -70,6 +76,8 @@ const EGRESS_CONTEXT: &[(&str, &str)] = &[
 /// Joern pinned by version and two hashes (docker/joern/Dockerfile). Never
 /// published or pulled; `vettalon joern build` builds it here.
 const JOERN_CONTEXT: &[(&str, &str)] = &[("Dockerfile", JOERN_DOCKERFILE)];
+/// Never published or pulled; `vettalon poc-node build` builds it locally.
+const POC_NODE_CONTEXT: &[(&str, &str)] = &[("Dockerfile", POC_NODE_DOCKERFILE)];
 
 /// First [`IMAGE_TAG_HEX_LEN`] hex digits of a SHA-256 over every
 /// `(name, body)` of a context.
@@ -111,6 +119,8 @@ static AGENTS_IMAGE: LazyLock<String> =
     LazyLock::new(|| layered_image_ref(AGENTS_REPO, tag_of(&BASE_IMAGE), AGENTS_CONTEXT));
 static EGRESS_IMAGE: LazyLock<String> = LazyLock::new(|| image_ref(EGRESS_REPO, EGRESS_CONTEXT));
 static JOERN_IMAGE: LazyLock<String> = LazyLock::new(|| image_ref(JOERN_REPO, JOERN_CONTEXT));
+static POC_NODE_IMAGE: LazyLock<String> =
+    LazyLock::new(|| image_ref(POC_NODE_REPO, POC_NODE_CONTEXT));
 
 /// The agents image this binary runs (`vettalon-agents:<definition digest>`).
 pub fn agents_image() -> &'static str {
@@ -130,6 +140,11 @@ pub fn egress_image() -> &'static str {
 /// The Joern image `--joern-keep` runs (`vettalon-joern:<definition digest>`).
 pub fn joern_image() -> &'static str {
     &JOERN_IMAGE
+}
+
+/// The local Node PoC image (`vettalon-poc-node:<definition digest>`).
+pub fn poc_node_image() -> &'static str {
+    &POC_NODE_IMAGE
 }
 
 /// What the user sees when an image this binary needs is not built yet.
@@ -229,15 +244,23 @@ pub async fn build_images() -> Result<(), String> {
 /// in this binary. Downloads the pinned Joern release (about 1.8 GB) and
 /// checks its hashes; analysis later runs without network.
 pub async fn build_joern_image() -> Result<(), String> {
+    build_local_image(joern_image(), JOERN_CONTEXT).await
+}
+
+/// `vettalon poc-node build`: build the local Node PoC image from this binary.
+pub async fn build_poc_node_image() -> Result<(), String> {
+    build_local_image(poc_node_image(), POC_NODE_CONTEXT).await
+}
+
+async fn build_local_image(tag: &str, context: &[(&str, &str)]) -> Result<(), String> {
     let bin = docker_bin()?;
     let ctx = tempfile::Builder::new()
-        .prefix("vettalon-build-joern-")
+        .prefix("vettalon-build-local-")
         .tempdir()
         .map_err(|e| format!("cannot create build dir: {e}"))?;
-    for (name, body) in JOERN_CONTEXT {
+    for (name, body) in context {
         std::fs::write(ctx.path().join(name), body).map_err(|e| e.to_string())?;
     }
-    let tag = joern_image();
     eprintln!(
         "[vettalon] {}",
         crate::tr!("建置 {tag}…", "building {tag}…")
@@ -338,6 +361,19 @@ fn is_sha256_digest(d: &str) -> bool {
     })
 }
 
+fn private_cosign_home() -> Result<tempfile::TempDir, String> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("vettalon-image-cosign-home-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder
+        .tempdir()
+        .map_err(|e| format!("cannot create private cosign HOME: {e}"))
+}
+
 /// Resolve one published image to a digest: verified with cosign, or (with
 /// `--no-verify`) whatever the tag points at, read back after the pull.
 async fn pull_one(docker_bin: &str, cosign: Option<&str>, local: &str) -> Result<String, String> {
@@ -352,17 +388,64 @@ async fn pull_one(docker_bin: &str, cosign: Option<&str>, local: &str) -> Result
                     "verifying the signature of {remote}…"
                 )
             );
-            let out = Command::new(cosign)
-                .args(cosign_verify_args(&remote))
-                .stdin(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
-                .await
-                .map_err(|e| format!("cannot run cosign: {e}"))?;
-            if !out.status.success() {
+            let program = TrustedExecutable::resolve(cosign, &[])?;
+            let home = private_cosign_home()?;
+            let version = run_attestation_subprocess(
+                &program,
+                &["version"],
+                home.path(),
+                &SubprocessLimits::default(),
+                AttestationEnv::Cosign {
+                    private_key: false,
+                    home: home.path(),
+                },
+            )
+            .await;
+            if let Some(error) = version
+                .spawn_error
+                .as_ref()
+                .or(version.cleanup_error.as_ref())
+            {
+                return Err(format!("cannot run cosign version: {error}"));
+            }
+            if version.timed_out || version.stdout_truncated || version.exit_code != Some(0) {
+                return Err(
+                    "cannot check cosign version; agents pull requires cosign v2.6.2+ or v3.0.4+"
+                        .into(),
+                );
+            }
+            crate::attest::cosign::require_image_version(&format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&version.stdout),
+                version.stderr_tail
+            ))?;
+            let args = cosign_verify_args(&remote);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            // Public GHCR keyless verification uses cosign's built-in Sigstore
+            // TUF bootstrap and network defaults, with its cache in private HOME.
+            // The SIGSTORE_*/TUF_* allow-list is empty: no custom root, mirror,
+            // cache, credentials or password is required by these fixed flags.
+            let out = run_attestation_subprocess(
+                &program,
+                &args,
+                home.path(),
+                &SubprocessLimits::default(),
+                AttestationEnv::Cosign {
+                    private_key: false,
+                    home: home.path(),
+                },
+            )
+            .await;
+            if let Some(error) = out.spawn_error.as_ref().or(out.cleanup_error.as_ref()) {
+                return Err(format!("cannot run cosign: {error}"));
+            }
+            if out.timed_out || out.stdout_truncated {
+                return Err("cosign verification exceeded its time or output limit".into());
+            }
+            if out.exit_code != Some(0) {
                 return Err(format!(
                     "signature check failed for {remote}: {}",
-                    crate::util::truncate_bytes(String::from_utf8_lossy(&out.stderr).trim(), 600)
+                    crate::util::truncate_bytes(out.stderr_tail.trim(), 600)
                 ));
             }
             let d = verified_digest(&String::from_utf8_lossy(&out.stdout), &repo)?;
@@ -411,7 +494,10 @@ async fn pull_one(docker_bin: &str, cosign: Option<&str>, local: &str) -> Result
 pub async fn pull_images(verify: bool) -> Result<(), String> {
     let bin = docker_bin()?;
     let cosign = if verify {
-        Some(crate::util::which_cli("cosign").ok_or_else(no_cosign_error)?)
+        Some(
+            crate::attest::cosign::resolve_program(std::env::var_os("VETTALON_COSIGN").as_deref())
+                .map_err(|error| format!("{}: {error}", no_cosign_error()))?,
+        )
     } else {
         None
     };
@@ -444,6 +530,8 @@ mod tests {
             (agents_image(), AGENTS_REPO),
             (agents_base_image(), AGENTS_BASE_REPO),
             (egress_image(), EGRESS_REPO),
+            (joern_image(), JOERN_REPO),
+            (poc_node_image(), POC_NODE_REPO),
         ] {
             let tag = img
                 .strip_prefix(repo)
@@ -477,6 +565,11 @@ mod tests {
             image_ref(AGENTS_BASE_REPO, BASE_CONTEXT)
         );
         assert_eq!(egress_image(), image_ref(EGRESS_REPO, EGRESS_CONTEXT));
+        assert_eq!(joern_image(), image_ref(JOERN_REPO, JOERN_CONTEXT));
+        assert_eq!(poc_node_image(), image_ref(POC_NODE_REPO, POC_NODE_CONTEXT));
+        let mut node_context = POC_NODE_CONTEXT.to_vec();
+        node_context[0].1 = "changed";
+        assert_ne!(poc_node_image(), image_ref(POC_NODE_REPO, &node_context));
         assert_eq!(
             agents_image(),
             layered_image_ref(AGENTS_REPO, tag_of(agents_base_image()), AGENTS_CONTEXT)
@@ -548,6 +641,7 @@ mod tests {
             ("agents", AGENTS_CONTEXT),
             ("egress", EGRESS_CONTEXT),
             ("joern", JOERN_CONTEXT),
+            ("poc-node", POC_NODE_CONTEXT),
         ] {
             for (name, body) in context {
                 let rel = format!("{dir}/{name}");
@@ -639,13 +733,36 @@ exit 0"#
         } else {
             "echo 'no matching signatures' >&2; exit 1".to_string()
         };
-        fake_bin(dir, "cosign", log, &body)
+        let check = r#"/usr/bin/env | while IFS= read -r entry; do
+  case "$entry" in
+    PATH=/usr/bin:/bin|LANG=C|LC_ALL=C|HOME=*|PWD=*|SHLVL=*|OLDPWD=*|_=*) ;;
+    *) echo "unexpected child environment: $entry" >&2; exit 1 ;;
+  esac
+done || exit 1
+case "$HOME" in *vettalon-image-cosign-home-*) ;; *) exit 1 ;; esac
+mode=$(/usr/bin/stat -c '%a' "$HOME" 2>/dev/null || /usr/bin/stat -f '%Lp' "$HOME")
+[ "$mode" = 700 ] || exit 1
+"#;
+        fake_bin(
+            dir,
+            "cosign",
+            log,
+            &format!(
+                "{check}\nif [ \"$1\" = version ]; then echo 'GitVersion: v3.0.4'; exit 0; fi\n{body}"
+            ),
+        )
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn pull_verifies_pins_by_digest_then_builds_grok_locally() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_cosign_home().unwrap();
+        assert!(
+            !dir.path()
+                .canonicalize()
+                .unwrap()
+                .starts_with(std::env::current_dir().unwrap())
+        );
         let log = dir.path().join("argv.log");
         let docker = fake_docker(dir.path(), &log);
         let cosign = fake_cosign(dir.path(), &log, true);
@@ -658,12 +775,14 @@ exit 0"#
         let base_repo = registry_repo(agents_base_image());
         let egress_repo = registry_repo(egress_image());
         let expect = [
+            "cosign version".to_string(),
             format!(
                 "cosign {}",
                 cosign_verify_args(&registry_ref(egress_image())).join(" ")
             ),
             format!("docker pull {egress_repo}@{FAKE_DIGEST}"),
             format!("docker tag {egress_repo}@{FAKE_DIGEST} {}", egress_image()),
+            "cosign version".to_string(),
             format!(
                 "cosign {}",
                 cosign_verify_args(&registry_ref(agents_base_image())).join(" ")
@@ -708,9 +827,61 @@ exit 0"#
     }
 
     #[cfg(unix)]
+    #[test]
+    fn pull_clears_inherited_secrets() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "llm::container::images::tests::pull_verifies_pins_by_digest_then_builds_grok_locally", "--nocapture"])
+            .env("COSIGN_PASSWORD", "must-not-reach-verifier")
+            .env("SIGSTORE_ROOT_FILE", "/untrusted/root.json")
+            .env("TUF_ROOT", "/untrusted/tuf")
+            .env("AWS_SECRET_ACCESS_KEY", "must-not-reach-verifier")
+            .env("LD_PRELOAD", "/nonexistent/vettalon-test-loader")
+            .env("DYLD_LIBRARY_PATH", "/untrusted/lib")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsupported_cosign_stops_before_verification_or_pull() {
+        for version in ["v2.6.1", "v3.0.3", "v4.0.0", "v3.0.4-rc.1"] {
+            let dir = private_cosign_home().unwrap();
+            let log = dir.path().join("argv.log");
+            let docker = fake_docker(dir.path(), &log);
+            let cosign = fake_bin(
+                dir.path(),
+                "cosign",
+                &log,
+                &format!("echo 'GitVersion: {version}'"),
+            );
+            let error = pull_images_with(&docker, Some(&cosign)).await.unwrap_err();
+            assert!(
+                error.contains("v2.6.2") && error.contains("v3.0.4"),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(log).unwrap().trim(),
+                "cosign version"
+            );
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_signature_stops_before_any_pull() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_cosign_home().unwrap();
+        assert!(
+            !dir.path()
+                .canonicalize()
+                .unwrap()
+                .starts_with(std::env::current_dir().unwrap())
+        );
         let log = dir.path().join("argv.log");
         let docker = fake_docker(dir.path(), &log);
         let cosign = fake_cosign(dir.path(), &log, false);
@@ -719,7 +890,9 @@ exit 0"#
         assert!(e.contains("no matching signatures"), "{e}");
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.lines().all(|l| l.starts_with("cosign verify")),
+            calls
+                .lines()
+                .all(|l| l == "cosign version" || l.starts_with("cosign verify")),
             "{calls}"
         );
     }
@@ -727,7 +900,13 @@ exit 0"#
     #[cfg(unix)]
     #[tokio::test]
     async fn no_verify_pulls_by_tag_but_still_pins_the_digest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_cosign_home().unwrap();
+        assert!(
+            !dir.path()
+                .canonicalize()
+                .unwrap()
+                .starts_with(std::env::current_dir().unwrap())
+        );
         let log = dir.path().join("argv.log");
         let docker = fake_docker(dir.path(), &log);
         pull_images_with(&docker, None).await.unwrap();

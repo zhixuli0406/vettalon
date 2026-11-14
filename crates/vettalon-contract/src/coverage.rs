@@ -220,6 +220,11 @@ pub enum IncompleteReason {
     /// Modules carrying suspected prompt-injection could not be cross-checked
     /// by a second family, because only one model family was in the run.
     InjectionUncrosschecked,
+    /// The 20-run PoC execution counter was spent. This is not a clock.
+    PocBudgetExhausted,
+    /// The scan reached its cap on harness fix checks, so later suggested
+    /// fixes were not checked.
+    FixCheckCapReached,
 }
 
 impl fmt::Display for IncompleteReason {
@@ -238,6 +243,10 @@ impl fmt::Display for IncompleteReason {
             Self::UnitsFailed => "some units got no usable result",
             Self::InjectionUncrosschecked => {
                 "modules with suspected prompt-injection were not cross-checked by a second family"
+            }
+            Self::PocBudgetExhausted => "the PoC run cap was reached before every eligible PoC ran",
+            Self::FixCheckCapReached => {
+                "the per-scan fix-check cap was reached before every suggested fix was checked"
             }
         })
     }
@@ -791,6 +800,14 @@ mod tests {
         );
         let r: IncompleteReason = serde_json::from_str("\"engine_unavailable\"").unwrap();
         assert_eq!(r, IncompleteReason::EngineUnavailable);
+        assert_eq!(
+            serde_json::to_value(IncompleteReason::PocBudgetExhausted).unwrap(),
+            "poc_budget_exhausted"
+        );
+        assert_eq!(
+            serde_json::to_value(IncompleteReason::FixCheckCapReached).unwrap(),
+            "fix_check_cap_reached"
+        );
         assert_eq!(serde_json::to_value(CheckMethod::Local).unwrap(), "local");
     }
 
@@ -832,6 +849,24 @@ mod tests {
             IncompleteReason::Interrupted.to_string(),
             "the run was interrupted"
         );
+        for wire in [
+            "budget_cannot_fund_reserves",
+            "validation_budget_exhausted",
+            "critic_budget_exhausted",
+            "time_budget_exhausted",
+            "engine_unavailable",
+            "scope_not_fully_reviewed",
+            "interrupted",
+            "model_refused",
+            "units_failed",
+            "injection_uncrosschecked",
+            "poc_budget_exhausted",
+            "fix_check_cap_reached",
+        ] {
+            let parsed: IncompleteReason = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+            assert!(!parsed.to_string().is_empty(), "{wire}");
+        }
         assert_eq!(CheckMethod::Source.to_string(), "source");
     }
 }

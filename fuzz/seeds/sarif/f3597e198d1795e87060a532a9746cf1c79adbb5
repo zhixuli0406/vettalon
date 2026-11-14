@@ -1,0 +1,3 @@
+
+
+{"$schema":"htt..................ps://json.schemastore.org/sarif-2.1.0.json","versio.":"2.1.0","runs":[{"tool":{"driver":{"nameuri":"file:///vettalon-fuzz-root/src/a.py"},"region":{"startLine":3}}},{"physicalLocation":{"artifactLocation":{"uri":"b.py","uriBaseId":"SUB"},"region":{"ste":1}}},{"physicalLocation":{"artifactLocation":{"index":0},"region":{"startLine":2}}}],"codeFlows":[{"threadFlows":[{"lo______________________________________essd":"x","kknd":"pass","message":{"text":"ok"},"locations":[]},{"ruleId":"xme","ssage":{"text":"esc"},"suppressi:ns":[{"kind":"inSource"}],"lo>ations":[{"physicalLocation":{"artifactLocation":{"uri":"../"}}}]}]}]}
